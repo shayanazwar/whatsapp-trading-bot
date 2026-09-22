@@ -1,14 +1,22 @@
-import os
-import json
-import hmac
-import hashlib
+from __future__ import annotations
+
 import asyncio
+import hmac
+import json
 import logging
 from typing import Optional
 
-import httpx
-from fastapi import FastAPI, Request, Query
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+from .alerts import AlertEngine
+from .bot import Bot
+from .charts import ChartRenderer
+from .config import get_settings
+from .database import Database
+from .market import MarketData
+from .whatsapp import WhatsAppClient
+
 
 # ---------------------------------------------------------
 # LOGGING
@@ -21,37 +29,60 @@ logging.basicConfig(
 
 logger = logging.getLogger("whatsapp_bot")
 
-# ---------------------------------------------------------
-# ENVIRONMENT
-# ---------------------------------------------------------
-
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
-
-# Your production WhatsApp Phone Number ID
-WHATSAPP_PHONE_NUMBER_ID = os.getenv(
-    "WHATSAPP_PHONE_NUMBER_ID",
-    "1285387147997440",
-)
-
-# Meta Graph API version
-META_GRAPH_VERSION = os.getenv(
-    "META_GRAPH_VERSION",
-    "v26.0",
-)
 
 # ---------------------------------------------------------
-# FASTAPI
+# CONFIG
+# ---------------------------------------------------------
+
+settings = get_settings()
+
+if not settings.meta_phone_number_id:
+    raise RuntimeError("META_PHONE_NUMBER_ID is not configured")
+
+if not settings.meta_access_token:
+    raise RuntimeError("META_ACCESS_TOKEN is not configured")
+
+if not settings.meta_app_secret:
+    raise RuntimeError("META_APP_SECRET is not configured")
+
+
+# ---------------------------------------------------------
+# APP SERVICES
 # ---------------------------------------------------------
 
 app = FastAPI(title="Pak Trading Academy WhatsApp Bot")
 
-# Keep references to background tasks so they cannot disappear
-_background_tasks = set()
+db = Database()
+market = MarketData(settings)
+
+whatsapp = WhatsAppClient(
+    access_token=settings.meta_access_token,
+    phone_number_id=settings.meta_phone_number_id,
+    graph_version=settings.meta_graph_version,
+    app_secret=settings.meta_app_secret,
+)
+
+charts = ChartRenderer(settings.chart_default_bars)
+
+bot = Bot(
+    settings=settings,
+    db=db,
+    market=market,
+    whatsapp=whatsapp,
+    charts=charts,
+)
+
+alert_engine = AlertEngine(
+    db=db,
+    market=market,
+    settings=settings,
+    on_trigger=bot.send_triggered_alert,
+)
+
+_background_tasks: set[asyncio.Task] = set()
 
 
-def _keep_task(task: asyncio.Task):
+def keep_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
@@ -70,13 +101,11 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-    }
+    return {"status": "healthy"}
 
 
 # ---------------------------------------------------------
-# WEBHOOK VERIFICATION
+# META WEBHOOK VERIFICATION
 # ---------------------------------------------------------
 
 @app.get("/webhook")
@@ -91,17 +120,13 @@ async def verify_webhook(
         alias="hub.challenge",
     ),
 ):
-    logger.info("========== WEBHOOK VERIFICATION ==========")
-    logger.info("hub.mode=%s", hub_mode)
-    logger.info("hub.verify_token_received=%s", bool(hub_verify_token))
-    logger.info("hub.challenge_received=%s", bool(hub_challenge))
-
     if (
         hub_mode == "subscribe"
         and hub_verify_token
+        and settings.meta_verify_token
         and hmac.compare_digest(
             hub_verify_token,
-            META_VERIFY_TOKEN,
+            settings.meta_verify_token,
         )
     ):
         logger.info("WEBHOOK VERIFICATION SUCCESS")
@@ -119,245 +144,78 @@ async def verify_webhook(
 
 
 # ---------------------------------------------------------
-# SIGNATURE VERIFICATION
+# PROCESS WHATSAPP EVENT
 # ---------------------------------------------------------
 
-def verify_meta_signature(
-    body: bytes,
-    signature: Optional[str],
-) -> bool:
-
-    # If App Secret isn't configured, reject production requests.
-    if not META_APP_SECRET:
-        logger.error(
-            "META_APP_SECRET is missing. "
-            "Cannot verify Meta webhook signature."
-        )
-        return False
-
-    if not signature:
-        logger.warning(
-            "POST /webhook arrived without X-Hub-Signature-256"
-        )
-        return False
-
-    expected = (
-        "sha256="
-        + hmac.new(
-            META_APP_SECRET.encode("utf-8"),
-            body,
-            hashlib.sha256,
-        ).hexdigest()
-    )
-
-    return hmac.compare_digest(
-        expected,
-        signature,
-    )
-
-
-# ---------------------------------------------------------
-# WHATSAPP SEND MESSAGE
-# ---------------------------------------------------------
-
-async def send_whatsapp_text(
-    recipient: str,
-    message: str,
-) -> dict:
-
-    if not META_ACCESS_TOKEN:
-        raise RuntimeError("META_ACCESS_TOKEN is not configured")
-
-    if not WHATSAPP_PHONE_NUMBER_ID:
-        raise RuntimeError(
-            "WHATSAPP_PHONE_NUMBER_ID is not configured"
-        )
-
-    url = (
-        f"https://graph.facebook.com/"
-        f"{META_GRAPH_VERSION}/"
-        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": recipient,
-        "type": "text",
-        "text": {
-            "body": message,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            url,
-            headers=headers,
-            json=payload,
-        )
-
-    logger.info(
-        "WhatsApp send response: HTTP %s",
-        response.status_code,
-    )
-
-    if response.status_code >= 400:
-        logger.error(
-            "WhatsApp API error: %s",
-            response.text,
-        )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-# ---------------------------------------------------------
-# PROCESS INCOMING WHATSAPP EVENT
-# ---------------------------------------------------------
-
-async def process_webhook(payload: dict):
-
+async def process_webhook(payload: dict) -> None:
     logger.info("========== PROCESSING WHATSAPP EVENT ==========")
 
-    logger.info(
-        "Webhook object=%s",
-        payload.get("object"),
-    )
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
 
-    entries = payload.get("entry", [])
+            if change.get("field") != "messages":
+                continue
 
-    if not entries:
-        logger.info("Webhook contains no entries.")
-        return
-
-    for entry in entries:
-
-        changes = entry.get("changes", [])
-
-        for change in changes:
-
-            field = change.get("field")
             value = change.get("value", {})
 
-            logger.info(
-                "Webhook field=%s",
-                field,
-            )
-
-            # We only need WhatsApp message events here.
-            if field != "messages":
-                logger.info(
-                    "Ignoring non-message webhook field: %s",
-                    field,
-                )
-                continue
-
-            messages = value.get("messages", [])
-
-            if not messages:
-                logger.info(
-                    "Message webhook contains no messages "
-                    "(possibly a status event)."
-                )
-                continue
-
-            for message in messages:
+            for message in value.get("messages", []):
 
                 message_id = message.get("id")
                 message_type = message.get("type")
                 sender = message.get("from")
 
                 logger.info(
-                    "Incoming WhatsApp message: "
-                    "id=%s type=%s from=%s",
+                    "Incoming message: id=%s type=%s from=%s",
                     message_id,
                     message_type,
                     sender,
                 )
 
-                # -------------------------------------------------
-                # TEXT MESSAGE
-                # -------------------------------------------------
-
-                if message_type == "text":
-
-                    text_data = message.get("text", {})
-                    incoming_text = text_data.get("body", "")
-
+                # Prevent duplicate processing when Meta retries events.
+                if message_id and not db.mark_message_seen(message_id):
                     logger.info(
-                        "Incoming text: %s",
-                        incoming_text,
+                        "Ignoring duplicate message: %s",
+                        message_id,
                     )
+                    continue
 
-                    # TEMPORARY TEST RESPONSE.
-                    #
-                    # Once webhook delivery is confirmed, this can
-                    # be replaced with your existing Bot handler.
-                    try:
-                        await send_whatsapp_text(
-                            sender,
-                            f"✅ Webhook received!\n\n"
-                            f"You said: {incoming_text}",
-                        )
-
-                        logger.info(
-                            "Webhook test reply sent successfully."
-                        )
-
-                    except Exception:
-                        logger.exception(
-                            "Failed to send WhatsApp reply."
-                        )
-
-                else:
+                if message_type != "text":
                     logger.info(
                         "Ignoring unsupported message type: %s",
                         message_type,
                     )
+                    continue
+
+                text = message.get("text", {}).get("body", "").strip()
+
+                if not sender or not text:
+                    continue
+
+                logger.info("Incoming text: %s", text)
+
+                try:
+                    await bot.handle(sender, text)
+                    logger.info(
+                        "Bot command processed successfully."
+                    )
+                except Exception:
+                    logger.exception(
+                        "Bot command processing failed."
+                    )
 
 
 # ---------------------------------------------------------
-# WEBHOOK POST
+# META WEBHOOK POST
 # ---------------------------------------------------------
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
 
-    # ---------------------------------------------------------
-    # CRITICAL DIAGNOSTIC LOG
-    # ---------------------------------------------------------
-    #
-    # This MUST appear in Render if Meta sends us anything.
-    #
-    logger.info("🔥🔥🔥 WEBHOOK POST RECEIVED 🔥🔥🔥")
-
-    # Read the raw body first.
     body = await request.body()
 
-    logger.info(
-        "Webhook body size=%d bytes",
-        len(body),
-    )
+    signature = request.headers.get("X-Hub-Signature-256")
 
-    signature = request.headers.get(
-        "X-Hub-Signature-256"
-    )
-
-    logger.info(
-        "X-Hub-Signature-256 present=%s",
-        bool(signature),
-    )
-
-    # ---------------------------------------------------------
-    # VERIFY META SIGNATURE
-    # ---------------------------------------------------------
-
-    if not verify_meta_signature(
+    if not whatsapp.verify_signature(
         body,
         signature,
     ):
@@ -366,19 +224,13 @@ async def receive_webhook(request: Request):
         )
 
         return JSONResponse(
-            content={
-                "status": "invalid_signature",
-            },
+            content={"status": "invalid_signature"},
             status_code=403,
         )
 
     logger.info(
         "Webhook signature verification PASSED"
     )
-
-    # ---------------------------------------------------------
-    # PARSE JSON
-    # ---------------------------------------------------------
 
     try:
         payload = json.loads(body)
@@ -388,42 +240,19 @@ async def receive_webhook(request: Request):
         )
 
         return JSONResponse(
-            content={
-                "status": "invalid_json",
-            },
+            content={"status": "invalid_json"},
             status_code=400,
         )
-
-    logger.info(
-        "Webhook JSON parsed successfully."
-    )
-
-    logger.info(
-        "Webhook object=%s",
-        payload.get("object"),
-    )
-
-    # ---------------------------------------------------------
-    # ACK META IMMEDIATELY
-    # ---------------------------------------------------------
-
-    # Meta should receive a successful response quickly.
-    # The actual processing happens in the background.
 
     task = asyncio.create_task(
         process_webhook(payload)
     )
 
-    _keep_task(task)
+    keep_task(task)
 
-    logger.info(
-        "Webhook acknowledged; processing task started."
-    )
-
+    # Acknowledge Meta immediately.
     return JSONResponse(
-        content={
-            "status": "ok",
-        },
+        content={"status": "ok"},
         status_code=200,
     )
 
@@ -440,37 +269,37 @@ async def startup_event():
     logger.info("==========================================")
 
     logger.info(
-        "WhatsApp Phone Number ID: %s",
-        WHATSAPP_PHONE_NUMBER_ID,
+        "Phone Number ID: %s",
+        settings.meta_phone_number_id,
     )
 
     logger.info(
-        "Meta Graph API version: %s",
-        META_GRAPH_VERSION,
+        "Graph API version: %s",
+        settings.meta_graph_version,
     )
 
     logger.info(
         "META_VERIFY_TOKEN configured: %s",
-        bool(META_VERIFY_TOKEN),
+        bool(settings.meta_verify_token),
     )
 
     logger.info(
         "META_APP_SECRET configured: %s",
-        bool(META_APP_SECRET),
+        bool(settings.meta_app_secret),
     )
 
     logger.info(
         "META_ACCESS_TOKEN configured: %s",
-        bool(META_ACCESS_TOKEN),
+        bool(settings.meta_access_token),
     )
 
-    logger.info(
-        "Webhook endpoint: /webhook"
-    )
+    await market.start()
+    logger.info("Binance market-data service started.")
 
-    logger.info(
-        "=========================================="
-    )
+    await alert_engine.start()
+    logger.info("Alert engine started.")
+
+    logger.info("Bot startup complete.")
 
 
 # ---------------------------------------------------------
@@ -480,6 +309,10 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
 
-    logger.info(
-        "Pak Trading Academy WhatsApp Bot shutting down."
-    )
+    logger.info("Shutting down Pak Trading Academy Bot...")
+
+    await alert_engine.stop()
+    await market.close()
+    await whatsapp.close()
+
+    logger.info("Shutdown complete.")

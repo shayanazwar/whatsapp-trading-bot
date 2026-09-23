@@ -19,6 +19,11 @@ HELP = """📈 WhatsApp Trading Bot
 Commands:
 
 PRICE BTCUSDT
+
+ANALYZE BTCUSDT
+ANALYZE ETHUSDT
+ANALYZE SOLUSDT
+
 CHART BTCUSDT 1H
 CHART BINANCE:BTCUSDT 4H
 CHART BYBIT:BTC/USDT 15M
@@ -71,160 +76,549 @@ class Bot:
 
     async def handle(self, phone: str, text: str) -> None:
         cleaned = text.strip()
+
         if not cleaned:
             return
-        if self.settings.allowed_user_set and phone not in self.settings.allowed_user_set:
-            await self.whatsapp.send_text(phone, "⛔ This bot is private.")
+
+        if (
+            self.settings.allowed_user_set
+            and phone not in self.settings.allowed_user_set
+        ):
+            await self.whatsapp.send_text(
+                phone,
+                "⛔ This bot is private.",
+            )
             return
 
         match = COMMAND_RE.match(cleaned)
+
         if not match:
-            await self.whatsapp.send_text(phone, HELP)
+            await self.whatsapp.send_text(
+                phone,
+                HELP,
+            )
             return
+
         command = match.group(1).upper()
         args = match.group(2).strip()
 
         try:
             if command in {"HELP", "MENU", "START"}:
-                await self.whatsapp.send_text(phone, HELP)
-            elif command == "PRICE":
-                await self._price(phone, args)
-            elif command == "CHART":
-                await self._chart(phone, args)
-            elif command == "ALERT":
-                await self._create_alert(phone, args)
-            elif command == "ALERTS":
-                await self._list_alerts(phone)
-            elif command == "DELETE":
-                await self._delete(phone, args)
-            elif command == "SEARCH":
-                await self._search(phone, args)
-            else:
-                # Friendly shortcut: "BTCUSDT 1H" means chart, and "BTCUSDT" means price.
-                await self._shortcut(phone, cleaned)
-        except Exception as exc:
-            LOGGER.exception("Command failed: %s", cleaned)
-            await self.whatsapp.send_text(phone, f"❌ {exc}")
+                await self.whatsapp.send_text(
+                    phone,
+                    HELP,
+                )
 
-    async def _price(self, phone: str, args: str) -> None:
+            elif command == "PRICE":
+                await self._price(
+                    phone,
+                    args,
+                )
+
+            elif command == "ANALYZE":
+                await self._analyze(
+                    phone,
+                    args,
+                )
+
+            elif command == "CHART":
+                await self._chart(
+                    phone,
+                    args,
+                )
+
+            elif command == "ALERT":
+                await self._create_alert(
+                    phone,
+                    args,
+                )
+
+            elif command == "ALERTS":
+                await self._list_alerts(
+                    phone,
+                )
+
+            elif command == "DELETE":
+                await self._delete(
+                    phone,
+                    args,
+                )
+
+            elif command == "SEARCH":
+                await self._search(
+                    phone,
+                    args,
+                )
+
+            else:
+                # Friendly shortcut:
+                # "BTCUSDT 1H" means chart
+                # "BTCUSDT" means price.
+                await self._shortcut(
+                    phone,
+                    cleaned,
+                )
+
+        except Exception as exc:
+            LOGGER.exception(
+                "Command failed: %s",
+                cleaned,
+            )
+
+            await self.whatsapp.send_text(
+                phone,
+                f"❌ {exc}",
+            )
+
+    async def _price(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
         if not args:
-            raise ValueError("Usage: PRICE BTCUSDT")
+            raise ValueError(
+                "Usage: PRICE BTCUSDT"
+            )
+
         raw = args.split()[0]
-        ref = await self.market.resolve(raw)
-        if ref.exchange != "binance":
-            raise ValueError("PRICE currently uses Binance spot real-time prices. Use a Binance symbol.")
-        price = await self.market.binance_price(ref.symbol)
-        if price is None:
-            raise ValueError("Could not get the current price.")
-        await self.whatsapp.send_text(
-            phone,
-            f"💰 {ref.symbol}\nExchange: BINANCE SPOT\nPrice: ${fmt_price(price)}",
+
+        ref = await self.market.resolve(
+            raw
         )
 
-    async def _chart(self, phone: str, args: str) -> None:
+        if ref.exchange != "binance":
+            raise ValueError(
+                "PRICE currently uses Binance spot real-time prices. "
+                "Use a Binance symbol."
+            )
+
+        price = await self.market.binance_price(
+            ref.symbol
+        )
+
+        if price is None:
+            raise ValueError(
+                "Could not get the current price."
+            )
+
+        await self.whatsapp.send_text(
+            phone,
+            (
+                f"💰 {ref.symbol}\n"
+                f"Exchange: BINANCE SPOT\n"
+                f"Price: ${fmt_price(price)}"
+            ),
+        )
+
+    async def _analyze(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
+        if not args:
+            raise ValueError(
+                "Usage: ANALYZE BTCUSDT"
+            )
+
+        raw_symbol = args.split()[0]
+
+        data = await analyze_symbol(
+            self.market,
+            raw_symbol,
+        )
+
+        def fmt_optional(
+            value: Optional[float],
+        ) -> str:
+
+            if value is None:
+                return "N/A"
+
+            return fmt_price(value)
+
+        body = (
+            f"🧠 {data['symbol']} ANALYSIS\n\n"
+
+            f"4H Trend: {data['trend_4h']}\n"
+            f"1H Structure: {data['structure_1h']}\n"
+            f"15M Structure: {data['bos_15m']}\n"
+
+            f"EMA 21/50: {data['ema_direction']}\n"
+            f"RSI: {data['rsi']:.1f}\n"
+            f"Volume: {data['volume']}\n"
+
+            f"Support: "
+            f"{fmt_optional(data['support'])}\n"
+
+            f"Resistance: "
+            f"{fmt_optional(data['resistance'])}\n"
+
+            f"Confluence: {data['score']}/6\n\n"
+
+            f"Potential Setup: {data['setup']}\n"
+        )
+
+        if data["entry"] is not None:
+
+            body += (
+                f"Entry: "
+                f"{fmt_price(data['entry'])}\n"
+
+                f"SL: "
+                f"{fmt_price(data['stop_loss'])}\n"
+
+                f"TP1: "
+                f"{fmt_price(data['tp1'])}\n"
+
+                f"TP2: "
+                f"{fmt_price(data['tp2'])}\n"
+
+                f"RR: "
+                f"1:{data['rr']:.2f}"
+            )
+
+        await self.whatsapp.send_text(
+            phone,
+            body,
+        )
+
+    async def _chart(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
         parts = args.split()
+
         if len(parts) < 2:
-            raise ValueError("Usage: CHART BTCUSDT 1H")
-        raw_symbol, raw_tf = parts[0], parts[1]
-        tf = TIMEFRAME_ALIASES.get(raw_tf.upper())
+            raise ValueError(
+                "Usage: CHART BTCUSDT 1H"
+            )
+
+        raw_symbol = parts[0]
+        raw_tf = parts[1]
+
+        tf = TIMEFRAME_ALIASES.get(
+            raw_tf.upper()
+        )
+
         if not tf:
-            raise ValueError("Supported chart timeframes: 5M, 15M, 1H, 4H, 1D")
-        ref = await self.market.resolve(raw_symbol)
-        rows = await self.market.ohlcv(ref, tf, self.settings.chart_default_bars)
-        path = await self.charts.render(ref, tf, rows)
+            raise ValueError(
+                "Supported chart timeframes: "
+                "5M, 15M, 1H, 4H, 1D"
+            )
+
+        ref = await self.market.resolve(
+            raw_symbol
+        )
+
+        rows = await self.market.ohlcv(
+            ref,
+            tf,
+            self.settings.chart_default_bars,
+        )
+
+        path = await self.charts.render(
+            ref,
+            tf,
+            rows,
+        )
+
         try:
-            media_id = await self.whatsapp.upload_image(path)
+            media_id = await self.whatsapp.upload_image(
+                path
+            )
+
             await self.whatsapp.send_image(
                 phone,
                 media_id,
-                caption=f"📊 {ref.exchange.upper()} {ref.symbol} • {tf.upper()}\nEMA 21 / EMA 50",
+                caption=(
+                    f"📊 {ref.exchange.upper()} "
+                    f"{ref.symbol} • {tf.upper()}\n"
+                    f"EMA 21 / EMA 50"
+                ),
             )
-        finally:
-            Path(path).unlink(missing_ok=True)
 
-    async def _create_alert(self, phone: str, args: str) -> None:
+        finally:
+            Path(path).unlink(
+                missing_ok=True
+            )
+
+    async def _create_alert(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
         parts = args.split()
+
         if len(parts) != 3:
-            raise ValueError("Usage: ALERT BTCUSDT ABOVE 120000")
+            raise ValueError(
+                "Usage: ALERT BTCUSDT ABOVE 120000"
+            )
+
         raw_symbol, condition, target_raw = parts
+
         condition = condition.lower()
+
         if condition not in {"above", "below"}:
-            raise ValueError("Condition must be ABOVE or BELOW")
+            raise ValueError(
+                "Condition must be ABOVE or BELOW"
+            )
+
         try:
-            target = float(target_raw.replace(",", ""))
+            target = float(
+                target_raw.replace(",", "")
+            )
+
         except ValueError as exc:
-            raise ValueError("Target must be a number.") from exc
+            raise ValueError(
+                "Target must be a number."
+            ) from exc
+
         if target <= 0:
-            raise ValueError("Target must be greater than zero.")
-        ref = await self.market.resolve(raw_symbol)
-        if ref.exchange != "binance":
-            raise ValueError("Real-time alerts in this version are enabled for Binance spot symbols.")
-        current = await self.market.binance_price(ref.symbol)
-        if current is None:
-            raise ValueError("Could not read the current Binance price. Try again.")
-        if condition == "above" and current >= target:
-            raise ValueError(f"Current price ${fmt_price(current)} is already at/above ${fmt_price(target)}.")
-        if condition == "below" and current <= target:
-            raise ValueError(f"Current price ${fmt_price(current)} is already at/below ${fmt_price(target)}.")
-        alert = self.db.create_alert(phone, "binance", ref.symbol, condition, target)
-        await self.whatsapp.send_text(
-            phone,
-            f"✅ Alert #{alert.id} created\n\n{ref.symbol}\nCondition: {condition.upper()} ${fmt_price(target)}\nCurrent: ${fmt_price(current)}\n\nYou will receive one WhatsApp alert when price crosses the target.",
+            raise ValueError(
+                "Target must be greater than zero."
+            )
+
+        ref = await self.market.resolve(
+            raw_symbol
         )
 
-    async def _list_alerts(self, phone: str) -> None:
-        alerts = self.db.list_alerts(phone)
-        if not alerts:
-            await self.whatsapp.send_text(phone, "🔔 No active alerts.")
-            return
-        lines = ["🔔 ACTIVE ALERTS", ""]
-        for alert in alerts:
-            lines.append(f"#{alert.id} {alert.symbol} {alert.condition.upper()} ${fmt_price(alert.target)}")
-        lines.append("")
-        lines.append("DELETE <id> to remove an alert.")
-        await self.whatsapp.send_text(phone, "\n".join(lines))
+        if ref.exchange != "binance":
+            raise ValueError(
+                "Real-time alerts in this version "
+                "are enabled for Binance spot symbols."
+            )
 
-    async def _delete(self, phone: str, args: str) -> None:
-        if not args:
-            raise ValueError("Usage: DELETE 12 or DELETE ALL")
-        token = args.strip().upper()
-        if token == "ALL":
-            count = self.db.deactivate_all(phone)
-            await self.whatsapp.send_text(phone, f"🗑️ Deleted {count} active alert(s).")
+        current = await self.market.binance_price(
+            ref.symbol
+        )
+
+        if current is None:
+            raise ValueError(
+                "Could not read the current Binance price. "
+                "Try again."
+            )
+
+        if (
+            condition == "above"
+            and current >= target
+        ):
+            raise ValueError(
+                f"Current price ${fmt_price(current)} "
+                f"is already at/above "
+                f"${fmt_price(target)}."
+            )
+
+        if (
+            condition == "below"
+            and current <= target
+        ):
+            raise ValueError(
+                f"Current price ${fmt_price(current)} "
+                f"is already at/below "
+                f"${fmt_price(target)}."
+            )
+
+        alert = self.db.create_alert(
+            phone,
+            "binance",
+            ref.symbol,
+            condition,
+            target,
+        )
+
+        await self.whatsapp.send_text(
+            phone,
+            (
+                f"✅ Alert #{alert.id} created\n\n"
+                f"{ref.symbol}\n"
+                f"Condition: "
+                f"{condition.upper()} "
+                f"${fmt_price(target)}\n"
+                f"Current: "
+                f"${fmt_price(current)}\n\n"
+                f"You will receive one WhatsApp alert "
+                f"when price crosses the target."
+            ),
+        )
+
+    async def _list_alerts(
+        self,
+        phone: str,
+    ) -> None:
+
+        alerts = self.db.list_alerts(
+            phone
+        )
+
+        if not alerts:
+            await self.whatsapp.send_text(
+                phone,
+                "🔔 No active alerts.",
+            )
             return
+
+        lines = [
+            "🔔 ACTIVE ALERTS",
+            "",
+        ]
+
+        for alert in alerts:
+            lines.append(
+                f"#{alert.id} "
+                f"{alert.symbol} "
+                f"{alert.condition.upper()} "
+                f"${fmt_price(alert.target)}"
+            )
+
+        lines.append("")
+        lines.append(
+            "DELETE <id> to remove an alert."
+        )
+
+        await self.whatsapp.send_text(
+            phone,
+            "\n".join(lines),
+        )
+
+    async def _delete(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
+        if not args:
+            raise ValueError(
+                "Usage: DELETE 12 or DELETE ALL"
+            )
+
+        token = args.strip().upper()
+
+        if token == "ALL":
+
+            count = self.db.deactivate_all(
+                phone
+            )
+
+            await self.whatsapp.send_text(
+                phone,
+                f"🗑️ Deleted {count} active alert(s).",
+            )
+
+            return
+
         try:
             alert_id = int(token)
+
         except ValueError as exc:
-            raise ValueError("Alert id must be a number or ALL.") from exc
-        if self.db.deactivate(alert_id, phone):
-            await self.whatsapp.send_text(phone, f"🗑️ Alert #{alert_id} deleted.")
-        else:
-            await self.whatsapp.send_text(phone, f"❌ Active alert #{alert_id} was not found.")
+            raise ValueError(
+                "Alert id must be a number or ALL."
+            ) from exc
 
-    async def _search(self, phone: str, args: str) -> None:
+        if self.db.deactivate(
+            alert_id,
+            phone,
+        ):
+
+            await self.whatsapp.send_text(
+                phone,
+                f"🗑️ Alert #{alert_id} deleted.",
+            )
+
+        else:
+
+            await self.whatsapp.send_text(
+                phone,
+                f"❌ Active alert #{alert_id} was not found.",
+            )
+
+    async def _search(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
         if not args:
-            raise ValueError("Usage: SEARCH PEPE")
-        results = await self.market.search(args, limit=20)
+            raise ValueError(
+                "Usage: SEARCH PEPE"
+            )
+
+        results = await self.market.search(
+            args,
+            limit=20,
+        )
+
         if not results:
-            await self.whatsapp.send_text(phone, "No matching spot markets found.")
+            await self.whatsapp.send_text(
+                phone,
+                "No matching spot markets found.",
+            )
             return
-        lines = [f"🔎 Matches for {args.upper()}:", ""]
+
+        lines = [
+            f"🔎 Matches for {args.upper()}:",
+            "",
+        ]
+
         for ref in results:
-            lines.append(f"{ref.exchange.upper()}: {ref.symbol}")
+            lines.append(
+                f"{ref.exchange.upper()}: {ref.symbol}"
+            )
+
         lines.append("")
-        lines.append("For a chart, use: CHART EXCHANGE:SYMBOL 1H")
-        await self.whatsapp.send_text(phone, "\n".join(lines))
+        lines.append(
+            "For a chart, use: "
+            "CHART EXCHANGE:SYMBOL 1H"
+        )
 
-    async def _shortcut(self, phone: str, text: str) -> None:
+        await self.whatsapp.send_text(
+            phone,
+            "\n".join(lines),
+        )
+
+    async def _shortcut(
+        self,
+        phone: str,
+        text: str,
+    ) -> None:
+
         parts = text.split()
-        if len(parts) == 2 and parts[1].upper() in TIMEFRAME_ALIASES:
-            await self._chart(phone, text)
-        elif len(parts) == 1:
-            await self._price(phone, text)
-        else:
-            await self.whatsapp.send_text(phone, HELP)
 
-    async def send_triggered_alert(self, alert: Alert, price: float) -> None:
+        if (
+            len(parts) == 2
+            and parts[1].upper()
+            in TIMEFRAME_ALIASES
+        ):
+
+            await self._chart(
+                phone,
+                text,
+            )
+
+        elif len(parts) == 1:
+
+            await self._price(
+                phone,
+                text,
+            )
+
+        else:
+
+            await self.whatsapp.send_text(
+                phone,
+                HELP,
+            )
+
+    async def send_triggered_alert(
+        self,
+        alert: Alert,
+        price: float,
+    ) -> None:
+
         body = (
             f"🚨 PRICE ALERT\n\n"
             f"{alert.symbol}\n"
@@ -234,4 +628,8 @@ class Bot:
             f"Condition: {alert.condition.upper()}\n\n"
             f"Alert #{alert.id} is now completed."
         )
-        await self.whatsapp.send_text(alert.phone, body)
+
+        await self.whatsapp.send_text(
+            alert.phone,
+            body,
+        )

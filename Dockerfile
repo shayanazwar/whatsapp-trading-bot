@@ -16,11 +16,13 @@ COPY requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /app/app
+RUN mkdir -p /app/app/analysis
 
-COPY app/ /app/app/
+COPY __init__.py alerts.py bot.py charts.py config.py database.py main.py market.py whatsapp.py /app/app/
+COPY app/analysis/ /app/app/analysis/
+
 COPY .env.example /app/
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "cd /app && python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .charts import ChartRenderer
-from .analysis.engine import analyze_symbol
+from app.analysis.engine import analyze_symbol
 from .config import Settings
 from .database import Alert, Database
 from .market import MarketData, MarketRef, TIMEFRAME_ALIASES

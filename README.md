@@ -1,165 +1,230 @@
-# WhatsApp Trading Alert Bot
+# Pak Trading Academy WhatsApp Trading Bot
 
-A WhatsApp-first cryptocurrency assistant. It accepts commands in WhatsApp, stores one-shot price alerts in SQLite, monitors Binance spot prices in real time, generates candlestick chart PNGs, and can search symbols across several public exchange market APIs.
+A WhatsApp-first cryptocurrency assistant with three separate paths:
 
-## Features in this first version
+1. Existing manual Binance commands (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
+2. A new deterministic MEXC Futures market scanner that uses closed candles and sends WhatsApp trade signals when the configured confluence/risk gates pass.
+3. A separately isolated MEXC Futures execution adapter. **Live execution is disabled in this build.**
 
-- WhatsApp Cloud API webhook with signature verification.
-- `HELP`, `PRICE`, `CHART`, `ALERT`, `ALERTS`, `DELETE`, `SEARCH` commands.
-- One-shot `ABOVE` / `BELOW` alerts.
-- Real-time Binance spot price cache using Binance's all-market mini-ticker WebSocket stream.
-- Chart images for `5m`, `15m`, `1h`, `4h`, and `1d`.
-- Candles + volume + EMA 21 + EMA 50.
-- Symbol search across Binance, Bybit, OKX, Gate.io, and KuCoin (when their public market endpoints are available).
-- SQLite persistence; data survives server restarts.
-- Docker deployment support.
+## Current architecture
 
-## Important scope
+```text
+WhatsApp Cloud API
+        |
+        v
+   app.main webhook
+        |
+        v
+      app.bot
+   /     |      \
+PRICE  ANALYZE  CHART/ALERT
+  |        |
+Binance  Binance
 
-This version uses **Binance spot market data for real-time price alerts**. Symbol discovery can use additional public exchange endpoints. It does **not** claim to contain every TradingView symbol; TradingView aggregates data from many venues, and this bot uses public market-data sources that you explicitly configure.
+MEXC automation (independent)
 
-Do not use this bot for automated trading. It only reads public market data and sends alerts/charts.
+MEXC Futures market data
+        |
+        v
+   Universe selector
+        |
+        v
+   4H / 1H / 15M
+        |
+        v
+   Deterministic analysis
+        |
+        v
+   Setup filter + RR
+        |
+        v
+   Signal validator
+        |
+        +----> SQLite signal state + WhatsApp
+        |
+        +----> execution gate (disabled)
+```
 
-## WhatsApp commands
+## Safety state shipped by default
+
+```text
+SCANNER_ENABLED=false
+AUTO_SIGNAL_ENABLED=false
+AUTO_TRADE_ENABLED=false
+ALLOW_LIVE_EXECUTION=false
+```
+
+Do not change the live-trading switches until the scanner has been observed and the execution path has been separately validated.
+
+## MEXC API notes
+
+The project uses the current MEXC Futures API base:
+
+```text
+https://api.mexc.com
+```
+
+Current documented public endpoints used by the scanner include:
+
+```text
+GET /api/v1/contract/ping
+GET /api/v1/contract/detail/country
+GET /api/v1/contract/ticker
+GET /api/v1/contract/kline/{symbol}
+```
+
+Current documented private endpoints prepared in the API client include:
+
+```text
+GET  /api/v1/private/account/assets
+GET  /api/v1/private/position/open_positions
+GET  /api/v1/private/position/position_mode
+POST /api/v1/private/position/change_leverage
+POST /api/v1/private/order/create
+GET  /api/v1/private/order/get/{orderId}
+POST /api/v1/private/stoporder/place
+```
+
+Private requests follow the current documented OPEN-API signing process: sorted GET/DELETE query parameters or the exact POST JSON string are combined with Access Key + timestamp and HMAC-SHA256 signed.
+
+MEXC does not currently provide a sandbox/test environment, so this build deliberately does not send real orders.
+
+## Scanner logic
+
+The scanner analyzes MEXC USDT-settled perpetual contracts that are live and API-allowed. It ranks the available universe by 24h turnover when ticker data is available and then scans up to `MAX_SYMBOLS`.
+
+The strategy gate is deterministic:
+
+- 4H trend
+- 1H market structure
+- 15M BOS
+- EMA 21/50
+- RSI directional zone
+- optional volume confirmation
+- support/resistance sanity check
+- ATR-derived SL/TP
+- minimum confluence
+- minimum risk/reward
+
+Only fully closed candles are passed to the scanner analysis. The current/open candle is discarded when its interval has not finished yet.
+
+The engine does not generate or claim a confidence percentage, guaranteed accuracy, or guaranteed profitability.
+
+## Automatic WhatsApp signals
+
+Set:
+
+```text
+SCANNER_ENABLED=true
+AUTO_SIGNAL_ENABLED=true
+AUTO_TRADE_ENABLED=false
+```
+
+Then configure either:
+
+```text
+AUTO_SIGNAL_RECIPIENTS=923xxxxxxxxx,923yyyyyyyyy
+```
+
+or, when that is blank, `ALLOWED_USERS` is used as the recipient set.
+
+Example signal shape:
+
+```text
+🚨 TRADE SIGNAL
+
+━━━━━━━━━━━━━━━━
+SOL_USDT — LONG
+━━━━━━━━━━━━━━━━
+
+📍 Entry
+$84.20
+
+🛑 Stop Loss
+$82.90
+
+🎯 TP1
+$86.80
+
+🎯 TP2
+$89.40
+
+📊 Risk/Reward
+1:2.00
+
+📈 4H
+BULLISH
+
+📊 1H
+HH/HL
+
+⚡ 15M
+BULLISH BOS
+
+EMA 21/50
+BULLISH
+
+RSI
+58.0
+
+Volume
+INCREASING
+
+Confluence
+6/6
+━━━━━━━━━━━━━━━━
+```
+
+Exact values come from the deterministic analysis; no fake values are inserted.
+
+## Manual commands
 
 ```text
 HELP
 PRICE BTCUSDT
+ANALYZE BTCUSDT
 CHART BTCUSDT 1H
-CHART BINANCE:BTCUSDT 4H
-SEARCH BTC
 ALERT BTCUSDT ABOVE 120000
-ALERT BTCUSDT BELOW 110000
-ALERT BINANCE:ETHUSDT ABOVE 4500
 ALERTS
 DELETE 12
 DELETE ALL
 SEARCH PEPE
 ```
 
-Accepted chart timeframes: `5M`, `15M`, `1H`, `4H`, `1D`.
+Existing manual functionality remains Binance-based and is intentionally separate from MEXC automation.
 
-Examples:
-
-```text
-ALERT BTCUSDT ABOVE 120000
-```
-
-creates a one-shot alert. It triggers only when price crosses from below the target to at/above the target. The inverse applies to `BELOW`.
-
-## What you need from Meta
-
-1. A Meta developer account.
-2. A Meta app with the WhatsApp product added.
-3. A WhatsApp Business phone number / Phone Number ID suitable for Cloud API use.
-4. A System User access token with the required WhatsApp permissions.
-5. Your Meta App Secret.
-6. A public HTTPS URL for this service.
-
-### Webhook URL
-
-After deployment, your webhook callback URL is:
-
-```text
-https://YOUR-DOMAIN.example.com/webhook
-```
-
-Set the Verify Token in Meta to the same value as `META_VERIFY_TOKEN`.
-
-Subscribe the WhatsApp webhook to the `messages` field.
-
-## Local setup
+## Local checks
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m compileall -q .
+python -m pytest -q
 ```
 
-Windows activation:
+The tests include package imports, alert/message dedupe, chart rendering, MEXC signature construction, candle look-ahead protection, confluence/level validation, position sizing, and scanner fault isolation.
 
-```powershell
-.venv\Scripts\activate
-```
+## Render deployment
 
-The health endpoint should return:
+For the current single-service design, run one web service so only one scanner loop is active. The scheduler is idempotent within the process and starts only when `SCANNER_ENABLED=true`.
+
+Environment variables should be entered in Render's encrypted environment-variable settings. Never commit `.env`, API keys, or secrets to GitHub.
+
+The current Dockerfile starts:
 
 ```text
-GET http://127.0.0.1:8000/health
+uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}
 ```
 
-## Android-only workflow
+## MEXC key safety
 
-You can edit and deploy this project from an Android phone using GitHub + a cloud IDE/host that supports Python Docker deployments. No laptop is required once the project is deployed.
-
-## Production deployment
-
-Use a service that keeps a Python web process alive continuously. A sleeping service can delay price alerts.
-
-Set all `.env.example` values as encrypted environment variables in the hosting platform.
-
-Start command without Docker:
+Only store:
 
 ```text
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+MEXC_ACCESS_KEY
+MEXC_SECRET_KEY
 ```
 
-Docker command is already included in the `Dockerfile`.
+in Render environment variables. Never paste the Secret Key into WhatsApp, GitHub, chat, logs, or source files.
 
-## Security notes
+## Live trading status
 
-- Never commit `.env` or access tokens.
-- Set `ALLOWED_USERS` to your own WhatsApp number(s) if this is a private bot.
-- Keep `META_APP_SECRET` set so webhook signatures are verified.
-- The bot never needs a Binance API key for the public spot-market data it uses.
-- The bot does not place trades and should not be given exchange trading credentials.
-
-## Troubleshooting
-
-### WhatsApp verification fails
-
-- The server must be publicly reachable over HTTPS.
-- `META_VERIFY_TOKEN` must exactly match the value entered in Meta.
-- `/webhook` must answer the verification GET request with the challenge.
-
-### Messages arrive but nothing happens
-
-Check server logs. Make sure `META_ACCESS_TOKEN` and `META_PHONE_NUMBER_ID` are correct, and that the Meta app is subscribed to the WhatsApp `messages` webhook field.
-
-### Alerts are late
-
-The Binance stream updates the all-market mini-ticker stream about once per second. Network and hosting latency can add delay. This is an alerting tool, not an exchange-grade execution system.
-
-### Chart fails for a symbol
-
-The symbol may not exist on the selected exchange or the exchange may not expose the requested timeframe through its public OHLCV API. Try `SEARCH <name>` and select a returned market.
-
-## Project structure
-
-```text
-app/
-  __init__.py
-  alerts.py
-  bot.py
-  charts.py
-  config.py
-  database.py
-  main.py
-  market.py
-  whatsapp.py
-
-tests/
-  test_alerts.py
-  test_bot_commands.py
-  test_charts.py
-```
-
-## Data sources
-
-- Binance public spot market-data REST/WebSocket endpoints for the real-time alert path.
-- Public exchange market endpoints for multi-exchange symbol discovery.
-- Charts are rendered by this application as PNG images.
-
-The project is not affiliated with Meta, Binance, TradingView, or CCXT.
+`app/automation/executor.py` contains the verified API payload builder and current endpoint adapter, but `LIVE_IMPLEMENTED = False` deliberately prevents real order placement. Before enabling live execution, the remaining work is post-fill position reconciliation and verified protective SL/TP installation using the current MEXC endpoint behavior on the user's account.

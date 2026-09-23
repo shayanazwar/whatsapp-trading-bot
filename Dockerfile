@@ -13,16 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt ./
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /app/app/analysis
-
-COPY __init__.py alerts.py bot.py charts.py config.py database.py main.py market.py whatsapp.py /app/app/
-COPY app/analysis/ /app/app/analysis/
-
-COPY .env.example /app/
+COPY app/ ./app/
+COPY .env.example ./
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "cd /app && python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000}"]

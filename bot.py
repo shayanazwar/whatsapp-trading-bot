@@ -73,9 +73,12 @@ class Bot:
         if not cleaned:
             return
 
-        if (
-            self.settings.allowed_user_set
-            and phone not in self.settings.allowed_user_set
+        if phone not in self.settings.allowed_user_set:
+    await self.whatsapp.send_text(
+        phone,
+        "❌ Access Denied\n\nThis bot is available to paid members only.\n\n💳 Contact admin to get access.",
+    )
+    return
         ):
             await self.whatsapp.send_text(
                 phone,

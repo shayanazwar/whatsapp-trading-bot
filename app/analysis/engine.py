@@ -1,3 +1,4 @@
+# Trading analysis engine
 from typing import Dict, List
 
 from .indicators import (

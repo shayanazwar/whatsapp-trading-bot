@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir -p /app/app
 
-COPY *.py /app/app/
+COPY app/ /app/app/
 COPY .env.example /app/
 
 EXPOSE 8000

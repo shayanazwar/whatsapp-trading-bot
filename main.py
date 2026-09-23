@@ -10,19 +10,19 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from .alerts import AlertEngine
-from .automation.executor import MexcExecutor
-from .automation.mexc_client import MexcClient
-from .automation.scanner import MexcScanner
-from .automation.scheduler import ScannerScheduler
-from .automation.signal_manager import SignalManager
-from .automation.universe import MexcUniverse
-from .bot import Bot
-from .charts import ChartRenderer
-from .config import get_settings
-from .database import Database
-from .market import MarketData
-from .whatsapp import WhatsAppClient
+from alerts import AlertEngine
+from app.automation.executor import MexcExecutor
+from app.automation.mexc_client import MexcClient
+from app.automation.scanner import MexcScanner
+from app.automation.scheduler import ScannerScheduler
+from app.automation.signal_manager import SignalManager
+from app.automation.universe import MexcUniverse
+from bot import Bot
+from charts import ChartRenderer
+from config import get_settings
+from database import Database
+from market import MarketData
+from whatsapp import WhatsAppClient
 
 logging.basicConfig(
     level=logging.INFO,

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .charts import ChartRenderer
+from .formatting import fmt_price
 from .analysis.engine import analyze_symbol
 from .config import Settings
 from .database import Alert, Database
@@ -49,14 +50,6 @@ def normalize_symbol_token(value: str) -> str:
     return value.strip().upper()
 
 
-def fmt_price(value: float) -> str:
-    if abs(value) >= 1000:
-        return f"{value:,.2f}"
-    if abs(value) >= 1:
-        return f"{value:,.4f}".rstrip("0").rstrip(".")
-    if abs(value) >= 0.01:
-        return f"{value:,.6f}".rstrip("0").rstrip(".")
-    return f"{value:.10f}".rstrip("0").rstrip(".")
 
 
 class Bot:

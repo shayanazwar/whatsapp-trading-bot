@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,9 +21,29 @@ class Alert:
     created_at: str
 
 
+@dataclass(frozen=True)
+class SignalRecord:
+    signal_key: str
+    symbol: str
+    side: str
+    candle_time: int
+    entry: float
+    stop_loss: float
+    tp1: float
+    tp2: float
+    rr: float
+    confluence: int
+    status: str
+    analysis_json: str
+    created_at: str
+    expires_at: str
+    updated_at: str
+
+
 class Database:
-    def __init__(self, path: str = "bot.sqlite3") -> None:
+    def __init__(self, path: str = "signals.db") -> None:
         self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
         self._init()
 
@@ -53,6 +74,29 @@ class Database:
                     message_id TEXT PRIMARY KEY,
                     processed_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS signals (
+                    signal_key TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('LONG', 'SHORT')),
+                    candle_time INTEGER NOT NULL,
+                    entry REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    tp1 REAL NOT NULL,
+                    tp2 REAL NOT NULL,
+                    rr REAL NOT NULL,
+                    confluence INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    analysis_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_signals_symbol_candle
+                ON signals(symbol, candle_time);
+                CREATE INDEX IF NOT EXISTS idx_signals_status
+                ON signals(status);
                 """
             )
 
@@ -104,7 +148,6 @@ class Database:
             return cursor.rowcount
 
     def mark_message_seen(self, message_id: str) -> bool:
-        """Return True only the first time a message id is seen."""
         processed = datetime.now(timezone.utc).isoformat()
         with self.lock, self._connect() as conn:
             try:
@@ -115,6 +158,78 @@ class Database:
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    def create_signal_if_new(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        side: str,
+        candle_time: int,
+        entry: float,
+        stop_loss: float,
+        tp1: float,
+        tp2: float,
+        rr: float,
+        confluence: int,
+        analysis_json: str,
+        created_at: str,
+        expires_at: str,
+    ) -> bool:
+        with self.lock, self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO signals(
+                        signal_key, symbol, side, candle_time, entry, stop_loss,
+                        tp1, tp2, rr, confluence, status, analysis_json,
+                        created_at, expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, ?)
+                    """,
+                    (
+                        signal_key,
+                        symbol,
+                        side,
+                        candle_time,
+                        entry,
+                        stop_loss,
+                        tp1,
+                        tp2,
+                        rr,
+                        confluence,
+                        analysis_json,
+                        created_at,
+                        expires_at,
+                        created_at,
+                    ),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def update_signal_status(self, signal_key: str, status: str) -> bool:
+        updated = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE signals SET status = ?, updated_at = ? WHERE signal_key = ?",
+                (status, updated, signal_key),
+            )
+            return cursor.rowcount == 1
+
+    def get_signal(self, signal_key: str) -> Optional[SignalRecord]:
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM signals WHERE signal_key = ?", (signal_key,)
+            ).fetchone()
+        return self._to_signal(row) if row else None
+
+    def list_recent_signals(self, limit: int = 100) -> list[SignalRecord]:
+        limit = max(1, min(limit, 500))
+        with self.lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM signals ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._to_signal(row) for row in rows]
 
     @staticmethod
     def _to_alert(row: sqlite3.Row) -> Alert:
@@ -127,4 +242,24 @@ class Database:
             target=float(row["target"]),
             active=bool(row["active"]),
             created_at=str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _to_signal(row: sqlite3.Row) -> SignalRecord:
+        return SignalRecord(
+            signal_key=str(row["signal_key"]),
+            symbol=str(row["symbol"]),
+            side=str(row["side"]),
+            candle_time=int(row["candle_time"]),
+            entry=float(row["entry"]),
+            stop_loss=float(row["stop_loss"]),
+            tp1=float(row["tp1"]),
+            tp2=float(row["tp2"]),
+            rr=float(row["rr"]),
+            confluence=int(row["confluence"]),
+            status=str(row["status"]),
+            analysis_json=str(row["analysis_json"]),
+            created_at=str(row["created_at"]),
+            expires_at=str(row["expires_at"]),
+            updated_at=str(row["updated_at"]),
         )

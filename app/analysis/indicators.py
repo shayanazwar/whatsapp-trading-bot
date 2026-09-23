@@ -84,7 +84,9 @@ def volume_status(
         return "DECREASING"
 
     return "NORMAL"
-    def atr(
+
+
+def atr(
     candles: List[Dict],
     period: int = 14,
 ) -> float:
@@ -95,9 +97,9 @@ def volume_status(
     true_ranges = []
 
     for i in range(1, len(candles)):
-
         high = float(candles[i]["high"])
         low = float(candles[i]["low"])
+
         previous_close = float(
             candles[i - 1]["close"]
         )
@@ -113,4 +115,3 @@ def volume_status(
     return sum(
         true_ranges[-period:]
     ) / period
-    

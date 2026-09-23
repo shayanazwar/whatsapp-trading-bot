@@ -22,6 +22,106 @@ def convert_candles(rows: List) -> List[Dict]:
     ]
 
 
+def calculate_confluence(data: Dict) -> Dict:
+
+    score = 0
+    reasons = []
+
+    # 4H trend
+    if data["trend_4h"] == "BULLISH":
+        score += 1
+        reasons.append("4H bullish")
+
+    elif data["trend_4h"] == "BEARISH":
+        score += 1
+        reasons.append("4H bearish")
+
+    # 1H structure
+    if data["structure_1h"] == "HH/HL":
+        score += 1
+        reasons.append("1H HH/HL")
+
+    elif data["structure_1h"] == "LH/LL":
+        score += 1
+        reasons.append("1H LH/LL")
+
+    # 15M BOS
+    if data["bos_15m"] == "BULLISH BOS":
+        score += 1
+        reasons.append("15M bullish BOS")
+
+    elif data["bos_15m"] == "BEARISH BOS":
+        score += 1
+        reasons.append("15M bearish BOS")
+
+    # EMA
+    if data["ema_direction"] == "BULLISH":
+        score += 1
+        reasons.append("EMA bullish")
+
+    elif data["ema_direction"] == "BEARISH":
+        score += 1
+        reasons.append("EMA bearish")
+
+    # RSI
+    if 50 <= data["rsi"] <= 70:
+        score += 1
+        reasons.append("RSI bullish zone")
+
+    elif 30 <= data["rsi"] < 50:
+        score += 1
+        reasons.append("RSI bearish zone")
+
+    # Volume
+    if data["volume"] == "INCREASING":
+        score += 1
+        reasons.append("Volume increasing")
+
+    # Direction
+    bullish_points = 0
+    bearish_points = 0
+
+    if data["trend_4h"] == "BULLISH":
+        bullish_points += 1
+    elif data["trend_4h"] == "BEARISH":
+        bearish_points += 1
+
+    if data["structure_1h"] == "HH/HL":
+        bullish_points += 1
+    elif data["structure_1h"] == "LH/LL":
+        bearish_points += 1
+
+    if data["bos_15m"] == "BULLISH BOS":
+        bullish_points += 1
+    elif data["bos_15m"] == "BEARISH BOS":
+        bearish_points += 1
+
+    if data["ema_direction"] == "BULLISH":
+        bullish_points += 1
+    elif data["ema_direction"] == "BEARISH":
+        bearish_points += 1
+
+    if data["rsi"] >= 50:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if bullish_points > bearish_points:
+        setup = "LONG"
+
+    elif bearish_points > bullish_points:
+        setup = "SHORT"
+
+    else:
+        setup = "NO TRADE"
+
+    return {
+        "score": score,
+        "setup": setup,
+        "reasons": reasons,
+    }
+
+
 async def analyze_symbol(market, symbol: str) -> Dict:
 
     ref = await market.resolve(symbol)
@@ -69,7 +169,7 @@ async def analyze_symbol(market, symbol: str) -> Dict:
     else:
         ema_direction = "NEUTRAL"
 
-    return {
+    data = {
         "symbol": ref.symbol,
         "price": current_price,
         "trend_4h": trend_4h,
@@ -83,3 +183,9 @@ async def analyze_symbol(market, symbol: str) -> Dict:
         "support": support,
         "resistance": resistance,
     }
+
+    confluence = calculate_confluence(data)
+
+    data.update(confluence)
+
+    return data

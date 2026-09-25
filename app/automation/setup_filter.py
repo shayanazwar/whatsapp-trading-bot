@@ -16,15 +16,6 @@ MAX_SL_ATR = 1.80
 MIN_CONFIRMATION_FAMILIES = 5
 
 
-def _add(
-    reasons: list[str],
-    condition: bool,
-    message: str,
-) -> None:
-    if condition:
-        reasons.append(message)
-
-
 def validate_analysis(
     data: dict[str, Any],
     *,
@@ -35,23 +26,24 @@ def validate_analysis(
 
     reasons: list[str] = []
 
-    side = data.get("setup")
+    side = str(
+        data.get("setup") or ""
+    ).upper()
 
     # ========================================================
     # 1. DETERMINISTIC SIDE
     # ========================================================
 
-    if side not in {"LONG", "SHORT"}:
+    if side not in {
+        "LONG",
+        "SHORT",
+    }:
         return False, [
             "No deterministic LONG/SHORT setup"
         ]
 
     # ========================================================
     # 2. SCORE
-    #
-    # Gold Standard uses 82/100.
-    # Ignore the legacy min_confluence value for the
-    # actual hard gate.
     # ========================================================
 
     score = int(
@@ -69,12 +61,18 @@ def validate_analysis(
         )
 
     # ========================================================
-    # 3. RR
+    # 3. RISK / REWARD
     # ========================================================
 
-    rr = float(
-        data.get("rr") or 0
-    )
+    try:
+        rr = float(
+            data.get("rr") or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rr = 0.0
 
     required_rr = max(
         MIN_RR,
@@ -91,7 +89,10 @@ def validate_analysis(
     # ========================================================
 
     direction_ok = bool(
-        data.get("direction_ok", False)
+        data.get(
+            "direction_ok",
+            False,
+        )
     )
 
     if not direction_ok:
@@ -104,7 +105,10 @@ def validate_analysis(
     # ========================================================
 
     structure_ok = bool(
-        data.get("structure_ok", False)
+        data.get(
+            "structure_ok",
+            False,
+        )
     )
 
     if not structure_ok:
@@ -113,11 +117,14 @@ def validate_analysis(
         )
 
     # ========================================================
-    # 6. 15M + 5M SETUP / TRIGGER
+    # 6. 15M SETUP + 5M TRIGGER
     # ========================================================
 
     setup_ok = bool(
-        data.get("setup_ok", False)
+        data.get(
+            "setup_ok",
+            False,
+        )
     )
 
     if not setup_ok:
@@ -151,22 +158,39 @@ def validate_analysis(
         )
     )
 
-    if side == "LONG" and not five_long:
-        reasons.append(
-            "5M LONG trigger confirmation failed"
-        )
+    if side == "LONG":
 
-    if side == "SHORT" and not five_short:
-        reasons.append(
-            "5M SHORT trigger confirmation failed"
-        )
+        if not five_long:
+            reasons.append(
+                "5M LONG trigger confirmation failed"
+            )
+
+        if five_short:
+            reasons.append(
+                "LONG contains conflicting 5M SHORT trigger"
+            )
+
+    else:
+
+        if not five_short:
+            reasons.append(
+                "5M SHORT trigger confirmation failed"
+            )
+
+        if five_long:
+            reasons.append(
+                "SHORT contains conflicting 5M LONG trigger"
+            )
 
     # ========================================================
     # 7. MOMENTUM
     # ========================================================
 
     momentum_ok = bool(
-        data.get("momentum_ok", False)
+        data.get(
+            "momentum_ok",
+            False,
+        )
     )
 
     if not momentum_ok:
@@ -175,11 +199,14 @@ def validate_analysis(
         )
 
     # ========================================================
-    # 8. VOLUME
+    # 8. VOLUME / PARTICIPATION
     # ========================================================
 
     volume_ok = bool(
-        data.get("volume_ok", False)
+        data.get(
+            "volume_ok",
+            False,
+        )
     )
 
     if not volume_ok:
@@ -189,7 +216,9 @@ def validate_analysis(
 
     if (
         require_increasing_volume
-        and data.get("volume")
+        and str(
+            data.get("volume") or ""
+        ).upper()
         != "INCREASING"
     ):
         reasons.append(
@@ -201,7 +230,10 @@ def validate_analysis(
     # ========================================================
 
     location_ok = bool(
-        data.get("location_ok", False)
+        data.get(
+            "location_ok",
+            False,
+        )
     )
 
     if not location_ok:
@@ -214,7 +246,10 @@ def validate_analysis(
     # ========================================================
 
     futures_ok = bool(
-        data.get("futures_ok", False)
+        data.get(
+            "futures_ok",
+            False,
+        )
     )
 
     if not futures_ok:
@@ -227,7 +262,10 @@ def validate_analysis(
     # ========================================================
 
     volatility_ok = bool(
-        data.get("volatility_ok", False)
+        data.get(
+            "volatility_ok",
+            False,
+        )
     )
 
     if not volatility_ok:
@@ -237,6 +275,12 @@ def validate_analysis(
 
     # ========================================================
     # 12. CONFIRMATION FAMILIES
+    #
+    # Direction + Structure + Setup are mandatory.
+    # At least 5 of 6 families must pass.
+    #
+    # Futures and volatility are separate hard gates and are
+    # intentionally NOT counted as confirmation families.
     # ========================================================
 
     families = [
@@ -249,22 +293,22 @@ def validate_analysis(
     ]
 
     family_count = sum(
-        1 for value in families
+        1
+        for value in families
         if value
     )
 
-    data["confirmation_family_count"] = (
-        family_count
-    )
+    data[
+        "confirmation_family_count"
+    ] = family_count
 
     if family_count < MIN_CONFIRMATION_FAMILIES:
         reasons.append(
             "Confirmation families "
-            f"{family_count}/6 < "
-            f"required {MIN_CONFIRMATION_FAMILIES}/6"
+            f"{family_count}/6 < required "
+            f"{MIN_CONFIRMATION_FAMILIES}/6"
         )
 
-    # Direction + Structure + Setup are mandatory.
     if not direction_ok:
         reasons.append(
             "Mandatory Direction family missing"
@@ -284,19 +328,33 @@ def validate_analysis(
     # 13. BULLISH / BEARISH COMPATIBILITY
     # ========================================================
 
-    bullish = int(
-        data.get(
-            "bullish_points",
-            0,
-        ) or 0
-    )
+    try:
+        bullish = int(
+            data.get(
+                "bullish_points",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        bullish = 0
 
-    bearish = int(
-        data.get(
-            "bearish_points",
-            0,
-        ) or 0
-    )
+    try:
+        bearish = int(
+            data.get(
+                "bearish_points",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        bearish = 0
 
     if side == "LONG":
 
@@ -431,9 +489,15 @@ def validate_analysis(
     # 17. ATR STOP DISTANCE
     # ========================================================
 
-    atr_value = float(
-        data.get("atr") or 0
-    )
+    try:
+        atr_value = float(
+            data.get("atr") or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        atr_value = 0.0
 
     if atr_value <= 0:
         reasons.append(
@@ -451,7 +515,9 @@ def validate_analysis(
             / atr_value
         )
 
-        data["sl_atr"] = sl_atr
+        data[
+            "sl_atr"
+        ] = sl_atr
 
         if sl_atr < MIN_SL_ATR:
             reasons.append(
@@ -469,12 +535,19 @@ def validate_analysis(
     # 18. 5M TRIGGER QUALITY
     # ========================================================
 
-    trigger_quality = float(
-        data.get(
-            "trigger_quality_5m",
-            0,
-        ) or 0
-    )
+    try:
+        trigger_quality = float(
+            data.get(
+                "trigger_quality_5m",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        trigger_quality = 0.0
 
     if trigger_quality < 0.55:
         reasons.append(
@@ -486,13 +559,33 @@ def validate_analysis(
     # 19. RSI SANITY
     # ========================================================
 
-    rsi_15m = float(
-        data.get("rsi") or 50
-    )
+    try:
+        rsi_15m = float(
+            data.get(
+                "rsi",
+                50,
+            )
+            or 50
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rsi_15m = 50.0
 
-    rsi_5m = float(
-        data.get("rsi_5m") or 50
-    )
+    try:
+        rsi_5m = float(
+            data.get(
+                "rsi_5m",
+                50,
+            )
+            or 50
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rsi_5m = 50.0
 
     if side == "LONG":
 
@@ -532,13 +625,33 @@ def validate_analysis(
     # 20. RVOL SANITY
     # ========================================================
 
-    rvol_15m = float(
-        data.get("rvol") or 0
-    )
+    try:
+        rvol_15m = float(
+            data.get(
+                "rvol",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rvol_15m = 0.0
 
-    rvol_5m = float(
-        data.get("rvol_5m") or 0
-    )
+    try:
+        rvol_5m = float(
+            data.get(
+                "rvol_5m",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rvol_5m = 0.0
 
     if rvol_15m < 1.0:
         reasons.append(
@@ -551,8 +664,13 @@ def validate_analysis(
         )
 
     # ========================================================
-    # 21. VOLATILITY
+    # 21. FINAL HARD GATES
     # ========================================================
+
+    if not futures_ok:
+        reasons.append(
+            "Futures context hard gate failed"
+        )
 
     if not volatility_ok:
         reasons.append(
@@ -560,10 +678,10 @@ def validate_analysis(
         )
 
     # ========================================================
-    # 22. FINAL RESULT
+    # 22. RESULT
     # ========================================================
 
     return (
-        not reasons,
+        len(reasons) == 0,
         reasons,
     )

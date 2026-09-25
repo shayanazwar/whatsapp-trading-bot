@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import time
 
 from .indicators import atr, ema, rsi, volume_status
 from .structure import (
     get_bos,
     get_structure,
     get_support_resistance,
-    get_trend,
 )
 
 
@@ -28,8 +28,6 @@ TIMEFRAME_MS = {
 # ============================================================
 
 def convert_candles(rows: List) -> List[Dict]:
-    """Convert normalized MEXC Futures rows into analysis dictionaries."""
-
     candles: list[Dict] = []
 
     for row in rows:
@@ -37,26 +35,28 @@ def convert_candles(rows: List) -> List[Dict]:
             continue
 
         try:
-            item: Dict = {
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-            }
+            timestamp = int(row[0])
 
-            if row[0] is not None:
-                timestamp = int(row[0])
+            if timestamp < 10**12:
+                timestamp *= 1000
 
-                if timestamp < 10**12:
-                    timestamp *= 1000
-
-                item["time"] = timestamp
-
-            candles.append(item)
+            candles.append(
+                {
+                    "time": timestamp,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
 
         except (TypeError, ValueError):
             continue
+
+    candles.sort(
+        key=lambda item: item["time"]
+    )
 
     return candles
 
@@ -75,8 +75,6 @@ def closed_candle_rows(
         raise ValueError(
             f"Unsupported interval: {interval}"
         )
-
-    import time
 
     now = int(
         now_ms
@@ -98,7 +96,6 @@ def closed_candle_rows(
             if timestamp < 10**12:
                 timestamp *= 1000
 
-            # Never use a candle that has not completely closed.
             if timestamp + interval_ms > now:
                 continue
 
@@ -134,7 +131,7 @@ def closed_candle_rows(
 
 
 # ============================================================
-# EMA HELPERS
+# EMA
 # ============================================================
 
 def _safe_ema(
@@ -146,9 +143,15 @@ def _safe_ema(
         return None
 
     try:
-        return float(
+        value = float(
             ema(values, period)
         )
+
+        if value != value:
+            return None
+
+        return value
+
     except Exception:
         return None
 
@@ -172,10 +175,11 @@ def _ema_slope(
         period,
     )
 
-    if current is None or previous is None:
-        return 0.0
-
-    if previous == 0:
+    if (
+        current is None
+        or previous is None
+        or previous == 0
+    ):
         return 0.0
 
     return (
@@ -228,10 +232,6 @@ def _safe_atr(
         return 0.0
 
 
-# ============================================================
-# ATR %
-# ============================================================
-
 def _atr_percent(
     price: float,
     atr_value: float,
@@ -240,49 +240,12 @@ def _atr_percent(
     if price <= 0:
         return 0.0
 
-    return (
-        atr_value / price
-    )
+    return atr_value / price
 
 
 # ============================================================
-# TRUE RANGE / ADX
+# ADX
 # ============================================================
-
-def _true_ranges(
-    candles: list[Dict],
-) -> list[float]:
-
-    if not candles:
-        return []
-
-    result: list[float] = []
-
-    previous_close: Optional[float] = None
-
-    for candle in candles:
-
-        high = float(candle["high"])
-        low = float(candle["low"])
-        close = float(candle["close"])
-
-        if previous_close is None:
-            tr = high - low
-        else:
-            tr = max(
-                high - low,
-                abs(high - previous_close),
-                abs(low - previous_close),
-            )
-
-        result.append(
-            max(0.0, tr)
-        )
-
-        previous_close = close
-
-    return result
-
 
 def _adx(
     candles: list[Dict],
@@ -332,15 +295,19 @@ def _adx(
 
         plus = (
             up_move
-            if up_move > down_move
-            and up_move > 0
+            if (
+                up_move > down_move
+                and up_move > 0
+            )
             else 0.0
         )
 
         minus = (
             down_move
-            if down_move > up_move
-            and down_move > 0
+            if (
+                down_move > up_move
+                and down_move > 0
+            )
             else 0.0
         )
 
@@ -348,25 +315,25 @@ def _adx(
         plus_dm.append(plus)
         minus_dm.append(minus)
 
-    if len(trs) < period:
-        return 0.0
+    def smooth(
+        values: list[float],
+    ) -> list[float]:
 
-    def smooth(values: list[float]) -> list[float]:
+        if len(values) < period:
+            return []
 
-        result: list[float] = []
+        result = []
 
-        initial = sum(
+        previous = sum(
             values[:period]
         )
 
-        result.append(initial)
-
-        previous = initial
+        result.append(previous)
 
         for value in values[period:]:
             previous = (
                 previous
-                - (previous / period)
+                - previous / period
                 + value
             )
 
@@ -377,6 +344,9 @@ def _adx(
     tr_s = smooth(trs)
     plus_s = smooth(plus_dm)
     minus_s = smooth(minus_dm)
+
+    if not tr_s:
+        return 0.0
 
     dx_values: list[float] = []
 
@@ -406,17 +376,16 @@ def _adx(
         )
 
         if denominator <= 0:
-            dx = 0.0
-        else:
-            dx = (
-                100.0
-                * abs(
-                    plus_di - minus_di
-                )
-                / denominator
-            )
+            dx_values.append(0.0)
+            continue
 
-        dx_values.append(dx)
+        dx_values.append(
+            100.0
+            * abs(
+                plus_di - minus_di
+            )
+            / denominator
+        )
 
     if len(dx_values) < period:
         return 0.0
@@ -452,74 +421,93 @@ def _relative_volume(
         ]
     ]
 
-    if not previous:
-        return 0.0
-
     average = (
         sum(previous)
         / len(previous)
+        if previous
+        else 0.0
     )
 
     if average <= 0:
         return 0.0
 
-    return (
-        current / average
-    )
+    return current / average
 
 
 # ============================================================
-# SWINGS
+# CONFIRMED SWINGS
 # ============================================================
 
 def _swing_highs(
     candles: list[Dict],
 ) -> list[tuple[int, float]]:
 
-    swings: list[tuple[int, float]] = []
+    result = []
 
-    for i in range(2, len(candles) - 2):
+    for i in range(
+        2,
+        len(candles) - 2,
+    ):
 
         high = float(
             candles[i]["high"]
         )
 
         if (
-            high > float(candles[i - 1]["high"])
-            and high > float(candles[i - 2]["high"])
-            and high > float(candles[i + 1]["high"])
-            and high > float(candles[i + 2]["high"])
+            high > float(
+                candles[i - 1]["high"]
+            )
+            and high > float(
+                candles[i - 2]["high"]
+            )
+            and high > float(
+                candles[i + 1]["high"]
+            )
+            and high > float(
+                candles[i + 2]["high"]
+            )
         ):
-            swings.append(
+            result.append(
                 (i, high)
             )
 
-    return swings
+    return result
 
 
 def _swing_lows(
     candles: list[Dict],
 ) -> list[tuple[int, float]]:
 
-    swings: list[tuple[int, float]] = []
+    result = []
 
-    for i in range(2, len(candles) - 2):
+    for i in range(
+        2,
+        len(candles) - 2,
+    ):
 
         low = float(
             candles[i]["low"]
         )
 
         if (
-            low < float(candles[i - 1]["low"])
-            and low < float(candles[i - 2]["low"])
-            and low < float(candles[i + 1]["low"])
-            and low < float(candles[i + 2]["low"])
+            low < float(
+                candles[i - 1]["low"]
+            )
+            and low < float(
+                candles[i - 2]["low"]
+            )
+            and low < float(
+                candles[i + 1]["low"]
+            )
+            and low < float(
+                candles[i + 2]["low"]
+            )
         ):
-            swings.append(
+            result.append(
                 (i, low)
             )
 
-    return swings
+    return result
 
 
 # ============================================================
@@ -536,69 +524,90 @@ def _protected_structure(
     result = {
         "bullish": False,
         "bearish": False,
-        "protected_high": None,
-        "protected_low": None,
+        "protected_high": (
+            highs[-1][1]
+            if highs
+            else None
+        ),
+        "protected_low": (
+            lows[-1][1]
+            if lows
+            else None
+        ),
         "state": "NEUTRAL",
     }
 
-    if len(highs) >= 2:
+    if (
+        len(highs) >= 2
+        and len(lows) >= 2
+    ):
 
-        previous_high = highs[-2][1]
-        latest_high = highs[-1][1]
+        higher_high = (
+            highs[-1][1]
+            > highs[-2][1]
+        )
 
-        if latest_high > previous_high:
+        higher_low = (
+            lows[-1][1]
+            > lows[-2][1]
+        )
+
+        lower_high = (
+            highs[-1][1]
+            < highs[-2][1]
+        )
+
+        lower_low = (
+            lows[-1][1]
+            < lows[-2][1]
+        )
+
+        if higher_high and higher_low:
             result["bullish"] = True
 
-    if len(lows) >= 2:
-
-        previous_low = lows[-2][1]
-        latest_low = lows[-1][1]
-
-        if latest_low > previous_low:
-            result["bullish"] = True
-
-        if latest_low < previous_low:
+        if lower_high and lower_low:
             result["bearish"] = True
 
-    if len(highs) >= 2:
-
-        previous_high = highs[-2][1]
-        latest_high = highs[-1][1]
-
-        if latest_high < previous_high:
-            result["bearish"] = True
-
-    if lows:
-        result["protected_low"] = lows[-1][1]
-
-    if highs:
-        result["protected_high"] = highs[-1][1]
-
-    if result["bullish"] and not result["bearish"]:
+    if (
+        result["bullish"]
+        and not result["bearish"]
+    ):
         result["state"] = "BULLISH"
 
-    elif result["bearish"] and not result["bullish"]:
+    elif (
+        result["bearish"]
+        and not result["bullish"]
+    ):
         result["state"] = "BEARISH"
 
     return result
 
 
 # ============================================================
-# BOS
+# CONFIRMED BOS
 # ============================================================
 
 def _confirmed_bos(
     candles: list[Dict],
     direction: str,
-) -> bool:
+) -> tuple[bool, Optional[float]]:
 
-    if len(candles) < 10:
-        return False
+    if len(candles) < 15:
+        return False, None
 
-    highs = _swing_highs(candles[:-2])
-    lows = _swing_lows(candles[:-2])
+    # Exclude the latest candle when identifying the
+    # structural level. The latest candle performs the break.
+    structure_candles = candles[:-1]
 
-    current_close = float(
+    highs = _swing_highs(
+        structure_candles
+    )
+
+    lows = _swing_lows(
+        structure_candles
+    )
+
+    close = float(
         candles[-1]["close"]
     )
 
@@ -608,7 +617,7 @@ def _confirmed_bos(
 
     buffer = max(
         atr_value * 0.10,
-        current_close * 0.0005,
+        close * 0.0005,
     )
 
     if direction == "LONG" and highs:
@@ -616,8 +625,8 @@ def _confirmed_bos(
         level = highs[-1][1]
 
         return (
-            current_close
-            > level + buffer
+            close > level + buffer,
+            level,
         )
 
     if direction == "SHORT" and lows:
@@ -625,11 +634,11 @@ def _confirmed_bos(
         level = lows[-1][1]
 
         return (
-            current_close
-            < level - buffer
+            close < level - buffer,
+            level,
         )
 
-    return False
+    return False, None
 
 
 # ============================================================
@@ -639,12 +648,14 @@ def _confirmed_bos(
 def _pullback_retest(
     candles: list[Dict],
     direction: str,
+    level: Optional[float],
 ) -> bool:
 
-    if len(candles) < 12:
+    if (
+        len(candles) < 8
+        or level is None
+    ):
         return False
-
-    recent = candles[-6:]
 
     atr_value = _safe_atr(
         candles
@@ -653,24 +664,19 @@ def _pullback_retest(
     if atr_value <= 0:
         return False
 
-    highs = _swing_highs(
-        candles[:-2]
+    recent = candles[-6:]
+
+    tolerance = (
+        atr_value * 0.35
     )
 
-    lows = _swing_lows(
-        candles[:-2]
-    )
-
-    if direction == "LONG" and highs:
-
-        level = highs[-1][1]
+    if direction == "LONG":
 
         touched = any(
-            abs(
-                float(candle["low"])
-                - level
-            )
-            <= atr_value * 0.35
+            float(candle["low"])
+            <= level + tolerance
+            and float(candle["low"])
+            >= level - tolerance
             for candle in recent
         )
 
@@ -679,21 +685,15 @@ def _pullback_retest(
             > level
         )
 
-        return (
-            touched
-            and reclaimed
-        )
+        return touched and reclaimed
 
-    if direction == "SHORT" and lows:
-
-        level = lows[-1][1]
+    if direction == "SHORT":
 
         touched = any(
-            abs(
-                float(candle["high"])
-                - level
-            )
-            <= atr_value * 0.35
+            float(candle["high"])
+            >= level - tolerance
+            and float(candle["high"])
+            <= level + tolerance
             for candle in recent
         )
 
@@ -702,121 +702,252 @@ def _pullback_retest(
             < level
         )
 
-        return (
-            touched
-            and reclaimed
-        )
+        return touched and reclaimed
 
     return False
 
 
 # ============================================================
-# CANDLE QUALITY
+# 5M TRIGGER
 # ============================================================
 
-def _trigger_quality(
-    candle: Dict,
+def _five_minute_trigger(
+    candles: list[Dict],
     direction: str,
-) -> float:
+    setup_level: Optional[float],
+) -> dict[str, Any]:
 
-    high = float(candle["high"])
-    low = float(candle["low"])
+    result = {
+        "ready": False,
+        "long": False,
+        "short": False,
+        "quality": 0.0,
+        "rsi": 50.0,
+        "rvol": 0.0,
+        "body_ratio": 0.0,
+        "break_level": None,
+        "candle_time": None,
+    }
+
+    if len(candles) < 30:
+        return result
+
+    current = candles[-1]
+    previous = candles[-2]
+
+    high = float(
+        current["high"]
+    )
+
+    low = float(
+        current["low"]
+    )
+
     open_price = float(
-        candle["open"]
-    )
-    close = float(
-        candle["close"]
+        current["open"]
     )
 
-    candle_range = high - low
+    close = float(
+        current["close"]
+    )
+
+    previous_high = float(
+        previous["high"]
+    )
+
+    previous_low = float(
+        previous["low"]
+    )
+
+    candle_range = (
+        high - low
+    )
 
     if candle_range <= 0:
-        return 0.0
-
-    body = abs(
-        close - open_price
-    )
+        return result
 
     body_ratio = (
-        body / candle_range
+        abs(close - open_price)
+        / candle_range
+    )
+
+    close_position_long = (
+        close - low
+    ) / candle_range
+
+    close_position_short = (
+        high - close
+    ) / candle_range
+
+    rsi_5m = _safe_rsi(
+        [
+            float(c["close"])
+            for c in candles
+        ]
+    )
+
+    rvol_5m = _relative_volume(
+        candles
+    )
+
+    atr_5m = _safe_atr(
+        candles
     )
 
     if direction == "LONG":
-        close_position = (
-            close - low
-        ) / candle_range
-    else:
-        close_position = (
-            high - close
-        ) / candle_range
 
-    return max(
-        0.0,
-        min(
-            1.0,
-            (
-                body_ratio
-                + close_position
-            )
-            / 2.0,
-        ),
-    )
+        broke_previous_high = (
+            close > previous_high
+        )
+
+        above_setup = (
+            setup_level is None
+            or close > setup_level
+        )
+
+        quality = (
+            body_ratio * 0.40
+            + close_position_long * 0.35
+            + min(
+                rvol_5m / 2.0,
+                1.0,
+            ) * 0.25
+        )
+
+        trigger = (
+            broke_previous_high
+            and above_setup
+            and body_ratio >= 0.55
+            and close_position_long >= 0.65
+            and rsi_5m > 50
+            and rsi_5m < 75
+            and rvol_5m >= 1.0
+        )
+
+        result.update(
+            {
+                "ready": trigger,
+                "long": trigger,
+                "short": False,
+                "quality": quality,
+                "rsi": rsi_5m,
+                "rvol": rvol_5m,
+                "body_ratio": body_ratio,
+                "break_level": previous_high,
+                "candle_time": current["time"],
+                "atr": atr_5m,
+            }
+        )
+
+    elif direction == "SHORT":
+
+        broke_previous_low = (
+            close < previous_low
+        )
+
+        below_setup = (
+            setup_level is None
+            or close < setup_level
+        )
+
+        quality = (
+            body_ratio * 0.40
+            + close_position_short * 0.35
+            + min(
+                rvol_5m / 2.0,
+                1.0,
+            ) * 0.25
+        )
+
+        trigger = (
+            broke_previous_low
+            and below_setup
+            and body_ratio >= 0.55
+            and close_position_short >= 0.65
+            and rsi_5m < 50
+            and rsi_5m > 25
+            and rvol_5m >= 1.0
+        )
+
+        result.update(
+            {
+                "ready": trigger,
+                "long": False,
+                "short": trigger,
+                "quality": quality,
+                "rsi": rsi_5m,
+                "rvol": rvol_5m,
+                "body_ratio": body_ratio,
+                "break_level": previous_low,
+                "candle_time": current["time"],
+                "atr": atr_5m,
+            }
+        )
+
+    return result
 
 
 # ============================================================
-# 100-POINT SCORE
+# TARGET PATH
 # ============================================================
 
-def _build_score(
+def _target_path(
     *,
-    direction_ok: bool,
-    structure_ok: bool,
-    setup_ok: bool,
-    momentum_ok: bool,
-    volume_ok: bool,
-    location_ok: bool,
-    futures_ok: bool,
-    volatility_ok: bool,
-) -> tuple[int, dict[str, int]]:
+    side: str,
+    entry: float,
+    risk: float,
+    resistance: Optional[float],
+    support: Optional[float],
+) -> tuple[bool, Optional[float], Optional[float]]:
 
-    groups = {
-        "direction_regime": 20
-        if direction_ok
-        else 0,
+    if risk <= 0:
+        return False, None, None
 
-        "market_structure": 20
-        if structure_ok
-        else 0,
+    if side == "LONG":
 
-        "setup_trigger": 20
-        if setup_ok
-        else 0,
+        tp1 = entry + (
+            risk * 1.20
+        )
 
-        "momentum": 10
-        if momentum_ok
-        else 0,
+        tp2 = entry + (
+            risk * 2.00
+        )
 
-        "volume_participation": 10
-        if volume_ok
-        else 0,
+        if (
+            resistance is not None
+            and float(resistance) <= tp2
+        ):
+            return (
+                False,
+                tp1,
+                tp2,
+            )
 
-        "location_target_path": 10
-        if location_ok
-        else 0,
+        return True, tp1, tp2
 
-        "futures_context": 5
-        if futures_ok
-        else 0,
+    if side == "SHORT":
 
-        "volatility_execution": 5
-        if volatility_ok
-        else 0,
-    }
+        tp1 = entry - (
+            risk * 1.20
+        )
 
-    return (
-        sum(groups.values()),
-        groups,
-    )
+        tp2 = entry - (
+            risk * 2.00
+        )
+
+        if (
+            support is not None
+            and float(support) >= tp2
+        ):
+            return (
+                False,
+                tp1,
+                tp2,
+            )
+
+        return True, tp1, tp2
+
+    return False, None, None
 
 
 # ============================================================
@@ -827,18 +958,24 @@ def calculate_trade_levels(
     data: Dict,
 ) -> Dict:
 
+    setup = data.get(
+        "setup"
+    )
+
     price = float(
-        data["price"]
+        data.get("price") or 0
     )
 
     atr_value = float(
-        data["atr"]
+        data.get("atr") or 0
     )
 
-    setup = data["setup"]
-
     if (
-        setup == "NO TRADE"
+        setup not in {
+            "LONG",
+            "SHORT",
+        }
+        or price <= 0
         or atr_value <= 0
     ):
         return {
@@ -859,90 +996,100 @@ def calculate_trade_levels(
 
     if setup == "LONG":
 
-        candidates = [
-            float(protected_low)
-            if protected_low is not None
-            else price - atr_value,
-
-            price - atr_value,
-        ]
-
-        structure_sl = min(
-            candidates
-        )
-
-        stop_loss = (
-            structure_sl
-            - (
-                atr_value * 0.10
+        if protected_low is not None:
+            stop_loss = (
+                float(protected_low)
+                - atr_value * 0.10
             )
-        )
+        else:
+            stop_loss = (
+                price
+                - atr_value
+            )
 
         risk = (
             price - stop_loss
         )
 
         if risk <= 0:
-            risk = atr_value
+            return {
+                "entry": None,
+                "stop_loss": None,
+                "tp1": None,
+                "tp2": None,
+                "rr": None,
+            }
 
-            stop_loss = (
-                price - risk
+        path_ok, tp1, tp2 = (
+            _target_path(
+                side="LONG",
+                entry=price,
+                risk=risk,
+                resistance=data.get(
+                    "resistance"
+                ),
+                support=data.get(
+                    "support"
+                ),
             )
-
-        tp1 = price + (
-            risk * 1.20
-        )
-
-        tp2 = price + (
-            risk * 2.00
         )
 
     else:
 
-        candidates = [
-            float(protected_high)
-            if protected_high is not None
-            else price + atr_value,
-
-            price + atr_value,
-        ]
-
-        structure_sl = max(
-            candidates
-        )
-
-        stop_loss = (
-            structure_sl
-            + (
-                atr_value * 0.10
+        if protected_high is not None:
+            stop_loss = (
+                float(protected_high)
+                + atr_value * 0.10
             )
-        )
+        else:
+            stop_loss = (
+                price
+                + atr_value
+            )
 
         risk = (
             stop_loss - price
         )
 
         if risk <= 0:
-            risk = atr_value
+            return {
+                "entry": None,
+                "stop_loss": None,
+                "tp1": None,
+                "tp2": None,
+                "rr": None,
+            }
 
-            stop_loss = (
-                price + risk
+        path_ok, tp1, tp2 = (
+            _target_path(
+                side="SHORT",
+                entry=price,
+                risk=risk,
+                resistance=data.get(
+                    "resistance"
+                ),
+                support=data.get(
+                    "support"
+                ),
             )
-
-        tp1 = price - (
-            risk * 1.20
         )
 
-        tp2 = price - (
-            risk * 2.00
-        )
+    if (
+        not path_ok
+        or tp1 is None
+        or tp2 is None
+    ):
+        return {
+            "entry": price,
+            "stop_loss": stop_loss,
+            "tp1": tp1,
+            "tp2": tp2,
+            "rr": 0.0,
+        }
 
-    if risk <= 0:
-        rr = 0.0
-    else:
-        rr = abs(
-            tp2 - price
-        ) / risk
+    rr = abs(
+        tp2 - price
+    ) / risk
 
     return {
         "entry": price,
@@ -954,6 +1101,55 @@ def calculate_trade_levels(
 
 
 # ============================================================
+# 100-POINT SCORE
+# ============================================================
+
+def _build_score(
+    *,
+    direction_ok: bool,
+    structure_ok: bool,
+    setup_ok: bool,
+    momentum_ok: bool,
+    volume_ok: bool,
+    location_ok: bool,
+    futures_ok: bool,
+    volatility_ok: bool,
+) -> tuple[int, dict[str, int]]:
+
+    groups = {
+        "direction_regime": (
+            20 if direction_ok else 0
+        ),
+        "market_structure": (
+            20 if structure_ok else 0
+        ),
+        "setup_trigger": (
+            20 if setup_ok else 0
+        ),
+        "momentum": (
+            10 if momentum_ok else 0
+        ),
+        "volume_participation": (
+            10 if volume_ok else 0
+        ),
+        "location_target_path": (
+            10 if location_ok else 0
+        ),
+        "futures_context": (
+            5 if futures_ok else 0
+        ),
+        "volatility_execution": (
+            5 if volatility_ok else 0
+        ),
+    }
+
+    return (
+        sum(groups.values()),
+        groups,
+    )
+
+
+# ============================================================
 # MAIN ANALYSIS ENGINE
 # ============================================================
 
@@ -962,6 +1158,7 @@ def analyze_candles(
     candles_4h: List,
     candles_1h: List,
     candles_15m: List,
+    candles_5m: Optional[List] = None,
 ) -> Dict:
 
     c4h = convert_candles(
@@ -976,29 +1173,47 @@ def analyze_candles(
         candles_15m
     )
 
-    # We need enough history for EMA200 on 4H.
-    if (
-        len(c4h) < 205
-        or len(c1h) < 205
-        or len(c15m) < 80
-    ):
+    c5m = convert_candles(
+        candles_5m or []
+    )
+
+    # ========================================================
+    # DATA REQUIREMENTS
+    # ========================================================
+
+    if len(c4h) < 205:
         raise ValueError(
-            "Not enough closed candle data for Gold Standard analysis"
+            "Not enough 4H candles"
+        )
+
+    if len(c1h) < 205:
+        raise ValueError(
+            "Not enough 1H candles"
+        )
+
+    if len(c15m) < 80:
+        raise ValueError(
+            "Not enough 15M candles"
+        )
+
+    if len(c5m) < 30:
+        raise ValueError(
+            "Not enough 5M candles"
         )
 
     closes_4h = [
-        candle["close"]
-        for candle in c4h
+        c["close"]
+        for c in c4h
     ]
 
     closes_1h = [
-        candle["close"]
-        for candle in c1h
+        c["close"]
+        for c in c1h
     ]
 
     closes_15m = [
-        candle["close"]
-        for candle in c15m
+        c["close"]
+        for c in c15m
     ]
 
     current_price = float(
@@ -1070,12 +1285,15 @@ def analyze_candles(
         and adx_4h >= 25
     )
 
-    if bullish_4h:
-        regime = "BULLISH"
-    elif bearish_4h:
-        regime = "BEARISH"
-    else:
-        regime = "NO_TRADE"
+    regime = (
+        "BULLISH"
+        if bullish_4h
+        else
+        "BEARISH"
+        if bearish_4h
+        else
+        "NO_TRADE"
+    )
 
     # ========================================================
     # 1H DIRECTION + STRUCTURE
@@ -1095,8 +1313,10 @@ def analyze_candles(
         c1h
     )
 
-    protected_1h = _protected_structure(
-        c1h
+    protected_1h = (
+        _protected_structure(
+            c1h
+        )
     )
 
     close_1h = closes_1h[-1]
@@ -1104,8 +1324,8 @@ def analyze_candles(
     long_1h = (
         regime == "BULLISH"
         and structure_1h == "HH/HL"
-        and ema50_1h is not None
         and ema21_1h is not None
+        and ema50_1h is not None
         and close_1h > ema50_1h
         and ema21_1h >= ema50_1h
         and protected_1h["state"]
@@ -1115,8 +1335,8 @@ def analyze_candles(
     short_1h = (
         regime == "BEARISH"
         and structure_1h == "LH/LL"
-        and ema50_1h is not None
         and ema21_1h is not None
+        and ema50_1h is not None
         and close_1h < ema50_1h
         and ema21_1h <= ema50_1h
         and protected_1h["state"]
@@ -1147,36 +1367,87 @@ def analyze_candles(
         c15m
     )
 
-    long_bos = _confirmed_bos(
-        c15m,
-        "LONG",
+    long_bos, long_bos_level = (
+        _confirmed_bos(
+            c15m,
+            "LONG",
+        )
     )
 
-    short_bos = _confirmed_bos(
-        c15m,
-        "SHORT",
+    short_bos, short_bos_level = (
+        _confirmed_bos(
+            c15m,
+            "SHORT",
+        )
     )
 
     long_retest = _pullback_retest(
         c15m,
         "LONG",
+        long_bos_level,
     )
 
     short_retest = _pullback_retest(
         c15m,
         "SHORT",
+        short_bos_level,
     )
 
-    long_setup = (
+    long_setup_candidate = (
         long_1h
         and long_bos
         and long_retest
     )
 
-    short_setup = (
+    short_setup_candidate = (
         short_1h
         and short_bos
         and short_retest
+    )
+
+    # ========================================================
+    # 5M TRIGGER
+    # ========================================================
+
+    if long_setup_candidate:
+        five_trigger = (
+            _five_minute_trigger(
+                c5m,
+                "LONG",
+                long_bos_level,
+            )
+        )
+
+    elif short_setup_candidate:
+        five_trigger = (
+            _five_minute_trigger(
+                c5m,
+                "SHORT",
+                short_bos_level,
+            )
+        )
+
+    else:
+        five_trigger = (
+            _five_minute_trigger(
+                c5m,
+                "NONE",
+                None,
+            )
+        )
+
+    # ========================================================
+    # FINAL SETUP
+    # ========================================================
+
+    long_setup = (
+        long_setup_candidate
+        and five_trigger["long"]
+    )
+
+    short_setup = (
+        short_setup_candidate
+        and five_trigger["short"]
     )
 
     if long_setup:
@@ -1189,37 +1460,98 @@ def analyze_candles(
         setup = "NO TRADE"
 
     # ========================================================
+    # DIRECTION
+    # ========================================================
+
+    direction_ok = (
+        (
+            setup == "LONG"
+            and bullish_4h
+            and long_1h
+        )
+        or
+        (
+            setup == "SHORT"
+            and bearish_4h
+            and short_1h
+        )
+    )
+
+    # ========================================================
+    # STRUCTURE
+    # ========================================================
+
+    structure_ok = (
+        (
+            setup == "LONG"
+            and structure_1h == "HH/HL"
+            and protected_1h["state"]
+            == "BULLISH"
+            and long_bos
+        )
+        or
+        (
+            setup == "SHORT"
+            and structure_1h == "LH/LL"
+            and protected_1h["state"]
+            == "BEARISH"
+            and short_bos
+        )
+    )
+
+    # ========================================================
+    # SETUP
+    # ========================================================
+
+    setup_ok = (
+        (
+            setup == "LONG"
+            and long_bos
+            and long_retest
+            and five_trigger["long"]
+        )
+        or
+        (
+            setup == "SHORT"
+            and short_bos
+            and short_retest
+            and five_trigger["short"]
+        )
+    )
+
+    # ========================================================
     # MOMENTUM
     # ========================================================
 
-    momentum_long = (
-        setup == "LONG"
-        and rsi_15m > 50
-        and rsi_15m < 75
-    )
-
-    momentum_short = (
-        setup == "SHORT"
-        and rsi_15m < 50
-        and rsi_15m > 25
-    )
-
     momentum_ok = (
-        momentum_long
-        or momentum_short
+        (
+            setup == "LONG"
+            and rsi_15m > 50
+            and rsi_15m < 75
+            and float(
+                five_trigger["rsi"]
+            ) > 50
+        )
+        or
+        (
+            setup == "SHORT"
+            and rsi_15m < 50
+            and rsi_15m > 25
+            and float(
+                five_trigger["rsi"]
+            ) < 50
+        )
     )
 
     # ========================================================
-    # VOLUME / PARTICIPATION
+    # VOLUME
     # ========================================================
 
     volume_ok = (
-        volume_15m == "INCREASING"
-        or rvol_15m >= 1.0
-    )
-
-    strong_volume = (
-        rvol_15m >= 1.5
+        rvol_15m >= 1.0
+        and float(
+            five_trigger["rvol"]
+        ) >= 1.0
     )
 
     # ========================================================
@@ -1234,18 +1566,21 @@ def analyze_candles(
 
     location_ok = True
 
-    if setup == "LONG" and resistance is not None:
-        # Don't enter directly into nearby resistance.
-        location_ok = (
-            current_price
-            < float(resistance)
-        )
+    if setup == "LONG":
 
-    elif setup == "SHORT" and support is not None:
-        location_ok = (
-            current_price
-            > float(support)
-        )
+        if resistance is not None:
+            location_ok = (
+                current_price
+                < float(resistance)
+            )
+
+    elif setup == "SHORT":
+
+        if support is not None:
+            location_ok = (
+                current_price
+                > float(support)
+            )
 
     # ========================================================
     # VOLATILITY
@@ -1258,58 +1593,159 @@ def analyze_candles(
 
     volatility_ok = (
         atr_15m > 0
-        and 0.002 <= atr_pct_15m <= 0.05
+        and 0.002
+        <= atr_pct_15m
+        <= 0.05
     )
 
     # ========================================================
     # FUTURES CONTEXT
     #
-    # Scanner will later attach funding/orderbook/deals.
-    # For now this group is neutral rather than fabricated.
+    # The scanner must replace this after retrieving real
+    # MEXC funding/orderbook/trade-flow information.
+    #
+    # Until that happens it is deliberately FALSE rather
+    # than pretending context exists.
     # ========================================================
 
     futures_context = "PENDING"
-
-    futures_ok = True
+    futures_ok = False
 
     # ========================================================
-    # STRUCTURE SCORE
+    # BULLISH / BEARISH EVIDENCE
+    #
+    # Four independent directional confirmations:
+    #
+    # 1. 4H regime
+    # 2. 1H structure
+    # 3. 1H EMA alignment
+    # 4. 15M setup direction
     # ========================================================
 
-    structure_ok = (
-        (
-            long_1h
-            and protected_1h["state"]
-            == "BULLISH"
+    bullish_points = 0
+    bearish_points = 0
+
+    if bullish_4h:
+        bullish_points += 1
+
+    if bearish_4h:
+        bearish_points += 1
+
+    if (
+        structure_1h == "HH/HL"
+        and protected_1h["state"]
+        == "BULLISH"
+    ):
+        bullish_points += 1
+
+    if (
+        structure_1h == "LH/LL"
+        and protected_1h["state"]
+        == "BEARISH"
+    ):
+        bearish_points += 1
+
+    if (
+        ema21_1h is not None
+        and ema50_1h is not None
+        and ema21_1h >= ema50_1h
+        and close_1h > ema50_1h
+    ):
+        bullish_points += 1
+
+    if (
+        ema21_1h is not None
+        and ema50_1h is not None
+        and ema21_1h <= ema50_1h
+        and close_1h < ema50_1h
+    ):
+        bearish_points += 1
+
+    if setup == "LONG":
+        bullish_points += 1
+
+    if setup == "SHORT":
+        bearish_points += 1
+
+    # ========================================================
+    # PRELIMINARY TARGET PATH
+    # ========================================================
+
+    preliminary_data = {
+        "setup": setup,
+        "price": current_price,
+        "atr": atr_15m,
+        "protected_low": protected_1h[
+            "protected_low"
+        ],
+        "protected_high": protected_1h[
+            "protected_high"
+        ],
+        "support": support,
+        "resistance": resistance,
+    }
+
+    preliminary_levels = (
+        calculate_trade_levels(
+            preliminary_data
         )
-        or
-        (
-            short_1h
-            and protected_1h["state"]
-            == "BEARISH"
-        )
-    )
-
-    direction_ok = (
-        bullish_4h
-        if setup == "LONG"
-        else
-        bearish_4h
-        if setup == "SHORT"
-        else False
-    )
-
-    setup_ok = (
-        long_setup
-        if setup == "LONG"
-        else
-        short_setup
-        if setup == "SHORT"
-        else False
     )
 
     # ========================================================
-    # BUILD 100-POINT SCORE
+    # LOCATION RECHECK USING TARGET PATH
+    # ========================================================
+
+    if setup in {
+        "LONG",
+        "SHORT",
+    }:
+
+        preliminary_tp2 = (
+            preliminary_levels.get(
+                "tp2"
+            )
+        )
+
+        preliminary_sl = (
+            preliminary_levels.get(
+                "stop_loss"
+            )
+        )
+
+        if (
+            preliminary_tp2 is None
+            or preliminary_sl is None
+        ):
+            location_ok = False
+
+        else:
+
+            risk = abs(
+                current_price
+                - float(preliminary_sl)
+            )
+
+            if risk <= 0:
+                location_ok = False
+
+            elif setup == "LONG":
+                if (
+                    resistance is not None
+                    and float(resistance)
+                    <= float(preliminary_tp2)
+                ):
+                    location_ok = False
+
+            elif setup == "SHORT":
+                if (
+                    support is not None
+                    and float(support)
+                    >= float(preliminary_tp2)
+                ):
+                    location_ok = False
+
+    # ========================================================
+    # SCORE
     # ========================================================
 
     score, score_groups = _build_score(
@@ -1322,15 +1758,6 @@ def analyze_candles(
         futures_ok=futures_ok,
         volatility_ok=volatility_ok,
     )
-
-    # Strong trigger-quality bonus is informational for now.
-    trigger_quality = _trigger_quality(
-        c15m[-1],
-        setup,
-    ) if setup in {
-        "LONG",
-        "SHORT",
-    } else 0.0
 
     # ========================================================
     # REASONS
@@ -1378,19 +1805,24 @@ def analyze_candles(
             "15M bearish retest"
         )
 
-    if momentum_ok:
+    if five_trigger["ready"]:
         reasons.append(
-            "15M momentum aligned"
+            "5M trigger confirmed"
         )
 
-    if strong_volume:
+    if momentum_ok:
         reasons.append(
-            "RVOL >= 1.5"
+            "Momentum aligned"
+        )
+
+    if volume_ok:
+        reasons.append(
+            "15M + 5M volume aligned"
         )
 
     if location_ok:
         reasons.append(
-            "Location acceptable"
+            "Target path acceptable"
         )
 
     if volatility_ok:
@@ -1399,7 +1831,7 @@ def analyze_candles(
         )
 
     # ========================================================
-    # TRADE LEVELS
+    # FINAL DATA
     # ========================================================
 
     data: Dict[str, Any] = {
@@ -1436,18 +1868,20 @@ def analyze_candles(
 
         "bos_15m": bos_15m,
 
-        "ema21": (
-            _safe_ema(
-                closes_15m,
-                21,
-            )
+        "long_bos_level": long_bos_level,
+        "short_bos_level": short_bos_level,
+
+        "long_retest": long_retest,
+        "short_retest": short_retest,
+
+        "ema21": _safe_ema(
+            closes_15m,
+            21,
         ),
 
-        "ema50": (
-            _safe_ema(
-                closes_15m,
-                50,
-            )
+        "ema50": _safe_ema(
+            closes_15m,
+            50,
         ),
 
         "ema21_4h": ema21_4h,
@@ -1460,9 +1894,20 @@ def analyze_candles(
 
         "rsi": rsi_15m,
 
+        "rsi_5m": float(
+            five_trigger["rsi"]
+        ),
+
         "atr": atr_15m,
 
         "atr_4h": atr_4h,
+
+        "atr_5m": float(
+            five_trigger.get(
+                "atr",
+                0.0,
+            )
+        ),
 
         "atr_pct": atr_pct_15m,
 
@@ -1474,28 +1919,51 @@ def analyze_candles(
 
         "rvol": rvol_15m,
 
-        "support": support,
+        "rvol_15m": rvol_15m,
 
+        "rvol_5m": float(
+            five_trigger["rvol"]
+        ),
+
+        "support": support,
         "resistance": resistance,
 
         "futures_context": futures_context,
 
-        "trigger_quality": trigger_quality,
+        "trigger_quality_5m": float(
+            five_trigger["quality"]
+        ),
+
+        "trigger_quality": float(
+            five_trigger["quality"]
+        ),
+
+        "five_minute_ready": bool(
+            five_trigger["ready"]
+        ),
+
+        "five_minute_long": bool(
+            five_trigger["long"]
+        ),
+
+        "five_minute_short": bool(
+            five_trigger["short"]
+        ),
+
+        "closed_5m_candle_time": (
+            five_trigger["candle_time"]
+        ),
 
         "score": score,
 
         "score_groups": score_groups,
 
         "bullish_points": (
-            1
-            if bullish_4h
-            else 0
+            bullish_points
         ),
 
         "bearish_points": (
-            1
-            if bearish_4h
-            else 0
+            bearish_points
         ),
 
         "direction_ok": direction_ok,
@@ -1510,15 +1978,50 @@ def analyze_candles(
         "reasons": reasons,
 
         "candle_time": (
-            c15m[-1].get("time")
+            c15m[-1]["time"]
         ),
     }
+
+    # ========================================================
+    # TRADE LEVELS
+    # ========================================================
 
     data.update(
         calculate_trade_levels(
             data
         )
     )
+
+    # ========================================================
+    # FINAL TARGET-PATH VALIDATION
+    # ========================================================
+
+    if setup in {
+        "LONG",
+        "SHORT",
+    }:
+
+        if (
+            data.get("entry") is None
+            or data.get("stop_loss") is None
+            or data.get("tp1") is None
+            or data.get("tp2") is None
+        ):
+            data["location_ok"] = False
+            data["score"] = max(
+                0,
+                data["score"]
+                - score_groups[
+                    "location_target_path"
+                ],
+            )
+
+    # ========================================================
+    # IMPORTANT:
+    # Futures context is deliberately pending here.
+    # scanner.py must attach real MEXC context and re-score
+    # before validation.
+    # ========================================================
 
     return data
 
@@ -1554,9 +2057,16 @@ async def analyze_symbol(
         250,
     )
 
+    candles_5m = await market.ohlcv(
+        ref,
+        "5M",
+        250,
+    )
+
     return analyze_candles(
         ref.symbol,
         candles_4h,
         candles_1h,
         candles_15m,
+        candles_5m,
     )

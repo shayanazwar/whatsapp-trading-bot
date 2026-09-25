@@ -36,11 +36,18 @@ class MexcOrderResponse:
     raw: dict[str, Any]
 
 
-def build_query_string(params: Mapping[str, Any] | None) -> str:
+def build_query_string(
+    params: Mapping[str, Any] | None,
+) -> str:
     if not params:
         return ""
 
-    clean = [(str(k), v) for k, v in params.items() if v is not None]
+    clean = [
+        (str(k), v)
+        for k, v in params.items()
+        if v is not None
+    ]
+
     clean.sort(key=lambda item: item[0])
 
     return urlencode(clean, doseq=True)
@@ -52,7 +59,11 @@ def build_signature(
     timestamp: str,
     parameter_string: str,
 ) -> str:
-    target = f"{access_key}{timestamp}{parameter_string}"
+    target = (
+        f"{access_key}"
+        f"{timestamp}"
+        f"{parameter_string}"
+    )
 
     return hmac.new(
         secret_key.encode("utf-8"),
@@ -61,41 +72,66 @@ def build_signature(
     ).hexdigest()
 
 
-def _normalize_timestamp_ms(value: int | float) -> int:
+def _normalize_timestamp_ms(
+    value: int | float,
+) -> int:
     timestamp = int(value)
-    return timestamp if timestamp >= 10**12 else timestamp * 1000
+
+    return (
+        timestamp
+        if timestamp >= 10**12
+        else timestamp * 1000
+    )
 
 
 class MexcClient:
-    """Async client for the MEXC Futures REST API."""
+    """
+    Async client for the MEXC Futures REST API.
 
-    def __init__(self, settings: Settings) -> None:
+    Live trading remains controlled by the higher-level execution
+    safety flags. This client only provides API communication.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+    ) -> None:
         self.settings = settings
-        self.base_url = settings.mexc_api_base_url.rstrip("/")
-        self.http = httpx.AsyncClient(timeout=20)
+
+        self.base_url = (
+            settings.mexc_api_base_url.rstrip("/")
+        )
+
+        self.http = httpx.AsyncClient(
+            timeout=20
+        )
 
         self._server_offset_ms = 0
         self._server_offset_initialized = False
 
-        # ------------------------------------------------------------------
-        # MEXC PUBLIC API RATE LIMITER
-        # ------------------------------------------------------------------
-        # Multiple scanner tasks can run at the same time. Without a shared
-        # limiter, they can send many requests simultaneously and trigger:
-        #
-        # "Requests are too frequent, please try again later"
-        #
-        # All public requests now pass through one shared queue.
-        # ------------------------------------------------------------------
-        self._public_request_lock = asyncio.Lock()
+        # --------------------------------------------------------------
+        # PUBLIC API RATE LIMITER
+        # --------------------------------------------------------------
+
+        self._public_request_lock = (
+            asyncio.Lock()
+        )
+
         self._last_public_request = 0.0
 
-        # Minimum gap between public MEXC requests.
-        # 0.15s keeps the scanner comfortably below bursty request rates.
+        # Minimum spacing between public requests.
         self._public_request_gap = 0.15
+
+    # ==================================================================
+    # CONNECTION
+    # ==================================================================
 
     async def close(self) -> None:
         await self.http.aclose()
+
+    # ==================================================================
+    # SERVER TIME
+    # ==================================================================
 
     async def _server_time_ms(self) -> int:
         response = await self.http.get(
@@ -105,50 +141,71 @@ class MexcClient:
         response.raise_for_status()
 
         payload = response.json()
+
         value = payload.get("data")
 
         if value is None:
             raise MexcAPIError(
-                f"MEXC server-time response missing data: {payload}"
+                "MEXC server-time response missing data: "
+                f"{payload}"
             )
 
         return int(value)
 
     async def sync_time(self) -> int:
-        before = int(time.time() * 1000)
+        before = int(
+            time.time() * 1000
+        )
 
         server = await self._server_time_ms()
 
-        after = int(time.time() * 1000)
-        midpoint = (before + after) // 2
+        after = int(
+            time.time() * 1000
+        )
 
-        self._server_offset_ms = server - midpoint
+        midpoint = (
+            before + after
+        ) // 2
+
+        self._server_offset_ms = (
+            server - midpoint
+        )
+
         self._server_offset_initialized = True
 
         return server
+
+    # ==================================================================
+    # PUBLIC REQUEST HANDLER
+    # ==================================================================
 
     async def _public_request(
         self,
         request_kwargs: dict[str, Any],
     ) -> httpx.Response:
         """
-        Send a public MEXC request through the shared rate limiter.
+        Shared public-request queue.
 
-        Handles both:
-        - HTTP 429 rate limits
-        - HTTP 200 responses containing MEXC's
-          "Requests are too frequent" error
+        Handles:
+        - HTTP 429
+        - MEXC HTTP 200 rate-limit responses
+        - temporary request failures
         """
 
         max_attempts = 4
 
         for attempt in range(max_attempts):
+
             async with self._public_request_lock:
+
                 now = time.monotonic()
 
                 wait = (
                     self._public_request_gap
-                    - (now - self._last_public_request)
+                    - (
+                        now
+                        - self._last_public_request
+                    )
                 )
 
                 if wait > 0:
@@ -158,51 +215,70 @@ class MexcClient:
                     response = await self.http.request(
                         **request_kwargs
                     )
+
                 except httpx.HTTPError as exc:
                     raise MexcAPIError(
                         f"MEXC HTTP request failed: {exc}"
                     ) from exc
 
-                self._last_public_request = time.monotonic()
+                self._last_public_request = (
+                    time.monotonic()
+                )
 
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------
             # HTTP 429
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------
+
             if response.status_code == 429:
+
                 if attempt >= max_attempts - 1:
                     raise MexcAPIError(
-                        f"MEXC HTTP 429: {response.text}",
+                        f"MEXC HTTP 429: "
+                        f"{response.text}",
                         status_code=429,
                     )
 
-                retry_delay = 1.0 * (attempt + 1)
+                retry_delay = (
+                    1.0 * (attempt + 1)
+                )
 
                 LOGGER.warning(
                     "MEXC rate limit HTTP 429. "
-                    "Retrying in %.1fs (attempt %d/%d)",
+                    "Retrying in %.1fs "
+                    "(attempt %d/%d)",
                     retry_delay,
                     attempt + 1,
                     max_attempts,
                 )
 
-                await asyncio.sleep(retry_delay)
+                await asyncio.sleep(
+                    retry_delay
+                )
+
                 continue
 
-            # --------------------------------------------------------------
-            # MEXC sometimes returns HTTP 200 with success=false
-            # --------------------------------------------------------------
+            # ----------------------------------------------------------
+            # HTTP 200 + success=false + too frequent
+            # ----------------------------------------------------------
+
             try:
                 payload = response.json()
+
             except ValueError:
                 payload = None
 
             if isinstance(payload, dict):
-                message = str(payload.get("message") or "").lower()
+
+                message = str(
+                    payload.get("message")
+                    or ""
+                ).lower()
 
                 if (
                     payload.get("success") is False
                     and "too frequent" in message
                 ):
+
                     if attempt >= max_attempts - 1:
                         raise MexcAPIError(
                             str(
@@ -212,24 +288,35 @@ class MexcClient:
                             code=payload.get("code"),
                         )
 
-                    retry_delay = 1.0 * (attempt + 1)
+                    retry_delay = (
+                        1.0 * (attempt + 1)
+                    )
 
                     LOGGER.warning(
                         "MEXC public API rate limited. "
-                        "Retrying in %.1fs (attempt %d/%d)",
+                        "Retrying in %.1fs "
+                        "(attempt %d/%d)",
                         retry_delay,
                         attempt + 1,
                         max_attempts,
                     )
 
-                    await asyncio.sleep(retry_delay)
+                    await asyncio.sleep(
+                        retry_delay
+                    )
+
                     continue
 
             return response
 
         raise MexcAPIError(
-            "MEXC public request failed after retries"
+            "MEXC public request failed "
+            "after retries"
         )
+
+    # ==================================================================
+    # GENERIC REQUEST
+    # ==================================================================
 
     async def _request(
         self,
@@ -240,8 +327,12 @@ class MexcClient:
         json_body: Mapping[str, Any] | None = None,
         private: bool = False,
     ) -> Any:
+
         method = method.upper()
-        params = dict(params or {})
+
+        params = dict(
+            params or {}
+        )
 
         headers = {
             "Language": "English",
@@ -249,33 +340,46 @@ class MexcClient:
 
         body_text: str | None = None
 
+        # --------------------------------------------------------------
+        # JSON BODY
+        # --------------------------------------------------------------
+
         if json_body is not None:
+
             body_text = json.dumps(
                 dict(json_body),
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
 
-            headers["Content-Type"] = "application/json"
+            headers[
+                "Content-Type"
+            ] = "application/json"
 
-        # ------------------------------------------------------------------
-        # PRIVATE REQUEST AUTHENTICATION
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # PRIVATE AUTHENTICATION
+        # --------------------------------------------------------------
+
         if private:
+
             if (
                 not self.settings.mexc_access_key
                 or not self.settings.mexc_secret_key
             ):
                 raise MexcAPIError(
-                    "MEXC private API credentials are not configured"
+                    "MEXC private API credentials "
+                    "are not configured"
                 )
 
             if not self._server_offset_initialized:
+
                 try:
                     await self.sync_time()
+
                 except Exception as exc:
                     raise MexcAPIError(
-                        f"Could not synchronize MEXC server time: {exc}"
+                        "Could not synchronize "
+                        f"MEXC server time: {exc}"
                     ) from exc
 
             timestamp = str(
@@ -291,7 +395,9 @@ class MexcClient:
 
             headers.update(
                 {
-                    "ApiKey": self.settings.mexc_access_key,
+                    "ApiKey": (
+                        self.settings.mexc_access_key
+                    ),
                     "Request-Time": timestamp,
                     "Signature": build_signature(
                         self.settings.mexc_access_key,
@@ -313,56 +419,71 @@ class MexcClient:
 
         request_kwargs: dict[str, Any] = {
             "method": method,
-            "url": f"{self.base_url}{path}",
+            "url": (
+                f"{self.base_url}{path}"
+            ),
             "headers": headers,
         }
 
         if params:
-            request_kwargs["params"] = params
+            request_kwargs[
+                "params"
+            ] = params
 
         if body_text is not None:
-            request_kwargs["content"] = body_text
+            request_kwargs[
+                "content"
+            ] = body_text
 
-        # ------------------------------------------------------------------
-        # PUBLIC vs PRIVATE REQUEST
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # SEND REQUEST
+        # --------------------------------------------------------------
+
         if private:
+
             try:
                 response = await self.http.request(
                     **request_kwargs
                 )
+
             except httpx.HTTPError as exc:
                 raise MexcAPIError(
                     f"MEXC HTTP request failed: {exc}"
                 ) from exc
+
         else:
             response = await self._public_request(
                 request_kwargs
             )
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # HTTP ERROR
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+
         if response.is_error:
             raise MexcAPIError(
-                f"MEXC HTTP {response.status_code}: "
+                f"MEXC HTTP "
+                f"{response.status_code}: "
                 f"{response.text}",
                 status_code=response.status_code,
             )
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # JSON
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+
         try:
             payload = response.json()
+
         except ValueError as exc:
             raise MexcAPIError(
                 "MEXC returned non-JSON data"
             ) from exc
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # MEXC API ERROR
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+
         if (
             isinstance(payload, dict)
             and payload.get("success") is False
@@ -375,6 +496,10 @@ class MexcClient:
                 code=payload.get("code"),
             )
 
+        # --------------------------------------------------------------
+        # UNWRAP DATA
+        # --------------------------------------------------------------
+
         if (
             isinstance(payload, dict)
             and "data" in payload
@@ -383,9 +508,14 @@ class MexcClient:
 
         return payload
 
+    # ==================================================================
+    # CONTRACTS
+    # ==================================================================
+
     async def get_contracts(
         self,
     ) -> list[dict[str, Any]]:
+
         data = await self._request(
             "GET",
             "/api/v1/contract/detail/country",
@@ -393,30 +523,8 @@ class MexcClient:
 
         if isinstance(data, list):
             return [
-                x for x in data
-                if isinstance(x, dict)
-            ]
-
-        if isinstance(data, dict):
-            if "symbol" in data:
-                return [data]
-
-        raise MexcAPIError(
-            "Unexpected MEXC contract response shape: "
-            f"{type(data).__name__}"
-        )
-
-    async def get_tickers(
-        self,
-    ) -> list[dict[str, Any]]:
-        data = await self._request(
-            "GET",
-            "/api/v1/contract/ticker",
-        )
-
-        if isinstance(data, list):
-            return [
-                x for x in data
+                x
+                for x in data
                 if isinstance(x, dict)
             ]
 
@@ -427,14 +535,46 @@ class MexcClient:
             return [data]
 
         raise MexcAPIError(
-            "Unexpected MEXC ticker response shape: "
-            f"{type(data).__name__}"
+            "Unexpected MEXC contract response "
+            f"shape: {type(data).__name__}"
+        )
+
+    # ==================================================================
+    # TICKERS
+    # ==================================================================
+
+    async def get_tickers(
+        self,
+    ) -> list[dict[str, Any]]:
+
+        data = await self._request(
+            "GET",
+            "/api/v1/contract/ticker",
+        )
+
+        if isinstance(data, list):
+            return [
+                x
+                for x in data
+                if isinstance(x, dict)
+            ]
+
+        if (
+            isinstance(data, dict)
+            and "symbol" in data
+        ):
+            return [data]
+
+        raise MexcAPIError(
+            "Unexpected MEXC ticker response "
+            f"shape: {type(data).__name__}"
         )
 
     async def get_ticker(
         self,
         symbol: str,
     ) -> dict[str, Any]:
+
         data = await self._request(
             "GET",
             "/api/v1/contract/ticker",
@@ -445,60 +585,165 @@ class MexcClient:
 
         if not isinstance(data, dict):
             raise MexcAPIError(
-                "Unexpected MEXC ticker response shape: "
-                f"{type(data).__name__}"
+                "Unexpected MEXC ticker response "
+                f"shape: {type(data).__name__}"
             )
 
         return data
 
-    async def get_depth(self, symbol: str, limit: int = 20) -> dict[str, Any]:
+    # ==================================================================
+    # ORDER BOOK
+    # ==================================================================
+
+    async def get_depth(
+        self,
+        symbol: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+
         data = await self._request(
             "GET",
             f"/api/v1/contract/depth/{symbol}",
-            params={"limit": max(1, min(int(limit), 50))},
+            params={
+                "limit": max(
+                    1,
+                    min(int(limit), 50),
+                )
+            },
         )
+
         if not isinstance(data, dict):
-            raise MexcAPIError(f"Unexpected MEXC depth response shape: {type(data).__name__}")
+            raise MexcAPIError(
+                "Unexpected MEXC depth response "
+                f"shape: {type(data).__name__}"
+            )
+
         return data
 
-    async def get_index_price(self, symbol: str) -> dict[str, Any]:
-        data = await self._request("GET", f"/api/v1/contract/index_price/{symbol}")
+    # ==================================================================
+    # INDEX / FAIR PRICE
+    # ==================================================================
+
+    async def get_index_price(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+
+        data = await self._request(
+            "GET",
+            f"/api/v1/contract/index_price/{symbol}",
+        )
+
         if not isinstance(data, dict):
-            raise MexcAPIError(f"Unexpected MEXC index-price response shape: {type(data).__name__}")
+            raise MexcAPIError(
+                "Unexpected MEXC index-price response "
+                f"shape: {type(data).__name__}"
+            )
+
         return data
 
-    async def get_fair_price(self, symbol: str) -> dict[str, Any]:
-        data = await self._request("GET", f"/api/v1/contract/fair_price/{symbol}")
+    async def get_fair_price(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+
+        data = await self._request(
+            "GET",
+            f"/api/v1/contract/fair_price/{symbol}",
+        )
+
         if not isinstance(data, dict):
-            raise MexcAPIError(f"Unexpected MEXC fair-price response shape: {type(data).__name__}")
+            raise MexcAPIError(
+                "Unexpected MEXC fair-price response "
+                f"shape: {type(data).__name__}"
+            )
+
         return data
 
-    async def get_funding_rate(self, symbol: str) -> dict[str, Any]:
-        data = await self._request("GET", f"/api/v1/contract/funding_rate/{symbol}")
+    # ==================================================================
+    # FUNDING
+    # ==================================================================
+
+    async def get_funding_rate(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+
+        data = await self._request(
+            "GET",
+            f"/api/v1/contract/funding_rate/{symbol}",
+        )
+
         if not isinstance(data, dict):
-            raise MexcAPIError(f"Unexpected MEXC funding response shape: {type(data).__name__}")
+            raise MexcAPIError(
+                "Unexpected MEXC funding response "
+                f"shape: {type(data).__name__}"
+            )
+
         return data
 
-    async def get_deals(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
+    # ==================================================================
+    # RECENT TRADES
+    # ==================================================================
+
+    async def get_deals(
+        self,
+        symbol: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+
         data = await self._request(
             "GET",
             f"/api/v1/contract/deals/{symbol}",
-            params={"limit": max(1, min(int(limit), 100))},
+            params={
+                "limit": max(
+                    1,
+                    min(int(limit), 100),
+                )
+            },
         )
-        if not isinstance(data, list):
-            raise MexcAPIError(f"Unexpected MEXC deals response shape: {type(data).__name__}")
-        return [item for item in data if isinstance(item, dict)]
 
-    async def get_trading_fee_rate(self, symbol: str) -> dict[str, Any]:
+        if not isinstance(data, list):
+            raise MexcAPIError(
+                "Unexpected MEXC deals response "
+                f"shape: {type(data).__name__}"
+            )
+
+        return [
+            item
+            for item in data
+            if isinstance(item, dict)
+        ]
+
+    # ==================================================================
+    # TRADING FEES
+    # ==================================================================
+
+    async def get_trading_fee_rate(
+        self,
+        symbol: str,
+    ) -> dict[str, Any]:
+
         data = await self._request(
             "GET",
             "/api/v1/private/account/tiered_fee_rate",
-            params={"symbol": symbol},
+            params={
+                "symbol": symbol,
+            },
             private=True,
         )
+
         if not isinstance(data, dict):
-            raise MexcAPIError(f"Unexpected MEXC fee-rate response shape: {type(data).__name__}")
+            raise MexcAPIError(
+                "Unexpected MEXC fee-rate response "
+                f"shape: {type(data).__name__}"
+            )
+
         return data
+
+    # ==================================================================
+    # KLINES
+    # ==================================================================
 
     async def get_klines(
         self,
@@ -506,6 +751,7 @@ class MexcClient:
         interval: str,
         limit: int = 200,
     ) -> list[list[float | int]]:
+
         interval_seconds = {
             "Min1": 60,
             "Min5": 300,
@@ -521,21 +767,25 @@ class MexcClient:
 
         if interval_seconds is None:
             raise ValueError(
-                f"Unsupported MEXC interval: {interval}"
+                f"Unsupported MEXC interval: "
+                f"{interval}"
             )
 
-        now_sec = int(time.time())
+        now_sec = int(
+            time.time()
+        )
 
         points = max(
             10,
-            min(limit, 2000),
+            min(int(limit), 2000),
         )
 
-        # Fetch a bounded window instead of relying on
-        # the full 2000-point default.
         start_sec = (
             now_sec
-            - (interval_seconds * (points + 3))
+            - (
+                interval_seconds
+                * (points + 3)
+            )
         )
 
         data = await self._request(
@@ -550,8 +800,8 @@ class MexcClient:
 
         if not isinstance(data, dict):
             raise MexcAPIError(
-                "Unexpected MEXC kline response shape: "
-                f"{type(data).__name__}"
+                "Unexpected MEXC kline response "
+                f"shape: {type(data).__name__}"
             )
 
         keys = (
@@ -585,9 +835,12 @@ class MexcClient:
         if size == 0:
             return []
 
-        rows: list[list[float | int]] = []
+        rows: list[
+            list[float | int]
+        ] = []
 
         for i in range(size):
+
             rows.append(
                 [
                     _normalize_timestamp_ms(
@@ -608,13 +861,21 @@ class MexcClient:
         return rows[
             -max(
                 1,
-                min(limit, 2000),
+                min(
+                    int(limit),
+                    2000,
+                ),
             ):
         ]
+
+    # ==================================================================
+    # ACCOUNT ASSETS
+    # ==================================================================
 
     async def get_account_assets(
         self,
     ) -> list[dict[str, Any]]:
+
         data = await self._request(
             "GET",
             "/api/v1/private/account/assets",
@@ -623,19 +884,136 @@ class MexcClient:
 
         if not isinstance(data, list):
             raise MexcAPIError(
-                f"Unexpected MEXC account asset response: "
-                f"{data!r}"
+                "Unexpected MEXC account asset "
+                f"response: {data!r}"
             )
 
         return [
-            x for x in data
+            x
+            for x in data
             if isinstance(x, dict)
         ]
+
+    async def get_futures_equity(
+        self,
+    ) -> float:
+        """
+        Return the USDT futures equity used by
+        the future 1% risk-per-trade system.
+
+        IMPORTANT:
+        This method intentionally checks the actual
+        returned USDT asset fields rather than blindly
+        assuming one field name.
+        """
+
+        assets = await self.get_account_assets()
+
+        if not assets:
+            raise MexcAPIError(
+                "MEXC returned no futures account assets"
+            )
+
+        usdt_assets = [
+            asset
+            for asset in assets
+            if str(
+                asset.get("currency")
+                or asset.get("asset")
+                or asset.get("coin")
+                or ""
+            ).upper() == "USDT"
+        ]
+
+        if not usdt_assets:
+            raise MexcAPIError(
+                "USDT futures asset was not found"
+            )
+
+        asset = usdt_assets[0]
+
+        candidates = (
+            "equity",
+            "totalEquity",
+            "availableBalance",
+            "available",
+            "balance",
+        )
+
+        for field in candidates:
+
+            value = asset.get(field)
+
+            if value is None:
+                continue
+
+            try:
+                equity = float(value)
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            if equity > 0:
+                return equity
+
+        raise MexcAPIError(
+            "Could not determine USDT futures "
+            "equity from MEXC asset response: "
+            f"{asset!r}"
+        )
+
+    async def get_max_risk_amount(
+        self,
+        risk_percent: float = 1.0,
+    ) -> float:
+        """
+        Calculate maximum planned risk for one
+        future auto-trade.
+
+        Default:
+            1% of total futures equity.
+
+        The method refuses values above 1%.
+        """
+
+        if risk_percent <= 0:
+            raise ValueError(
+                "Risk percentage must be positive"
+            )
+
+        if risk_percent > 1.0:
+            raise ValueError(
+                "Auto-trade risk cannot exceed 1% "
+                "of total futures equity"
+            )
+
+        equity = await self.get_futures_equity()
+
+        risk_amount = (
+            equity
+            * risk_percent
+            / 100.0
+        )
+
+        if risk_amount <= 0:
+            raise MexcAPIError(
+                "Calculated maximum risk is zero"
+            )
+
+        return risk_amount
+
+    # ==================================================================
+    # OPEN POSITIONS
+    # ==================================================================
 
     async def get_open_positions(
         self,
         symbol: str | None = None,
     ) -> list[dict[str, Any]]:
+
         params = (
             {"symbol": symbol}
             if symbol
@@ -651,28 +1029,39 @@ class MexcClient:
 
         if not isinstance(data, list):
             raise MexcAPIError(
-                f"Unexpected MEXC positions response: "
+                "Unexpected MEXC positions response: "
                 f"{data!r}"
             )
 
         return [
-            x for x in data
+            x
+            for x in data
             if isinstance(x, dict)
         ]
+
+    # ==================================================================
+    # POSITION MODE
+    # ==================================================================
 
     async def get_position_mode(
         self,
     ) -> Any:
+
         return await self._request(
             "GET",
             "/api/v1/private/position/position_mode",
             private=True,
         )
 
+    # ==================================================================
+    # LEVERAGE
+    # ==================================================================
+
     async def change_leverage(
         self,
         payload: Mapping[str, Any],
     ) -> dict[str, Any] | Any:
+
         return await self._request(
             "POST",
             "/api/v1/private/position/change_leverage",
@@ -680,10 +1069,15 @@ class MexcClient:
             private=True,
         )
 
+    # ==================================================================
+    # ORDER CREATION
+    # ==================================================================
+
     async def place_order(
         self,
         payload: Mapping[str, Any],
     ) -> MexcOrderResponse:
+
         data = await self._request(
             "POST",
             "/api/v1/private/order/create",
@@ -696,19 +1090,26 @@ class MexcClient:
             or not data.get("orderId")
         ):
             raise MexcAPIError(
-                "MEXC order response missing orderId: "
-                f"{data!r}"
+                "MEXC order response missing "
+                f"orderId: {data!r}"
             )
 
         return MexcOrderResponse(
-            order_id=str(data["orderId"]),
+            order_id=str(
+                data["orderId"]
+            ),
             raw=data,
         )
+
+    # ==================================================================
+    # ORDER STATUS
+    # ==================================================================
 
     async def get_order(
         self,
         order_id: str,
     ) -> dict[str, Any]:
+
         data = await self._request(
             "GET",
             f"/api/v1/private/order/get/{order_id}",
@@ -723,10 +1124,15 @@ class MexcClient:
 
         return data
 
+    # ==================================================================
+    # POSITION TP/SL
+    # ==================================================================
+
     async def place_position_tpsl(
         self,
         payload: Mapping[str, Any],
     ) -> Any:
+
         return await self._request(
             "POST",
             "/api/v1/private/stoporder/place",

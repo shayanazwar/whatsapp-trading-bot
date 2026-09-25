@@ -4,7 +4,7 @@ Date: 2026-09-24
 
 ## What is in this package
 
-The canonical runtime is the `app/` package. Market data, analysis, alerts, charts, signals, and future execution are MEXC Futures based. Alternate-exchange market paths have been removed from the production runtime. WhatsApp remains the interface/notification layer.
+The repository has been normalized into a real Python package under `app/`. The existing WhatsApp/Binance functionality is preserved. The new automation system uses MEXC Futures market data and is separate from the manual Binance path.
 
 ## Safety state
 

@@ -2,7 +2,7 @@
 
 A WhatsApp-first cryptocurrency assistant with three separate paths:
 
-1. Manual WhatsApp commands backed by MEXC Futures (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
+1. Existing manual Binance commands (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
 2. A new deterministic MEXC Futures market scanner that uses closed candles and sends WhatsApp trade signals when the configured confluence/risk gates pass.
 3. A separately isolated MEXC Futures execution adapter. **Live execution is disabled in this build.**
 
@@ -19,7 +19,7 @@ WhatsApp Cloud API
    /     |      \
 PRICE  ANALYZE  CHART/ALERT
   |        |
-MEXC Futures  MEXC Futures
+Binance  Binance
 
 MEXC automation (independent)
 
@@ -191,7 +191,7 @@ DELETE ALL
 SEARCH PEPE
 ```
 
-All market/trading functionality is now MEXC Futures based. WhatsApp remains the interface and notification layer.
+Existing manual functionality remains Binance-based and is intentionally separate from MEXC automation.
 
 ## Local checks
 

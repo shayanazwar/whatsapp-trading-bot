@@ -95,7 +95,12 @@ def closed_candle_rows(candles: List[Dict], timeframe_ms: int, now_ms: Optional[
     if not candles:
         return []
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    out = list(candles)
+    # Scanner may pass raw MEXC rows (lists) while the analysis layer may
+    # pass already-normalized dictionaries. Normalize here so this public
+    # helper is safe for both call paths.
+    out = convert_candles(candles)
+    if not out:
+        return []
     last = out[-1]
     # MEXC candle timestamps are treated as open timestamps.
     if last["time"] + timeframe_ms > now:

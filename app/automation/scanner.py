@@ -11,7 +11,7 @@ from ..analysis.engine import (
 from .mexc_client import MexcClient
 from .signal_manager import SignalManager
 from .signal_validator import validate_signal
-from .universe import UniverseSelector
+from .universe import MexcUniverse
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,28 +25,60 @@ MEXC_INTERVALS = {
 
 
 class MexcScanner:
+    """
+    Deterministic MEXC Futures scanner.
+
+    Pipeline:
+
+        Universe
+          ↓
+        4H / 1H / 15M / 5M closed candles
+          ↓
+        Analysis engine
+          ↓
+        Fresh MEXC executable quote
+          ↓
+        Spread / reference-price checks
+          ↓
+        Funding / orderbook / trade-flow context
+          ↓
+        Final grouped score
+          ↓
+        Entry-drift protection
+          ↓
+        Reprice
+          ↓
+        Final deterministic validator
+          ↓
+        WhatsApp publication
+
+    Live execution remains disabled.
+    """
+
     def __init__(
         self,
         *,
         settings: Any,
         client: MexcClient,
-        universe: UniverseSelector,
+        universe: MexcUniverse,
         signal_manager: SignalManager,
+        executor: Any | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         self.universe = universe
         self.signal_manager = signal_manager
+        self.executor = executor
 
     # ============================================================
     # PUBLIC SCAN
     # ============================================================
 
     async def scan_once(self) -> dict[str, int]:
-
         symbols = await self.universe.refresh()
 
         if not symbols:
+            LOGGER.warning("MEXC scanner universe is empty")
             return {
                 "symbols": 0,
                 "valid": 0,
@@ -59,15 +91,13 @@ class MexcScanner:
             int(
                 getattr(
                     self.settings,
-                    "scanner_concurrency",
-                    5,
+                    "scan_concurrency",
+                    4,
                 )
             ),
         )
 
-        semaphore = asyncio.Semaphore(
-            concurrency
-        )
+        semaphore = asyncio.Semaphore(concurrency)
 
         results = await asyncio.gather(
             *[
@@ -88,18 +118,11 @@ class MexcScanner:
         }
 
         for result in results:
-
-            if isinstance(
-                result,
-                Exception,
-            ):
+            if isinstance(result, Exception):
                 stats["errors"] += 1
                 continue
 
-            if not isinstance(
-                result,
-                dict,
-            ):
+            if not isinstance(result, dict):
                 continue
 
             if result.get("valid"):
@@ -135,9 +158,8 @@ class MexcScanner:
         async with semaphore:
 
             try:
-
                 # ====================================================
-                # 1. FETCH 4H / 1H / 15M / 5M
+                # 1. FETCH MULTI-TIMEFRAME CANDLES
                 # ====================================================
 
                 (
@@ -146,25 +168,21 @@ class MexcScanner:
                     candles_15m_raw,
                     candles_5m_raw,
                 ) = await asyncio.gather(
-
                     self.client.get_klines(
                         symbol,
                         MEXC_INTERVALS["4H"],
                         250,
                     ),
-
                     self.client.get_klines(
                         symbol,
                         MEXC_INTERVALS["1H"],
                         250,
                     ),
-
                     self.client.get_klines(
                         symbol,
                         MEXC_INTERVALS["15M"],
                         250,
                     ),
-
                     self.client.get_klines(
                         symbol,
                         MEXC_INTERVALS["5M"],
@@ -208,16 +226,14 @@ class MexcScanner:
                 )
 
                 for candles, minimum, label in required:
-
                     if len(candles) < minimum:
-
                         return self._reject(
                             symbol,
                             f"Insufficient closed {label} candles",
                         )
 
                 # ====================================================
-                # 4. FULL MULTI-TIMEFRAME ENGINE
+                # 4. MULTI-TIMEFRAME ANALYSIS
                 # ====================================================
 
                 analysis = analyze_candles(
@@ -228,26 +244,30 @@ class MexcScanner:
                     closed_5m,
                 )
 
-                # ====================================================
-                # 5. STORE 5M INFORMATION
-                # ====================================================
+                analysis["mexc_4h_rows"] = closed_4h
+                analysis["mexc_1h_rows"] = closed_1h
+                analysis["mexc_15m_rows"] = closed_15m
+                analysis["mexc_5m_rows"] = closed_5m
 
-                analysis[
-                    "mexc_5m_rows"
-                ] = closed_5m
+                analysis["closed_4h_candles"] = len(
+                    closed_4h
+                )
+                analysis["closed_1h_candles"] = len(
+                    closed_1h
+                )
+                analysis["closed_15m_candles"] = len(
+                    closed_15m
+                )
+                analysis["closed_5m_candles"] = len(
+                    closed_5m
+                )
 
-                analysis[
-                    "closed_5m_candles"
-                ] = len(closed_5m)
-
-                analysis[
-                    "closed_5m_candle_time"
-                ] = int(
+                analysis["closed_5m_candle_time"] = int(
                     closed_5m[-1][0]
                 )
 
                 # ====================================================
-                # 6. NO SETUP = STOP
+                # 5. SETUP CHECK
                 # ====================================================
 
                 setup = str(
@@ -257,22 +277,26 @@ class MexcScanner:
                     )
                 ).upper()
 
+                LOGGER.info(
+                    "MEXC ANALYSIS | %s | setup=%s | score=%s | rr=%s",
+                    symbol,
+                    setup or "NO TRADE",
+                    analysis.get("score"),
+                    analysis.get("rr"),
+                )
+
                 if setup not in {
                     "LONG",
                     "SHORT",
                 }:
-
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": "NO TRADE",
-                        "analysis": analysis,
-                    }
+                    return self._reject(
+                        symbol,
+                        "Analysis engine produced no valid LONG/SHORT setup",
+                        analysis,
+                    )
 
                 # ====================================================
-                # 7. FRESH EXECUTABLE MEXC QUOTE
+                # 6. FRESH EXECUTABLE MEXC QUOTE
                 # ====================================================
 
                 ticker = await self.client.get_ticker(
@@ -280,10 +304,10 @@ class MexcScanner:
                 )
 
                 if not ticker:
-
                     return self._reject(
                         symbol,
                         "Missing MEXC ticker",
+                        analysis,
                     )
 
                 bid = self._safe_float(
@@ -307,10 +331,10 @@ class MexcScanner:
                     or ask <= 0
                     or ask < bid
                 ):
-
                     return self._reject(
                         symbol,
                         "Invalid MEXC bid/ask",
+                        analysis,
                     )
 
                 executable_price = (
@@ -320,7 +344,7 @@ class MexcScanner:
                 )
 
                 # ====================================================
-                # 8. SPREAD
+                # 7. SPREAD
                 # ====================================================
 
                 mid = (
@@ -328,8 +352,7 @@ class MexcScanner:
                 ) / 2.0
 
                 spread_pct = (
-                    abs(ask - bid)
-                    / mid
+                    abs(ask - bid) / mid
                     if mid > 0
                     else 999.0
                 )
@@ -337,23 +360,10 @@ class MexcScanner:
                 max_spread_pct = float(
                     getattr(
                         self.settings,
-                        "max_spread_pct",
-                        0.002,
+                        "max_mexc_spread_pct",
+                        0.001,
                     )
                 )
-
-                if (
-                    spread_pct
-                    > max_spread_pct
-                ):
-
-                    return self._reject(
-                        symbol,
-                        (
-                            "Spread too high: "
-                            f"{spread_pct:.6f}"
-                        ),
-                    )
 
                 analysis.update(
                     {
@@ -364,30 +374,35 @@ class MexcScanner:
                     }
                 )
 
+                if spread_pct > max_spread_pct:
+                    return self._reject(
+                        symbol,
+                        (
+                            "MEXC spread too high: "
+                            f"{spread_pct:.6f} "
+                            f"> {max_spread_pct:.6f}"
+                        ),
+                        analysis,
+                    )
+
                 # ====================================================
-                # 9. INDEX / FAIR PRICE
+                # 8. INDEX / FAIR PRICE
                 # ====================================================
 
-                index_price = (
-                    await self._safe_index_price(
-                        symbol
-                    )
+                index_price = await self._safe_index_price(
+                    symbol
                 )
 
-                fair_price = (
-                    await self._safe_fair_price(
-                        symbol
-                    )
+                fair_price = await self._safe_fair_price(
+                    symbol
                 )
 
                 if index_price > 0:
-
                     analysis[
                         "mexc_index_price"
                     ] = index_price
 
                 if fair_price > 0:
-
                     analysis[
                         "mexc_fair_price"
                     ] = fair_price
@@ -399,7 +414,6 @@ class MexcScanner:
                 )
 
                 if reference_price > 0:
-
                     dislocation_pct = (
                         abs(
                             executable_price
@@ -415,107 +429,82 @@ class MexcScanner:
                     max_dislocation = float(
                         getattr(
                             self.settings,
-                            "max_price_dislocation_pct",
-                            0.005,
+                            "max_index_dislocation_pct",
+                            0.002,
                         )
                     )
 
-                    if (
-                        dislocation_pct
-                        > max_dislocation
-                    ):
-
+                    if dislocation_pct > max_dislocation:
                         return self._reject(
                             symbol,
-                            "Executable price too far from MEXC reference",
+                            (
+                                "Executable price too far from "
+                                "MEXC index/fair reference"
+                            ),
                             analysis,
                         )
 
                 # ====================================================
-                # 10. FUNDING
+                # 9. FUNDING
                 # ====================================================
 
-                funding = (
-                    await self._safe_funding(
-                        symbol
-                    )
+                funding = await self._safe_funding(
+                    symbol
                 )
 
                 if funding is not None:
-
                     analysis[
                         "mexc_funding_rate"
                     ] = funding
 
                 # ====================================================
-                # 11. ORDERBOOK
+                # 10. ORDERBOOK
                 # ====================================================
 
-                orderbook = (
-                    await self._safe_orderbook(
-                        symbol
-                    )
+                orderbook = await self._safe_orderbook(
+                    symbol
                 )
 
                 if orderbook:
-
-                    depth = (
-                        self._calculate_depth(
-                            orderbook
-                        )
+                    depth = self._calculate_depth(
+                        orderbook
                     )
 
-                    analysis.update(
-                        depth
-                    )
+                    analysis.update(depth)
 
                 # ====================================================
-                # 12. RECENT DEALS
+                # 11. RECENT TRADE FLOW
                 # ====================================================
 
-                deals = (
-                    await self._safe_deals(
-                        symbol
-                    )
+                deals = await self._safe_deals(
+                    symbol
                 )
 
                 if deals:
-
-                    flow = (
-                        self._calculate_trade_flow(
-                            deals
-                        )
+                    flow = self._calculate_trade_flow(
+                        deals
                     )
 
-                    analysis.update(
-                        flow
-                    )
+                    analysis.update(flow)
 
                 # ====================================================
-                # 13. REAL FUTURES CONTEXT
+                # 12. FUTURES CONTEXT
                 # ====================================================
 
-                futures_ok = (
-                    self._futures_context_ok(
-                        analysis,
-                        setup,
-                    )
+                futures_ok = self._futures_context_ok(
+                    analysis,
+                    setup,
                 )
 
-                analysis[
-                    "futures_ok"
-                ] = futures_ok
+                analysis["futures_ok"] = futures_ok
 
-                analysis[
-                    "futures_context"
-                ] = (
+                analysis["futures_context"] = (
                     "AVAILABLE"
                     if futures_ok
                     else "FAILED"
                 )
 
                 if not futures_ok:
-
                     return self._reject(
                         symbol,
                         "MEXC futures context failed",
@@ -523,36 +512,33 @@ class MexcScanner:
                     )
 
                 # ====================================================
-                # 14. RECALCULATE SCORE
-                #
-                # Engine initially calculates the structural score.
-                # Futures data was unavailable there.
-                #
-                # Now calculate the final score with REAL context.
+                # 13. REBUILD CONFIRMATION FAMILIES
                 # ====================================================
 
-                analysis[
-                    "score"
-                ], analysis[
-                    "score_groups"
-                ] = self._recalculate_score(
+                self._update_confirmation_families(
                     analysis
                 )
 
                 # ====================================================
-                # 15. FINAL ENTRY DRIFT
+                # 14. FINAL 100-POINT SCORE
                 # ====================================================
 
-                planned_entry = (
-                    self._safe_float(
-                        analysis.get(
-                            "entry"
-                        )
-                    )
+                (
+                    analysis["score"],
+                    analysis["score_groups"],
+                ) = self._recalculate_score(
+                    analysis
+                )
+
+                # ====================================================
+                # 15. ENTRY DRIFT PROTECTION
+                # ====================================================
+
+                planned_entry = self._safe_float(
+                    analysis.get("entry")
                 )
 
                 if planned_entry <= 0:
-
                     return self._reject(
                         symbol,
                         "Invalid planned entry",
@@ -575,26 +561,23 @@ class MexcScanner:
                     getattr(
                         self.settings,
                         "max_entry_drift_pct",
-                        0.005,
+                        0.002,
                     )
                 )
 
-                if (
-                    entry_drift_pct
-                    > max_entry_drift
-                ):
-
+                if entry_drift_pct > max_entry_drift:
                     return self._reject(
                         symbol,
                         (
-                            "Executable entry drift "
-                            "exceeds limit"
+                            "Executable entry drift exceeds limit: "
+                            f"{entry_drift_pct:.6f} "
+                            f"> {max_entry_drift:.6f}"
                         ),
                         analysis,
                     )
 
                 # ====================================================
-                # 16. REPRICE AROUND REAL EXECUTION PRICE
+                # 16. REPRICE LEVELS
                 # ====================================================
 
                 self._reprice_levels(
@@ -603,14 +586,17 @@ class MexcScanner:
                 )
 
                 # ====================================================
-                # 17. RECHECK SCORE/RR AFTER REPRICE
+                # 17. RECHECK FAMILIES / SCORE
                 # ====================================================
 
-                analysis[
-                    "score"
-                ], analysis[
-                    "score_groups"
-                ] = self._recalculate_score(
+                self._update_confirmation_families(
+                    analysis
+                )
+
+                (
+                    analysis["score"],
+                    analysis["score_groups"],
+                ) = self._recalculate_score(
                     analysis
                 )
 
@@ -618,46 +604,40 @@ class MexcScanner:
                 # 18. FINAL VALIDATOR
                 # ====================================================
 
-                validated, reasons = (
-                    validate_signal(
-                        analysis,
-                        min_confluence=int(
-                            getattr(
-                                self.settings,
-                                "min_confluence",
-                                5,
-                            )
-                        ),
-                        min_rr=float(
-                            getattr(
-                                self.settings,
-                                "min_rr",
-                                2.0,
-                            )
-                        ),
-                        require_increasing_volume=bool(
-                            getattr(
-                                self.settings,
-                                "require_increasing_volume",
-                                False,
-                            )
-                        ),
-                    )
+                validated, reasons = validate_signal(
+                    analysis,
+                    min_confluence=int(
+                        getattr(
+                            self.settings,
+                            "min_confluence",
+                            5,
+                        )
+                    ),
+                    min_rr=float(
+                        getattr(
+                            self.settings,
+                            "min_rr",
+                            2.0,
+                        )
+                    ),
+                    require_increasing_volume=bool(
+                        getattr(
+                            self.settings,
+                            "require_increasing_volume",
+                            False,
+                        )
+                    ),
                 )
 
                 if validated is None:
-
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": reasons,
-                        "analysis": analysis,
-                    }
+                    return self._reject(
+                        symbol,
+                        reasons,
+                        analysis,
+                    )
 
                 # ====================================================
-                # 19. PUBLISH
+                # 19. PUBLISH SIGNAL
                 # ====================================================
 
                 sent = False
@@ -665,23 +645,26 @@ class MexcScanner:
                 auto_signals = bool(
                     getattr(
                         self.settings,
-                        "auto_signals_enabled",
+                        "auto_signal_enabled",
                         False,
                     )
                 )
 
                 if auto_signals:
-
-                    sent = (
-                        await self._publish_signal(
-                            validated
-                        )
+                    sent = await self._publish_signal(
+                        validated
                     )
 
                 # ====================================================
                 # 20. LIVE EXECUTION
+                # ====================================================
                 #
-                # STILL DISABLED.
+                # HARD DISABLED.
+                #
+                # Even if Render environment variables are
+                # accidentally changed, the executor itself must
+                # remain disabled until the execution architecture
+                # is completed and tested.
                 # ====================================================
 
                 auto_trade = bool(
@@ -695,25 +678,12 @@ class MexcScanner:
                 live_allowed = bool(
                     getattr(
                         self.settings,
-                        "live_execution_allowed",
+                        "allow_live_execution",
                         False,
                     )
                 )
 
-                live_implemented = bool(
-                    getattr(
-                        self.settings,
-                        "live_implemented",
-                        False,
-                    )
-                )
-
-                if (
-                    auto_trade
-                    and live_allowed
-                    and live_implemented
-                ):
-
+                if auto_trade and live_allowed:
                     await self._execute_signal(
                         validated
                     )
@@ -728,7 +698,6 @@ class MexcScanner:
                 }
 
             except Exception as exc:
-
                 LOGGER.exception(
                     "MEXC scan failed for %s",
                     symbol,
@@ -752,7 +721,6 @@ class MexcScanner:
         side: str,
     ) -> bool:
 
-        # We require actual market-context data.
         has_funding = (
             "mexc_funding_rate"
             in analysis
@@ -792,7 +760,7 @@ class MexcScanner:
         if side == "LONG" and imbalance > 0:
             confirmations += 1
 
-        if side == "SHORT" and imbalance < 0:
+        elif side == "SHORT" and imbalance < 0:
             confirmations += 1
 
         # --------------------------------------------------------
@@ -810,20 +778,48 @@ class MexcScanner:
         if side == "LONG" and delta_ratio > 0:
             confirmations += 1
 
-        if side == "SHORT" and delta_ratio < 0:
+        elif side == "SHORT" and delta_ratio < 0:
             confirmations += 1
 
         # --------------------------------------------------------
         # Funding
         #
-        # Funding is NOT treated as a standalone direction signal.
-        # It only acts as a context/warning input.
+        # Funding is contextual.
+        # It is not treated as a standalone directional signal.
         # --------------------------------------------------------
 
         if has_funding:
             confirmations += 1
 
         return confirmations >= 2
+
+    # ============================================================
+    # CONFIRMATION FAMILIES
+    # ============================================================
+
+    @staticmethod
+    def _update_confirmation_families(
+        analysis: dict[str, Any],
+    ) -> None:
+
+        families = (
+            "direction_ok",
+            "structure_ok",
+            "setup_ok",
+            "momentum_ok",
+            "volume_ok",
+            "location_ok",
+        )
+
+        family_count = sum(
+            1
+            for family in families
+            if bool(analysis.get(family, False))
+        )
+
+        analysis[
+            "confirmation_family_count"
+        ] = family_count
 
     # ============================================================
     # SCORE
@@ -894,31 +890,24 @@ class MexcScanner:
             "direction_regime": (
                 20 if direction_ok else 0
             ),
-
             "market_structure": (
                 20 if structure_ok else 0
             ),
-
             "setup_trigger": (
                 20 if setup_ok else 0
             ),
-
             "momentum": (
                 10 if momentum_ok else 0
             ),
-
             "volume_participation": (
                 10 if volume_ok else 0
             ),
-
             "location_target_path": (
                 10 if location_ok else 0
             ),
-
             "futures_context": (
                 5 if futures_ok else 0
             ),
-
             "volatility_execution": (
                 5 if volatility_ok else 0
             ),
@@ -939,7 +928,6 @@ class MexcScanner:
     ) -> float:
 
         try:
-
             if value is None:
                 return 0.0
 
@@ -961,7 +949,6 @@ class MexcScanner:
     ) -> float | None:
 
         try:
-
             result = await self.client.get_funding_rate(
                 symbol
             )
@@ -973,15 +960,9 @@ class MexcScanner:
                 return None
 
             value = (
-                result.get(
-                    "fundingRate"
-                )
-                or result.get(
-                    "funding_rate"
-                )
-                or result.get(
-                    "rate"
-                )
+                result.get("fundingRate")
+                or result.get("funding_rate")
+                or result.get("rate")
             )
 
             if value is None:
@@ -990,11 +971,10 @@ class MexcScanner:
             return float(value)
 
         except Exception:
-
             return None
 
     # ============================================================
-    # SAFE INDEX
+    # SAFE INDEX PRICE
     # ============================================================
 
     async def _safe_index_price(
@@ -1003,11 +983,8 @@ class MexcScanner:
     ) -> float:
 
         try:
-
-            result = (
-                await self.client.get_index_price(
-                    symbol
-                )
+            result = await self.client.get_index_price(
+                symbol
             )
 
             if not isinstance(
@@ -1017,19 +994,12 @@ class MexcScanner:
                 return 0.0
 
             return self._safe_float(
-                result.get(
-                    "indexPrice"
-                )
-                or result.get(
-                    "index"
-                )
-                or result.get(
-                    "price"
-                )
+                result.get("indexPrice")
+                or result.get("index")
+                or result.get("price")
             )
 
         except Exception:
-
             return 0.0
 
     # ============================================================
@@ -1042,11 +1012,8 @@ class MexcScanner:
     ) -> float:
 
         try:
-
-            result = (
-                await self.client.get_fair_price(
-                    symbol
-                )
+            result = await self.client.get_fair_price(
+                symbol
             )
 
             if not isinstance(
@@ -1056,25 +1023,14 @@ class MexcScanner:
                 return 0.0
 
             return self._safe_float(
-                result.get(
-                    "fairPrice"
-                )
-                or result.get(
-                    "fair"
-                )
-                or result.get(
-                    "markPrice"
-                )
-                or result.get(
-                    "mark"
-                )
-                or result.get(
-                    "price"
-                )
+                result.get("fairPrice")
+                or result.get("fair")
+                or result.get("markPrice")
+                or result.get("mark")
+                or result.get("price")
             )
 
         except Exception:
-
             return 0.0
 
     # ============================================================
@@ -1087,10 +1043,15 @@ class MexcScanner:
     ) -> dict[str, Any] | None:
 
         try:
-
             result = await self.client.get_depth(
                 symbol,
-                20,
+                int(
+                    getattr(
+                        self.settings,
+                        "orderbook_levels",
+                        10,
+                    )
+                ),
             )
 
             if isinstance(
@@ -1102,7 +1063,6 @@ class MexcScanner:
             return None
 
         except Exception:
-
             return None
 
     # ============================================================
@@ -1115,10 +1075,15 @@ class MexcScanner:
     ) -> list[dict[str, Any]] | None:
 
         try:
-
             result = await self.client.get_deals(
                 symbol,
-                100,
+                int(
+                    getattr(
+                        self.settings,
+                        "trade_flow_limit",
+                        100,
+                    )
+                ),
             )
 
             if isinstance(
@@ -1137,15 +1102,14 @@ class MexcScanner:
             return None
 
         except Exception:
-
             return None
 
     # ============================================================
     # ORDERBOOK DEPTH
     # ============================================================
 
+    @staticmethod
     def _calculate_depth(
-        self,
         orderbook: dict[str, Any],
     ) -> dict[str, Any]:
 
@@ -1166,29 +1130,20 @@ class MexcScanner:
             total = 0.0
 
             for level in levels:
-
                 try:
-
                     if isinstance(
                         level,
                         dict,
                     ):
-
                         quantity = (
-                            level.get(
-                                "quantity"
-                            )
-                            or level.get(
-                                "qty"
-                            )
-                            or level.get(
-                                "volume"
-                            )
+                            level.get("quantity")
+                            or level.get("qty")
+                            or level.get("volume")
+                            or level.get("vol")
                             or 0
                         )
 
                     else:
-
                         quantity = (
                             level[1]
                             if len(level) > 1
@@ -1200,21 +1155,16 @@ class MexcScanner:
                     )
 
                 except Exception:
-
                     continue
 
             return total
 
-        bid_depth = (
-            total_volume(
-                bids
-            )
+        bid_depth = total_volume(
+            bids
         )
 
-        ask_depth = (
-            total_volume(
-                asks
-            )
+        ask_depth = total_volume(
+            asks
         )
 
         total_depth = (
@@ -1235,6 +1185,7 @@ class MexcScanner:
         return {
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
+            "total_depth": total_depth,
             "orderbook_imbalance": imbalance,
         }
 
@@ -1242,8 +1193,8 @@ class MexcScanner:
     # TRADE FLOW
     # ============================================================
 
+    @staticmethod
     def _calculate_trade_flow(
-        self,
         deals: list[dict[str, Any]],
     ) -> dict[str, Any]:
 
@@ -1251,22 +1202,12 @@ class MexcScanner:
         sell_volume = 0.0
 
         for deal in deals:
-
             try:
-
                 quantity = (
-                    deal.get(
-                        "quantity"
-                    )
-                    or deal.get(
-                        "qty"
-                    )
-                    or deal.get(
-                        "volume"
-                    )
-                    or deal.get(
-                        "vol"
-                    )
+                    deal.get("quantity")
+                    or deal.get("qty")
+                    or deal.get("volume")
+                    or deal.get("vol")
                     or 0
                 )
 
@@ -1275,16 +1216,11 @@ class MexcScanner:
                 )
 
                 side = str(
-                    deal.get(
-                        "side"
-                    )
-                    or deal.get(
-                        "type"
-                    )
+                    deal.get("side")
+                    or deal.get("type")
                     or ""
                 ).lower()
 
-                # MEXC trade-side formats vary.
                 if (
                     "buy" in side
                     or side in {
@@ -1292,7 +1228,6 @@ class MexcScanner:
                         "bid",
                     }
                 ):
-
                     buy_volume += quantity
 
                 elif (
@@ -1302,11 +1237,9 @@ class MexcScanner:
                         "ask",
                     }
                 ):
-
                     sell_volume += quantity
 
             except Exception:
-
                 continue
 
         total = (
@@ -1364,32 +1297,35 @@ class MexcScanner:
         )
 
         new_sl = (
-            old_sl + delta
+            old_sl
+            + delta
         )
 
         new_tp1 = (
-            old_tp1 + delta
+            old_tp1
+            + delta
         )
 
         new_tp2 = (
-            old_tp2 + delta
+            old_tp2
+            + delta
         )
 
-        analysis[
-            "entry"
-        ] = executable_price
+        analysis["entry"] = (
+            executable_price
+        )
 
-        analysis[
-            "stop_loss"
-        ] = new_sl
+        analysis["stop_loss"] = (
+            new_sl
+        )
 
-        analysis[
-            "tp1"
-        ] = new_tp1
+        analysis["tp1"] = (
+            new_tp1
+        )
 
-        analysis[
-            "tp2"
-        ] = new_tp2
+        analysis["tp2"] = (
+            new_tp2
+        )
 
         risk = abs(
             executable_price
@@ -1401,9 +1337,7 @@ class MexcScanner:
             - executable_price
         )
 
-        analysis[
-            "rr"
-        ] = (
+        analysis["rr"] = (
             reward / risk
             if risk > 0
             else 0.0
@@ -1416,9 +1350,30 @@ class MexcScanner:
     @staticmethod
     def _reject(
         symbol: str,
-        reason: str,
+        reason: Any,
         analysis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+
+        LOGGER.info(
+            "MEXC REJECT | %s | reason=%s | setup=%s | score=%s | rr=%s",
+            symbol,
+            reason,
+            (
+                analysis.get("setup")
+                if analysis
+                else None
+            ),
+            (
+                analysis.get("score")
+                if analysis
+                else None
+            ),
+            (
+                analysis.get("rr")
+                if analysis
+                else None
+            ),
+        )
 
         return {
             "valid": False,
@@ -1439,17 +1394,13 @@ class MexcScanner:
     ) -> bool:
 
         try:
-
-            result = (
-                await self.signal_manager.publish(
-                    validated
-                )
+            result = await self.signal_manager.publish(
+                validated
             )
 
             return bool(result)
 
         except Exception:
-
             LOGGER.exception(
                 "Failed to publish MEXC signal"
             )
@@ -1465,26 +1416,15 @@ class MexcScanner:
         validated: Any,
     ) -> None:
 
-        # ========================================================
-        # HARD DISABLED
-        # ========================================================
+        # --------------------------------------------------------
+        # HARD SAFETY LOCK
         #
-        # Do NOT send an order from the scanner yet.
-        #
-        # Live execution requires:
-        # - account balance risk sizing
-        # - contract metadata
-        # - leverage validation
-        # - order reconciliation
-        # - protective SL
-        # - TP1 / TP2
-        # - break-even
-        # - emergency recovery
-        #
-        # ========================================================
+        # Do NOT place a real order from the scanner yet.
+        # --------------------------------------------------------
 
         LOGGER.warning(
-            "Live execution requested but remains disabled"
+            "Live execution requested but remains disabled "
+            "by the scanner safety lock"
         )
 
         return

@@ -262,8 +262,11 @@ class MexcScanner:
                     closed_5m
                 )
 
+                # normalized candles returned by the analysis engine are
+                # dictionaries: {"time", "open", "high", "low", "close", "volume"}.
+                # Keep the timestamp access format consistent with that contract.
                 analysis["closed_5m_candle_time"] = int(
-                    closed_5m[-1][0]
+                    closed_5m[-1]["time"]
                 )
 
                 # ====================================================

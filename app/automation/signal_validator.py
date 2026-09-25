@@ -8,6 +8,14 @@ from .risk_manager import TradePlan, validate_levels
 from .setup_filter import validate_analysis
 
 
+MIN_SCORE = 82
+MIN_RR = 2.0
+MIN_CONFIRMATION_FAMILIES = 5
+
+FIVE_MINUTE_MS = 5 * 60 * 1000
+FIFTEEN_MINUTE_MS = 15 * 60 * 1000
+
+
 @dataclass(frozen=True)
 class ValidatedSignal:
     key: str
@@ -23,7 +31,6 @@ def make_signal_key(
     side: str,
     candle_time: int,
 ) -> str:
-
     raw = (
         f"mexc|"
         f"{symbol.upper()}|"
@@ -34,6 +41,78 @@ def make_signal_key(
     return hashlib.sha256(
         raw.encode("utf-8")
     ).hexdigest()[:40]
+
+
+def _normalize_timestamp_ms(
+    value: Any,
+) -> int | None:
+    try:
+        timestamp = int(value)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    # Accept either seconds or milliseconds.
+    if timestamp < 10**12:
+        timestamp *= 1000
+
+    return timestamp
+
+
+def _validate_5m_timestamp(
+    *,
+    candle_15m_time: int,
+    candle_5m_time: int,
+) -> tuple[bool, str]:
+    """
+    Validate chronological relationship between the 15M setup
+    candle and the 5M trigger.
+
+    The 15M setup must already be closed before the 5M trigger
+    can be used.
+
+    Therefore:
+
+        5M trigger time >= 15M setup time
+
+    A trigger that is excessively old is rejected.
+    """
+
+    if candle_5m_time < candle_15m_time:
+        return (
+            False,
+            "5M trigger belongs to an earlier 15M candle",
+        )
+
+    age = (
+        candle_5m_time
+        - candle_15m_time
+    )
+
+    # Do not allow a stale trigger from many 5M candles later.
+    # The setup remains valid only for the current 15M window
+    # plus one additional 5M candle of execution tolerance.
+    max_age = (
+        FIFTEEN_MINUTE_MS
+        + FIVE_MINUTE_MS
+    )
+
+    if age > max_age:
+        return (
+            False,
+            "5M trigger is stale relative to the 15M setup",
+        )
+
+    # 5M candles must be aligned to the normal 5-minute boundary.
+    if candle_5m_time % FIVE_MINUTE_MS != 0:
+        return (
+            False,
+            "5M trigger timestamp is not 5M-aligned",
+        )
+
+    return True, "OK"
 
 
 def validate_signal(
@@ -64,59 +143,64 @@ def validate_signal(
         return None, reasons
 
     # ============================================================
-    # 2. CANDLE TIMESTAMP
+    # 2. 15M CANDLE TIMESTAMP
     # ============================================================
 
-    candle_time = data.get(
+    candle_time_raw = data.get(
         "candle_time"
     )
 
-    if candle_time is None:
+    if candle_time_raw is None:
         return None, [
             "15M closed candle timestamp is missing"
         ]
 
-    try:
-        candle_time = int(
-            candle_time
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
+    candle_time = _normalize_timestamp_ms(
+        candle_time_raw
+    )
+
+    if candle_time is None:
         return None, [
             "Invalid 15M candle timestamp"
         ]
 
+    if candle_time % FIFTEEN_MINUTE_MS != 0:
+        return None, [
+            "15M candle timestamp is not 15M-aligned"
+        ]
+
     # ============================================================
-    # 3. 5M TIMESTAMP
+    # 3. 5M TRIGGER TIMESTAMP
     # ============================================================
 
-    candle_5m_time = data.get(
+    candle_5m_raw = data.get(
         "closed_5m_candle_time"
     )
 
-    if candle_5m_time is None:
+    if candle_5m_raw is None:
         return None, [
             "5M closed candle timestamp is missing"
         ]
 
-    try:
-        candle_5m_time = int(
-            candle_5m_time
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
+    candle_5m_time = _normalize_timestamp_ms(
+        candle_5m_raw
+    )
+
+    if candle_5m_time is None:
         return None, [
             "Invalid 5M candle timestamp"
         ]
 
-    # 5M trigger must not belong to a future candle.
-    if candle_5m_time > candle_time:
+    timestamp_ok, timestamp_reason = (
+        _validate_5m_timestamp(
+            candle_15m_time=candle_time,
+            candle_5m_time=candle_5m_time,
+        )
+    )
+
+    if not timestamp_ok:
         return None, [
-            "5M trigger timestamp is ahead of 15M analysis"
+            timestamp_reason
         ]
 
     # ============================================================
@@ -124,7 +208,7 @@ def validate_signal(
     # ============================================================
 
     side = str(
-        data.get("setup")
+        data.get("setup") or ""
     ).upper()
 
     if side not in {
@@ -140,7 +224,6 @@ def validate_signal(
     # ============================================================
 
     try:
-
         entry = float(
             data["entry"]
         )
@@ -198,12 +281,14 @@ def validate_signal(
     # 7. RISK MANAGER VALIDATION
     # ============================================================
 
+    required_rr = max(
+        MIN_RR,
+        float(min_rr or 0),
+    )
+
     levels_ok, level_reason = validate_levels(
         plan,
-        max(
-            2.0,
-            float(min_rr or 0),
-        ),
+        required_rr,
     )
 
     if not levels_ok:
@@ -258,13 +343,22 @@ def validate_signal(
     # ============================================================
 
     score = int(
-        data.get("score", 0)
+        data.get(
+            "score",
+            0,
+        )
         or 0
     )
 
-    if score < 82:
+    required_score = max(
+        MIN_SCORE,
+        int(min_confluence or 0),
+    )
+
+    if score < required_score:
         return None, [
-            f"Final score {score}/100 is below 82"
+            f"Final score {score}/100 "
+            f"is below {required_score}"
         ]
 
     # ============================================================
@@ -279,23 +373,110 @@ def validate_signal(
         or 0
     )
 
-    if family_count < 5:
+    if family_count < MIN_CONFIRMATION_FAMILIES:
         return None, [
-            f"Only {family_count}/6 confirmation families passed"
+            f"Only {family_count}/6 "
+            "confirmation families passed"
         ]
 
     # ============================================================
-    # 11. SIGNAL KEY
+    # 11. MANDATORY FAMILY FLAGS
+    # ============================================================
+
+    if not bool(
+        data.get(
+            "direction_ok",
+            False,
+        )
+    ):
+        return None, [
+            "Mandatory Direction family failed"
+        ]
+
+    if not bool(
+        data.get(
+            "structure_ok",
+            False,
+        )
+    ):
+        return None, [
+            "Mandatory Structure family failed"
+        ]
+
+    if not bool(
+        data.get(
+            "setup_ok",
+            False,
+        )
+    ):
+        return None, [
+            "Mandatory Setup family failed"
+        ]
+
+    # ============================================================
+    # 12. SIDE/DIRECTION CONSISTENCY
+    # ============================================================
+
+    if side == "LONG":
+
+        if not bool(
+            data.get(
+                "bullish_points",
+                0,
+            )
+        ):
+            return None, [
+                "LONG signal has no bullish directional evidence"
+            ]
+
+        if bool(
+            data.get(
+                "bearish_points",
+                0,
+            )
+        ):
+            return None, [
+                "LONG signal contains bearish directional conflict"
+            ]
+
+    else:
+
+        if not bool(
+            data.get(
+                "bearish_points",
+                0,
+            )
+        ):
+            return None, [
+                "SHORT signal has no bearish directional evidence"
+            ]
+
+        if bool(
+            data.get(
+                "bullish_points",
+                0,
+            )
+        ):
+            return None, [
+                "SHORT signal contains bullish directional conflict"
+            ]
+
+    # ============================================================
+    # 13. SYMBOL
     # ============================================================
 
     symbol = str(
-        data.get("symbol")
-    ).upper()
+        data.get("symbol") or ""
+    ).upper().strip()
 
     if not symbol:
         return None, [
             "Signal symbol is missing"
         ]
+
+    # ============================================================
+    # 14. SIGNAL KEY
+    # ============================================================
 
     key = make_signal_key(
         symbol,
@@ -304,15 +485,35 @@ def validate_signal(
     )
 
     # ============================================================
-    # 12. IMMUTABLE VALIDATED SIGNAL
+    # 15. IMMUTABLE VALIDATED SIGNAL
     # ============================================================
+
+    analysis = dict(data)
+
+    # Store normalized timestamps so every downstream component
+    # receives the same units.
+    analysis[
+        "candle_time"
+    ] = candle_time
+
+    analysis[
+        "closed_5m_candle_time"
+    ] = candle_5m_time
+
+    analysis[
+        "score"
+    ] = score
+
+    analysis[
+        "confirmation_family_count"
+    ] = family_count
 
     validated = ValidatedSignal(
         key=key,
         symbol=symbol,
         side=side,
         candle_time=candle_time,
-        analysis=dict(data),
+        analysis=analysis,
         plan=plan,
     )
 

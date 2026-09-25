@@ -27,9 +27,9 @@ class FakeWhatsApp:
 
 class FakeMarket:
     async def resolve(self, raw):
-        return MarketRef("binance", raw.upper().replace("/", ""))
+        return MarketRef("mexc", raw.upper().replace("/", "_"))
 
-    async def binance_price(self, symbol):
+    async def price(self, symbol):
         return 1234.56
 
 
@@ -48,7 +48,7 @@ def test_price_command_still_works(tmp_path):
     bot = make_bot(tmp_path)
     asyncio.run(bot.handle("923001234567", "PRICE BTCUSDT"))
     assert bot.whatsapp.texts == [
-        ("923001234567", "💰 BTCUSDT\nExchange: BINANCE SPOT\nPrice: $1,234.56")
+        ("923001234567", "💰 BTCUSDT\nExchange: MEXC FUTURES\nPrice: $1,234.56")
     ]
 
 

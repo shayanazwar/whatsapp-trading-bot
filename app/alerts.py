@@ -51,9 +51,9 @@ class AlertEngine:
                 for alert_id in set(self._states) - active_ids:
                     self._states.pop(alert_id, None)
                 for alert in alerts:
-                    if alert.exchange != "binance":
+                    if alert.exchange != "mexc":
                         continue
-                    price = await self.market.binance_price(alert.symbol)
+                    price = await self.market.price(alert.symbol)
                     if price is None:
                         continue
                     state = self._states.setdefault(alert.id, RuntimeState())

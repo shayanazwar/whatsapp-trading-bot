@@ -26,8 +26,7 @@ ANALYZE ETHUSDT
 ANALYZE SOLUSDT
 
 CHART BTCUSDT 1H
-CHART BINANCE:BTCUSDT 4H
-CHART BYBIT:BTC/USDT 15M
+CHART MEXC:BTCUSDT 4H
 
 ALERT BTCUSDT ABOVE 120000
 ALERT BTCUSDT BELOW 110000
@@ -180,15 +179,10 @@ class Bot:
             raw
         )
 
-        if ref.exchange != "binance":
-            raise ValueError(
-                "PRICE currently uses Binance spot real-time prices. "
-                "Use a Binance symbol."
-            )
+        if ref.exchange != "mexc":
+            raise ValueError("Only MEXC Futures markets are supported.")
 
-        price = await self.market.binance_price(
-            ref.symbol
-        )
+        price = await self.market.price(ref.symbol)
 
         if price is None:
             raise ValueError(
@@ -199,7 +193,7 @@ class Bot:
             phone,
             (
                 f"💰 {ref.symbol}\n"
-                f"Exchange: BINANCE SPOT\n"
+                f"Exchange: MEXC FUTURES\n"
                 f"Price: ${fmt_price(price)}"
             ),
         )
@@ -248,7 +242,8 @@ class Bot:
             f"Resistance: "
             f"{fmt_optional(data['resistance'])}\n"
 
-            f"Confluence: {data['score']}/6\n\n"
+            f"Score: {data['score']}/100\n"
+            f"Families: {data.get('confirmation_family_count', 0)}/6\n\n"
 
             f"Potential Setup: {data['setup']}\n"
         )
@@ -380,19 +375,14 @@ class Bot:
             raw_symbol
         )
 
-        if ref.exchange != "binance":
-            raise ValueError(
-                "Real-time alerts in this version "
-                "are enabled for Binance spot symbols."
-            )
+        if ref.exchange != "mexc":
+            raise ValueError("Only MEXC Futures markets are supported.")
 
-        current = await self.market.binance_price(
-            ref.symbol
-        )
+        current = await self.market.price(ref.symbol)
 
         if current is None:
             raise ValueError(
-                "Could not read the current Binance price. "
+                "Could not read the current MEXC price. "
                 "Try again."
             )
 
@@ -418,7 +408,7 @@ class Bot:
 
         alert = self.db.create_alert(
             phone,
-            "binance",
+            "mexc",
             ref.symbol,
             condition,
             target,
@@ -548,7 +538,7 @@ class Bot:
         if not results:
             await self.whatsapp.send_text(
                 phone,
-                "No matching spot markets found.",
+                "No matching MEXC Futures markets found.",
             )
             return
 
@@ -564,8 +554,7 @@ class Bot:
 
         lines.append("")
         lines.append(
-            "For a chart, use: "
-            "CHART EXCHANGE:SYMBOL 1H"
+            "Charts use MEXC Futures. Example: CHART MEXC:BTCUSDT 1H"
         )
 
         await self.whatsapp.send_text(
@@ -615,7 +604,7 @@ class Bot:
         body = (
             f"🚨 PRICE ALERT\n\n"
             f"{alert.symbol}\n"
-            f"BINANCE SPOT\n"
+            f"MEXC FUTURES\n"
             f"Current: ${fmt_price(price)}\n"
             f"Target: ${fmt_price(alert.target)}\n"
             f"Condition: {alert.condition.upper()}\n\n"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,26 +21,10 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     database_path: str = Field(default="signals.db", alias="DATABASE_PATH")
 
-    # Existing Binance alert/chart path. Kept intact for existing commands.
-    binance_ws_url: str = Field(
-        default="wss://data-stream.binance.vision/ws/!miniTicker@arr",
-        alias="BINANCE_WS_URL",
-    )
-    binance_rest_url: str = Field(
-        default="https://data-api.binance.vision",
-        alias="BINANCE_REST_URL",
-    )
+    # MEXC Futures is the sole market/trading venue.
     alert_check_seconds: float = Field(default=0.75, alias="ALERT_CHECK_SECONDS")
     market_cache_retry_seconds: int = Field(default=5, alias="MARKET_CACHE_RETRY_SECONDS")
-
-    discovery_exchanges: str = Field(
-        default="binance,bybit,okx,gateio,kucoin",
-        alias="DISCOVERY_EXCHANGES",
-    )
-    discovery_refresh_seconds: int = Field(
-        default=21600,
-        alias="DISCOVERY_REFRESH_SECONDS",
-    )
+    discovery_refresh_seconds: int = Field(default=900, alias="DISCOVERY_REFRESH_SECONDS")
     chart_default_bars: int = Field(default=180, alias="CHART_DEFAULT_BARS")
     force_utc: bool = Field(default=True, alias="FORCE_UTC")
 
@@ -57,7 +40,7 @@ class Settings(BaseSettings):
     mexc_order_type: int = Field(default=1, alias="MEXC_ORDER_TYPE")
     mexc_open_type: int = Field(default=1, alias="MEXC_OPEN_TYPE")  # isolated
     mexc_default_leverage: int = Field(default=3, alias="MEXC_DEFAULT_LEVERAGE")
-    max_risk_per_trade: float = Field(default=0.01, alias="MAX_RISK_PER_TRADE")
+    max_risk_per_trade: float = Field(default=1.0, alias="MAX_RISK_PER_TRADE")
     max_open_trades: int = Field(default=3, alias="MAX_OPEN_TRADES")
     max_daily_loss: float = Field(default=0.05, alias="MAX_DAILY_LOSS")
 
@@ -65,17 +48,24 @@ class Settings(BaseSettings):
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
-    scan_interval_seconds: int = Field(default=60, alias="SCAN_INTERVAL_SECONDS")
-    max_symbols: int = Field(default=100, alias="MAX_SYMBOLS")
-    scan_concurrency: int = Field(default=4, alias="SCAN_CONCURRENCY")
-    candle_limit: int = Field(default=200, alias="CANDLE_LIMIT")
-    min_confluence: int = Field(default=5, alias="MIN_CONFLUENCE")
+    scan_interval_seconds: int = Field(default=300, alias="SCAN_INTERVAL_SECONDS")
+    max_symbols: int = Field(default=120, alias="MAX_SYMBOLS")
+    scan_concurrency: int = Field(default=8, alias="SCAN_CONCURRENCY")
+    candle_limit: int = Field(default=250, alias="CANDLE_LIMIT")
+    min_confluence: int = Field(default=82, alias="MIN_CONFLUENCE")
     min_rr: float = Field(default=2.0, alias="MIN_RR")
+    max_entry_drift_pct: float = Field(default=0.002, alias="MAX_ENTRY_DRIFT_PCT")
+    max_mexc_spread_pct: float = Field(default=0.001, alias="MAX_MEXC_SPREAD_PCT")
+    max_index_dislocation_pct: float = Field(default=0.002, alias="MAX_INDEX_DISLOCATION_PCT")
+    max_data_age_seconds: float = Field(default=5.0, alias="MAX_DATA_AGE_SECONDS")
+    orderbook_levels: int = Field(default=10, alias="ORDERBOOK_LEVELS")
+    trade_flow_limit: int = Field(default=100, alias="TRADE_FLOW_LIMIT")
     require_increasing_volume: bool = Field(
         default=False,
         alias="REQUIRE_INCREASING_VOLUME",
     )
     signal_expiry_minutes: int = Field(default=30, alias="SIGNAL_EXPIRY_MINUTES")
+    max_signal_age_seconds: float = Field(default=330.0, alias="MAX_SIGNAL_AGE_SECONDS")
     auto_signal_recipients: str = Field(default="", alias="AUTO_SIGNAL_RECIPIENTS")
     test_symbols: str = Field(default="", alias="TEST_SYMBOLS")
 
@@ -110,14 +100,6 @@ class Settings(BaseSettings):
             if value.strip()
         }
         return configured or self.allowed_user_set
-
-    @property
-    def discovery_exchange_list(self) -> List[str]:
-        return [
-            value.strip().lower()
-            for value in self.discovery_exchanges.split(",")
-            if value.strip()
-        ]
 
     @property
     def test_symbol_list(self) -> list[str]:

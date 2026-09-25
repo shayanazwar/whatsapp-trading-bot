@@ -2,7 +2,7 @@
 
 A WhatsApp-first cryptocurrency assistant with three separate paths:
 
-1. Existing manual Binance commands (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
+1. Manual WhatsApp commands backed by MEXC Futures (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
 2. A new deterministic MEXC Futures market scanner that uses closed candles and sends WhatsApp trade signals when the configured confluence/risk gates pass.
 3. A separately isolated MEXC Futures execution adapter. **Live execution is disabled in this build.**
 
@@ -19,23 +19,29 @@ WhatsApp Cloud API
    /     |      \
 PRICE  ANALYZE  CHART/ALERT
   |        |
-Binance  Binance
+MEXC Futures  MEXC Futures
 
 MEXC automation (independent)
 
 MEXC Futures market data
         |
         v
-   Universe selector
+   Data integrity / closed candles
         |
         v
-   4H / 1H / 15M
+   Universe + BTC filter
         |
         v
-   Deterministic analysis
+   1D -> 4H -> 1H -> 15M -> 5M
         |
         v
-   Setup filter + RR
+   Deterministic analysis + structural targets
+        |
+        v
+   Live MEXC execution-quality context
+        |
+        v
+   82/100 + RR>=2 + Families>=5/6
         |
         v
    Signal validator
@@ -91,24 +97,26 @@ MEXC does not currently provide a sandbox/test environment, so this build delibe
 
 ## Scanner logic
 
-The scanner analyzes MEXC USDT-settled perpetual contracts that are live and API-allowed. It ranks the available universe by 24h turnover when ticker data is available and then scans up to `MAX_SYMBOLS`.
+The scanner uses a deterministic hierarchy rather than a large stack of interchangeable indicators:
 
-The strategy gate is deterministic:
+```text
+1D context
+  -> 4H regime
+  -> 1H direction / protected structure
+  -> 15M BOS + post-BOS retest
+  -> 5M trigger
+  -> momentum / RVOL / volatility
+  -> structural target path
+  -> SL / TP / RR
+  -> hard rejection gates
+  -> MEXC spread / reference-price / funding / depth / trade-flow context
+  -> grouped 100-point score
+  -> final validation
+```
 
-- 4H trend
-- 1H market structure
-- 15M BOS
-- EMA 21/50
-- RSI directional zone
-- optional volume confirmation
-- support/resistance sanity check
-- ATR-derived SL/TP
-- minimum confluence
-- minimum risk/reward
+The default hard gates are `Score >= 82/100`, `RR >= 2.0`, and at least `5/6` confirmation families. Only fully closed candles are used for decisions. The engine does not fabricate fixed targets and does not claim a guaranteed win rate.
 
-Only fully closed candles are passed to the scanner analysis. The current/open candle is discarded when its interval has not finished yet.
-
-The engine does not generate or claim a confidence percentage, guaranteed accuracy, or guaranteed profitability.
+The current scanner is designed to reject most apparent setups rather than force a signal every cycle. A clean `valid=0` result is not, by itself, a reason to weaken the gates; the logs now expose technical rejection stages for diagnosis.
 
 ## Automatic WhatsApp signals
 
@@ -170,7 +178,10 @@ RSI
 Volume
 INCREASING
 
-Confluence
+Score
+100/100
+
+Families
 6/6
 ━━━━━━━━━━━━━━━━
 ```
@@ -191,7 +202,7 @@ DELETE ALL
 SEARCH PEPE
 ```
 
-Existing manual functionality remains Binance-based and is intentionally separate from MEXC automation.
+All market/trading functionality is now MEXC Futures based. WhatsApp remains the interface and notification layer.
 
 ## Local checks
 

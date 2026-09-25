@@ -223,6 +223,15 @@ class Database:
             ).fetchone()
         return self._to_signal(row) if row else None
 
+
+    def get_last_signal_for_symbol_side(self, symbol: str, side: str) -> Optional[SignalRecord]:
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM signals WHERE symbol = ? AND side = ? ORDER BY created_at DESC LIMIT 1",
+                (symbol.upper(), side.upper()),
+            ).fetchone()
+        return self._to_signal(row) if row else None
+
     def list_recent_signals(self, limit: int = 100) -> list[SignalRecord]:
         limit = max(1, min(limit, 500))
         with self.lock, self._connect() as conn:

@@ -84,7 +84,7 @@ class ChartRenderer:
         vol_ax.grid(True, alpha=0.12)
         plt.setp(ax.get_xticklabels(), visible=False)
         vol_ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=frame.index.tz))
-        fig.text(0.99, 0.01, "Market data: Binance public spot API", ha="right", va="bottom", fontsize=7, alpha=0.6)
+        fig.text(0.99, 0.01, "Market data: MEXC Futures API", ha="right", va="bottom", fontsize=7, alpha=0.6)
         fig.savefig(path_str, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         return Path(path_str)

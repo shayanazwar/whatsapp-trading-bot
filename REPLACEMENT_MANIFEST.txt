@@ -1,0 +1,32 @@
+Pak Trading Academy — MEXC Gold v1.3 replacement manifest
+
+REPLACE THESE FILES:
+app/analysis/engine.py
+app/automation/scanner.py
+app/automation/setup_filter.py
+app/automation/signal_validator.py
+app/automation/signal_manager.py
+app/automation/scheduler.py
+app/automation/mexc_client.py
+app/automation/executor.py
+app/automation/universe.py
+app/config.py
+app/database.py
+app/bot.py
+app/main.py
+.env.example
+tests/test_automation.py
+
+OPTIONAL DOCS INCLUDED:
+FINAL_CODE_AUDIT.md
+PROJECT_STATE.md
+REPLACEMENT_MANIFEST.txt
+
+VERIFICATION:
+pytest -q -> 17 passed
+python -m compileall -q app tests -> OK
+
+LIVE TRADING:
+AUTO_TRADE_ENABLED=false
+ALLOW_LIVE_EXECUTION=false
+LIVE_IMPLEMENTED=false

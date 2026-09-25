@@ -1,10 +1,39 @@
-# Project State — Pak Trading Academy WhatsApp Bot
+# Project State — 2026-09-25
 
-Date: 2026-09-24
+## Current release
 
-## What is in this package
+This package is the corrected deterministic MEXC Futures scanner release for the Pak Trading Academy WhatsApp bot.
 
-The repository has been normalized into a real Python package under `app/`. The existing WhatsApp/Binance functionality is preserved. The new automation system uses MEXC Futures market data and is separate from the manual Binance path.
+## Canonical runtime
+
+```text
+Docker -> uvicorn app.main:app
+```
+
+The `app/` package is canonical.
+
+## Deterministic decision flow
+
+```text
+MEXC Futures data
+  -> data integrity / closed candles
+  -> 120-symbol universe
+  -> BTC market filter
+  -> 1D context
+  -> 4H regime
+  -> 1H direction + protected structure
+  -> 15M BOS + post-BOS retest
+  -> 5M trigger
+  -> momentum / volume / volatility
+  -> structural target path
+  -> structural SL / RR
+  -> hard technical gates
+  -> MEXC executable quote / spread / index-fair / funding / depth / trade flow
+  -> grouped 100-point score
+  -> final validator (score >=82, RR >=2, families >=5/6)
+  -> symbol/side cooldown
+  -> WhatsApp signal
+```
 
 ## Safety state
 
@@ -15,46 +44,19 @@ AUTO_TRADE_ENABLED=false
 ALLOW_LIVE_EXECUTION=false
 ```
 
-These are the shipped defaults.
+These are the package defaults.
 
-## Automation components
+## Important limitations
 
-```text
-app/automation/mexc_client.py
-app/automation/universe.py
-app/automation/scanner.py
-app/automation/setup_filter.py
-app/automation/signal_validator.py
-app/automation/risk_manager.py
-app/automation/signal_manager.py
-app/automation/scheduler.py
-app/automation/executor.py
-```
+The scanner is deterministic, but a target win rate such as 70–80% is not guaranteed. The score is an evidence score, not a probability.
 
-The executor contains a verified limit-order payload builder and current MEXC endpoint adapter, but `LIVE_IMPLEMENTED = False` hard-stops real order placement. Post-fill position reconciliation and protective TP/SL installation still need to be completed and tested before live execution is enabled.
+Live execution is deliberately disabled. Missing live-trading components still include post-fill reconciliation, protective-order verification, partial TP/break-even management, portfolio exposure controls and emergency recovery.
 
-## Current MEXC API facts verified from official documentation
-
-- Futures API base: `https://api.mexc.com`
-- Public contract, ticker, kline, and server-time endpoints are available.
-- Current Futures API supports order placement.
-- Current API supports position-based TP/SL placement.
-- Private Open-API authentication uses `ApiKey`, `Request-Time`, `Signature`, and optional `Recv-Window`; HMAC-SHA256 is used as documented.
-- `Recv-Window` is treated as seconds and capped at 60 in this implementation; the default is 10.
-- MEXC currently has no sandbox/test environment.
-
-## Tests
-
-Current local result before packaging:
+## Verification
 
 ```text
-12 passed
+pytest -q
+17 passed
+python -m compileall -q app tests
+OK
 ```
-
-The repository was also compiled with `python -m compileall -q .` successfully.
-
-## Deployment note
-
-The current design assumes one Render web service instance so that only one scanner loop is active. The scheduler is idempotent within a process.
-
-Never commit `MEXC_SECRET_KEY`, `META_ACCESS_TOKEN`, or any other secret to GitHub.

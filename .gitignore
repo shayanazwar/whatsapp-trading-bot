@@ -1,0 +1,9 @@
+.venv/
+**/__pycache__/
+**/.pytest_cache/
+*.pyc
+.test_tmp/
+.venvpytest-temp/
+pytest-cache-files-*/
+local-gold-standard-working-tree.patch
+local-gold-standard-index.patch

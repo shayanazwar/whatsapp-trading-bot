@@ -336,74 +336,122 @@ def _bos_strength(candle: Candle, level: float, atr_value: float) -> float:
 
 
 def _bos_events(candles: List[Candle], side: str, lookback: int = 60) -> List[Dict[str, Any]]:
+    """Return confirmed, non-lookahead BOS events in the recent window.
+
+    A BOS may break an older confirmed pivot while a newer pivot remains
+    unbroken. The previous implementation only inspected the newest pivot,
+    which could hide valid structural breaks and produce zero setups.
+    """
     if len(candles) < 10 or side not in {"LONG", "SHORT"}:
         return []
+
     atr_values = _atr_series(candles, 14)
     highs = _swing_highs(candles)
     lows = _swing_lows(candles)
+    pivots = highs if side == "LONG" else lows
     events: list[Dict[str, Any]] = []
     start = max(1, len(candles) - lookback)
-    pivots = highs if side == "LONG" else lows
+
     for i in range(start, len(candles)):
-        candidates = [(idx, price) for idx, price in pivots if idx + 2 <= i]
-        if not candidates:
-            continue
-        swing_idx, level = candidates[-1]
         a = atr_values[i]
         if a <= 0:
             continue
-        buffer = max(a * BOS_BUFFER_ATR, float(candles[i]["close"]) * BOS_BUFFER_PCT)
-        prev_close = float(candles[i - 1]["close"])
+
         close = float(candles[i]["close"])
-        crossed = (prev_close <= level + buffer and close > level + buffer) if side == "LONG" else (prev_close >= level - buffer and close < level - buffer)
-        if crossed:
+        prev_close = float(candles[i - 1]["close"])
+        buffer = max(a * BOS_BUFFER_ATR, close * BOS_BUFFER_PCT)
+
+        # Check the newest confirmed pivot first, but fall back to older
+        # confirmed pivots on the same candle. This preserves chronology
+        # while avoiding the "latest pivot only" blind spot.
+        candidates = [
+            (idx, price)
+            for idx, price in pivots
+            if idx + 2 <= i
+        ]
+        for swing_idx, level in reversed(candidates):
+            level = float(level)
+            if side == "LONG":
+                crossed = prev_close <= level + buffer and close > level + buffer
+            else:
+                crossed = prev_close >= level - buffer and close < level - buffer
+
+            if not crossed:
+                continue
+
             events.append({
                 "index": i,
                 "time": int(candles[i]["time"]),
-                "level": float(level),
+                "level": level,
                 "atr": a,
                 "strength": _bos_strength(candles[i], level, a),
                 "swing_index": swing_idx,
             })
+            # One deterministic BOS event per candle/side.
+            break
+
     return events
 
 
 def _pullback_retest(candles: List[Candle], side: str, bos: Optional[Dict[str, Any]], max_bars: int = 8) -> Dict[str, Any]:
+    """Find a post-BOS retest using a bounded structural zone.
+
+    The retest must occur strictly after the BOS candle. The candle range
+    only needs to intersect the BOS zone; requiring the exact low/high to sit
+    inside a narrow band was too brittle for volatile MEXC futures candles.
+    """
     invalid = {"valid": False, "index": None, "time": None, "level": bos.get("level") if bos else None, "quality": 0.0, "rejection": False, "low": None, "high": None}
     if not bos:
         return invalid
+
     start = int(bos["index"]) + 1
     end = min(len(candles), start + max_bars)
     if start >= end:
         return invalid
+
     level = float(bos["level"])
     atr_value = max(_num(bos.get("atr")), 0.0)
-    tolerance = max(atr_value * 0.25, abs(level) * 0.001)
-    penetration = max(atr_value * 0.50, abs(level) * 0.0015)
+    if atr_value <= 0:
+        return invalid
+
+    # Bounded retest zone: tolerant enough for normal futures noise, but not
+    # wide enough to become an arbitrary pullback.
+    tolerance = max(atr_value * 0.35, abs(level) * 0.0015)
+    penetration = max(atr_value * 0.75, abs(level) * 0.0030)
+    close_tolerance = max(atr_value * 0.15, abs(level) * 0.00075)
+
     for i in range(start, end):
         c = candles[i]
-        low = float(c["low"]); high = float(c["high"]); close = float(c["close"])
-        if side == "LONG":
-            touched = level - penetration <= low <= level + tolerance
-            held = close > level
-            wick = min(float(c["open"]), close) - low
-        else:
-            touched = level - tolerance <= high <= level + penetration
-            held = close < level
-            wick = high - max(float(c["open"]), close)
+        open_price = float(c["open"])
+        low = float(c["low"])
+        high = float(c["high"])
+        close = float(c["close"])
         rng = max(high - low, 1e-12)
-        rejection = touched and held and wick / rng >= 0.20
-        if touched and held:
+
+        if side == "LONG":
+            intersects = low <= level + tolerance and high >= level - penetration
+            held = close >= level - close_tolerance
+            wick = min(open_price, close) - low
+        else:
+            intersects = high >= level - tolerance and low <= level + penetration
+            held = close <= level + close_tolerance
+            wick = high - max(open_price, close)
+
+        rejection = intersects and held and wick / rng >= 0.20
+        if intersects and held:
+            # More quality when the candle actually rejects from the zone.
+            quality = 0.70 + (0.30 if rejection else 0.0)
             return {
                 "valid": True,
                 "index": i,
                 "time": int(c["time"]),
                 "level": level,
-                "quality": 0.50 + 0.30 + (0.20 if rejection else 0.0),
+                "quality": quality,
                 "rejection": bool(rejection),
                 "low": low,
                 "high": high,
             }
+
     return invalid
 
 
@@ -899,7 +947,18 @@ def analyze_candles(
     )
 
     ema_direction = "BULLISH" if (_safe_ema(close15, 21) or 0) > (_safe_ema(close15, 50) or 0) else "BEARISH" if (_safe_ema(close15, 21) or 0) < (_safe_ema(close15, 50) or 0) else "NEUTRAL"
-    technical_candidate = bool(setup in {"LONG", "SHORT"} and direction_ok and structure_ok and setup_ok and momentum_ok and volume_ok and location_ok and volatility_ok)
+    # Direction + structure + valid setup/risk are mandatory. Structural
+    # target path and volatility remain hard safety gates. Momentum/volume
+    # stay as confirmation families and are enforced by the final validator
+    # through the 5/6 family rule rather than being all-or-nothing here.
+    technical_candidate = bool(
+        setup in {"LONG", "SHORT"}
+        and direction_ok
+        and structure_ok
+        and setup_ok
+        and location_ok
+        and volatility_ok
+    )
     signal_blocked = not technical_candidate
 
     technical_failures: list[str] = []
@@ -907,8 +966,13 @@ def analyze_candles(
         technical_failures.append("4H regime")
     if not long1 and not short1:
         technical_failures.append("1H alignment")
+    long_events = _bos_events(c15, "LONG")
+    short_events = _bos_events(c15, "SHORT")
     if not bos_long and not bos_short:
-        technical_failures.append("15M BOS/retest")
+        if not long_events and not short_events:
+            technical_failures.append("15M BOS")
+        else:
+            technical_failures.append("15M post-BOS retest")
     if trigger_side != "NONE" and not trigger.get("ready"):
         technical_failures.append("5M trigger")
     if setup in {"LONG", "SHORT"} and not momentum_ok:
@@ -953,6 +1017,8 @@ def analyze_candles(
         "bos_15m_strength": _num((active_bos or {}).get("strength")),
         "long_bos_level": bos_long.get("level") if bos_long else None,
         "short_bos_level": bos_short.get("level") if bos_short else None,
+        "long_bos_event_count": len(long_events),
+        "short_bos_event_count": len(short_events),
         "long_retest": bool(ret_long.get("valid")),
         "short_retest": bool(ret_short.get("valid")),
         "long_retest_time": ret_long.get("time"),

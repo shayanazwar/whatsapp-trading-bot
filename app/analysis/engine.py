@@ -43,6 +43,7 @@ MAX_SETUP_AGE_15M = 8
 MAX_ENTRY_DISTANCE_ATR = 1.20
 BOS_BUFFER_ATR = 0.10
 BOS_BUFFER_PCT = 0.0005
+ENGINE_VERSION = "gold-v1.2-fixed-candle-bos-targets"
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -90,22 +91,43 @@ def convert_candles(rows: List) -> List[Dict]:
     return out
 
 
-def closed_candle_rows(candles: List[Dict], timeframe_ms: int, now_ms: Optional[int] = None) -> List[Dict]:
-    """Remove the currently forming candle when timestamps are aligned."""
+def closed_candle_rows(
+    candles: List,
+    timeframe_ms: Any,
+    now_ms: Optional[int] = None,
+) -> List[Dict]:
+    """Return only completed MEXC candles.
+
+    Accepts either a timeframe in milliseconds (legacy scanner API) or a
+    timeframe string such as ``"4h"``. Timestamps are normalized to integer
+    milliseconds before any arithmetic, preventing the historical ``int + str``
+    failure.
+    """
     if not candles:
         return []
+
+    if isinstance(timeframe_ms, str):
+        if timeframe_ms not in TIMEFRAME_MS:
+            raise ValueError(f"Unsupported interval: {timeframe_ms}")
+        interval_ms = TIMEFRAME_MS[timeframe_ms]
+    else:
+        interval_ms = int(timeframe_ms)
+
+    if interval_ms <= 0:
+        raise ValueError("timeframe_ms must be positive")
+
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    # Scanner may pass raw MEXC rows (lists) while the analysis layer may
-    # pass already-normalized dictionaries. Normalize here so this public
-    # helper is safe for both call paths.
     out = convert_candles(candles)
     if not out:
         return []
-    last = out[-1]
-    # MEXC candle timestamps are treated as open timestamps.
-    if last["time"] + timeframe_ms > now:
-        out = out[:-1]
-    return out
+
+    # MEXC candle timestamps are open timestamps. A candle is closed only
+    # after open_time + interval has passed.
+    closed = [
+        c for c in out
+        if int(c["time"]) + interval_ms <= now
+    ]
+    return closed
 
 
 def _safe_ema(values: List[float], period: int) -> Optional[float]:
@@ -277,38 +299,70 @@ def _protected_structure(candles: List[Dict]) -> Dict[str, Any]:
 
 
 def _bos_events(candles: List[Dict], side: str, lookback: int = 50) -> List[Dict[str, Any]]:
-    """Return confirmed BOS events with their actual candle index.
+    """Return confirmed, non-repeating BOS events with strict chronology.
 
-    A swing is confirmed only after two right candles. The BOS candle must
-    close beyond the latest confirmed opposing swing plus a volatility buffer.
+    Rules:
+    - The broken swing must already be confirmed (index + 2 <= BOS index).
+    - BOS is a genuine crossing: the previous close must be on/before the
+      buffered level for LONG (on/after for SHORT).
+    - Only closed candles supplied to this function are considered.
     """
-    if len(candles) < 10:
+    if len(candles) < 10 or side not in {"LONG", "SHORT"}:
         return []
+
     atr_values = [_safe_atr(candles[:i + 1]) for i in range(len(candles))]
     highs = _swing_highs(candles)
     lows = _swing_lows(candles)
     events: list[Dict[str, Any]] = []
-    start = max(0, len(candles) - lookback)
+    start = max(1, len(candles) - lookback)
+
     if side == "LONG":
         for i in range(start, len(candles)):
-            candidates = [(idx, price) for idx, price in highs if idx < i]
+            # A swing with right=2 is only known at i once i >= swing_idx+2.
+            candidates = [(idx, price) for idx, price in highs if idx + 2 <= i]
             if not candidates:
                 continue
             swing_idx, level = candidates[-1]
             a = atr_values[i]
+            if a <= 0:
+                continue
             buffer = max(a * BOS_BUFFER_ATR, candles[i]["close"] * BOS_BUFFER_PCT)
-            if candles[i]["close"] > level + buffer:
-                events.append({"index": i, "time": candles[i]["time"], "level": level, "atr": a, "strength": _bos_strength(candles[i], level, a)})
+            previous = candles[i - 1]["close"]
+            current = candles[i]["close"]
+
+            crossed = previous <= level + buffer and current > level + buffer
+            if crossed:
+                events.append({
+                    "index": i,
+                    "time": candles[i]["time"],
+                    "level": level,
+                    "atr": a,
+                    "strength": _bos_strength(candles[i], level, a),
+                    "swing_index": swing_idx,
+                })
     else:
         for i in range(start, len(candles)):
-            candidates = [(idx, price) for idx, price in lows if idx < i]
+            candidates = [(idx, price) for idx, price in lows if idx + 2 <= i]
             if not candidates:
                 continue
             swing_idx, level = candidates[-1]
             a = atr_values[i]
+            if a <= 0:
+                continue
             buffer = max(a * BOS_BUFFER_ATR, candles[i]["close"] * BOS_BUFFER_PCT)
-            if candles[i]["close"] < level - buffer:
-                events.append({"index": i, "time": candles[i]["time"], "level": level, "atr": a, "strength": _bos_strength(candles[i], level, a)})
+            previous = candles[i - 1]["close"]
+            current = candles[i]["close"]
+
+            crossed = previous >= level - buffer and current < level - buffer
+            if crossed:
+                events.append({
+                    "index": i,
+                    "time": candles[i]["time"],
+                    "level": level,
+                    "atr": a,
+                    "strength": _bos_strength(candles[i], level, a),
+                    "swing_index": swing_idx,
+                })
     return events
 
 
@@ -325,33 +379,72 @@ def _latest_bos(candles: List[Dict], side: str) -> Optional[Dict[str, Any]]:
     return events[-1] if events else None
 
 
-def _pullback_retest(candles: List[Dict], side: str, bos: Optional[Dict[str, Any]], max_bars: int = 8) -> Dict[str, Any]:
-    """Detect a retest strictly AFTER the BOS candle.
+def _pullback_retest(
+    candles: List[Dict],
+    side: str,
+    bos: Optional[Dict[str, Any]],
+    max_bars: int = 8,
+) -> Dict[str, Any]:
+    """Detect a controlled retest strictly after BOS.
 
-    This fixes the previous engine's critical bug: pre-BOS touches can never
-    satisfy the retest condition.
+    A valid retest must:
+    - occur after the BOS candle;
+    - touch the BOS level within a bounded tolerance;
+    - not collapse materially through the level;
+    - close back on the correct side;
+    - preferably show rejection/wick evidence.
     """
+    invalid = {
+        "valid": False, "index": None, "time": None, "level": bos.get("level") if bos else None,
+        "quality": 0.0, "rejection": False,
+    }
     if not bos:
-        return {"valid": False, "index": None, "time": None, "level": None, "quality": 0.0, "rejection": False}
+        return invalid
+
     start = int(bos["index"]) + 1
     end = min(len(candles), start + max_bars)
     if start >= end:
-        return {"valid": False, "index": None, "time": None, "level": bos["level"], "quality": 0.0, "rejection": False}
+        return invalid
+
     level = float(bos["level"])
-    a = _num(bos.get("atr"), _safe_atr(candles))
-    tolerance = max(a * 0.25, level * 0.001)
-    best = None
+    a = max(_num(bos.get("atr")), 0.0)
+    tolerance = max(a * 0.25, abs(level) * 0.001)
+    # Do not allow an ordinary retest to be an unlimited deep sweep.
+    penetration = max(a * 0.50, abs(level) * 0.0015)
+
+    best: Optional[Dict[str, Any]] = None
+
     for i in range(start, end):
         c = candles[i]
-        touched = c["low"] <= level + tolerance if side == "LONG" else c["high"] >= level - tolerance
-        held = c["close"] > level if side == "LONG" else c["close"] < level
-        wick = (min(c["open"], c["close"]) - c["low"]) if side == "LONG" else (c["high"] - max(c["open"], c["close"]))
+        if side == "LONG":
+            touched = c["low"] <= level + tolerance and c["low"] >= level - penetration
+            held = c["close"] > level
+            wick = min(c["open"], c["close"]) - c["low"]
+        else:
+            touched = c["high"] >= level - tolerance and c["high"] <= level + penetration
+            held = c["close"] < level
+            wick = c["high"] - max(c["open"], c["close"])
+
         rng = max(c["high"] - c["low"], 1e-12)
-        rejection = touched and held and wick / rng >= 0.20
+        rejection = touched and held and (wick / rng >= 0.20)
+
         if touched:
-            quality = 0.5 + (0.3 if held else 0.0) + (0.2 if rejection else 0.0)
-            best = {"valid": bool(held or rejection), "index": i, "time": c["time"], "level": level, "quality": quality, "rejection": rejection}
-    return best or {"valid": False, "index": None, "time": None, "level": level, "quality": 0.0, "rejection": False}
+            quality = 0.50 + (0.30 if held else 0.0) + (0.20 if rejection else 0.0)
+            candidate = {
+                "valid": bool(held),
+                "index": i,
+                "time": c["time"],
+                "level": level,
+                "quality": quality,
+                "rejection": bool(rejection),
+            }
+            if candidate["valid"]:
+                best = candidate
+                # First valid retest is the actionable retest. Later touches
+                # are not allowed to silently replace the setup.
+                break
+
+    return best or invalid
 
 
 def _five_minute_trigger(candles: List[Dict], side: str, setup_level: Optional[float]) -> Dict[str, Any]:
@@ -409,27 +502,102 @@ def _level_clusters(candles: List[Dict], atr_value: float, lookback: int = 100) 
     return support, resistance
 
 
-def _target_path(candles_15m: List[Dict], side: str, entry: float, stop: float, atr_value: float) -> Dict[str, Any]:
+def _target_path(
+    candles_15m: List[Dict],
+    side: str,
+    entry: float,
+    stop: float,
+    atr_value: float,
+) -> Dict[str, Any]:
+    """Build targets from actual confirmed 15M swing structure.
+
+    No synthetic 1.2R/2R target is accepted as a structural target. If the
+    market does not provide a real path to TP2 >= 2R, the trade is rejected.
+    """
     risk = abs(entry - stop)
-    if risk <= 0:
-        return {"ok": False, "tp1": None, "tp2": None, "obstacle": None, "reason": "zero risk"}
-    highs = [x[1] for x in _swing_highs(candles_15m)]
-    lows = [x[1] for x in _swing_lows(candles_15m)]
+    if risk <= 0 or atr_value <= 0:
+        return {
+            "ok": False, "tp1": None, "tp2": None, "obstacle": None,
+            "reason": "zero risk or ATR",
+            "risk": risk,
+        }
+
+    highs = sorted({float(x[1]) for x in _swing_highs(candles_15m)})
+    lows = sorted({float(x[1]) for x in _swing_lows(candles_15m)})
+
+    min_tp1 = 1.20 * risk
+    min_tp2 = 2.00 * risk
+    clearance = 0.10 * atr_value
+
     if side == "LONG":
-        above = sorted(x for x in highs if x > entry + 0.20 * atr_value)
-        tp1 = above[0] if above else entry + 1.2 * risk
-        tp2_candidates = [x for x in above if x > entry + 2.0 * risk]
-        tp2 = tp2_candidates[0] if tp2_candidates else entry + 2.0 * risk
-        obstacle = above[0] if above else None
-        ok = tp1 >= entry + 1.2 * risk and (obstacle is None or obstacle > entry + 2.0 * risk)
-    else:
-        below = sorted((x for x in lows if x < entry - 0.20 * atr_value), reverse=True)
-        tp1 = below[0] if below else entry - 1.2 * risk
-        tp2_candidates = [x for x in below if x < entry - 2.0 * risk]
-        tp2 = tp2_candidates[0] if tp2_candidates else entry - 2.0 * risk
-        obstacle = below[0] if below else None
-        ok = tp1 <= entry - 1.2 * risk and (obstacle is None or obstacle < entry - 2.0 * risk)
-    return {"ok": bool(ok), "tp1": float(tp1), "tp2": float(tp2), "obstacle": obstacle, "risk": risk}
+        levels = sorted(
+            x for x in highs
+            if x > entry + clearance
+        )
+        tp1_candidates = [x for x in levels if x - entry >= min_tp1]
+        tp2_candidates = [x for x in levels if x - entry >= min_tp2]
+
+        if not tp1_candidates or not tp2_candidates:
+            return {
+                "ok": False, "tp1": None, "tp2": None, "obstacle": None,
+                "reason": "no confirmed structural target >= required RR",
+                "risk": risk,
+            }
+
+        tp1 = tp1_candidates[0]
+        tp2 = tp2_candidates[0]
+        obstacle = None
+
+        # Any confirmed swing between entry and TP2 is a path obstacle unless
+        # it is the selected TP1/TP2 level itself.
+        intermediate = [x for x in levels if entry < x < tp2]
+        if intermediate and intermediate[0] != tp1:
+            obstacle = intermediate[0]
+            return {
+                "ok": False, "tp1": tp1, "tp2": tp2, "obstacle": obstacle,
+                "reason": "intermediate resistance",
+                "risk": risk,
+            }
+
+        return {
+            "ok": tp1 - entry >= min_tp1 and tp2 - entry >= min_tp2,
+            "tp1": tp1, "tp2": tp2, "obstacle": obstacle,
+            "reason": "confirmed structural path",
+            "risk": risk,
+        }
+
+    levels = sorted(
+        (x for x in lows if x < entry - clearance),
+        reverse=True,
+    )
+    tp1_candidates = [x for x in levels if entry - x >= min_tp1]
+    tp2_candidates = [x for x in levels if entry - x >= min_tp2]
+
+    if not tp1_candidates or not tp2_candidates:
+        return {
+            "ok": False, "tp1": None, "tp2": None, "obstacle": None,
+            "reason": "no confirmed structural target >= required RR",
+            "risk": risk,
+        }
+
+    tp1 = tp1_candidates[0]
+    tp2 = tp2_candidates[0]
+    obstacle = None
+    intermediate = [x for x in levels if tp2 < x < entry]
+    if intermediate and intermediate[0] != tp1:
+        obstacle = intermediate[0]
+        return {
+            "ok": False, "tp1": tp1, "tp2": tp2, "obstacle": obstacle,
+            "reason": "intermediate support",
+            "risk": risk,
+        }
+
+    return {
+        "ok": entry - tp1 >= min_tp1 and entry - tp2 >= min_tp2,
+        "tp1": tp1, "tp2": tp2, "obstacle": obstacle,
+        "reason": "confirmed structural path",
+        "risk": risk,
+    }
 
 
 def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -534,8 +702,8 @@ def analyze_candles(
     # -------------------- 4H regime --------------------
     e21_4 = _safe_ema(close4, 21); e50_4 = _safe_ema(close4, 50); e100_4 = _safe_ema(close4, 100); e200_4 = _safe_ema(close4, 200)
     a4 = _safe_atr(c4h); adx4 = _adx(c4h); slope4 = _ema_slope(close4, 50)
-    bull4 = bool(e21_4 and e50_4 and e100_4 and e200_4 and price > e200_4 and e21_4 > e50_4 > e100_4 > e200_4 and slope4 > 0 and adx4 >= 25)
-    bear4 = bool(e21_4 and e50_4 and e100_4 and e200_4 and price < e200_4 and e21_4 < e50_4 < e100_4 < e200_4 and slope4 < 0 and adx4 >= 25)
+    bull4 = bool(e21_4 and e50_4 and e100_4 and e200_4 and close4[-1] > e200_4 and e21_4 > e50_4 > e100_4 > e200_4 and slope4 > 0 and adx4 >= 25)
+    bear4 = bool(e21_4 and e50_4 and e100_4 and e200_4 and close4[-1] < e200_4 and e21_4 < e50_4 < e100_4 < e200_4 and slope4 < 0 and adx4 >= 25)
     regime = "BULLISH" if bull4 else "BEARISH" if bear4 else "NO_TRADE"
 
     # -------------------- 1H direction --------------------
@@ -688,6 +856,7 @@ def analyze_candles(
         "volume": vol15, "rvol": rv15, "rvol_15m": rv15, "rvol_5m": trigger["rvol"],
         "support": support, "resistance": resistance,
         "futures_context": futures_context, "futures_ok": futures_ok,
+         "signal_engine_version": ENGINE_VERSION,
         "trigger_quality_5m": trigger["quality"], "trigger_quality": trigger["quality"],
         "five_minute_ready": trigger["ready"], "five_minute_long": trigger["long"], "five_minute_short": trigger["short"],
         "closed_5m_candle_time": trigger["candle_time"],

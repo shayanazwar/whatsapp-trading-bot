@@ -44,7 +44,20 @@ class MexcScanner:
         semaphore = asyncio.Semaphore(concurrency)
         results = await asyncio.gather(*(self._scan_one(symbol, semaphore) for symbol in symbols), return_exceptions=True)
 
-        stats: dict[str, int] = {"symbols": len(symbols), "valid": 0, "sent": 0, "errors": 0, "technical_candidates": 0, "rejected_setup": 0, "rejected_futures": 0, "rejected_final": 0}
+        stats: dict[str, int] = {
+            "symbols": len(symbols),
+            "valid": 0,
+            "sent": 0,
+            "errors": 0,
+            "technical_candidates": 0,
+            "rejected_setup": 0,
+            "rejected_futures": 0,
+            "rejected_final": 0,
+            "rejected_btc": 0,
+            "rejected_quote": 0,
+            "rejected_execution_quality": 0,
+            "rejected_freshness": 0,
+        }
         for result in results:
             if isinstance(result, Exception):
                 stats["errors"] += 1
@@ -55,12 +68,33 @@ class MexcScanner:
             if result.get("sent"): stats["sent"] += 1
             if result.get("error"): stats["errors"] += 1
             stage = str(result.get("rejection_stage") or "")
-            if stage == "TECHNICAL": stats["rejected_setup"] += 1
-            elif stage == "FUTURES": stats["rejected_futures"] += 1
-            elif stage: stats["rejected_final"] += 1
+            if stage == "TECHNICAL":
+                stats["rejected_setup"] += 1
+            elif stage == "FUTURES":
+                stats["rejected_futures"] += 1
+            elif stage == "BTC":
+                stats["rejected_btc"] += 1
+            elif stage == "QUOTE":
+                stats["rejected_quote"] += 1
+            elif stage == "FRESHNESS":
+                stats["rejected_freshness"] += 1
+            elif stage == "EXECUTION_QUALITY":
+                stats["rejected_execution_quality"] += 1
+            elif stage:
+                stats["rejected_final"] += 1
             if result.get("technical_candidate"): stats["technical_candidates"] += 1
 
-        LOGGER.info("MEXC scan complete: symbols=%s valid=%s sent=%s errors=%s technical_candidates=%s rejected_setup=%s rejected_futures=%s rejected_final=%s", stats["symbols"], stats["valid"], stats["sent"], stats["errors"], stats["technical_candidates"], stats["rejected_setup"], stats["rejected_futures"], stats["rejected_final"])
+        LOGGER.info(
+            "MEXC scan complete: symbols=%s valid=%s sent=%s errors=%s "
+            "technical_candidates=%s rejected_setup=%s rejected_btc=%s "
+            "rejected_futures=%s rejected_quote=%s rejected_freshness=%s "
+            "rejected_execution_quality=%s rejected_final=%s",
+            stats["symbols"], stats["valid"], stats["sent"], stats["errors"],
+            stats["technical_candidates"], stats["rejected_setup"],
+            stats["rejected_btc"], stats["rejected_futures"],
+            stats["rejected_quote"], stats["rejected_freshness"],
+            stats["rejected_execution_quality"], stats["rejected_final"],
+        )
         return stats
 
     async def _refresh_btc_context(self) -> None:
@@ -103,7 +137,19 @@ class MexcScanner:
                 analysis.update({"mexc_4h_rows": c4, "mexc_1h_rows": c1, "mexc_15m_rows": c15, "mexc_5m_rows": c5, "mexc_1d_rows": c1d, "closed_4h_candles": len(c4), "closed_1h_candles": len(c1), "closed_15m_candles": len(c15), "closed_5m_candles": len(c5), "closed_5m_candle_time": int(c5[-1]["time"])})
 
                 setup = str(analysis.get("setup") or "NO TRADE").upper()
-                LOGGER.info("MEXC ANALYSIS | %s | setup=%s | score=%s | rr=%s | stage=%s | failures=%s", symbol, setup, analysis.get("score"), analysis.get("rr"), analysis.get("rejection_stage") or "CANDIDATE", analysis.get("technical_gate_failures", []))
+                LOGGER.info(
+                    "MEXC ANALYSIS | %s | setup=%s | score=%s | rr=%s | "
+                    "stage=%s | failures=%s | bos(L/S)=%s/%s | retest(L/S)=%s/%s | "
+                    "trigger=%s",
+                    symbol, setup, analysis.get("score"), analysis.get("rr"),
+                    analysis.get("rejection_stage") or "CANDIDATE",
+                    analysis.get("technical_gate_failures", []),
+                    analysis.get("long_bos_event_count", 0),
+                    analysis.get("short_bos_event_count", 0),
+                    analysis.get("long_retest", False),
+                    analysis.get("short_retest", False),
+                    analysis.get("trigger_5m", "NONE"),
+                )
                 if setup not in {"LONG", "SHORT"}:
                     return self._reject(symbol, "Analysis engine produced no valid LONG/SHORT setup", stage="TECHNICAL", analysis=analysis)
 
@@ -118,6 +164,8 @@ class MexcScanner:
                     return self._reject(symbol, "Missing MEXC ticker", stage="QUOTE", analysis=analysis)
                 now_ms = int(time.time() * 1000)
                 ts = self._safe_int(ticker.get("timestamp") or ticker.get("ts") or ticker.get("time"))
+                if 0 < ts < 10**12:
+                    ts *= 1000
                 max_age_ms = int(float(getattr(self.settings, "max_data_age_seconds", 5.0)) * 1000)
                 data_fresh = bool(ts > 0 and abs(now_ms - ts) <= max_age_ms)
                 analysis["ticker_timestamp"] = ts; analysis["data_fresh"] = data_fresh
@@ -166,10 +214,11 @@ class MexcScanner:
 
                 futures_ok = self._futures_context_ok(analysis, setup)
                 analysis["futures_ok"] = futures_ok
-                analysis["futures_context"] = "AVAILABLE" if futures_ok else "FAILED"
-                if not futures_ok:
-                    return self._reject(symbol, "MEXC futures context failed", stage="FUTURES", analysis=analysis)
+                analysis["futures_context"] = "AVAILABLE" if futures_ok else "INSUFFICIENT_DIRECTIONAL_CONFIRMATION"
 
+                # Futures context is a 5-point supporting family. Missing or
+                # non-directional order-flow data must not erase a technically
+                # valid setup before the final validator.
                 self._update_confirmation_families(analysis)
                 analysis["score"], analysis["score_groups"] = self._recalculate_score(analysis)
 
@@ -204,13 +253,18 @@ class MexcScanner:
 
     @staticmethod
     def _futures_context_ok(analysis: dict[str, Any], side: str) -> bool:
-        if not bool(analysis.get("funding_available")):
-            return False
+        """Return True only when live futures flow has directional agreement.
+
+        Funding availability is contextual data, not a directional vote.
+        """
         imbalance = float(analysis.get("orderbook_imbalance", 0.0) or 0.0)
         flow = float(analysis.get("volume_delta_ratio", 0.0) or 0.0)
+        threshold = 0.05
         if side == "LONG":
-            return imbalance >= 0.05 or flow >= 0.05
-        return imbalance <= -0.05 or flow <= -0.05
+            return imbalance >= threshold or flow >= threshold
+        if side == "SHORT":
+            return imbalance <= -threshold or flow <= -threshold
+        return False
 
     @staticmethod
     def _update_confirmation_families(analysis: dict[str, Any]) -> None:

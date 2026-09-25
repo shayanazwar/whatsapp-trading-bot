@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import logging
 from typing import Any
 
 from ..analysis.engine import (
@@ -12,6 +12,8 @@ from .mexc_client import MexcClient
 from .signal_manager import SignalManager
 from .signal_validator import validate_signal
 from .universe import UniverseSelector
+
+LOGGER = logging.getLogger(__name__)
 
 
 MEXC_INTERVALS = {
@@ -41,6 +43,7 @@ class MexcScanner:
     # ============================================================
 
     async def scan_once(self) -> dict[str, int]:
+
         symbols = await self.universe.refresh()
 
         if not symbols:
@@ -51,14 +54,19 @@ class MexcScanner:
                 "errors": 0,
             }
 
-        semaphore = asyncio.Semaphore(
+        concurrency = max(
+            1,
             int(
                 getattr(
                     self.settings,
                     "scanner_concurrency",
                     5,
                 )
-            )
+            ),
+        )
+
+        semaphore = asyncio.Semaphore(
+            concurrency
         )
 
         results = await asyncio.gather(
@@ -80,11 +88,18 @@ class MexcScanner:
         }
 
         for result in results:
-            if isinstance(result, Exception):
+
+            if isinstance(
+                result,
+                Exception,
+            ):
                 stats["errors"] += 1
                 continue
 
-            if not isinstance(result, dict):
+            if not isinstance(
+                result,
+                dict,
+            ):
                 continue
 
             if result.get("valid"):
@@ -95,6 +110,15 @@ class MexcScanner:
 
             if result.get("error"):
                 stats["errors"] += 1
+
+        LOGGER.info(
+            "MEXC scan complete: "
+            "symbols=%s valid=%s sent=%s errors=%s",
+            stats["symbols"],
+            stats["valid"],
+            stats["sent"],
+            stats["errors"],
+        )
 
         return stats
 
@@ -111,38 +135,46 @@ class MexcScanner:
         async with semaphore:
 
             try:
-                # ------------------------------------------------
-                # 1. FETCH MULTI-TIMEFRAME MEXC FUTURES DATA
-                # ------------------------------------------------
 
-                candles_4h_raw, candles_1h_raw, candles_15m_raw, candles_5m_raw = (
-                    await asyncio.gather(
-                        self.client.get_klines(
-                            symbol,
-                            MEXC_INTERVALS["4H"],
-                            250,
-                        ),
-                        self.client.get_klines(
-                            symbol,
-                            MEXC_INTERVALS["1H"],
-                            250,
-                        ),
-                        self.client.get_klines(
-                            symbol,
-                            MEXC_INTERVALS["15M"],
-                            250,
-                        ),
-                        self.client.get_klines(
-                            symbol,
-                            MEXC_INTERVALS["5M"],
-                            250,
-                        ),
-                    )
+                # ====================================================
+                # 1. FETCH 4H / 1H / 15M / 5M
+                # ====================================================
+
+                (
+                    candles_4h_raw,
+                    candles_1h_raw,
+                    candles_15m_raw,
+                    candles_5m_raw,
+                ) = await asyncio.gather(
+
+                    self.client.get_klines(
+                        symbol,
+                        MEXC_INTERVALS["4H"],
+                        250,
+                    ),
+
+                    self.client.get_klines(
+                        symbol,
+                        MEXC_INTERVALS["1H"],
+                        250,
+                    ),
+
+                    self.client.get_klines(
+                        symbol,
+                        MEXC_INTERVALS["15M"],
+                        250,
+                    ),
+
+                    self.client.get_klines(
+                        symbol,
+                        MEXC_INTERVALS["5M"],
+                        250,
+                    ),
                 )
 
-                # ------------------------------------------------
-                # 2. ONLY CLOSED CANDLES
-                # ------------------------------------------------
+                # ====================================================
+                # 2. CLOSED CANDLES ONLY
+                # ====================================================
 
                 closed_4h = closed_candle_rows(
                     candles_4h_raw,
@@ -164,90 +196,66 @@ class MexcScanner:
                     "5m",
                 )
 
-                # ------------------------------------------------
+                # ====================================================
                 # 3. DATA SUFFICIENCY
-                # ------------------------------------------------
+                # ====================================================
 
-                if len(closed_4h) < 205:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Insufficient closed 4H candles"
-                        ),
-                    }
+                required = (
+                    (closed_4h, 205, "4H"),
+                    (closed_1h, 205, "1H"),
+                    (closed_15m, 80, "15M"),
+                    (closed_5m, 30, "5M"),
+                )
 
-                if len(closed_1h) < 205:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Insufficient closed 1H candles"
-                        ),
-                    }
+                for candles, minimum, label in required:
 
-                if len(closed_15m) < 80:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Insufficient closed 15M candles"
-                        ),
-                    }
+                    if len(candles) < minimum:
 
-                if len(closed_5m) < 30:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Insufficient closed 5M candles"
-                        ),
-                    }
+                        return self._reject(
+                            symbol,
+                            f"Insufficient closed {label} candles",
+                        )
 
-                # ------------------------------------------------
-                # 4. ANALYZE 4H / 1H / 15M
-                # ------------------------------------------------
+                # ====================================================
+                # 4. FULL MULTI-TIMEFRAME ENGINE
+                # ====================================================
 
                 analysis = analyze_candles(
                     symbol,
                     closed_4h,
                     closed_1h,
                     closed_15m,
+                    closed_5m,
                 )
 
-                # ------------------------------------------------
-                # 5. ATTACH REAL 5M DATA
-                #
-                # The engine currently receives 4H/1H/15M
-                # directly. We attach the CLOSED 5M candles here
-                # so the next validation layer can use them.
-                # ------------------------------------------------
+                # ====================================================
+                # 5. STORE 5M INFORMATION
+                # ====================================================
 
-                analysis["mexc_5m_rows"] = closed_5m
+                analysis[
+                    "mexc_5m_rows"
+                ] = closed_5m
 
-                analysis["closed_5m_candle_time"] = (
+                analysis[
+                    "closed_5m_candles"
+                ] = len(closed_5m)
+
+                analysis[
+                    "closed_5m_candle_time"
+                ] = int(
                     closed_5m[-1][0]
                 )
 
-                analysis["closed_5m_candles"] = len(
-                    closed_5m
-                )
+                # ====================================================
+                # 6. NO SETUP = STOP
+                # ====================================================
 
-                # ------------------------------------------------
-                # 6. DO NOT CONTINUE IF NO SETUP
-                # ------------------------------------------------
-
-                setup = analysis.get(
-                    "setup"
-                )
+                setup = str(
+                    analysis.get(
+                        "setup",
+                        "",
+                    )
+                ).upper()
 
                 if setup not in {
                     "LONG",
@@ -263,28 +271,20 @@ class MexcScanner:
                         "analysis": analysis,
                     }
 
-                # ------------------------------------------------
-                # 7. FRESH MEXC EXECUTABLE QUOTE
-                # ------------------------------------------------
+                # ====================================================
+                # 7. FRESH EXECUTABLE MEXC QUOTE
+                # ====================================================
 
                 ticker = await self.client.get_ticker(
                     symbol
                 )
 
                 if not ticker:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Missing MEXC ticker"
-                        ),
-                    }
 
-                # ------------------------------------------------
-                # 8. EXTRACT BID / ASK
-                # ------------------------------------------------
+                    return self._reject(
+                        symbol,
+                        "Missing MEXC ticker",
+                    )
 
                 bid = self._safe_float(
                     ticker.get("bidPrice")
@@ -302,20 +302,16 @@ class MexcScanner:
                     or ticker.get("price")
                 )
 
-                if bid <= 0 or ask <= 0:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Invalid MEXC bid/ask"
-                        ),
-                    }
+                if (
+                    bid <= 0
+                    or ask <= 0
+                    or ask < bid
+                ):
 
-                # ------------------------------------------------
-                # 9. EXECUTABLE PRICE
-                # ------------------------------------------------
+                    return self._reject(
+                        symbol,
+                        "Invalid MEXC bid/ask",
+                    )
 
                 executable_price = (
                     ask
@@ -323,13 +319,13 @@ class MexcScanner:
                     else bid
                 )
 
-                # ------------------------------------------------
-                # 10. SPREAD
-                # ------------------------------------------------
+                # ====================================================
+                # 8. SPREAD
+                # ====================================================
 
                 mid = (
-                    (bid + ask) / 2.0
-                )
+                    bid + ask
+                ) / 2.0
 
                 spread_pct = (
                     abs(ask - bid)
@@ -346,47 +342,52 @@ class MexcScanner:
                     )
                 )
 
-                if spread_pct > max_spread_pct:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            f"Spread too high: "
+                if (
+                    spread_pct
+                    > max_spread_pct
+                ):
+
+                    return self._reject(
+                        symbol,
+                        (
+                            "Spread too high: "
                             f"{spread_pct:.6f}"
                         ),
+                    )
+
+                analysis.update(
+                    {
+                        "mexc_bid": bid,
+                        "mexc_ask": ask,
+                        "mexc_last": last,
+                        "mexc_spread_pct": spread_pct,
                     }
-
-                analysis["mexc_bid"] = bid
-                analysis["mexc_ask"] = ask
-                analysis["mexc_last"] = last
-                analysis["mexc_spread_pct"] = (
-                    spread_pct
                 )
 
-                # ------------------------------------------------
-                # 11. INDEX / FAIR PRICE
-                # ------------------------------------------------
+                # ====================================================
+                # 9. INDEX / FAIR PRICE
+                # ====================================================
 
-                index_price = self._safe_float(
-                    ticker.get("indexPrice")
-                    or ticker.get("index")
+                index_price = (
+                    await self._safe_index_price(
+                        symbol
+                    )
                 )
 
-                fair_price = self._safe_float(
-                    ticker.get("fairPrice")
-                    or ticker.get("fair")
-                    or ticker.get("markPrice")
-                    or ticker.get("mark")
+                fair_price = (
+                    await self._safe_fair_price(
+                        symbol
+                    )
                 )
 
                 if index_price > 0:
+
                     analysis[
                         "mexc_index_price"
                     ] = index_price
 
                 if fair_price > 0:
+
                     analysis[
                         "mexc_fair_price"
                     ] = fair_price
@@ -397,19 +398,19 @@ class MexcScanner:
                     else index_price
                 )
 
-                if (
-                    reference_price > 0
-                    and executable_price > 0
-                ):
+                if reference_price > 0:
 
-                    dislocation = abs(
-                        executable_price
-                        - reference_price
-                    ) / reference_price
+                    dislocation_pct = (
+                        abs(
+                            executable_price
+                            - reference_price
+                        )
+                        / reference_price
+                    )
 
                     analysis[
                         "mexc_reference_dislocation_pct"
-                    ] = dislocation
+                    ] = dislocation_pct
 
                     max_dislocation = float(
                         getattr(
@@ -420,102 +421,143 @@ class MexcScanner:
                     )
 
                     if (
-                        dislocation
+                        dislocation_pct
                         > max_dislocation
                     ):
-                        return {
-                            "valid": False,
-                            "sent": False,
-                            "error": False,
-                            "symbol": symbol,
-                            "reason": (
-                                "Executable price "
-                                "too far from "
-                                "MEXC reference"
-                            ),
-                        }
 
-                # ------------------------------------------------
-                # 12. MEXC MARKET CONTEXT
-                # ------------------------------------------------
+                        return self._reject(
+                            symbol,
+                            "Executable price too far from MEXC reference",
+                            analysis,
+                        )
 
-                funding = await self._safe_funding(
-                    symbol
+                # ====================================================
+                # 10. FUNDING
+                # ====================================================
+
+                funding = (
+                    await self._safe_funding(
+                        symbol
+                    )
                 )
 
                 if funding is not None:
+
                     analysis[
                         "mexc_funding_rate"
                     ] = funding
 
-                # ------------------------------------------------
-                # 13. ORDERBOOK / DEPTH
-                # ------------------------------------------------
+                # ====================================================
+                # 11. ORDERBOOK
+                # ====================================================
 
-                orderbook = await self._safe_orderbook(
-                    symbol
+                orderbook = (
+                    await self._safe_orderbook(
+                        symbol
+                    )
                 )
 
                 if orderbook:
-                    depth_data = self._calculate_depth(
-                        orderbook
-                    )
 
-                    analysis[
-                        "mexc_orderbook"
-                    ] = orderbook
+                    depth = (
+                        self._calculate_depth(
+                            orderbook
+                        )
+                    )
 
                     analysis.update(
-                        depth_data
+                        depth
                     )
 
-                # ------------------------------------------------
-                # 14. RECENT DEALS / BUY-SELL FLOW
-                # ------------------------------------------------
+                # ====================================================
+                # 12. RECENT DEALS
+                # ====================================================
 
-                deals = await self._safe_deals(
-                    symbol
+                deals = (
+                    await self._safe_deals(
+                        symbol
+                    )
                 )
 
                 if deals:
-                    flow = self._calculate_trade_flow(
-                        deals
-                    )
 
-                    analysis[
-                        "mexc_deals"
-                    ] = deals
+                    flow = (
+                        self._calculate_trade_flow(
+                            deals
+                        )
+                    )
 
                     analysis.update(
                         flow
                     )
 
-                # ------------------------------------------------
-                # 15. UPDATE FUTURES CONTEXT
-                # ------------------------------------------------
+                # ====================================================
+                # 13. REAL FUTURES CONTEXT
+                # ====================================================
+
+                futures_ok = (
+                    self._futures_context_ok(
+                        analysis,
+                        setup,
+                    )
+                )
+
+                analysis[
+                    "futures_ok"
+                ] = futures_ok
 
                 analysis[
                     "futures_context"
-                ] = "AVAILABLE"
+                ] = (
+                    "AVAILABLE"
+                    if futures_ok
+                    else "FAILED"
+                )
 
-                # ------------------------------------------------
-                # 16. EXECUTABLE ENTRY DRIFT
-                # ------------------------------------------------
+                if not futures_ok:
 
-                planned_entry = self._safe_float(
-                    analysis.get("entry")
+                    return self._reject(
+                        symbol,
+                        "MEXC futures context failed",
+                        analysis,
+                    )
+
+                # ====================================================
+                # 14. RECALCULATE SCORE
+                #
+                # Engine initially calculates the structural score.
+                # Futures data was unavailable there.
+                #
+                # Now calculate the final score with REAL context.
+                # ====================================================
+
+                analysis[
+                    "score"
+                ], analysis[
+                    "score_groups"
+                ] = self._recalculate_score(
+                    analysis
+                )
+
+                # ====================================================
+                # 15. FINAL ENTRY DRIFT
+                # ====================================================
+
+                planned_entry = (
+                    self._safe_float(
+                        analysis.get(
+                            "entry"
+                        )
+                    )
                 )
 
                 if planned_entry <= 0:
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Invalid planned entry"
-                        ),
-                    }
+
+                    return self._reject(
+                        symbol,
+                        "Invalid planned entry",
+                        analysis,
+                    )
 
                 entry_drift_pct = (
                     abs(
@@ -541,30 +583,40 @@ class MexcScanner:
                     entry_drift_pct
                     > max_entry_drift
                 ):
-                    return {
-                        "valid": False,
-                        "sent": False,
-                        "error": False,
-                        "symbol": symbol,
-                        "reason": (
-                            "Executable entry "
-                            "drift exceeds limit"
-                        ),
-                        "analysis": analysis,
-                    }
 
-                # ------------------------------------------------
-                # 17. REPRICE PLAN AROUND REAL EXECUTABLE QUOTE
-                # ------------------------------------------------
+                    return self._reject(
+                        symbol,
+                        (
+                            "Executable entry drift "
+                            "exceeds limit"
+                        ),
+                        analysis,
+                    )
+
+                # ====================================================
+                # 16. REPRICE AROUND REAL EXECUTION PRICE
+                # ====================================================
 
                 self._reprice_levels(
                     analysis,
                     executable_price,
                 )
 
-                # ------------------------------------------------
-                # 18. FINAL DETERMINISTIC VALIDATION
-                # ------------------------------------------------
+                # ====================================================
+                # 17. RECHECK SCORE/RR AFTER REPRICE
+                # ====================================================
+
+                analysis[
+                    "score"
+                ], analysis[
+                    "score_groups"
+                ] = self._recalculate_score(
+                    analysis
+                )
+
+                # ====================================================
+                # 18. FINAL VALIDATOR
+                # ====================================================
 
                 validated, reasons = (
                     validate_signal(
@@ -594,6 +646,7 @@ class MexcScanner:
                 )
 
                 if validated is None:
+
                     return {
                         "valid": False,
                         "sent": False,
@@ -603,9 +656,9 @@ class MexcScanner:
                         "analysis": analysis,
                     }
 
-                # ------------------------------------------------
-                # 19. PUBLISH SIGNAL
-                # ------------------------------------------------
+                # ====================================================
+                # 19. PUBLISH
+                # ====================================================
 
                 sent = False
 
@@ -618,13 +671,18 @@ class MexcScanner:
                 )
 
                 if auto_signals:
-                    sent = await self._publish_signal(
-                        validated
+
+                    sent = (
+                        await self._publish_signal(
+                            validated
+                        )
                     )
 
-                # ------------------------------------------------
-                # 20. LIVE EXECUTION REMAINS DISABLED
-                # ------------------------------------------------
+                # ====================================================
+                # 20. LIVE EXECUTION
+                #
+                # STILL DISABLED.
+                # ====================================================
 
                 auto_trade = bool(
                     getattr(
@@ -655,6 +713,7 @@ class MexcScanner:
                     and live_allowed
                     and live_implemented
                 ):
+
                     await self._execute_signal(
                         validated
                     )
@@ -669,6 +728,12 @@ class MexcScanner:
                 }
 
             except Exception as exc:
+
+                LOGGER.exception(
+                    "MEXC scan failed for %s",
+                    symbol,
+                )
+
                 return {
                     "valid": False,
                     "sent": False,
@@ -678,7 +743,194 @@ class MexcScanner:
                 }
 
     # ============================================================
-    # SAFE HELPERS
+    # FUTURES CONTEXT
+    # ============================================================
+
+    @staticmethod
+    def _futures_context_ok(
+        analysis: dict[str, Any],
+        side: str,
+    ) -> bool:
+
+        # We require actual market-context data.
+        has_funding = (
+            "mexc_funding_rate"
+            in analysis
+        )
+
+        has_orderbook = (
+            "orderbook_imbalance"
+            in analysis
+        )
+
+        has_flow = (
+            "volume_delta_ratio"
+            in analysis
+        )
+
+        if not (
+            has_funding
+            or has_orderbook
+            or has_flow
+        ):
+            return False
+
+        confirmations = 0
+
+        # --------------------------------------------------------
+        # Orderbook
+        # --------------------------------------------------------
+
+        imbalance = float(
+            analysis.get(
+                "orderbook_imbalance",
+                0.0,
+            )
+            or 0.0
+        )
+
+        if side == "LONG" and imbalance > 0:
+            confirmations += 1
+
+        if side == "SHORT" and imbalance < 0:
+            confirmations += 1
+
+        # --------------------------------------------------------
+        # Trade flow
+        # --------------------------------------------------------
+
+        delta_ratio = float(
+            analysis.get(
+                "volume_delta_ratio",
+                0.0,
+            )
+            or 0.0
+        )
+
+        if side == "LONG" and delta_ratio > 0:
+            confirmations += 1
+
+        if side == "SHORT" and delta_ratio < 0:
+            confirmations += 1
+
+        # --------------------------------------------------------
+        # Funding
+        #
+        # Funding is NOT treated as a standalone direction signal.
+        # It only acts as a context/warning input.
+        # --------------------------------------------------------
+
+        if has_funding:
+            confirmations += 1
+
+        return confirmations >= 2
+
+    # ============================================================
+    # SCORE
+    # ============================================================
+
+    @staticmethod
+    def _recalculate_score(
+        analysis: dict[str, Any],
+    ) -> tuple[int, dict[str, int]]:
+
+        direction_ok = bool(
+            analysis.get(
+                "direction_ok",
+                False,
+            )
+        )
+
+        structure_ok = bool(
+            analysis.get(
+                "structure_ok",
+                False,
+            )
+        )
+
+        setup_ok = bool(
+            analysis.get(
+                "setup_ok",
+                False,
+            )
+        )
+
+        momentum_ok = bool(
+            analysis.get(
+                "momentum_ok",
+                False,
+            )
+        )
+
+        volume_ok = bool(
+            analysis.get(
+                "volume_ok",
+                False,
+            )
+        )
+
+        location_ok = bool(
+            analysis.get(
+                "location_ok",
+                False,
+            )
+        )
+
+        futures_ok = bool(
+            analysis.get(
+                "futures_ok",
+                False,
+            )
+        )
+
+        volatility_ok = bool(
+            analysis.get(
+                "volatility_ok",
+                False,
+            )
+        )
+
+        groups = {
+            "direction_regime": (
+                20 if direction_ok else 0
+            ),
+
+            "market_structure": (
+                20 if structure_ok else 0
+            ),
+
+            "setup_trigger": (
+                20 if setup_ok else 0
+            ),
+
+            "momentum": (
+                10 if momentum_ok else 0
+            ),
+
+            "volume_participation": (
+                10 if volume_ok else 0
+            ),
+
+            "location_target_path": (
+                10 if location_ok else 0
+            ),
+
+            "futures_context": (
+                5 if futures_ok else 0
+            ),
+
+            "volatility_execution": (
+                5 if volatility_ok else 0
+            ),
+        }
+
+        return (
+            sum(groups.values()),
+            groups,
+        )
+
+    # ============================================================
+    # SAFE FLOAT
     # ============================================================
 
     @staticmethod
@@ -687,6 +939,7 @@ class MexcScanner:
     ) -> float:
 
         try:
+
             if value is None:
                 return 0.0
 
@@ -698,6 +951,10 @@ class MexcScanner:
         ):
             return 0.0
 
+    # ============================================================
+    # SAFE FUNDING
+    # ============================================================
+
     async def _safe_funding(
         self,
         symbol: str,
@@ -705,37 +962,27 @@ class MexcScanner:
 
         try:
 
-            method = getattr(
-                self.client,
-                "get_funding_rate",
-                None,
-            )
-
-            if method is None:
-                return None
-
-            result = await method(
+            result = await self.client.get_funding_rate(
                 symbol
             )
 
-            if isinstance(
+            if not isinstance(
                 result,
                 dict,
             ):
-                value = (
-                    result.get(
-                        "fundingRate"
-                    )
-                    or result.get(
-                        "funding_rate"
-                    )
-                    or result.get(
-                        "rate"
-                    )
-                )
+                return None
 
-            else:
-                value = result
+            value = (
+                result.get(
+                    "fundingRate"
+                )
+                or result.get(
+                    "funding_rate"
+                )
+                or result.get(
+                    "rate"
+                )
+            )
 
             if value is None:
                 return None
@@ -743,7 +990,96 @@ class MexcScanner:
             return float(value)
 
         except Exception:
+
             return None
+
+    # ============================================================
+    # SAFE INDEX
+    # ============================================================
+
+    async def _safe_index_price(
+        self,
+        symbol: str,
+    ) -> float:
+
+        try:
+
+            result = (
+                await self.client.get_index_price(
+                    symbol
+                )
+            )
+
+            if not isinstance(
+                result,
+                dict,
+            ):
+                return 0.0
+
+            return self._safe_float(
+                result.get(
+                    "indexPrice"
+                )
+                or result.get(
+                    "index"
+                )
+                or result.get(
+                    "price"
+                )
+            )
+
+        except Exception:
+
+            return 0.0
+
+    # ============================================================
+    # SAFE FAIR PRICE
+    # ============================================================
+
+    async def _safe_fair_price(
+        self,
+        symbol: str,
+    ) -> float:
+
+        try:
+
+            result = (
+                await self.client.get_fair_price(
+                    symbol
+                )
+            )
+
+            if not isinstance(
+                result,
+                dict,
+            ):
+                return 0.0
+
+            return self._safe_float(
+                result.get(
+                    "fairPrice"
+                )
+                or result.get(
+                    "fair"
+                )
+                or result.get(
+                    "markPrice"
+                )
+                or result.get(
+                    "mark"
+                )
+                or result.get(
+                    "price"
+                )
+            )
+
+        except Exception:
+
+            return 0.0
+
+    # ============================================================
+    # SAFE ORDERBOOK
+    # ============================================================
 
     async def _safe_orderbook(
         self,
@@ -752,24 +1088,9 @@ class MexcScanner:
 
         try:
 
-            method = getattr(
-                self.client,
-                "get_depth",
-                None,
-            )
-
-            if method is None:
-                method = getattr(
-                    self.client,
-                    "get_orderbook",
-                    None,
-                )
-
-            if method is None:
-                return None
-
-            result = await method(
-                symbol
+            result = await self.client.get_depth(
+                symbol,
+                20,
             )
 
             if isinstance(
@@ -781,64 +1102,46 @@ class MexcScanner:
             return None
 
         except Exception:
+
             return None
+
+    # ============================================================
+    # SAFE DEALS
+    # ============================================================
 
     async def _safe_deals(
         self,
         symbol: str,
-    ) -> list[Any] | None:
+    ) -> list[dict[str, Any]] | None:
 
         try:
 
-            method = getattr(
-                self.client,
-                "get_deals",
-                None,
-            )
-
-            if method is None:
-                method = getattr(
-                    self.client,
-                    "get_recent_trades",
-                    None,
-                )
-
-            if method is None:
-                return None
-
-            result = await method(
-                symbol
+            result = await self.client.get_deals(
+                symbol,
+                100,
             )
 
             if isinstance(
                 result,
                 list,
             ):
-                return result
-
-            if isinstance(
-                result,
-                dict,
-            ):
-                deals = (
-                    result.get("data")
-                    or result.get("deals")
-                    or result.get("trades")
-                )
-
-                if isinstance(
-                    deals,
-                    list,
-                ):
-                    return deals
+                return [
+                    item
+                    for item in result
+                    if isinstance(
+                        item,
+                        dict,
+                    )
+                ]
 
             return None
 
         except Exception:
+
             return None
 
     # ============================================================
-    # ORDERBOOK ANALYSIS
+    # ORDERBOOK DEPTH
     # ============================================================
 
     def _calculate_depth(
@@ -865,18 +1168,27 @@ class MexcScanner:
             for level in levels:
 
                 try:
+
                     if isinstance(
                         level,
                         dict,
                     ):
+
                         quantity = (
-                            level.get("quantity")
-                            or level.get("qty")
-                            or level.get("volume")
+                            level.get(
+                                "quantity"
+                            )
+                            or level.get(
+                                "qty"
+                            )
+                            or level.get(
+                                "volume"
+                            )
                             or 0
                         )
 
                     else:
+
                         quantity = (
                             level[1]
                             if len(level) > 1
@@ -888,20 +1200,26 @@ class MexcScanner:
                     )
 
                 except Exception:
+
                     continue
 
             return total
 
-        bid_depth = total_volume(
-            bids
+        bid_depth = (
+            total_volume(
+                bids
+            )
         )
 
-        ask_depth = total_volume(
-            asks
+        ask_depth = (
+            total_volume(
+                asks
+            )
         )
 
         total_depth = (
-            bid_depth + ask_depth
+            bid_depth
+            + ask_depth
         )
 
         imbalance = (
@@ -926,7 +1244,7 @@ class MexcScanner:
 
     def _calculate_trade_flow(
         self,
-        deals: list[Any],
+        deals: list[dict[str, Any]],
     ) -> dict[str, Any]:
 
         buy_volume = 0.0
@@ -936,42 +1254,37 @@ class MexcScanner:
 
             try:
 
-                if isinstance(
-                    deal,
-                    dict,
-                ):
-
-                    quantity = (
-                        deal.get("quantity")
-                        or deal.get("qty")
-                        or deal.get("volume")
-                        or 0
+                quantity = (
+                    deal.get(
+                        "quantity"
                     )
-
-                    side = str(
-                        deal.get("side")
-                        or deal.get("type")
-                        or ""
-                    ).lower()
-
-                else:
-
-                    quantity = (
-                        deal[1]
-                        if len(deal) > 1
-                        else 0
+                    or deal.get(
+                        "qty"
                     )
-
-                    side = str(
-                        deal[2]
-                        if len(deal) > 2
-                        else ""
-                    ).lower()
+                    or deal.get(
+                        "volume"
+                    )
+                    or deal.get(
+                        "vol"
+                    )
+                    or 0
+                )
 
                 quantity = float(
                     quantity
                 )
 
+                side = str(
+                    deal.get(
+                        "side"
+                    )
+                    or deal.get(
+                        "type"
+                    )
+                    or ""
+                ).lower()
+
+                # MEXC trade-side formats vary.
                 if (
                     "buy" in side
                     or side in {
@@ -979,6 +1292,7 @@ class MexcScanner:
                         "bid",
                     }
                 ):
+
                     buy_volume += quantity
 
                 elif (
@@ -988,9 +1302,11 @@ class MexcScanner:
                         "ask",
                     }
                 ):
+
                     sell_volume += quantity
 
             except Exception:
+
                 continue
 
         total = (
@@ -1059,13 +1375,21 @@ class MexcScanner:
             old_tp2 + delta
         )
 
-        analysis["entry"] = (
-            executable_price
-        )
+        analysis[
+            "entry"
+        ] = executable_price
 
-        analysis["stop_loss"] = new_sl
-        analysis["tp1"] = new_tp1
-        analysis["tp2"] = new_tp2
+        analysis[
+            "stop_loss"
+        ] = new_sl
+
+        analysis[
+            "tp1"
+        ] = new_tp1
+
+        analysis[
+            "tp2"
+        ] = new_tp2
 
         risk = abs(
             executable_price
@@ -1077,14 +1401,36 @@ class MexcScanner:
             - executable_price
         )
 
-        analysis["rr"] = (
+        analysis[
+            "rr"
+        ] = (
             reward / risk
             if risk > 0
             else 0.0
         )
 
     # ============================================================
-    # SIGNAL PUBLISH
+    # REJECTION
+    # ============================================================
+
+    @staticmethod
+    def _reject(
+        symbol: str,
+        reason: str,
+        analysis: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+
+        return {
+            "valid": False,
+            "sent": False,
+            "error": False,
+            "symbol": symbol,
+            "reason": reason,
+            "analysis": analysis,
+        }
+
+    # ============================================================
+    # PUBLISH
     # ============================================================
 
     async def _publish_signal(
@@ -1100,15 +1446,14 @@ class MexcScanner:
                 )
             )
 
-            if isinstance(
-                result,
-                bool,
-            ):
-                return result
-
-            return True
+            return bool(result)
 
         except Exception:
+
+            LOGGER.exception(
+                "Failed to publish MEXC signal"
+            )
+
             return False
 
     # ============================================================
@@ -1120,15 +1465,26 @@ class MexcScanner:
         validated: Any,
     ) -> None:
 
-        # Intentionally left disabled at this stage.
+        # ========================================================
+        # HARD DISABLED
+        # ========================================================
         #
-        # Live MEXC execution must remain behind:
+        # Do NOT send an order from the scanner yet.
         #
-        # AUTO_TRADE_ENABLED
-        # LIVE_EXECUTION_ALLOWED
-        # LIVE_IMPLEMENTED
+        # Live execution requires:
+        # - account balance risk sizing
+        # - contract metadata
+        # - leverage validation
+        # - order reconciliation
+        # - protective SL
+        # - TP1 / TP2
+        # - break-even
+        # - emergency recovery
         #
-        # until backtesting, paper trading,
-        # reconciliation and protection are complete.
+        # ========================================================
+
+        LOGGER.warning(
+            "Live execution requested but remains disabled"
+        )
 
         return

@@ -1,0 +1,42 @@
+MEXC WhatsApp BACKTEST PATCH — CORRECTED VERSION
+
+ONLY replace these existing files:
+1. app/bot.py
+2. app/main.py
+3. app/automation/mexc_client.py
+4. app/analysis/engine.py
+
+ADD these new files:
+5. app/backtest/__init__.py
+6. app/backtest/runner.py
+7. app/backtest/simulator.py
+8. app/backtest/report.py
+9. tests/test_backtest_feature.py
+
+IMPORTANT:
+- Do NOT replace scanner.py, universe.py, scheduler.py, executor.py, signal_manager.py, or other live files.
+- The backtest never calls the live executor and never places an order.
+- Existing live analysis behavior is preserved when analyze_candles() is called without now_ms.
+- No new environment variable is required.
+- BACKTEST 7D / 30D / 90D uses a SEPARATE MEXC client and SEPARATE universe instance so historical requests cannot consume the live scanner client's rate-limit state or mutate the live scanner's universe object.
+- The live scanner continues using the original mexc_client and mexc_universe.
+- The backtest candidate prescan explicitly scans the full fetched 15M history instead of only the last 70 bars.
+- Same-candle TP1+SL and TP2+SL are handled conservatively as SL-first because OHLC data cannot determine intrabar order.
+- The report identifies the universe as the current eligible MEXC universe. This is NOT a historical-universe/survivorship-bias-free test.
+- The report is based on technical engine + historical BTC filter.
+- Historical spread, orderbook, funding, freshness, and other live execution-only filters cannot be reconstructed from ordinary OHLCV and are explicitly excluded from the report.
+
+DEPLOYMENT ORDER:
+1. Commit/backup the currently working bot in GitHub.
+2. Replace only the 4 existing files listed above.
+3. Add the 5 new files.
+4. Deploy to Render.
+5. Confirm /health returns healthy.
+6. Send BACKTEST 7D first.
+7. Verify the completed report.
+8. Verify that signal timestamps are distributed across the requested 7-day window.
+9. Only then run BACKTEST 30D.
+10. Only after 30D is healthy, run BACKTEST 90D.
+
+ROLLBACK:
+If the live bot behaves unexpectedly, immediately restore the Git commit from before this patch. Do not replace scanner.py, universe.py, scheduler.py, executor.py, or signal_manager.py with files from this patch.

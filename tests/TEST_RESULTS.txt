@@ -1,0 +1,37 @@
+BACKTEST PATCH VERIFICATION — 2026-09-27
+
+Fixes verified:
+- Historical 15M BOS candidate scan now explicitly scans the full fetched 15M history via lookback=len(c15), instead of the default final 70 bars.
+- Same-candle TP1 + SL is now treated conservatively as SL-first, just like TP2 + SL.
+- Backtest uses a separate MEXC client and separate universe instance, so historical backtest traffic/rate limiting and universe refresh do not share live scanner state.
+- Backtest client is closed during application shutdown.
+- Report labels average RR as planned RR and discloses that the universe is current eligible MEXC contracts, not a historical-universe test.
+
+Tests performed:
+1. Python compile of all shipped app/tests Python files: PASSED.
+2. Backtest test module: 9 tests PASSED.
+3. Backtest test module repeated 5 consecutive times: 9/9 PASSED each run.
+4. Simulator: TP1->SL: PASSED.
+5. Simulator: same-candle TP1+SL conservative SL-first: PASSED.
+6. Simulator: same-candle TP2+SL conservative SL-first: PASSED.
+7. Simulator: LONG TP2: PASSED.
+8. Simulator: SHORT TP2: PASSED.
+9. Report metrics: PASSED.
+10. Historical MEXC range parsing/filtering: PASSED.
+11. Live/backtest client and universe isolation source checks: PASSED.
+12. Runtime BOS coverage proof using the patched real _bos_events():
+    - Full-history lookback found an event at index 40.
+    - Default last-70 lookback did not.
+    - Patched runner requests full-history lookback.
+    PASSED.
+
+Testing limitation:
+- The uploaded ZIP is a patch, not the complete production repository. Missing production modules (indicators.py, structure.py, config.py, universe.py and other live modules) prevented an unmodified full-project pytest run from this ZIP alone.
+- For the 9 backtest tests, temporary minimal import stubs were created outside the shipped patch only to satisfy missing imports. The actual patched engine, runner, simulator, report, and MEXC client code were executed.
+- No real MEXC API calls or real orders were made during verification.
+- MEXC server-side behavior for very wide historical start/end ranges remains dependent on the live API and was not claimed as verified offline.
+
+Deployment recommendation:
+- This corrected patch fixes the critical defects identified in the prior audit.
+- Still deploy to Render in the existing backup/rollback workflow and run BACKTEST 7D first.
+- Do not treat backtest performance as validated until 7D completes and its signal timestamps are confirmed to span the requested period.

@@ -66,6 +66,8 @@ INTERVALS = {
 # ---------------------------------------------------------------------------
 
 REQUEST_TIMEOUT_SECONDS = 30
+HISTORICAL_REQUEST_RETRIES = 3
+HISTORICAL_RETRY_BACKOFF_SECONDS = 1.5
 
 # Render Free is only 0.1 CPU / 512 MB. One CPU-bound historical worker is
 # deliberately used even if main.py passes a larger value.
@@ -706,29 +708,47 @@ async def _fetch_range(
         page_end = min(final, cursor + page_span)
         request_count += 1
 
-        try:
-            rows = await asyncio.wait_for(
-                client.get_klines_range(
+        rows = None
+        last_error: Exception | None = None
+
+        for attempt in range(1, HISTORICAL_REQUEST_RETRIES + 1):
+            try:
+                rows = await asyncio.wait_for(
+                    client.get_klines_range(
+                        symbol,
+                        interval,
+                        cursor,
+                        page_end,
+                        limit=MAX_KLINE_POINTS,
+                    ),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                last_error = None
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "BACKTEST RANGE RETRY | %s %s attempt=%d/%d error=%s: %s",
                     symbol,
                     interval,
-                    cursor,
-                    page_end,
-                    limit=MAX_KLINE_POINTS,
-                ),
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"{symbol} {interval}: MEXC range request timed out after "
-                f"{REQUEST_TIMEOUT_SECONDS}s (start={cursor}, end={page_end})"
-            ) from exc
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+                    attempt,
+                    HISTORICAL_REQUEST_RETRIES,
+                    type(exc).__name__,
+                    exc,
+                )
+                if attempt < HISTORICAL_REQUEST_RETRIES:
+                    await asyncio.sleep(
+                        HISTORICAL_RETRY_BACKOFF_SECONDS * attempt
+                    )
+
+        if last_error is not None:
             raise RuntimeError(
-                f"{symbol} {interval}: MEXC range request failed: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+                f"{symbol} {interval}: MEXC range request failed after "
+                f"{HISTORICAL_REQUEST_RETRIES} attempts: "
+                f"{type(last_error).__name__}: {last_error}"
+            ) from last_error
 
         if rows is None:
             rows = []

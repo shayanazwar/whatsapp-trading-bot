@@ -58,6 +58,21 @@ INTERVALS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Backtest safety/performance
+# ---------------------------------------------------------------------------
+
+# A single MEXC request should never be allowed to hang the whole backtest.
+REQUEST_TIMEOUT_SECONDS = 45
+
+# A complete symbol fetch contains 5 timeframe requests.
+# Keep this aligned with the existing public request limiter.
+MAX_SYMBOL_CONCURRENCY = 4
+
+# Log detailed progress every symbol.
+PROGRESS_LOG_EVERY = 1
+
+
 class BacktestAlreadyRunning(RuntimeError):
     pass
 
@@ -165,8 +180,7 @@ def _closed_slice(
     Candle:
         open_time -> open_time + timeframe
 
-    Therefore a candle is closed only when:
-
+    Candle is closed only when:
         open_time + timeframe <= now_ms
     """
     if not rows:
@@ -195,28 +209,12 @@ def _convert_for_engine(
     """
     Convert raw MEXC list candles into the exact Candle/dict format
     expected by the deterministic analysis engine.
-
-    This is the critical backtest adapter.
-
-    Raw:
-        [time, open, high, low, close, volume]
-
-    Engine:
-        {
-            "time": ...,
-            "open": ...,
-            "high": ...,
-            "low": ...,
-            "close": ...,
-            "volume": ...
-        }
     """
     converted = convert_candles(rows)
 
     if rows and not converted:
         LOGGER.warning(
-            "BACKTEST CONVERSION | %s | %s | "
-            "raw=%d converted=0",
+            "BACKTEST CONVERSION | %s | %s | raw=%d converted=0",
             symbol,
             timeframe,
             len(rows),
@@ -281,8 +279,7 @@ async def _fetch_range(
     ] = {}
 
     page_span = (
-        interval_ms
-        * (MAX_KLINE_POINTS - 1)
+        interval_ms * (MAX_KLINE_POINTS - 1)
     )
 
     request_count = 0
@@ -295,13 +292,23 @@ async def _fetch_range(
 
         request_count += 1
 
-        rows = await client.get_klines_range(
-            symbol,
-            interval,
-            cursor,
-            page_end,
-            limit=MAX_KLINE_POINTS,
-        )
+        try:
+            rows = await asyncio.wait_for(
+                client.get_klines_range(
+                    symbol,
+                    interval,
+                    cursor,
+                    page_end,
+                    limit=MAX_KLINE_POINTS,
+                ),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"{symbol} {interval}: MEXC request "
+                f"timed out after {REQUEST_TIMEOUT_SECONDS}s "
+                f"at cursor={cursor}"
+            ) from exc
 
         if rows is None:
             rows = []
@@ -313,6 +320,8 @@ async def _fetch_range(
                 f"{type(rows).__name__}"
             )
 
+        valid_page_rows = 0
+
         for row in rows:
             if not _valid_candle(row):
                 continue
@@ -323,11 +332,25 @@ async def _fetch_range(
 
             if cursor <= timestamp <= page_end:
                 result[timestamp] = list(row)
+                valid_page_rows += 1
+
+        # ---------------------------------------------------------------
+        # No rows returned
+        # ---------------------------------------------------------------
 
         if not rows:
             cursor = (
-                page_end
-                + interval_ms
+                page_end + interval_ms
+            )
+            continue
+
+        # ---------------------------------------------------------------
+        # Rows existed but none were valid
+        # ---------------------------------------------------------------
+
+        if valid_page_rows == 0:
+            cursor = (
+                page_end + interval_ms
             )
             continue
 
@@ -339,8 +362,7 @@ async def _fetch_range(
 
         if not valid_timestamps:
             cursor = (
-                page_end
-                + interval_ms
+                page_end + interval_ms
             )
             continue
 
@@ -349,14 +371,12 @@ async def _fetch_range(
         )
 
         next_cursor = (
-            last_timestamp
-            + interval_ms
+            last_timestamp + interval_ms
         )
 
         if next_cursor <= cursor:
             next_cursor = (
-                page_end
-                + interval_ms
+                page_end + interval_ms
             )
 
         cursor = next_cursor
@@ -368,8 +388,7 @@ async def _fetch_range(
 
     if request_count > 1:
         LOGGER.debug(
-            "BACKTEST DATA | %s | %s | "
-            "requests=%d candles=%d",
+            "BACKTEST DATA | %s | %s | requests=%d candles=%d",
             symbol,
             interval,
             request_count,
@@ -397,7 +416,7 @@ class BacktestRunner:
         universe: MexcUniverse,
         settings: Settings,
         *,
-        max_concurrency: int = 4,
+        max_concurrency: int = MAX_SYMBOL_CONCURRENCY,
     ) -> None:
         self.client = client
         self.universe = universe
@@ -405,7 +424,10 @@ class BacktestRunner:
 
         self.max_concurrency = max(
             1,
-            min(int(max_concurrency), 4),
+            min(
+                int(max_concurrency),
+                MAX_SYMBOL_CONCURRENCY,
+            ),
         )
 
         self._lock = asyncio.Lock()
@@ -472,8 +494,7 @@ class BacktestRunner:
                 )
 
             LOGGER.info(
-                "BACKTEST START | days=%d symbols=%d "
-                "start=%d end=%d",
+                "BACKTEST START | days=%d symbols=%d start=%d end=%d",
                 days,
                 len(symbols),
                 period_start,
@@ -484,9 +505,23 @@ class BacktestRunner:
             # BTC historical context
             # ---------------------------------------------------------------
 
+            LOGGER.info(
+                "BACKTEST BTC FETCH START | days=%d",
+                days,
+            )
+
             btc_history = await self._fetch_btc_history(
                 period_start,
                 period_end,
+            )
+
+            LOGGER.info(
+                "BACKTEST BTC FETCH DONE | 4H=%d 1H=%d 15M=%d 5M=%d 1D=%d",
+                len(btc_history.candles_4h),
+                len(btc_history.candles_1h),
+                len(btc_history.candles_15m),
+                len(btc_history.candles_5m),
+                len(btc_history.candles_1d),
             )
 
             trades: list[
@@ -495,6 +530,7 @@ class BacktestRunner:
 
             errors = 0
             tested = 0
+            processed = 0
 
             semaphore = asyncio.Semaphore(
                 self.max_concurrency
@@ -508,6 +544,13 @@ class BacktestRunner:
                 str | None,
             ]:
                 async with semaphore:
+                    fetch_started = time.monotonic()
+
+                    LOGGER.info(
+                        "BACKTEST FETCH START | symbol=%s",
+                        symbol,
+                    )
+
                     try:
                         history = (
                             await self._fetch_symbol_history(
@@ -515,6 +558,30 @@ class BacktestRunner:
                                 period_start,
                                 period_end,
                             )
+                        )
+
+                        fetch_seconds = (
+                            time.monotonic()
+                            - fetch_started
+                        )
+
+                        LOGGER.info(
+                            "BACKTEST FETCH DONE | "
+                            "symbol=%s | 4H=%d 1H=%d "
+                            "15M=%d 5M=%d 1D=%d | "
+                            "seconds=%.2f",
+                            symbol,
+                            len(history.candles_4h),
+                            len(history.candles_1h),
+                            len(history.candles_15m),
+                            len(history.candles_5m),
+                            len(history.candles_1d),
+                            fetch_seconds,
+                        )
+
+                        LOGGER.info(
+                            "BACKTEST ANALYSIS START | symbol=%s",
+                            symbol,
                         )
 
                         symbol_trades = (
@@ -526,11 +593,25 @@ class BacktestRunner:
                             )
                         )
 
+                        LOGGER.info(
+                            "BACKTEST ANALYSIS DONE | "
+                            "symbol=%s | signals=%d",
+                            symbol,
+                            len(symbol_trades),
+                        )
+
                         return (
                             symbol,
                             symbol_trades,
                             None,
                         )
+
+                    except asyncio.CancelledError:
+                        LOGGER.warning(
+                            "BACKTEST SYMBOL CANCELLED | %s",
+                            symbol,
+                        )
+                        raise
 
                     except Exception as exc:
                         LOGGER.exception(
@@ -545,6 +626,12 @@ class BacktestRunner:
                             [],
                             f"{type(exc).__name__}: {exc}",
                         )
+
+            # ---------------------------------------------------------------
+            # Process symbols
+            #
+            # Keep a small controlled batch so MEXC is not flooded.
+            # ---------------------------------------------------------------
 
             batch_size = self.max_concurrency
 
@@ -571,6 +658,8 @@ class BacktestRunner:
                     error,
                 ) in results:
 
+                    processed += 1
+
                     if error:
                         errors += 1
 
@@ -584,19 +673,34 @@ class BacktestRunner:
                         continue
 
                     tested += 1
+
                     trades.extend(
                         symbol_trades
                     )
 
-                LOGGER.info(
-                    "BACKTEST PROGRESS | days=%d "
-                    "processed=%d/%d tested=%d "
-                    "errors=%d signals=%d",
-                    days,
-                    min(
-                        offset + batch_size,
+                    LOGGER.info(
+                        "BACKTEST SYMBOL COMPLETE | "
+                        "processed=%d/%d | "
+                        "tested=%d | errors=%d | "
+                        "signals=%d | symbol=%s",
+                        processed,
                         len(symbols),
-                    ),
+                        tested,
+                        errors,
+                        len(trades),
+                        symbol,
+                    )
+
+                # -----------------------------------------------------------
+                # Progress after EVERY batch
+                # -----------------------------------------------------------
+
+                LOGGER.info(
+                    "BACKTEST PROGRESS | "
+                    "days=%d processed=%d/%d "
+                    "tested=%d errors=%d signals=%d",
+                    days,
+                    processed,
                     len(symbols),
                     tested,
                     errors,
@@ -714,6 +818,9 @@ class BacktestRunner:
                 ),
             )
 
+        except asyncio.CancelledError:
+            raise
+
         except Exception as exc:
             raise RuntimeError(
                 f"{symbol}: historical data fetch failed: "
@@ -755,8 +862,7 @@ class BacktestRunner:
         # -------------------------------------------------------------------
         # RAW MEXC CANDLES
         #
-        # These stay as lists because the simulator uses the raw OHLCV
-        # representation.
+        # These stay as lists because the simulator uses raw OHLCV.
         # -------------------------------------------------------------------
 
         raw_c4 = history.candles_4h
@@ -768,9 +874,8 @@ class BacktestRunner:
         # -------------------------------------------------------------------
         # ENGINE CANDLES
         #
-        # CRITICAL FIX:
-        # MEXC returns list rows, while the engine expects Candle/dict rows.
-        # Convert once at the backtest boundary.
+        # MEXC returns list rows.
+        # Engine expects Candle/dict rows.
         # -------------------------------------------------------------------
 
         c4 = _convert_for_engine(
@@ -804,6 +909,7 @@ class BacktestRunner:
         )
 
         # BTC engine-format candles.
+
         btc_c4_engine = _convert_for_engine(
             btc_history.candles_4h,
             "BTC_USDT",
@@ -854,14 +960,14 @@ class BacktestRunner:
         # Timestamp indexes
         # ---------------------------------------------------------------
 
-        c5_times = [
-            _row_time(row)
-            for row in c5
-        ]
-
         c15_times = [
             _row_time(row)
             for row in c15
+        ]
+
+        c5_times = [
+            _row_time(row)
+            for row in c5
         ]
 
         # ---------------------------------------------------------------
@@ -884,8 +990,7 @@ class BacktestRunner:
 
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST BOS failed | %s | "
-                    "side=%s",
+                    "BACKTEST BOS failed | %s | side=%s",
                     history.symbol,
                     side,
                 )
@@ -1018,8 +1123,7 @@ class BacktestRunner:
                     except Exception:
                         LOGGER.exception(
                             "BACKTEST TRIGGER failed | "
-                            "%s | side=%s | "
-                            "index=%d",
+                            "%s | side=%s | index=%d",
                             history.symbol,
                             side,
                             index,
@@ -1081,6 +1185,16 @@ class BacktestRunner:
         ]
 
         # ---------------------------------------------------------------
+        # Raw 5M timestamps for simulation
+        # ---------------------------------------------------------------
+
+        raw_c5_times = [
+            int(float(row[0]))
+            for row in raw_c5
+            if _valid_candle(row)
+        ]
+
+        # ---------------------------------------------------------------
         # Simulate signals
         # ---------------------------------------------------------------
 
@@ -1124,35 +1238,36 @@ class BacktestRunner:
             # Point-in-time historical slices
             # -----------------------------------------------------------
 
-            c4_slice = _closed_slice(
-                c4,
-                M4H_MS,
-                signal_close_time,
+            c4_end = bisect_right(
+                c4_times,
+                signal_close_time - M4H_MS,
             )
 
-            c1_slice = _closed_slice(
-                c1,
-                M1H_MS,
-                signal_close_time,
+            c1_end = bisect_right(
+                c1_times,
+                signal_close_time - M1H_MS,
             )
 
-            c15_slice = _closed_slice(
-                c15,
-                M15_MS,
-                signal_close_time,
+            c15_end = bisect_right(
+                c15_times,
+                signal_close_time - M15_MS,
             )
 
-            c5_slice = _closed_slice(
-                c5,
-                M5_MS,
-                signal_close_time,
+            c5_end = bisect_right(
+                c5_times,
+                signal_close_time - M5_MS,
             )
 
-            c1d_slice = _closed_slice(
-                c1d,
-                M1D_MS,
-                signal_close_time,
+            c1d_end = bisect_right(
+                c1d_times,
+                signal_close_time - M1D_MS,
             )
+
+            c4_slice = c4[:c4_end]
+            c1_slice = c1[:c1_end]
+            c15_slice = c15[:c15_end]
+            c5_slice = c5[:c5_end]
+            c1d_slice = c1d[:c1d_end]
 
             # -----------------------------------------------------------
             # Engine
@@ -1207,40 +1322,37 @@ class BacktestRunner:
             else:
                 btc_c4_end = bisect_right(
                     btc4_times,
-                    signal_close_time
-                    - M4H_MS,
+                    signal_close_time - M4H_MS,
                 )
 
                 btc_c1_end = bisect_right(
                     btc1_times,
-                    signal_close_time
-                    - M1H_MS,
+                    signal_close_time - M1H_MS,
                 )
 
                 btc_c15_end = bisect_right(
                     btc15_times,
-                    signal_close_time
-                    - M15_MS,
+                    signal_close_time - M15_MS,
                 )
 
-                btc_c4 = btc_c4_engine[
-                    :btc_c4_end
-                ]
+                btc_c4_slice = (
+                    btc_c4_engine[:btc_c4_end]
+                )
 
-                btc_c1 = btc_c1_engine[
-                    :btc_c1_end
-                ]
+                btc_c1_slice = (
+                    btc_c1_engine[:btc_c1_end]
+                )
 
-                btc_c15 = btc_c15_engine[
-                    :btc_c15_end
-                ]
+                btc_c15_slice = (
+                    btc_c15_engine[:btc_c15_end]
+                )
 
                 try:
                     btc_context = (
                         build_btc_context(
-                            btc_c4,
-                            btc_c1,
-                            btc_c15,
+                            btc_c4_slice,
+                            btc_c1_slice,
+                            btc_c15_slice,
                         )
                     )
 
@@ -1265,16 +1377,13 @@ class BacktestRunner:
                 continue
 
             # -----------------------------------------------------------
-            # Future candles
+            # Future 5M candles
             #
-            # IMPORTANT:
-            # Simulator continues to receive RAW MEXC rows.
+            # Start AFTER the signal candle.
+            # Stop at the requested backtest period.
+            #
+            # Simulator receives RAW MEXC rows.
             # -----------------------------------------------------------
-
-            raw_c5_times = [
-                int(float(row[0]))
-                for row in raw_c5
-            ]
 
             future_start = bisect_right(
                 raw_c5_times,
@@ -1293,8 +1402,7 @@ class BacktestRunner:
                 continue
 
             future_candles = raw_c5[
-                future_start:
-                future_end
+                future_start:future_end
             ]
 
             if not future_candles:

@@ -17,6 +17,7 @@ from .automation.scanner import MexcScanner
 from .automation.scheduler import ScannerScheduler
 from .automation.signal_manager import SignalManager
 from .automation.universe import MexcUniverse
+from .backtest.runner import BacktestRunner
 from .bot import Bot
 from .charts import ChartRenderer
 from .config import get_settings
@@ -132,6 +133,30 @@ scanner_scheduler = ScannerScheduler(
     mexc_scanner,
     interval_seconds=settings.scan_interval_seconds,
 )
+
+
+# ============================================================
+# HISTORICAL BACKTEST
+# IMPORTANT:
+# This is paper simulation only. It never uses the executor.
+# ============================================================
+
+backtest_mexc_client = MexcClient(settings)
+
+backtest_universe = MexcUniverse(
+    backtest_mexc_client,
+    max_symbols=settings.max_symbols,
+    test_symbols=settings.test_symbol_list,
+)
+
+backtest_runner = BacktestRunner(
+    client=backtest_mexc_client,
+    universe=backtest_universe,
+    settings=settings,
+    max_concurrency=4,
+)
+
+bot.set_backtest_runner(backtest_runner)
 
 
 # ============================================================
@@ -463,6 +488,9 @@ async def shutdown_event():
 
     with suppress(Exception):
         await mexc_client.close()
+
+    with suppress(Exception):
+        await backtest_mexc_client.close()
 
     with suppress(Exception):
         await whatsapp.close()

@@ -13,7 +13,7 @@ LOGGER = logging.getLogger(__name__)
 # ============================================================
 
 MIN_SCAN_SYMBOLS = 100
-TARGET_SCAN_SYMBOLS = 120
+TARGET_SCAN_SYMBOLS = 300
 MAX_ALLOWED_SYMBOLS = 500
 
 
@@ -385,7 +385,7 @@ class MexcUniverse:
             )
 
             # ====================================================
-            # SELECT 120 TARGET
+            # SELECT 300 TARGET
             # ====================================================
 
             symbols = ranked_symbols[

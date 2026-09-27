@@ -18,7 +18,9 @@ from .signal_manager import SignalManager
 from .signal_validator import validate_signal
 from .universe import MexcUniverse
 
+
 LOGGER = logging.getLogger(__name__)
+
 
 MEXC_INTERVALS = {
     "4H": "Hour4",
@@ -30,7 +32,33 @@ MEXC_INTERVALS = {
 
 
 class MexcScanner:
-    """Deterministic MEXC Futures scanner with technical + live-context gates."""
+    """
+    Deterministic MEXC Futures scanner.
+
+    Pipeline:
+
+        MEXC DATA
+            ↓
+        ENGINE ANALYSIS
+            ↓
+        BTC FILTER
+            ↓
+        LIVE QUOTE
+            ↓
+        EXECUTION QUALITY
+            ↓
+        FUTURES CONTEXT
+            ↓
+        FINAL TECHNICAL SYNCHRONIZATION
+            ↓
+        SAFE LEVEL REPRICING
+            ↓
+        FINAL TECHNICAL SYNCHRONIZATION
+            ↓
+        SIGNAL VALIDATOR
+            ↓
+        PUBLISH / EXECUTE
+    """
 
     def __init__(
         self,
@@ -51,6 +79,10 @@ class MexcScanner:
             "ok": False,
             "reason": "not loaded",
         }
+
+    # =========================================================
+    # PUBLIC SCAN
+    # =========================================================
 
     async def scan_once(self) -> dict[str, int]:
         symbols = await self.universe.refresh()
@@ -139,16 +171,22 @@ class MexcScanner:
 
             if stage == "TECHNICAL":
                 stats["rejected_setup"] += 1
+
             elif stage == "FUTURES":
                 stats["rejected_futures"] += 1
+
             elif stage == "BTC":
                 stats["rejected_btc"] += 1
+
             elif stage == "QUOTE":
                 stats["rejected_quote"] += 1
+
             elif stage == "FRESHNESS":
                 stats["rejected_freshness"] += 1
+
             elif stage == "EXECUTION_QUALITY":
                 stats["rejected_execution_quality"] += 1
+
             elif stage:
                 stats["rejected_final"] += 1
 
@@ -175,6 +213,10 @@ class MexcScanner:
         )
 
         return stats
+
+    # =========================================================
+    # BTC CONTEXT
+    # =========================================================
 
     async def _refresh_btc_context(self) -> None:
         try:
@@ -249,6 +291,10 @@ class MexcScanner:
                 "reason": str(exc),
             }
 
+    # =========================================================
+    # SINGLE SYMBOL SCAN
+    # =========================================================
+
     async def _scan_one(
         self,
         symbol: str,
@@ -267,6 +313,10 @@ class MexcScanner:
                         )
                     ),
                 )
+
+                # -------------------------------------------------
+                # MARKET DATA
+                # -------------------------------------------------
 
                 raw4, raw1, raw15, raw5 = await asyncio.gather(
                     self.client.get_klines(
@@ -327,6 +377,10 @@ class MexcScanner:
                             analysis={},
                         )
 
+                # -------------------------------------------------
+                # DAILY DATA
+                # -------------------------------------------------
+
                 raw1d = await self.client.get_klines(
                     symbol,
                     MEXC_INTERVALS["1D"],
@@ -337,6 +391,10 @@ class MexcScanner:
                     raw1d,
                     "1d",
                 )
+
+                # -------------------------------------------------
+                # ENGINE
+                # -------------------------------------------------
 
                 analysis = analyze_candles(
                     symbol,
@@ -360,6 +418,7 @@ class MexcScanner:
 
                 analysis.update(
                     {
+                        "symbol": symbol,
                         "mexc_4h_rows": c4,
                         "mexc_1h_rows": c1,
                         "mexc_15m_rows": c15,
@@ -374,6 +433,10 @@ class MexcScanner:
                         ),
                     }
                 )
+
+                # -------------------------------------------------
+                # INITIAL ENGINE DIAGNOSTICS
+                # -------------------------------------------------
 
                 self._synchronize_technical_diagnostics(
                     analysis
@@ -422,6 +485,10 @@ class MexcScanner:
                     ),
                 )
 
+                # -------------------------------------------------
+                # NO TECHNICAL SETUP
+                # -------------------------------------------------
+
                 if setup not in {
                     "LONG",
                     "SHORT",
@@ -436,6 +503,10 @@ class MexcScanner:
                         analysis=analysis,
                     )
 
+                # -------------------------------------------------
+                # BTC FILTER
+                # -------------------------------------------------
+
                 btc_ok, btc_reason = btc_filter_ok(
                     setup,
                     self._btc_context,
@@ -445,8 +516,14 @@ class MexcScanner:
                     ),
                 )
 
-                analysis["btc_filter_ok"] = btc_ok
-                analysis["btc_filter_reason"] = btc_reason
+                analysis["btc_filter_ok"] = bool(
+                    btc_ok
+                )
+
+                analysis["btc_filter_reason"] = (
+                    btc_reason
+                )
+
                 analysis["btc_context"] = (
                     self._btc_context
                 )
@@ -458,6 +535,10 @@ class MexcScanner:
                         stage="BTC",
                         analysis=analysis,
                     )
+
+                # -------------------------------------------------
+                # LIVE TICKER
+                # -------------------------------------------------
 
                 ticker = await self.client.get_ticker(
                     symbol
@@ -557,7 +638,8 @@ class MexcScanner:
                 spread = (
                     abs(
                         ask - bid
-                    ) / mid
+                    )
+                    / mid
                     if mid > 0
                     else 999.0
                 )
@@ -571,19 +653,29 @@ class MexcScanner:
                     }
                 )
 
-                if spread > float(
+                max_spread = float(
                     getattr(
                         self.settings,
                         "max_mexc_spread_pct",
                         0.001,
                     )
-                ):
+                )
+
+                analysis[
+                    "max_mexc_spread_pct"
+                ] = max_spread
+
+                if spread > max_spread:
                     return self._reject(
                         symbol,
                         "MEXC spread too high",
                         stage="EXECUTION_QUALITY",
                         analysis=analysis,
                     )
+
+                # -------------------------------------------------
+                # INDEX / FAIR / FUNDING
+                # -------------------------------------------------
 
                 index_price = self._safe_float(
                     ticker.get("indexPrice")
@@ -674,28 +766,35 @@ class MexcScanner:
                     / reference
                 )
 
+                max_dislocation = float(
+                    getattr(
+                        self.settings,
+                        "max_index_dislocation_pct",
+                        0.002,
+                    )
+                )
+
                 analysis.update(
                     {
                         "mexc_index_price": index_price,
                         "mexc_fair_price": fair_price,
                         "mexc_funding_rate": funding,
                         "mexc_reference_dislocation_pct": dislocation,
+                        "max_index_dislocation_pct": max_dislocation,
                     }
                 )
 
-                if dislocation > float(
-                    getattr(
-                        self.settings,
-                        "max_index_dislocation_pct",
-                        0.002,
-                    )
-                ):
+                if dislocation > max_dislocation:
                     return self._reject(
                         symbol,
                         "MEXC executable price is too far from index/fair",
                         stage="EXECUTION_QUALITY",
                         analysis=analysis,
                     )
+
+                # -------------------------------------------------
+                # ORDER BOOK + TRADE FLOW
+                # -------------------------------------------------
 
                 depth, deals = await asyncio.gather(
                     self._safe_call(
@@ -747,6 +846,10 @@ class MexcScanner:
                     funding is not None
                 )
 
+                # -------------------------------------------------
+                # FUTURES CONTEXT
+                # -------------------------------------------------
+
                 futures_ok = (
                     self._futures_context_ok(
                         analysis,
@@ -754,13 +857,19 @@ class MexcScanner:
                     )
                 )
 
-                analysis["futures_ok"] = futures_ok
+                analysis["futures_ok"] = (
+                    futures_ok
+                )
 
                 analysis["futures_context"] = (
                     "AVAILABLE"
                     if futures_ok
                     else "INSUFFICIENT_DIRECTIONAL_CONFIRMATION"
                 )
+
+                # -------------------------------------------------
+                # CONFIRMATION FAMILIES + SCORE
+                # -------------------------------------------------
 
                 self._update_confirmation_families(
                     analysis
@@ -771,6 +880,10 @@ class MexcScanner:
                 ] = self._recalculate_score(
                     analysis
                 )
+
+                # -------------------------------------------------
+                # PLANNED ENTRY
+                # -------------------------------------------------
 
                 planned_entry = self._safe_float(
                     analysis.get("entry")
@@ -784,14 +897,9 @@ class MexcScanner:
                         analysis=analysis,
                     )
 
-                # --------------------------------------------------
+                # -------------------------------------------------
                 # ENTRY DRIFT
-                # --------------------------------------------------
-                #
-                # Check drift BEFORE repricing. If the market has
-                # moved too far away from the analyzed entry, reject
-                # instead of silently chasing price.
-                #
+                # -------------------------------------------------
 
                 drift = (
                     abs(
@@ -801,14 +909,20 @@ class MexcScanner:
                     / planned_entry
                 )
 
-                analysis["entry_drift_pct"] = drift
-
                 max_entry_drift = float(
                     getattr(
                         self.settings,
                         "max_entry_drift_pct",
                         0.002,
                     )
+                )
+
+                analysis["entry_drift_pct"] = (
+                    drift
+                )
+
+                analysis["max_entry_drift_pct"] = (
+                    max_entry_drift
                 )
 
                 if drift > max_entry_drift:
@@ -819,9 +933,9 @@ class MexcScanner:
                         analysis=analysis,
                     )
 
-                # --------------------------------------------------
+                # -------------------------------------------------
                 # SAFE LEVEL REPRICING
-                # --------------------------------------------------
+                # -------------------------------------------------
 
                 repriced, repricing_reason = (
                     self._reprice_levels(
@@ -838,6 +952,13 @@ class MexcScanner:
                         analysis=analysis,
                     )
 
+                # -------------------------------------------------
+                # FINAL TECHNICAL SYNCHRONIZATION
+                #
+                # Repricing can change RR and therefore the final
+                # technical candidate state.
+                # -------------------------------------------------
+
                 self._update_confirmation_families(
                     analysis
                 )
@@ -848,9 +969,13 @@ class MexcScanner:
                     analysis
                 )
 
-                analysis[
-                    "max_entry_drift_pct"
-                ] = max_entry_drift
+                self._synchronize_final_candidate(
+                    analysis
+                )
+
+                # -------------------------------------------------
+                # SIGNAL AGE CONFIGURATION
+                # -------------------------------------------------
 
                 analysis[
                     "max_signal_age_seconds"
@@ -861,6 +986,10 @@ class MexcScanner:
                         330.0,
                     )
                 )
+
+                # -------------------------------------------------
+                # FINAL VALIDATOR
+                # -------------------------------------------------
 
                 validated, reasons = validate_signal(
                     analysis,
@@ -895,6 +1024,10 @@ class MexcScanner:
                         analysis=analysis,
                     )
 
+                # -------------------------------------------------
+                # PUBLISH
+                # -------------------------------------------------
+
                 sent = False
 
                 if bool(
@@ -907,6 +1040,10 @@ class MexcScanner:
                     sent = await self._publish_signal(
                         validated
                     )
+
+                # -------------------------------------------------
+                # OPTIONAL LIVE EXECUTION
+                # -------------------------------------------------
 
                 if (
                     bool(
@@ -955,6 +1092,10 @@ class MexcScanner:
                     "technical_candidate": False,
                 }
 
+    # =========================================================
+    # ENGINE DIAGNOSTIC SYNCHRONIZATION
+    # =========================================================
+
     @staticmethod
     def _synchronize_technical_diagnostics(
         analysis: dict[str, Any],
@@ -962,8 +1103,11 @@ class MexcScanner:
         """
         Synchronize scanner diagnostics with the engine result.
 
-        This function never creates a trading setup.
-        It only makes the engine's rejection state explicit.
+        IMPORTANT:
+        This method never creates a setup.
+
+        It only translates the engine's existing state into
+        explicit diagnostic failures.
         """
 
         setup = str(
@@ -980,56 +1124,103 @@ class MexcScanner:
             list,
         ):
             failures = [
-                str(item)
+                str(item).strip()
                 for item in failures_raw
                 if str(item).strip()
             ]
         else:
             failures = []
 
+        # ---------------------------------------------------------
+        # NO SETUP
+        # ---------------------------------------------------------
+
         if setup not in {
             "LONG",
             "SHORT",
         }:
             direction_ok = bool(
-                analysis.get("direction_ok")
+                analysis.get(
+                    "direction_ok",
+                    False,
+                )
             )
 
             structure_ok = bool(
-                analysis.get("structure_ok")
+                analysis.get(
+                    "structure_ok",
+                    False,
+                )
             )
 
             setup_ok = bool(
-                analysis.get("setup_ok")
+                analysis.get(
+                    "setup_ok",
+                    False,
+                )
             )
 
             momentum_ok = bool(
-                analysis.get("momentum_ok")
+                analysis.get(
+                    "momentum_ok",
+                    False,
+                )
             )
 
             volume_ok = bool(
-                analysis.get("volume_ok")
+                analysis.get(
+                    "volume_ok",
+                    False,
+                )
             )
 
             location_ok = bool(
-                analysis.get("location_ok")
+                analysis.get(
+                    "location_ok",
+                    False,
+                )
             )
 
             volatility_ok = bool(
-                analysis.get("volatility_ok")
+                analysis.get(
+                    "volatility_ok",
+                    False,
+                )
             )
 
             risk_ok = bool(
-                analysis.get("risk_ok")
+                analysis.get(
+                    "risk_ok",
+                    False,
+                )
             )
 
-            trigger = str(
+            trigger_side = str(
+                analysis.get(
+                    "trigger_side",
+                    "NONE",
+                )
+                or "NONE"
+            ).upper()
+
+            trigger_state = str(
                 analysis.get(
                     "trigger_5m",
                     "NONE",
                 )
                 or "NONE"
             ).upper()
+
+            five_minute_ready = bool(
+                analysis.get(
+                    "five_minute_ready",
+                    False,
+                )
+            )
+
+            # -----------------------------------------------------
+            # DIRECTION
+            # -----------------------------------------------------
 
             if (
                 not direction_ok
@@ -1040,6 +1231,10 @@ class MexcScanner:
                     "1H alignment"
                 )
 
+            # -----------------------------------------------------
+            # 15M STRUCTURE
+            # -----------------------------------------------------
+
             if (
                 not structure_ok
                 and "15M structure"
@@ -1049,15 +1244,51 @@ class MexcScanner:
                     "15M structure"
                 )
 
+            # -----------------------------------------------------
+            # 5M TRIGGER
+            #
+            # DO NOT infer trigger failure merely because setup_ok
+            # is false.
+            #
+            # If trigger_side is NONE because 1H/15M selection
+            # failed, the correct diagnostic is the upstream gate.
+            # -----------------------------------------------------
+
+            trigger_failed = bool(
+                (
+                    trigger_side
+                    in {
+                        "LONG",
+                        "SHORT",
+                    }
+                    and not five_minute_ready
+                )
+                or (
+                    trigger_state
+                    not in {
+                        "NONE",
+                        "",
+                    }
+                    and trigger_state
+                    not in {
+                        "LONG",
+                        "SHORT",
+                    }
+                )
+            )
+
             if (
-                not setup_ok
-                and trigger == "NONE"
+                trigger_failed
                 and "5M trigger"
                 not in failures
             ):
                 failures.append(
                     "5M trigger"
                 )
+
+            # -----------------------------------------------------
+            # MOMENTUM
+            # -----------------------------------------------------
 
             if (
                 not momentum_ok
@@ -1068,6 +1299,10 @@ class MexcScanner:
                     "momentum"
                 )
 
+            # -----------------------------------------------------
+            # VOLUME
+            # -----------------------------------------------------
+
             if (
                 not volume_ok
                 and "volume"
@@ -1076,6 +1311,10 @@ class MexcScanner:
                 failures.append(
                     "volume"
                 )
+
+            # -----------------------------------------------------
+            # LOCATION
+            # -----------------------------------------------------
 
             if (
                 not location_ok
@@ -1086,6 +1325,10 @@ class MexcScanner:
                     "location/target path"
                 )
 
+            # -----------------------------------------------------
+            # VOLATILITY
+            # -----------------------------------------------------
+
             if (
                 not volatility_ok
                 and "volatility"
@@ -1094,6 +1337,10 @@ class MexcScanner:
                 failures.append(
                     "volatility"
                 )
+
+            # -----------------------------------------------------
+            # RISK / RR
+            # -----------------------------------------------------
 
             if (
                 not risk_ok
@@ -1104,67 +1351,391 @@ class MexcScanner:
                     "risk/RR"
                 )
 
+            # -----------------------------------------------------
+            # FINAL FALLBACK
+            # -----------------------------------------------------
+
             if not failures:
                 failures.append(
                     "No LONG/SHORT setup selected by engine"
                 )
 
-            analysis["technical_candidate"] = False
-            analysis["signal_blocked"] = True
-            analysis["rejection_stage"] = "TECHNICAL"
+            analysis[
+                "technical_candidate"
+            ] = False
+
+            analysis[
+                "signal_blocked"
+            ] = True
+
+            analysis[
+                "rejection_stage"
+            ] = "TECHNICAL"
 
         else:
-            # A LONG/SHORT setup can still be blocked by the engine's
-            # hard technical gates. Never force a candidate to True.
-            analysis["technical_candidate"] = bool(
+            # A setup exists, but the engine may still have technical
+            # hard-gate failures. Do not create a candidate here.
+            analysis[
+                "technical_gate_failures"
+            ] = failures
+
+    # =========================================================
+    # FINAL TECHNICAL CANDIDATE SYNCHRONIZATION
+    # =========================================================
+
+    @staticmethod
+    def _synchronize_final_candidate(
+        analysis: dict[str, Any],
+    ) -> None:
+        """
+        Rebuild the final technical_candidate flag from the current
+        post-repricing analysis.
+
+        This prevents a stale candidate flag from surviving after
+        RR, levels, score, or confirmation families change.
+        """
+
+        side = str(
+            analysis.get("setup")
+            or ""
+        ).upper()
+
+        score = MexcScanner._safe_int(
+            analysis.get("score")
+        )
+
+        rr = MexcScanner._safe_float(
+            analysis.get("rr")
+        )
+
+        min_score = max(
+            82,
+            MexcScanner._safe_int(
                 analysis.get(
-                    "technical_candidate",
-                    False,
+                    "min_confluence",
+                    getattr(
+                        analysis,
+                        "min_confluence",
+                        82,
+                    ),
                 )
+            ),
+        )
+
+        # The engine's normal configuration is 82.
+        # If the analysis does not explicitly carry a minimum,
+        # use 82.
+        if min_score <= 0:
+            min_score = 82
+
+        min_rr = MexcScanner._safe_float(
+            analysis.get(
+                "min_rr",
+                2.0,
             )
+        )
+
+        if min_rr <= 0:
+            min_rr = 2.0
+
+        families = MexcScanner._safe_int(
+            analysis.get(
+                "confirmation_family_count",
+                0,
+            )
+        )
+
+        direction_ok = bool(
+            analysis.get(
+                "direction_ok",
+                False,
+            )
+        )
+
+        structure_ok = bool(
+            analysis.get(
+                "structure_ok",
+                False,
+            )
+        )
+
+        setup_ok = bool(
+            analysis.get(
+                "setup_ok",
+                False,
+            )
+        )
+
+        momentum_ok = bool(
+            analysis.get(
+                "momentum_ok",
+                False,
+            )
+        )
+
+        volume_ok = bool(
+            analysis.get(
+                "volume_ok",
+                False,
+            )
+        )
+
+        location_ok = bool(
+            analysis.get(
+                "location_ok",
+                False,
+            )
+        )
+
+        volatility_ok = bool(
+            analysis.get(
+                "volatility_ok",
+                False,
+            )
+        )
+
+        risk_ok = bool(
+            analysis.get(
+                "risk_ok",
+                False,
+            )
+        )
+
+        btc_ok = bool(
+            analysis.get(
+                "btc_filter_ok",
+                False,
+            )
+        )
+
+        data_fresh = bool(
+            analysis.get(
+                "data_fresh",
+                False,
+            )
+        )
+
+        structural_targets = bool(
+            analysis.get(
+                "target_path_structural",
+                False,
+            )
+        )
+
+        signal_blocked = bool(
+            analysis.get(
+                "signal_blocked",
+                False,
+            )
+        )
+
+        sl_atr = MexcScanner._safe_float(
+            analysis.get(
+                "sl_atr"
+            )
+        )
+
+        rr_ok = rr >= min_rr
+
+        score_ok = score >= min_score
+
+        families_ok = (
+            families >= 5
+        )
+
+        sl_ok = (
+            sl_atr >= 0.50
+            and sl_atr <= 1.80
+        )
+
+        candidate = bool(
+            side in {
+                "LONG",
+                "SHORT",
+            }
+            and not signal_blocked
+            and direction_ok
+            and structure_ok
+            and setup_ok
+            and momentum_ok
+            and volume_ok
+            and location_ok
+            and volatility_ok
+            and risk_ok
+            and btc_ok
+            and data_fresh
+            and structural_targets
+            and score_ok
+            and rr_ok
+            and families_ok
+            and sl_ok
+        )
+
+        analysis[
+            "technical_candidate"
+        ] = candidate
+
+        # ---------------------------------------------------------
+        # Keep diagnostics synchronized.
+        # ---------------------------------------------------------
+
+        failures_raw = analysis.get(
+            "technical_gate_failures"
+        )
+
+        if isinstance(
+            failures_raw,
+            list,
+        ):
+            failures = [
+                str(item).strip()
+                for item in failures_raw
+                if str(item).strip()
+            ]
+        else:
+            failures = []
+
+        def add_failure(
+            condition: bool,
+            message: str,
+        ) -> None:
+            if condition and message not in failures:
+                failures.append(message)
+
+        add_failure(
+            not direction_ok,
+            "4H/1H direction",
+        )
+
+        add_failure(
+            not structure_ok,
+            "15M structure",
+        )
+
+        add_failure(
+            not setup_ok,
+            "15M setup / 5M trigger",
+        )
+
+        add_failure(
+            not momentum_ok,
+            "momentum",
+        )
+
+        add_failure(
+            not volume_ok,
+            "volume",
+        )
+
+        add_failure(
+            not location_ok,
+            "location/target path",
+        )
+
+        add_failure(
+            not volatility_ok,
+            "volatility",
+        )
+
+        add_failure(
+            not risk_ok,
+            "risk/RR",
+        )
+
+        add_failure(
+            not score_ok,
+            "score",
+        )
+
+        add_failure(
+            not families_ok,
+            "confirmation families",
+        )
+
+        add_failure(
+            not rr_ok,
+            "risk/RR",
+        )
+
+        add_failure(
+            not sl_ok,
+            "SL distance",
+        )
+
+        add_failure(
+            not btc_ok,
+            "BTC/global filter",
+        )
+
+        add_failure(
+            not data_fresh,
+            "market data freshness",
+        )
+
+        add_failure(
+            not structural_targets,
+            "structural target path",
+        )
 
         analysis[
             "technical_gate_failures"
         ] = failures
+
+        if candidate:
+            analysis[
+                "signal_blocked"
+            ] = False
+
+    # =========================================================
+    # FUTURES CONTEXT
+    # =========================================================
 
     @staticmethod
     def _futures_context_ok(
         analysis: dict[str, Any],
         side: str,
     ) -> bool:
-        """Return True only when live futures flow has directional agreement."""
+        """
+        Return True only when live futures flow has directional
+        agreement.
 
-        imbalance = float(
+        Futures context is supporting context and is NOT an
+        independent technical hard gate.
+        """
+
+        imbalance = MexcScanner._safe_float(
             analysis.get(
                 "orderbook_imbalance",
                 0.0,
             )
-            or 0.0
         )
 
-        flow = float(
+        flow = MexcScanner._safe_float(
             analysis.get(
                 "volume_delta_ratio",
                 0.0,
             )
-            or 0.0
         )
 
         threshold = 0.05
 
         if side == "LONG":
-            return (
+            return bool(
                 imbalance >= threshold
                 or flow >= threshold
             )
 
         if side == "SHORT":
-            return (
+            return bool(
                 imbalance <= -threshold
                 or flow <= -threshold
             )
 
         return False
+
+    # =========================================================
+    # CONFIRMATION FAMILIES
+    # =========================================================
 
     @staticmethod
     def _update_confirmation_families(
@@ -1190,6 +1761,10 @@ class MexcScanner:
             )
             for name in families
         )
+
+    # =========================================================
+    # SCORE
+    # =========================================================
 
     @staticmethod
     def _recalculate_score(
@@ -1239,20 +1814,18 @@ class MexcScanner:
             ),
         }
 
-        setup_q = float(
+        setup_q = MexcScanner._safe_float(
             analysis.get(
                 "trigger_quality_5m",
                 0.0,
             )
-            or 0.0
         )
 
-        bos_q = float(
+        bos_q = MexcScanner._safe_float(
             analysis.get(
                 "bos_15m_strength",
                 0.0,
             )
-            or 0.0
         )
 
         retest = (
@@ -1266,12 +1839,11 @@ class MexcScanner:
         ):
             retest = {}
 
-        ret_q = float(
+        ret_q = MexcScanner._safe_float(
             retest.get(
                 "quality",
                 0.0,
             )
-            or 0.0
         )
 
         quality = (
@@ -1288,15 +1860,16 @@ class MexcScanner:
                 "setup_entry_trigger"
             ] -= 5
 
+        rvol_15m = MexcScanner._safe_float(
+            analysis.get(
+                "rvol_15m",
+                0.0,
+            )
+        )
+
         if (
             groups["volume_participation"]
-            and float(
-                analysis.get(
-                    "rvol_15m",
-                    0.0,
-                )
-                or 0.0
-            ) < 1.25
+            and rvol_15m < 1.25
         ):
             groups[
                 "volume_participation"
@@ -1311,22 +1884,32 @@ class MexcScanner:
                 0,
                 min(
                     100,
-                    score,
+                    int(score),
                 ),
             ),
             groups,
         )
+
+    # =========================================================
+    # SAFE NUMERIC HELPERS
+    # =========================================================
 
     @staticmethod
     def _safe_float(
         value: Any,
     ) -> float:
         try:
-            return (
+            result = (
                 float(value)
                 if value is not None
                 else 0.0
             )
+
+            if result != result:
+                return 0.0
+
+            return result
+
         except (
             TypeError,
             ValueError,
@@ -1338,13 +1921,12 @@ class MexcScanner:
         value: Any,
     ) -> float | None:
         try:
-            x = float(value)
+            result = float(value)
 
-            return (
-                x
-                if x == x
-                else None
-            )
+            if result != result:
+                return None
+
+            return result
 
         except (
             TypeError,
@@ -1362,11 +1944,16 @@ class MexcScanner:
                 if value is not None
                 else 0
             )
+
         except (
             TypeError,
             ValueError,
         ):
             return 0
+
+    # =========================================================
+    # SAFE OPTIONAL API CALL
+    # =========================================================
 
     @staticmethod
     async def _safe_call(
@@ -1382,6 +1969,10 @@ class MexcScanner:
                 exc,
             )
             return None
+
+    # =========================================================
+    # ORDER BOOK
+    # =========================================================
 
     @staticmethod
     def _calculate_depth(
@@ -1401,6 +1992,7 @@ class MexcScanner:
         def total(
             levels: list[Any],
         ) -> float:
+
             value = 0.0
 
             for level in levels:
@@ -1424,6 +2016,7 @@ class MexcScanner:
                             )
                             or 0
                         )
+
                     else:
                         qty = (
                             level[1]
@@ -1431,15 +2024,22 @@ class MexcScanner:
                             else 0
                         )
 
-                    value += float(qty)
+                    value += float(
+                        qty
+                    )
 
                 except Exception:
                     continue
 
             return value
 
-        bid_depth = total(bids)
-        ask_depth = total(asks)
+        bid_depth = total(
+            bids
+        )
+
+        ask_depth = total(
+            asks
+        )
 
         total_depth = (
             bid_depth
@@ -1461,6 +2061,10 @@ class MexcScanner:
             "ask_depth": ask_depth,
             "orderbook_imbalance": imbalance,
         }
+
+    # =========================================================
+    # TRADE FLOW
+    # =========================================================
 
     @staticmethod
     def _calculate_trade_flow(
@@ -1519,8 +2123,15 @@ class MexcScanner:
             except Exception:
                 continue
 
-        total = buy + sell
-        delta = buy - sell
+        total = (
+            buy
+            + sell
+        )
+
+        delta = (
+            buy
+            - sell
+        )
 
         ratio = (
             delta / total
@@ -1535,21 +2146,32 @@ class MexcScanner:
             "volume_delta_ratio": ratio,
         }
 
+    # =========================================================
+    # SAFE LEVEL REPRICING
+    # =========================================================
+
     @staticmethod
     def _reprice_levels(
         analysis: dict[str, Any],
         executable_price: float,
     ) -> tuple[bool, str]:
 
-        # ----------------------------------------------------------
-        # HARD INPUT VALIDATION
-        # ----------------------------------------------------------
+        # ---------------------------------------------------------
+        # EXECUTABLE PRICE
+        # ---------------------------------------------------------
 
-        if executable_price <= 0:
+        if (
+            executable_price <= 0
+            or executable_price != executable_price
+        ):
             return (
                 False,
                 "Invalid executable price",
             )
+
+        # ---------------------------------------------------------
+        # REQUIRED LEVELS
+        # ---------------------------------------------------------
 
         required_fields = (
             "entry",
@@ -1561,7 +2183,9 @@ class MexcScanner:
         values: dict[str, float] = {}
 
         for field in required_fields:
-            raw_value = analysis.get(field)
+            raw_value = analysis.get(
+                field
+            )
 
             if raw_value is None:
                 return (
@@ -1570,7 +2194,10 @@ class MexcScanner:
                 )
 
             try:
-                value = float(raw_value)
+                value = float(
+                    raw_value
+                )
+
             except (
                 TypeError,
                 ValueError,
@@ -1580,13 +2207,20 @@ class MexcScanner:
                     f"Invalid trade level: {field}",
                 )
 
-            if value <= 0:
+            if (
+                value <= 0
+                or value != value
+            ):
                 return (
                     False,
                     f"Trade level must be positive: {field}",
                 )
 
             values[field] = value
+
+        # ---------------------------------------------------------
+        # SIDE
+        # ---------------------------------------------------------
 
         side = str(
             analysis.get("setup")
@@ -1603,13 +2237,19 @@ class MexcScanner:
                 "Missing or invalid trade side for repricing",
             )
 
-        old_entry = values["entry"]
+        old_entry = values[
+            "entry"
+        ]
 
         if old_entry <= 0:
             return (
                 False,
                 "Invalid original entry",
             )
+
+        # ---------------------------------------------------------
+        # TRANSLATION
+        # ---------------------------------------------------------
 
         delta = (
             executable_price
@@ -1631,11 +2271,12 @@ class MexcScanner:
             + delta
         )
 
-        # ----------------------------------------------------------
-        # SIDE-SPECIFIC LEVEL VALIDATION
-        # ----------------------------------------------------------
+        # ---------------------------------------------------------
+        # SIDE-SPECIFIC VALIDATION
+        # ---------------------------------------------------------
 
         if side == "LONG":
+
             if not (
                 new_stop
                 < executable_price
@@ -1659,6 +2300,7 @@ class MexcScanner:
             )
 
         else:
+
             if not (
                 new_tp2
                 < new_tp1
@@ -1694,18 +2336,22 @@ class MexcScanner:
             )
 
         rr = (
-            reward / risk
+            reward
+            / risk
         )
 
-        if rr <= 0:
+        if (
+            rr <= 0
+            or rr != rr
+        ):
             return (
                 False,
                 "Repriced RR is invalid",
             )
 
-        # ----------------------------------------------------------
-        # WRITE VALUES ONLY AFTER ALL VALIDATION PASSES
-        # ----------------------------------------------------------
+        # ---------------------------------------------------------
+        # WRITE ONLY AFTER VALIDATION
+        # ---------------------------------------------------------
 
         analysis["entry"] = float(
             executable_price
@@ -1728,10 +2374,16 @@ class MexcScanner:
         )
 
         analysis["repriced"] = True
-        analysis["repriced_from_entry"] = float(
+
+        analysis[
+            "repriced_from_entry"
+        ] = float(
             old_entry
         )
-        analysis["repriced_entry"] = float(
+
+        analysis[
+            "repriced_entry"
+        ] = float(
             executable_price
         )
 
@@ -1739,6 +2391,10 @@ class MexcScanner:
             True,
             "OK",
         )
+
+    # =========================================================
+    # REJECTION
+    # =========================================================
 
     @staticmethod
     def _reject(
@@ -1755,7 +2411,9 @@ class MexcScanner:
             else {}
         )
 
-        payload["rejection_stage"] = stage
+        payload[
+            "rejection_stage"
+        ] = stage
 
         if isinstance(
             reason,
@@ -1766,7 +2424,9 @@ class MexcScanner:
             ] = [
                 str(item)
                 for item in reason
+                if str(item).strip()
             ]
+
         else:
             payload[
                 "rejection_reasons"
@@ -1810,6 +2470,10 @@ class MexcScanner:
             ),
         }
 
+    # =========================================================
+    # SIGNAL PUBLISH
+    # =========================================================
+
     async def _publish_signal(
         self,
         signal,
@@ -1826,7 +2490,12 @@ class MexcScanner:
                 "Signal publication failed for %s",
                 signal.symbol,
             )
+
             return False
+
+    # =========================================================
+    # LIVE EXECUTION
+    # =========================================================
 
     async def _execute_signal(
         self,

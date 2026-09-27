@@ -5,6 +5,7 @@ from typing import Any
 
 MIN_SCORE = 82
 MIN_RR = 2.0
+
 MIN_SL_ATR = 0.50
 MAX_SL_ATR = 1.80
 
@@ -14,10 +15,20 @@ MAX_ATR_PERCENTILE = 95.0
 MIN_ATR_PERCENTILE = 20.0
 
 
-def _f(value: Any, default: float = 0.0) -> float:
+def _f(
+    value: Any,
+    default: float = 0.0,
+) -> float:
     try:
-        return float(value) if value is not None else default
-    except (TypeError, ValueError):
+        return (
+            float(value)
+            if value is not None
+            else default
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
         return default
 
 
@@ -28,27 +39,61 @@ def validate_analysis(
     min_rr: float,
     require_increasing_volume: bool = False,
 ) -> tuple[bool, list[str]]:
+    """
+    Final setup filter.
+
+    This layer validates the engine's already-produced analysis.
+    It must NOT create a new LONG/SHORT setup.
+
+    The engine remains responsible for:
+        4H regime
+        1H alignment
+        15M structure/setup
+        5M trigger
+        momentum
+        volume
+        location
+        volatility
+        trade levels
+
+    This filter only performs the final consistency checks.
+    """
 
     reasons: list[str] = []
 
-    # ---------------------------------------------------------
+    # =========================================================
     # BASIC SETUP
-    # ---------------------------------------------------------
+    # =========================================================
 
-    side = str(data.get("setup") or "").upper()
+    side = str(
+        data.get("setup")
+        or ""
+    ).upper()
 
-    if side not in {"LONG", "SHORT"}:
-        reasons.append("No deterministic LONG/SHORT setup")
+    if side not in {
+        "LONG",
+        "SHORT",
+    }:
+        reasons.append(
+            "No deterministic LONG/SHORT setup"
+        )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # SCORE
-    # ---------------------------------------------------------
+    # =========================================================
 
-    score = int(_f(data.get("score"), 0))
+    score = int(
+        _f(
+            data.get("score"),
+            0,
+        )
+    )
 
     required_score = max(
         MIN_SCORE,
-        int(min_confluence or 0),
+        int(
+            min_confluence or 0
+        ),
     )
 
     if score < required_score:
@@ -56,15 +101,20 @@ def validate_analysis(
             f"Score {score}/100 < required {required_score}"
         )
 
-    # ---------------------------------------------------------
-    # RR
-    # ---------------------------------------------------------
+    # =========================================================
+    # RISK / REWARD
+    # =========================================================
 
-    rr = _f(data.get("rr"), 0.0)
+    rr = _f(
+        data.get("rr"),
+        0.0,
+    )
 
     required_rr = max(
         MIN_RR,
-        float(min_rr or 0),
+        float(
+            min_rr or 0
+        ),
     )
 
     if rr < required_rr:
@@ -72,20 +122,44 @@ def validate_analysis(
             f"RR {rr:.2f} < required {required_rr:.2f}"
         )
 
-    # ---------------------------------------------------------
-    # HARD TECHNICAL GATES
+    # =========================================================
+    # CORE ENGINE GATES
     #
-    # These are mandatory.
-    # ---------------------------------------------------------
+    # These are the gates that define whether the engine
+    # considers the setup technically valid.
+    #
+    # Do NOT add duplicate RSI/RVOL/5M gates below.
+    # =========================================================
 
     hard_gates = (
-        ("direction_ok", "4H/1H directional alignment failed"),
-        ("structure_ok", "Market structure confirmation failed"),
-        ("setup_ok", "15M setup / 5M trigger failed"),
-        ("location_ok", "Location / structural target path failed"),
-        ("volatility_ok", "Volatility hard gate failed"),
-        ("btc_filter_ok", "BTC/global filter failed"),
-        ("data_fresh", "Market data is stale"),
+        (
+            "direction_ok",
+            "4H/1H directional alignment failed",
+        ),
+        (
+            "structure_ok",
+            "Market structure confirmation failed",
+        ),
+        (
+            "setup_ok",
+            "15M setup / 5M trigger failed",
+        ),
+        (
+            "location_ok",
+            "Location / structural target path failed",
+        ),
+        (
+            "volatility_ok",
+            "Volatility hard gate failed",
+        ),
+        (
+            "btc_filter_ok",
+            "BTC/global filter failed",
+        ),
+        (
+            "data_fresh",
+            "Market data is stale",
+        ),
         (
             "target_path_structural",
             "Targets are not backed by structural/liquidity levels",
@@ -93,49 +167,62 @@ def validate_analysis(
     )
 
     for key, message in hard_gates:
-        if not bool(data.get(key, False)):
+        if not bool(
+            data.get(
+                key,
+                False,
+            )
+        ):
             reasons.append(message)
 
-    # ---------------------------------------------------------
-    # 5M TRIGGER
-    # ---------------------------------------------------------
+    # =========================================================
+    # ENGINE TECHNICAL CANDIDATE
+    #
+    # If the engine explicitly says this is not a technical
+    # candidate, do not allow this layer to resurrect it.
+    # =========================================================
 
-    if not bool(data.get("five_minute_ready", False)):
-        reasons.append("5M data is not ready")
-
-    if side == "LONG" and not bool(
-        data.get("five_minute_long", False)
+    if not bool(
+        data.get(
+            "technical_candidate",
+            False,
+        )
     ):
         reasons.append(
-            "5M LONG trigger confirmation failed"
+            "Engine did not mark this as a technical candidate"
         )
 
-    if side == "SHORT" and not bool(
-        data.get("five_minute_short", False)
+    # =========================================================
+    # ENGINE BLOCK
+    # =========================================================
+
+    if bool(
+        data.get(
+            "signal_blocked",
+            False,
+        )
     ):
         reasons.append(
-            "5M SHORT trigger confirmation failed"
+            "Engine marked signal blocked"
         )
 
-    if (
-        bool(data.get("five_minute_long"))
-        and bool(data.get("five_minute_short"))
-    ):
-        reasons.append("Conflicting 5M triggers")
-
-    # ---------------------------------------------------------
+    # =========================================================
     # CONFIRMATION FAMILIES
     #
-    # 6 families:
-    # Direction
-    # Structure
-    # Setup
-    # Momentum
-    # Volume
-    # Location
+    # Six families:
     #
-    # Minimum = 5/6
-    # ---------------------------------------------------------
+    # 1. Direction
+    # 2. Structure
+    # 3. Setup
+    # 4. Momentum
+    # 5. Volume
+    # 6. Location
+    #
+    # Minimum = 5/6.
+    #
+    # Futures context is intentionally NOT included because
+    # it is a supporting 5-point context family in the scanner.
+    # =========================================================
 
     families = int(
         _f(
@@ -153,15 +240,73 @@ def validate_analysis(
             f"{MIN_CONFIRMATION_FAMILIES}/6"
         )
 
-    # ---------------------------------------------------------
-    # MOMENTUM CONFIRMATION
+    # =========================================================
+    # 5M TRIGGER CONSISTENCY
     #
-    # Momentum is a confirmation family, not an
-    # independent hard gate. The 5/6 rule handles it.
-    # ---------------------------------------------------------
+    # The engine already determines the trigger.
+    # We only verify that its reported state is internally
+    # consistent with the selected side.
+    # =========================================================
+
+    trigger_ready = bool(
+        data.get(
+            "five_minute_ready",
+            False,
+        )
+    )
+
+    trigger_long = bool(
+        data.get(
+            "five_minute_long",
+            False,
+        )
+    )
+
+    trigger_short = bool(
+        data.get(
+            "five_minute_short",
+            False,
+        )
+    )
+
+    if side in {
+        "LONG",
+        "SHORT",
+    }:
+        if not trigger_ready:
+            reasons.append(
+                "5M trigger is not ready"
+            )
+
+        if side == "LONG" and not trigger_long:
+            reasons.append(
+                "5M LONG trigger is not confirmed"
+            )
+
+        if side == "SHORT" and not trigger_short:
+            reasons.append(
+                "5M SHORT trigger is not confirmed"
+            )
+
+    if trigger_long and trigger_short:
+        reasons.append(
+            "Conflicting 5M triggers"
+        )
+
+    # =========================================================
+    # TRIGGER QUALITY
+    #
+    # This remains a consistency check, but we do not create
+    # another separate RSI/RVOL hard gate here.
+    #
+    # The engine's setup/score logic already incorporates
+    # trigger quality.
+    # =========================================================
 
     trigger_q = _f(
-        data.get("trigger_quality_5m"),
+        data.get(
+            "trigger_quality_5m",
+        ),
         0.0,
     )
 
@@ -171,69 +316,36 @@ def validate_analysis(
             f"{trigger_q:.2f} < 0.55"
         )
 
-    # ---------------------------------------------------------
-    # RSI CONFIRMATION
-    # ---------------------------------------------------------
-
-    r15 = _f(
-        data.get("rsi"),
-        50.0,
-    )
-
-    r5 = _f(
-        data.get("rsi_5m"),
-        50.0,
-    )
-
-    if side == "LONG":
-
-        if r15 <= 50 or r5 <= 50:
-            reasons.append(
-                "RSI does not confirm LONG"
-            )
-
-        if r5 >= 75:
-            reasons.append(
-                "5M RSI is excessively extended"
-            )
-
-    elif side == "SHORT":
-
-        if r15 >= 50 or r5 >= 50:
-            reasons.append(
-                "RSI does not confirm SHORT"
-            )
-
-        if r5 <= 25:
-            reasons.append(
-                "5M RSI is excessively extended"
-            )
-
-    # ---------------------------------------------------------
-    # RVOL
-    # ---------------------------------------------------------
-
-    if _f(data.get("rvol_15m"), 0.0) < 1.0:
-        reasons.append("15M RVOL < 1.0")
-
-    if _f(data.get("rvol_5m"), 0.0) < 1.0:
-        reasons.append("5M RVOL < 1.0")
+    # =========================================================
+    # VOLUME REQUIREMENT
+    #
+    # Only enforce increasing volume if explicitly enabled
+    # by configuration.
+    #
+    # Normal RVOL remains part of the engine's volume family
+    # rather than becoming a second hidden hard gate.
+    # =========================================================
 
     if (
         require_increasing_volume
-        and str(data.get("volume") or "").upper()
+        and str(
+            data.get("volume")
+            or ""
+        ).upper()
         != "INCREASING"
     ):
         reasons.append(
             "15M volume is not INCREASING"
         )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # SL / ATR
-    # ---------------------------------------------------------
+    # =========================================================
 
     sl_atr = _f(
-        data.get("sl_atr"),
+        data.get(
+            "sl_atr",
+        ),
         999.0,
     )
 
@@ -249,12 +361,14 @@ def validate_analysis(
             f"> maximum {MAX_SL_ATR:.2f}"
         )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # ATR VOLATILITY PERCENTILE
-    # ---------------------------------------------------------
+    # =========================================================
 
     atr_rank = _f(
-        data.get("atr_percentile"),
+        data.get(
+            "atr_percentile",
+        ),
         50.0,
     )
 
@@ -267,17 +381,24 @@ def validate_analysis(
             "outside allowed range"
         )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # MEXC EXECUTION QUALITY
-    # ---------------------------------------------------------
+    #
+    # These values may be unavailable before live-context
+    # enrichment. Defaults therefore remain permissive.
+    # =========================================================
 
     spread = _f(
-        data.get("mexc_spread_pct"),
-        999.0,
+        data.get(
+            "mexc_spread_pct",
+        ),
+        0.0,
     )
 
     max_spread = _f(
-        data.get("max_mexc_spread_pct"),
+        data.get(
+            "max_mexc_spread_pct",
+        ),
         0.001,
     )
 
@@ -287,12 +408,16 @@ def validate_analysis(
         )
 
     drift = _f(
-        data.get("entry_drift_pct"),
+        data.get(
+            "entry_drift_pct",
+        ),
         0.0,
     )
 
     max_drift = _f(
-        data.get("max_entry_drift_pct"),
+        data.get(
+            "max_entry_drift_pct",
+        ),
         0.002,
     )
 
@@ -301,45 +426,54 @@ def validate_analysis(
             "Entry drift gate failed"
         )
 
-    # ---------------------------------------------------------
-    # ENGINE BLOCK
-    # ---------------------------------------------------------
-
-    if (
-        bool(data.get("signal_blocked", False))
-        and not bool(
-            data.get("technical_candidate", False)
-        )
-    ):
-        reasons.append(
-            "Engine marked signal blocked"
-        )
-
-    # ---------------------------------------------------------
+    # =========================================================
     # TRADE LEVELS
-    # ---------------------------------------------------------
+    # =========================================================
+
+    entry = data.get("entry")
+    stop_loss = data.get("stop_loss")
+    tp1 = data.get("tp1")
+    tp2 = data.get("tp2")
 
     if (
-        not data.get("entry")
-        or not data.get("stop_loss")
-        or not data.get("tp1")
-        or not data.get("tp2")
+        entry is None
+        or stop_loss is None
+        or tp1 is None
+        or tp2 is None
     ):
         reasons.append(
             "Trade levels are incomplete"
         )
+    else:
+        if (
+            _f(entry, 0.0) <= 0
+            or _f(stop_loss, 0.0) <= 0
+            or _f(tp1, 0.0) <= 0
+            or _f(tp2, 0.0) <= 0
+        ):
+            reasons.append(
+                "Trade levels contain invalid values"
+            )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # FUTURES CONTEXT
     #
-    # IMPORTANT:
-    # futures_ok is a confirmation family.
-    # It is NOT an independent hard rejection here.
+    # futures_ok is deliberately NOT an independent hard gate.
     #
-    # The 5/6 family rule determines whether enough
-    # confirmation exists.
-    # ---------------------------------------------------------
+    # Missing futures flow must not erase an otherwise valid
+    # technical setup.
+    #
+    # It contributes supporting context/score through the
+    # scanner.
+    # =========================================================
 
     # No direct rejection for futures_ok=False.
 
-    return len(reasons) == 0, reasons
+    # =========================================================
+    # FINAL RESULT
+    # =========================================================
+
+    return (
+        len(reasons) == 0,
+        reasons,
+    )

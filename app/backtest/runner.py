@@ -609,4 +609,729 @@ class BacktestRunner:
                                         period_start,
                                         period_end,
                                         btc_history,
-                          
+                                        btc_engine_cache,
+                                    ),
+                                    timeout=ANALYSIS_TIMEOUT_SECONDS,
+                                )
+
+                                LOGGER.info(
+                                    "BACKTEST ANALYSIS DONE | worker=%d symbol=%s "
+                                    "| signals=%d seconds=%.2f",
+                                    worker_id,
+                                    symbol,
+                                    len(symbol_trades),
+                                    time.monotonic() - analysis_started,
+                                )
+
+                                trades.extend(symbol_trades)
+
+                                async with state_lock:
+                                    state["tested"] = int(state["tested"]) + 1
+                                    state["signals"] = len(trades)
+
+                            except asyncio.CancelledError:
+                                LOGGER.warning(
+                                    "BACKTEST SYMBOL CANCELLED | worker=%d symbol=%s",
+                                    worker_id,
+                                    symbol,
+                                )
+                                raise
+
+                            except Exception as exc:
+                                async with state_lock:
+                                    state["errors"] = int(state["errors"]) + 1
+
+                                LOGGER.exception(
+                                    "BACKTEST symbol failed: %s | %s",
+                                    symbol,
+                                    exc,
+                                )
+                                LOGGER.error(
+                                    "BACKTEST DATA ERROR | %s | %s: %s",
+                                    symbol,
+                                    type(exc).__name__,
+                                    exc,
+                                )
+
+                            finally:
+                                async with state_lock:
+                                    state["processed"] = int(state["processed"]) + 1
+                                    processed = int(state["processed"])
+                                    tested = int(state["tested"])
+                                    errors = int(state["errors"])
+                                    signal_count = int(state["signals"])
+
+                                touch(
+                                    phase="SYMBOL DATA",
+                                    symbol=symbol,
+                                    worker=worker_id,
+                                )
+
+                                LOGGER.info(
+                                    "BACKTEST SYMBOL COMPLETE | processed=%d/%d "
+                                    "| tested=%d | errors=%d | signals=%d | symbol=%s",
+                                    processed,
+                                    len(symbols),
+                                    tested,
+                                    errors,
+                                    signal_count,
+                                    symbol,
+                                )
+                                LOGGER.info(
+                                    "BACKTEST PROGRESS | days=%d processed=%d/%d "
+                                    "tested=%d errors=%d signals=%d",
+                                    days,
+                                    processed,
+                                    len(symbols),
+                                    tested,
+                                    errors,
+                                    signal_count,
+                                )
+
+                                await asyncio.sleep(0)
+
+                        finally:
+                            queue.task_done()
+
+                workers = [
+                    asyncio.create_task(
+                        worker(worker_id),
+                        name=f"backtest-worker-{worker_id}",
+                    )
+                    for worker_id in range(self.max_concurrency)
+                ]
+
+                try:
+                    await asyncio.gather(*workers)
+                except BaseException:
+                    for task in workers:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    raise
+
+                # -----------------------------------------------------------
+                # Final report
+                # -----------------------------------------------------------
+
+                touch(phase="FINALIZING", symbol="-", worker="-")
+                trades.sort(key=lambda trade: trade.signal_time_ms)
+
+                summary = summarize(
+                    days=days,
+                    coins_selected=len(symbols),
+                    coins_tested=int(state["tested"]),
+                    data_errors=int(state["errors"]),
+                    trades=trades,
+                )
+
+                LOGGER.info(
+                    "BACKTEST COMPLETE | days=%d tested=%d errors=%d signals=%d duration=%.2fs",
+                    days,
+                    int(state["tested"]),
+                    int(state["errors"]),
+                    len(trades),
+                    time.monotonic() - started,
+                )
+                return summary
+
+            except asyncio.CancelledError:
+                LOGGER.warning(
+                    "BACKTEST CANCELLED | days=%d duration=%.2fs",
+                    days,
+                    time.monotonic() - started,
+                )
+                raise
+
+            finally:
+                for task in workers:
+                    if not task.done():
+                        task.cancel()
+                if workers:
+                    await asyncio.gather(*workers, return_exceptions=True)
+
+                heartbeat_stop.set()
+                if heartbeat_task is not None:
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+
+    # -----------------------------------------------------------------------
+    # Historical data
+    # -----------------------------------------------------------------------
+
+    async def _fetch_symbol_history(
+        self,
+        symbol: str,
+        period_start: int,
+        period_end: int,
+    ) -> SymbolHistory:
+        starts = {
+            "4h": period_start - MIN_4H_WARMUP_MS,
+            "1h": period_start - MIN_1H_WARMUP_MS,
+            "15m": period_start - MIN_15M_WARMUP_MS,
+            "5m": period_start - MIN_5M_WARMUP_MS,
+            "1d": period_start - MIN_1D_WARMUP_MS,
+        }
+
+        tasks = [
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "4H",
+                    INTERVALS["4h"],
+                    starts["4h"],
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "1H",
+                    INTERVALS["1h"],
+                    starts["1h"],
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "15M",
+                    INTERVALS["15m"],
+                    starts["15m"],
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "5M",
+                    INTERVALS["5m"],
+                    starts["5m"],
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "1D",
+                    INTERVALS["1d"],
+                    starts["1d"],
+                    period_end,
+                )
+            ),
+        ]
+
+        try:
+            c4h, c1h, c15m, c5m, c1d = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        except Exception as exc:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise RuntimeError(
+                f"{symbol}: historical data fetch failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        return SymbolHistory(
+            symbol=symbol,
+            candles_4h=c4h,
+            candles_1h=c1h,
+            candles_15m=c15m,
+            candles_5m=c5m,
+            candles_1d=c1d,
+        )
+
+    async def _fetch_btc_history(
+        self,
+        period_start: int,
+        period_end: int,
+    ) -> SymbolHistory:
+        return await self._fetch_symbol_history(
+            "BTC_USDT",
+            period_start,
+            period_end,
+        )
+
+    # -----------------------------------------------------------------------
+    # Optimized 5M trigger metrics
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _precompute_5m_metrics(
+        candles: list,
+    ) -> tuple[list[float], list[float], list[float]]:
+        """
+        Calculate the exact final RSI, RVOL and ATR values needed by
+        _five_minute_trigger() for every 5M candle.
+
+        This changes the workload from repeated O(n) indicator calculation
+        for every candidate to one O(n) preprocessing pass per symbol.
+        """
+        count = len(candles)
+        rsi_values = [50.0] * count
+        rvol_values = [0.0] * count
+        atr_values = [0.0] * count
+
+        if count < 2:
+            return rsi_values, rvol_values, atr_values
+
+        closes = [float(c["close"]) for c in candles]
+        volumes = [float(c["volume"]) for c in candles]
+        highs = [float(c["high"]) for c in candles]
+        lows = [float(c["low"]) for c in candles]
+
+        # Same RSI implementation as indicators.rsi(period=14).
+        period = 14
+        gains = [0.0] * (count - 1)
+        losses = [0.0] * (count - 1)
+
+        for i in range(1, count):
+            change = closes[i] - closes[i - 1]
+            gains[i - 1] = max(change, 0.0)
+            losses[i - 1] = max(-change, 0.0)
+
+        if count >= period + 1:
+            avg_gain = sum(gains[:period]) / period
+            avg_loss = sum(losses[:period]) / period
+
+            def rsi_value() -> float:
+                if avg_loss == 0:
+                    return 100.0
+                rs = avg_gain / avg_loss
+                return 100.0 - (100.0 / (1.0 + rs))
+
+            rsi_values[period] = rsi_value()
+
+            for i in range(period + 1, count):
+                avg_gain = (
+                    (avg_gain * (period - 1)) + gains[i - 1]
+                ) / period
+                avg_loss = (
+                    (avg_loss * (period - 1)) + losses[i - 1]
+                ) / period
+                rsi_values[i] = rsi_value()
+
+        # Same _relative_volume(candles, lookback=20).
+        lookback = 20
+        if count >= lookback + 1:
+            rolling = sum(volumes[:lookback])
+            for i in range(lookback, count):
+                average = rolling / lookback
+                rvol_values[i] = (
+                    volumes[i] / average if average > 0 else 0.0
+                )
+                rolling += volumes[i]
+                rolling -= volumes[i - lookback]
+
+        # Same indicators.atr(candles, period=14).
+        atr_period = 14
+        true_ranges = [0.0] * count
+
+        for i in range(1, count):
+            previous_close = closes[i - 1]
+            true_ranges[i] = max(
+                highs[i] - lows[i],
+                abs(highs[i] - previous_close),
+                abs(lows[i] - previous_close),
+            )
+
+        if count >= atr_period + 1:
+            rolling_tr = sum(true_ranges[1 : atr_period + 1])
+            atr_values[atr_period] = rolling_tr / atr_period
+
+            for i in range(atr_period + 1, count):
+                rolling_tr += true_ranges[i]
+                rolling_tr -= true_ranges[i - atr_period]
+                atr_values[i] = rolling_tr / atr_period
+
+        return rsi_values, rvol_values, atr_values
+
+    @staticmethod
+    def _fast_trigger_ready(
+        candles: list,
+        index: int,
+        side: str,
+        setup_level: float,
+        rsi_values: list[float],
+        rvol_values: list[float],
+    ) -> bool:
+        """
+        Exact boolean equivalent of _five_minute_trigger().ready for the
+        production engine, without allocating c5[:index+1].
+        """
+        if index < 29:
+            return False
+
+        cur = candles[index]
+        prev = candles[index - 1]
+
+        open_price = float(cur["open"])
+        high = float(cur["high"])
+        low = float(cur["low"])
+        close = float(cur["close"])
+
+        previous_high = float(prev["high"])
+        previous_low = float(prev["low"])
+
+        rng = max(high - low, 1e-12)
+        body = abs(close - open_price) / rng
+
+        rsi_value = rsi_values[index]
+        rvol_value = rvol_values[index]
+
+        long_level = close > setup_level
+        short_level = close < setup_level
+
+        breakout_long = (
+            close > open_price
+            and close > previous_high
+            and long_level
+        )
+        breakout_short = (
+            close < open_price
+            and close < previous_low
+            and short_level
+        )
+
+        reclaim_long = (
+            close > open_price
+            and long_level
+            and low <= setup_level
+        )
+        reclaim_short = (
+            close < open_price
+            and short_level
+            and high >= setup_level
+        )
+
+        momentum_long = (
+            rsi_value >= 51.0
+            and rvol_value >= MIN_TRIGGER_RVOL
+            and body >= MIN_TRIGGER_BODY
+        )
+        momentum_short = (
+            rsi_value <= 49.0
+            and rvol_value >= MIN_TRIGGER_RVOL
+            and body >= MIN_TRIGGER_BODY
+        )
+
+        if side == "LONG":
+            return (breakout_long or reclaim_long) and momentum_long
+
+        if side == "SHORT":
+            return (breakout_short or reclaim_short) and momentum_short
+
+        return False
+
+    # -----------------------------------------------------------------------
+    # Symbol backtest
+    # -----------------------------------------------------------------------
+
+    def _backtest_symbol(
+        self,
+        history: SymbolHistory,
+        period_start: int,
+        period_end: int,
+        btc_history: SymbolHistory,
+        btc_engine: tuple[list, list, list] | None = None,
+    ) -> list[SimulatedTrade]:
+        raw_c4 = history.candles_4h
+        raw_c1 = history.candles_1h
+        raw_c15 = history.candles_15m
+        raw_c5 = history.candles_5m
+        raw_c1d = history.candles_1d
+
+        c4 = _convert_for_engine(raw_c4, history.symbol, "4H")
+        c1 = _convert_for_engine(raw_c1, history.symbol, "1H")
+        c15 = _convert_for_engine(raw_c15, history.symbol, "15M")
+        c5 = _convert_for_engine(raw_c5, history.symbol, "5M")
+        c1d = _convert_for_engine(raw_c1d, history.symbol, "1D")
+
+        if btc_engine is None:
+            btc_c4_engine = _convert_for_engine(
+                btc_history.candles_4h, "BTC_USDT", "4H"
+            )
+            btc_c1_engine = _convert_for_engine(
+                btc_history.candles_1h, "BTC_USDT", "1H"
+            )
+            btc_c15_engine = _convert_for_engine(
+                btc_history.candles_15m, "BTC_USDT", "15M"
+            )
+        else:
+            btc_c4_engine, btc_c1_engine, btc_c15_engine = btc_engine
+
+        if len(c4) < 205:
+            raise ValueError(
+                f"{history.symbol}: insufficient 4H candles ({len(c4)} < 205)"
+            )
+        if len(c1) < 205:
+            raise ValueError(
+                f"{history.symbol}: insufficient 1H candles ({len(c1)} < 205)"
+            )
+        if len(c15) < 80:
+            raise ValueError(
+                f"{history.symbol}: insufficient 15M candles ({len(c15)} < 80)"
+            )
+        if len(c5) < 30:
+            raise ValueError(
+                f"{history.symbol}: insufficient 5M candles ({len(c5)} < 30)"
+            )
+
+        c4_times = [_row_time(row) for row in c4]
+        c1_times = [_row_time(row) for row in c1]
+        c15_times = [_row_time(row) for row in c15]
+        c5_times = [_row_time(row) for row in c5]
+        c1d_times = [_row_time(row) for row in c1d]
+
+        btc4_times = [_row_time(row) for row in btc_c4_engine]
+        btc1_times = [_row_time(row) for row in btc_c1_engine]
+        btc15_times = [_row_time(row) for row in btc_c15_engine]
+
+        raw_c5_times = [int(float(row[0])) for row in raw_c5]
+
+        # Precompute 5M indicators once. This is the primary performance fix.
+        rsi_values, rvol_values, _atr_values = self._precompute_5m_metrics(c5)
+
+        candidate_times: set[int] = set()
+
+        for side in ("LONG", "SHORT"):
+            try:
+                bos_events = _bos_events(
+                    c15,
+                    side,
+                    lookback=len(c15),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "BACKTEST BOS failed | %s | side=%s",
+                    history.symbol,
+                    side,
+                )
+                continue
+
+            for bos in bos_events:
+                try:
+                    retest = _pullback_retest(
+                        c15,
+                        side,
+                        bos,
+                        MAX_SETUP_AGE_15M,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST RETEST failed | %s | side=%s",
+                        history.symbol,
+                        side,
+                    )
+                    continue
+
+                if not retest.get("valid"):
+                    continue
+
+                try:
+                    retest_time = int(retest["time"])
+                    bos_time = int(bos["time"])
+                    setup_level = float(bos["level"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+                if retest_time + M15_MS < period_start:
+                    continue
+                if retest_time > period_end:
+                    continue
+                if bos_time > retest_time:
+                    continue
+
+                trigger_start = max(
+                    period_start,
+                    retest_time + M15_MS,
+                )
+                trigger_end = min(
+                    period_end - M5_MS,
+                    retest_time + 30 * 60 * 1000,
+                )
+
+                if trigger_start > trigger_end:
+                    continue
+
+                first_index = bisect_right(c5_times, trigger_start - 1)
+                last_index = bisect_right(c5_times, trigger_end)
+
+                for index in range(first_index, last_index):
+                    trigger_open = c5_times[index]
+                    trigger_close = trigger_open + M5_MS
+
+                    if trigger_close > period_end:
+                        continue
+                    if index < 29:
+                        continue
+
+                    # Compatibility path for monkeypatched/custom trigger
+                    # functions. Production uses the optimized exact boolean
+                    # equivalent above.
+                    if _five_minute_trigger is not _ENGINE_FIVE_MINUTE_TRIGGER:
+                        try:
+                            trigger = _five_minute_trigger(
+                                c5[: index + 1],
+                                side,
+                                setup_level,
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "BACKTEST TRIGGER failed | %s | side=%s | index=%d",
+                                history.symbol,
+                                side,
+                                index,
+                            )
+                            continue
+
+                        if trigger.get("ready"):
+                            candidate_times.add(trigger_close)
+                    else:
+                        if self._fast_trigger_ready(
+                            c5,
+                            index,
+                            side,
+                            setup_level,
+                            rsi_values,
+                            rvol_values,
+                        ):
+                            candidate_times.add(trigger_close)
+
+        if not candidate_times:
+            return []
+
+        # ---------------------------------------------------------------
+        # Full deterministic engine + paper simulation
+        # ---------------------------------------------------------------
+
+        trades: list[SimulatedTrade] = []
+
+        for signal_close_time in sorted(candidate_times):
+            if signal_close_time < period_start or signal_close_time > period_end:
+                continue
+
+            if trades:
+                previous_trade = trades[-1]
+                if previous_trade.exit_time_ms is None:
+                    continue
+                if signal_close_time <= previous_trade.exit_time_ms:
+                    continue
+
+            c4_slice = _closed_slice(c4, M4H_MS, signal_close_time)
+            c1_slice = _closed_slice(c1, M1H_MS, signal_close_time)
+            c15_slice = _closed_slice(c15, M15_MS, signal_close_time)
+            c5_slice = _closed_slice(c5, M5_MS, signal_close_time)
+            c1d_slice = _closed_slice(c1d, M1D_MS, signal_close_time)
+
+            try:
+                analysis = analyze_candles(
+                    history.symbol,
+                    c4_slice,
+                    c1_slice,
+                    c15_slice,
+                    c5_slice,
+                    c1d_slice,
+                    now_ms=signal_close_time,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "BACKTEST ENGINE failed | %s | signal=%d",
+                    history.symbol,
+                    signal_close_time,
+                )
+                continue
+
+            if not analysis.get("technical_candidate"):
+                continue
+
+            side = str(analysis.get("setup") or "").upper()
+            if side not in {"LONG", "SHORT"}:
+                continue
+
+            if history.symbol.upper() == "BTC_USDT":
+                btc_ok = True
+            else:
+                btc_c4_end = bisect_right(
+                    btc4_times,
+                    signal_close_time - M4H_MS,
+                )
+                btc_c1_end = bisect_right(
+                    btc1_times,
+                    signal_close_time - M1H_MS,
+                )
+                btc_c15_end = bisect_right(
+                    btc15_times,
+                    signal_close_time - M15_MS,
+                )
+
+                try:
+                    btc_context = build_btc_context(
+                        btc_c4_engine[:btc_c4_end],
+                        btc_c1_engine[:btc_c1_end],
+                        btc_c15_engine[:btc_c15_end],
+                    )
+                    btc_ok, _ = btc_filter_ok(
+                        side,
+                        btc_context,
+                        is_btc=False,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST BTC filter failed | %s | signal=%d",
+                        history.symbol,
+                        signal_close_time,
+                    )
+                    btc_ok = False
+
+            if not btc_ok:
+                continue
+
+            future_start = bisect_right(
+                raw_c5_times,
+                signal_close_time - 1,
+            )
+            future_end = bisect_right(
+                raw_c5_times,
+                period_end - 1,
+            )
+
+            if future_start >= future_end:
+                continue
+
+            future_candles = raw_c5[future_start:future_end]
+            if not future_candles:
+                continue
+
+            try:
+                trade = simulate_trade(
+                    analysis,
+                    future_candles,
+                    signal_close_time_ms=signal_close_time,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "BACKTEST SIMULATION failed | %s | signal=%d",
+                    history.symbol,
+                    signal_close_time,
+                )
+                continue
+
+            if trade is not None:
+                trades.append(trade)
+
+        return trades

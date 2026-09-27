@@ -549,25 +549,6 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
     tp1=tp1_level["price"]
     tp2_level=next((x for x in ordered if ((x["price"]>tp1+clearance) if side=="LONG" else (x["price"]<tp1-clearance)) and (((x["price"]-entry) if side=="LONG" else (entry-x["price"]))>=min2)),None)
     if not tp2_level:
-        # Safe TP2 fallback: when the nearest confirmed structural level is
-        # already >= 2R, there is no nearer structural obstacle. In that
-        # specific case use 1.20R as the partial-profit TP1 and keep the
-        # confirmed structural level as TP2. TP2 remains fully structural;
-        # we never fabricate a structural level.
-        first_distance = ((ordered[0]["price"] - entry) if side == "LONG" else (entry - ordered[0]["price"]))
-        if first_distance >= min2:
-            tp1_fallback = entry + min1 if side == "LONG" else entry - min1
-            base.update({
-                "ok":True,
-                "tp1":tp1_fallback,
-                "tp2":ordered[0]["price"],
-                "reason":"single structural target beyond 2.00R; TP1 at 1.20R and TP2 at confirmed structural target",
-                "structural":True,
-                "tp1_level":None,
-                "tp2_level":ordered[0],
-                "target_levels":ordered[:8],
-            })
-            return base
         base.update({"tp1":tp1,"reason":"no second structural target reaches 2.00R","structural":True,"tp1_level":tp1_level,"target_levels":ordered[:8]})
         return base
     base.update({"ok":True,"tp1":tp1,"tp2":tp2_level["price"],"reason":"two distinct structural targets","structural":True,
@@ -714,8 +695,10 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
 
 
 def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m: List,
-                    candles_5m: Optional[List]=None, candles_1d: Optional[List]=None) -> Dict[str,Any]:
-    now=int(time.time()*1000)
+                    candles_5m: Optional[List]=None, candles_1d: Optional[List]=None,
+                    now_ms: Optional[int]=None) -> Dict[str,Any]:
+    # Live behavior is unchanged when ``now_ms`` is omitted.
+    now=int(now_ms if now_ms is not None else time.time()*1000)
     c4=closed_candle_rows(candles_4h,"4h",now); c1=closed_candle_rows(candles_1h,"1h",now)
     c15=closed_candle_rows(candles_15m,"15m",now); c5=closed_candle_rows(candles_5m or [],"5m",now)
     c1d=closed_candle_rows(candles_1d or [],"1d",now)

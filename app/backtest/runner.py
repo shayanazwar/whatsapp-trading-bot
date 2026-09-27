@@ -64,42 +64,24 @@ INTERVALS = {
 # ---------------------------------------------------------------------------
 
 # Hard timeout around ONE historical MEXC range request.
-#
-# This covers:
-#   - MEXC HTTP request
-#   - MEXC client's public request limiter
-#   - retry waits
-#
-# If the request cannot complete within this period, the current symbol
-# fails cleanly and the rolling worker continues with the next symbol.
 REQUEST_TIMEOUT_SECONDS = 30
 
-
-# Maximum number of symbols being processed concurrently.
-#
-# Each symbol fetches five timeframes concurrently:
-#   4H / 1H / 15M / 5M / 1D
-#
-# Therefore max 2 symbols means approximately 10 historical requests can
-# be active/queued by the backtest at one time.
+# Maximum number of symbols processed concurrently.
 MAX_SYMBOL_CONCURRENCY = 2
 
-
 # Hard maximum for ALL historical data fetching for one symbol.
-#
-# This is deliberately larger than REQUEST_TIMEOUT_SECONDS because one
-# symbol can require multiple paginated 5M requests.
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
-
 
 # Maximum time allowed for the backtest universe refresh.
 UNIVERSE_REFRESH_TIMEOUT_SECONDS = 60
 
+# Maximum time allowed for CPU-side historical analysis of one symbol.
+# asyncio.wait_for() stops awaiting a stuck worker, but cannot forcibly kill
+# the underlying thread. This timeout is therefore a safety boundary rather
+# than a thread-kill mechanism.
+ANALYSIS_TIMEOUT_SECONDS = 180
 
 # Independent heartbeat interval.
-#
-# This does NOT change the backtest logic.
-# It only makes long waits visible in Render logs.
 HEARTBEAT_INTERVAL_SECONDS = 30
 
 
@@ -123,6 +105,7 @@ class SymbolHistory:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _align_5m_timestamp(timestamp_ms: int) -> int:
     """Align timestamp to the opening timestamp of a 5-minute candle."""
@@ -179,10 +162,7 @@ def _normalize_rows(
 
         result[timestamp] = list(row)
 
-    return [
-        result[timestamp]
-        for timestamp in sorted(result)
-    ]
+    return [result[timestamp] for timestamp in sorted(result)]
 
 
 def _row_time(row: object) -> int:
@@ -212,20 +192,20 @@ def _closed_slice(
 
     Candle is closed only when:
         open_time + timeframe <= now_ms
+
+    Uses bisect with a key instead of rebuilding a full timestamp list on
+    every historical signal. This preserves the exact boundary behavior while
+    avoiding unnecessary O(n) allocations for each candidate signal.
     """
     if not rows:
         return []
 
     cutoff = int(now_ms) - int(timeframe_ms)
 
-    times = [
-        _row_time(row)
-        for row in rows
-    ]
-
     end_index = bisect_right(
-        times,
+        rows,
         cutoff,
+        key=_row_time,
     )
 
     return rows[:end_index]
@@ -239,15 +219,6 @@ def _convert_for_engine(
     """
     Convert raw MEXC list candles into the exact Candle/dict format
     expected by the deterministic analysis engine.
-
-    Raw MEXC:
-        [time, open, high, low, close, volume]
-
-    Engine:
-        Candle(time=..., open=..., high=..., low=..., close=..., volume=...)
-
-    This adapter is mandatory because engine internals access candles by
-    string keys such as candle["high"].
     """
     converted = convert_candles(rows)
 
@@ -263,6 +234,7 @@ def _convert_for_engine(
 # ---------------------------------------------------------------------------
 # Historical pagination
 # ---------------------------------------------------------------------------
+
 
 async def _fetch_range(
     client: MexcClient,
@@ -304,37 +276,20 @@ async def _fetch_range(
     if end_ms < start_ms:
         return []
 
-    cursor = (
-        start_ms // interval_ms
-    ) * interval_ms
+    cursor = (start_ms // interval_ms) * interval_ms
+    final = (end_ms // interval_ms) * interval_ms
 
-    final = (
-        end_ms // interval_ms
-    ) * interval_ms
+    result: dict[int, list[float | int]] = {}
 
-    result: dict[
-        int,
-        list[float | int],
-    ] = {}
-
-    page_span = (
-        interval_ms
-        * (MAX_KLINE_POINTS - 1)
-    )
-
+    page_span = interval_ms * (MAX_KLINE_POINTS - 1)
     request_count = 0
 
     while cursor <= final:
-        page_end = min(
-            final,
-            cursor + page_span,
-        )
-
+        page_end = min(final, cursor + page_span)
         request_count += 1
 
         LOGGER.debug(
-            "BACKTEST REQUEST | %s | %s | "
-            "start=%d end=%d page=%d",
+            "BACKTEST REQUEST | %s | %s | start=%d end=%d page=%d",
             symbol,
             interval,
             cursor,
@@ -385,60 +340,35 @@ async def _fetch_range(
             if not _valid_candle(row):
                 continue
 
-            timestamp = int(
-                float(row[0])
-            )
+            timestamp = int(float(row[0]))
 
             if cursor <= timestamp <= page_end:
                 result[timestamp] = list(row)
+                valid_timestamps.append(timestamp)
 
-                valid_timestamps.append(
-                    timestamp
-                )
-
-        # Empty response:
-        # safely advance beyond this page.
+        # Empty response: safely advance beyond this page.
         if not rows:
-            cursor = (
-                page_end
-                + interval_ms
-            )
+            cursor = page_end + interval_ms
             continue
 
         # Response existed but contained no valid rows.
         if not valid_timestamps:
-            cursor = (
-                page_end
-                + interval_ms
-            )
+            cursor = page_end + interval_ms
             continue
 
-        last_timestamp = max(
-            valid_timestamps
-        )
-
-        next_cursor = (
-            last_timestamp
-            + interval_ms
-        )
+        last_timestamp = max(valid_timestamps)
+        next_cursor = last_timestamp + interval_ms
 
         # Defensive monotonicity guard.
         if next_cursor <= cursor:
-            next_cursor = (
-                page_end
-                + interval_ms
-            )
+            next_cursor = page_end + interval_ms
 
         cursor = next_cursor
 
-    final_rows = [
-        result[timestamp]
-        for timestamp in sorted(result)
-    ]
+    final_rows = [result[timestamp] for timestamp in sorted(result)]
 
     LOGGER.debug(
-        "BACKTEST DATA | %s | %s | "
-        "requests=%d candles=%d",
+        "BACKTEST DATA | %s | %s | requests=%d candles=%d",
         symbol,
         interval,
         request_count,
@@ -448,9 +378,48 @@ async def _fetch_range(
     return final_rows
 
 
+async def _fetch_timeframe(
+    client: MexcClient,
+    symbol: str,
+    timeframe: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+) -> list[list[float | int]]:
+    """Fetch one timeframe with explicit start/done logs."""
+    started = time.monotonic()
+
+    LOGGER.info(
+        "BACKTEST TF FETCH START | symbol=%s timeframe=%s start=%d end=%d",
+        symbol,
+        timeframe,
+        start_ms,
+        end_ms,
+    )
+
+    rows = await _fetch_range(
+        client,
+        symbol,
+        interval,
+        start_ms,
+        end_ms,
+    )
+
+    LOGGER.info(
+        "BACKTEST TF FETCH DONE | symbol=%s timeframe=%s candles=%d seconds=%.2f",
+        symbol,
+        timeframe,
+        len(rows),
+        time.monotonic() - started,
+    )
+
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
 
 class BacktestRunner:
     """
@@ -499,17 +468,15 @@ class BacktestRunner:
         self,
         *,
         days: int,
-        total: int,
-        state: dict[str, int],
+        state: dict[str, object],
         started: float,
         stop_event: asyncio.Event,
     ) -> None:
         """
-        Independent backtest heartbeat.
+        Independent heartbeat.
 
-        This task never performs trading work.
-        It only reports progress so a long-running/stalled backtest is
-        observable in Render logs.
+        It starts before universe/BTC fetching so a stalled early phase is
+        visible in Render logs. It reports both phase and current symbol.
         """
 
         while not stop_event.is_set():
@@ -521,22 +488,24 @@ class BacktestRunner:
                 break
 
             except asyncio.TimeoutError:
-                elapsed = (
-                    time.monotonic()
-                    - started
-                )
+                elapsed = time.monotonic() - started
+                last_activity = float(state.get("last_activity", started))
+                idle = max(0.0, time.monotonic() - last_activity)
 
                 LOGGER.info(
-                    "BACKTEST HEARTBEAT | "
-                    "days=%d processed=%d/%d "
-                    "tested=%d errors=%d signals=%d "
-                    "elapsed=%.1fs",
+                    "BACKTEST HEARTBEAT | days=%d phase=%s "
+                    "processed=%d/%d tested=%d errors=%d signals=%d "
+                    "worker=%s symbol=%s idle=%.1fs elapsed=%.1fs",
                     days,
-                    state["processed"],
-                    total,
-                    state["tested"],
-                    state["errors"],
-                    state["signals"],
+                    str(state.get("phase", "UNKNOWN")),
+                    int(state.get("processed", 0)),
+                    int(state.get("total", 0)),
+                    int(state.get("tested", 0)),
+                    int(state.get("errors", 0)),
+                    int(state.get("signals", 0)),
+                    str(state.get("worker", "-")),
+                    str(state.get("current_symbol", "-")),
+                    idle,
                     elapsed,
                 )
 
@@ -544,25 +513,15 @@ class BacktestRunner:
     # Main backtest
     # -----------------------------------------------------------------------
 
-    async def run(
-        self,
-        days: int,
-    ) -> BacktestSummary:
+    async def run(self, days: int) -> BacktestSummary:
         days = int(days)
 
-        if days not in {
-            7,
-            30,
-            90,
-        }:
-            raise ValueError(
-                "Supported backtests: 7D, 30D, 90D"
-            )
+        if days not in {7, 30, 90}:
+            raise ValueError("Supported backtests: 7D, 30D, 90D")
 
         if self._lock.locked():
             raise BacktestAlreadyRunning(
-                "A backtest is already running. "
-                "Please wait for it to finish."
+                "A backtest is already running. Please wait for it to finish."
             )
 
         async with self._lock:
@@ -570,24 +529,54 @@ class BacktestRunner:
 
             heartbeat_stop = asyncio.Event()
             heartbeat_task: asyncio.Task | None = None
+            workers: list[asyncio.Task] = []
+
+            state: dict[str, object] = {
+                "phase": "INITIALIZING",
+                "total": 0,
+                "processed": 0,
+                "tested": 0,
+                "errors": 0,
+                "signals": 0,
+                "worker": "-",
+                "current_symbol": "-",
+                "last_activity": started,
+            }
+
+            def touch(
+                *,
+                phase: str | None = None,
+                symbol: str | None = None,
+                worker: int | str | None = None,
+            ) -> None:
+                if phase is not None:
+                    state["phase"] = phase
+                if symbol is not None:
+                    state["current_symbol"] = symbol
+                if worker is not None:
+                    state["worker"] = worker
+                state["last_activity"] = time.monotonic()
+
+            # IMPORTANT: heartbeat begins BEFORE any external/network phase.
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat(
+                    days=days,
+                    state=state,
+                    started=started,
+                    stop_event=heartbeat_stop,
+                ),
+                name="backtest-heartbeat",
+            )
+
+            trades: list[SimulatedTrade] = []
 
             try:
-                now_ms = int(
-                    time.time() * 1000
-                )
-
-                period_end = _align_5m_timestamp(
-                    now_ms
-                )
-
-                period_start = (
-                    period_end
-                    - days * 24 * 60 * 60 * 1000
-                )
+                now_ms = int(time.time() * 1000)
+                period_end = _align_5m_timestamp(now_ms)
+                period_start = period_end - days * 24 * 60 * 60 * 1000
 
                 LOGGER.info(
-                    "BACKTEST INIT | "
-                    "days=%d period_start=%d period_end=%d",
+                    "BACKTEST INIT | days=%d period_start=%d period_end=%d",
                     days,
                     period_start,
                     period_end,
@@ -596,6 +585,8 @@ class BacktestRunner:
                 # -----------------------------------------------------------
                 # Universe
                 # -----------------------------------------------------------
+
+                touch(phase="UNIVERSE", symbol="-", worker="-")
 
                 LOGGER.info(
                     "BACKTEST UNIVERSE FETCH START | days=%d",
@@ -607,40 +598,40 @@ class BacktestRunner:
                         self.universe.refresh(),
                         timeout=UNIVERSE_REFRESH_TIMEOUT_SECONDS,
                     )
-
                 except asyncio.TimeoutError as exc:
                     raise TimeoutError(
                         "MEXC backtest universe refresh timed out "
                         f"after {UNIVERSE_REFRESH_TIMEOUT_SECONDS}s"
                     ) from exc
 
-                symbols = list(
-                    symbols or []
-                )[:300]
+                symbols = list(symbols or [])[:300]
 
                 if not symbols:
                     raise RuntimeError(
-                        "No eligible MEXC Futures symbols "
-                        "are available for backtesting."
+                        "No eligible MEXC Futures symbols are available for backtesting."
                     )
 
                 LOGGER.info(
-                    "BACKTEST START | "
-                    "days=%d symbols=%d start=%d end=%d",
+                    "BACKTEST START | days=%d symbols=%d start=%d end=%d",
                     days,
                     len(symbols),
                     period_start,
                     period_end,
                 )
 
+                # Update heartbeat total after universe is known.
+                state["total"] = len(symbols)
+                state["last_activity"] = time.monotonic()
+                touch(phase="BTC DATA", symbol="BTC_USDT", worker="-")
+
                 LOGGER.info(
-                    "BACKTEST UNIVERSE READY | "
-                    "symbols=%d concurrency=%d "
-                    "request_timeout=%ss symbol_timeout=%ss",
+                    "BACKTEST UNIVERSE READY | symbols=%d concurrency=%d "
+                    "request_timeout=%ss symbol_timeout=%ss analysis_timeout=%ss",
                     len(symbols),
                     self.max_concurrency,
                     REQUEST_TIMEOUT_SECONDS,
                     SYMBOL_FETCH_TIMEOUT_SECONDS,
+                    ANALYSIS_TIMEOUT_SECONDS,
                 )
 
                 # -----------------------------------------------------------
@@ -660,27 +651,17 @@ class BacktestRunner:
                     timeout=SYMBOL_FETCH_TIMEOUT_SECONDS,
                 )
 
+                touch(phase="BTC DATA", symbol="BTC_USDT", worker="-")
+
                 LOGGER.info(
-                    "BACKTEST BTC FETCH DONE | "
-                    "4H=%d 1H=%d 15M=%d 5M=%d 1D=%d",
-                    len(
-                        btc_history.candles_4h
-                    ),
-                    len(
-                        btc_history.candles_1h
-                    ),
-                    len(
-                        btc_history.candles_15m
-                    ),
-                    len(
-                        btc_history.candles_5m
-                    ),
-                    len(
-                        btc_history.candles_1d
-                    ),
+                    "BACKTEST BTC FETCH DONE | 4H=%d 1H=%d 15M=%d 5M=%d 1D=%d",
+                    len(btc_history.candles_4h),
+                    len(btc_history.candles_1h),
+                    len(btc_history.candles_15m),
+                    len(btc_history.candles_5m),
+                    len(btc_history.candles_1d),
                 )
 
-                # BTC filter uses only 4H / 1H / 15M engine candles.
                 btc_engine_cache = (
                     _convert_for_engine(
                         btc_history.candles_4h,
@@ -700,77 +681,34 @@ class BacktestRunner:
                 )
 
                 if (
-                    len(
-                        btc_engine_cache[0]
-                    ) < 205
-                    or len(
-                        btc_engine_cache[1]
-                    ) < 205
-                    or len(
-                        btc_engine_cache[2]
-                    ) < 80
+                    len(btc_engine_cache[0]) < 205
+                    or len(btc_engine_cache[1]) < 205
+                    or len(btc_engine_cache[2]) < 80
                 ):
                     raise ValueError(
-                        "BTC historical context is insufficient "
-                        "for the deterministic engine"
+                        "BTC historical context is insufficient for the deterministic engine"
                     )
-
-                trades: list[
-                    SimulatedTrade
-                ] = []
-
-                state = {
-                    "processed": 0,
-                    "tested": 0,
-                    "errors": 0,
-                    "signals": 0,
-                }
-
-                # -----------------------------------------------------------
-                # Heartbeat starts BEFORE symbol processing.
-                # -----------------------------------------------------------
-
-                heartbeat_task = asyncio.create_task(
-                    self._heartbeat(
-                        days=days,
-                        total=len(symbols),
-                        state=state,
-                        started=started,
-                        stop_event=heartbeat_stop,
-                    ),
-                    name="backtest-heartbeat",
-                )
 
                 # -----------------------------------------------------------
                 # Rolling worker pool
                 # -----------------------------------------------------------
-                #
-                # IMPORTANT:
-                # Only max_concurrency tasks are active at once.
-                #
-                # We do NOT create 300 network-heavy worker tasks.
-                # This keeps the historical request pressure controlled.
-                # -----------------------------------------------------------
+
+                state["phase"] = "SYMBOL DATA"
+                state["current_symbol"] = "-"
+                state["worker"] = "-"
+                state["last_activity"] = time.monotonic()
 
                 symbol_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
                 for symbol in symbols:
-                    await symbol_queue.put(
-                        symbol
-                    )
+                    await symbol_queue.put(symbol)
 
-                for _ in range(
-                    self.max_concurrency
-                ):
-                    await symbol_queue.put(
-                        None
-                    )
+                for _ in range(self.max_concurrency):
+                    await symbol_queue.put(None)
 
                 state_lock = asyncio.Lock()
 
-                async def worker(
-                    worker_id: int,
-                ) -> None:
+                async def worker(worker_id: int) -> None:
                     while True:
                         symbol = await symbol_queue.get()
 
@@ -778,11 +716,16 @@ class BacktestRunner:
                             if symbol is None:
                                 return
 
+                            touch(
+                                phase="SYMBOL DATA",
+                                symbol=symbol,
+                                worker=worker_id,
+                            )
+
                             fetch_started = time.monotonic()
 
                             LOGGER.info(
-                                "BACKTEST FETCH START | "
-                                "worker=%d symbol=%s",
+                                "BACKTEST FETCH START | worker=%d symbol=%s",
                                 worker_id,
                                 symbol,
                             )
@@ -797,73 +740,71 @@ class BacktestRunner:
                                     timeout=SYMBOL_FETCH_TIMEOUT_SECONDS,
                                 )
 
-                                LOGGER.info(
-                                    "BACKTEST FETCH DONE | "
-                                    "worker=%d symbol=%s | "
-                                    "4H=%d 1H=%d 15M=%d "
-                                    "5M=%d 1D=%d | "
-                                    "seconds=%.2f",
-                                    worker_id,
-                                    symbol,
-                                    len(
-                                        history.candles_4h
-                                    ),
-                                    len(
-                                        history.candles_1h
-                                    ),
-                                    len(
-                                        history.candles_15m
-                                    ),
-                                    len(
-                                        history.candles_5m
-                                    ),
-                                    len(
-                                        history.candles_1d
-                                    ),
-                                    time.monotonic()
-                                    - fetch_started,
+                                touch(
+                                    phase="ANALYSIS",
+                                    symbol=symbol,
+                                    worker=worker_id,
                                 )
 
                                 LOGGER.info(
-                                    "BACKTEST ANALYSIS START | "
-                                    "worker=%d symbol=%s",
+                                    "BACKTEST FETCH DONE | worker=%d symbol=%s | "
+                                    "4H=%d 1H=%d 15M=%d 5M=%d 1D=%d | seconds=%.2f",
+                                    worker_id,
+                                    symbol,
+                                    len(history.candles_4h),
+                                    len(history.candles_1h),
+                                    len(history.candles_15m),
+                                    len(history.candles_5m),
+                                    len(history.candles_1d),
+                                    time.monotonic() - fetch_started,
+                                )
+
+                                LOGGER.info(
+                                    "BACKTEST ANALYSIS START | worker=%d symbol=%s",
                                     worker_id,
                                     symbol,
                                 )
 
-                                # CPU-heavy historical analysis runs outside
-                                # the Uvicorn event loop.
-                                symbol_trades = await asyncio.to_thread(
-                                    self._backtest_symbol,
-                                    history,
-                                    period_start,
-                                    period_end,
-                                    btc_history,
-                                    btc_engine_cache,
+                                try:
+                                    symbol_trades = await asyncio.wait_for(
+                                        asyncio.to_thread(
+                                            self._backtest_symbol,
+                                            history,
+                                            period_start,
+                                            period_end,
+                                            btc_history,
+                                            btc_engine_cache,
+                                        ),
+                                        timeout=ANALYSIS_TIMEOUT_SECONDS,
+                                    )
+                                except asyncio.TimeoutError as exc:
+                                    raise TimeoutError(
+                                        f"{symbol}: historical analysis timed out after "
+                                        f"{ANALYSIS_TIMEOUT_SECONDS}s"
+                                    ) from exc
+
+                                touch(
+                                    phase="ANALYSIS",
+                                    symbol=symbol,
+                                    worker=worker_id,
                                 )
 
                                 LOGGER.info(
-                                    "BACKTEST ANALYSIS DONE | "
-                                    "worker=%d symbol=%s | signals=%d",
+                                    "BACKTEST ANALYSIS DONE | worker=%d symbol=%s | signals=%d",
                                     worker_id,
                                     symbol,
                                     len(symbol_trades),
                                 )
 
-                                trades.extend(
-                                    symbol_trades
-                                )
+                                trades.extend(symbol_trades)
 
                                 async with state_lock:
-                                    state["tested"] += 1
-                                    state["signals"] = len(
-                                        trades
-                                    )
+                                    state["tested"] = int(state["tested"]) + 1
+                                    state["signals"] = len(trades)
 
                             except asyncio.CancelledError:
                                 LOGGER.warning(
-                                    "BACKTEST SYMBOL CANCELLED | "
-                                    "worker=%d symbol=%s",
+                                    "BACKTEST SYMBOL CANCELLED | worker=%d symbol=%s",
                                     worker_id,
                                     symbol,
                                 )
@@ -871,18 +812,16 @@ class BacktestRunner:
 
                             except Exception as exc:
                                 async with state_lock:
-                                    state["errors"] += 1
+                                    state["errors"] = int(state["errors"]) + 1
 
                                 LOGGER.exception(
-                                    "BACKTEST symbol failed: "
-                                    "%s | %s",
+                                    "BACKTEST symbol failed: %s | %s",
                                     symbol,
                                     exc,
                                 )
 
                                 LOGGER.error(
-                                    "BACKTEST DATA ERROR | "
-                                    "%s | %s: %s",
+                                    "BACKTEST DATA ERROR | %s | %s: %s",
                                     symbol,
                                     type(exc).__name__,
                                     exc,
@@ -890,28 +829,21 @@ class BacktestRunner:
 
                             finally:
                                 async with state_lock:
-                                    state["processed"] += 1
+                                    state["processed"] = int(state["processed"]) + 1
+                                    processed = int(state["processed"])
+                                    tested = int(state["tested"])
+                                    errors = int(state["errors"])
+                                    signal_count = int(state["signals"])
 
-                                    processed = (
-                                        state["processed"]
-                                    )
-                                    tested = (
-                                        state["tested"]
-                                    )
-                                    errors = (
-                                        state["errors"]
-                                    )
-                                    signal_count = (
-                                        state["signals"]
-                                    )
+                                touch(
+                                    phase="SYMBOL DATA",
+                                    symbol=symbol,
+                                    worker=worker_id,
+                                )
 
                                 LOGGER.info(
-                                    "BACKTEST SYMBOL COMPLETE | "
-                                    "processed=%d/%d | "
-                                    "tested=%d | "
-                                    "errors=%d | "
-                                    "signals=%d | "
-                                    "symbol=%s",
+                                    "BACKTEST SYMBOL COMPLETE | processed=%d/%d | "
+                                    "tested=%d | errors=%d | signals=%d | symbol=%s",
                                     processed,
                                     len(symbols),
                                     tested,
@@ -921,12 +853,8 @@ class BacktestRunner:
                                 )
 
                                 LOGGER.info(
-                                    "BACKTEST PROGRESS | "
-                                    "days=%d "
-                                    "processed=%d/%d "
-                                    "tested=%d "
-                                    "errors=%d "
-                                    "signals=%d",
+                                    "BACKTEST PROGRESS | days=%d processed=%d/%d "
+                                    "tested=%d errors=%d signals=%d",
                                     days,
                                     processed,
                                     len(symbols),
@@ -935,7 +863,6 @@ class BacktestRunner:
                                     signal_count,
                                 )
 
-                                # Explicit event-loop scheduling opportunity.
                                 await asyncio.sleep(0)
 
                         finally:
@@ -944,68 +871,49 @@ class BacktestRunner:
                 workers = [
                     asyncio.create_task(
                         worker(worker_id),
-                        name=(
-                            f"backtest-worker-{worker_id}"
-                        ),
+                        name=f"backtest-worker-{worker_id}",
                     )
-                    for worker_id in range(
-                        self.max_concurrency
-                    )
+                    for worker_id in range(self.max_concurrency)
                 ]
 
                 try:
-                    await asyncio.gather(
-                        *workers
-                    )
+                    await asyncio.gather(*workers)
 
                 except asyncio.CancelledError:
                     for task in workers:
                         if not task.done():
                             task.cancel()
-
-                    await asyncio.gather(
-                        *workers,
-                        return_exceptions=True,
-                    )
-
+                    await asyncio.gather(*workers, return_exceptions=True)
                     raise
 
                 except Exception:
                     for task in workers:
                         if not task.done():
                             task.cancel()
-
-                    await asyncio.gather(
-                        *workers,
-                        return_exceptions=True,
-                    )
-
+                    await asyncio.gather(*workers, return_exceptions=True)
                     raise
 
                 # -----------------------------------------------------------
                 # Final report
                 # -----------------------------------------------------------
 
-                trades.sort(
-                    key=lambda trade:
-                    trade.signal_time_ms
-                )
+                touch(phase="FINALIZING", symbol="-", worker="-")
+
+                trades.sort(key=lambda trade: trade.signal_time_ms)
 
                 summary = summarize(
                     days=days,
                     coins_selected=len(symbols),
-                    coins_tested=state["tested"],
-                    data_errors=state["errors"],
+                    coins_tested=int(state["tested"]),
+                    data_errors=int(state["errors"]),
                     trades=trades,
                 )
 
                 LOGGER.info(
-                    "BACKTEST COMPLETE | "
-                    "days=%d tested=%d errors=%d "
-                    "signals=%d duration=%.2fs",
+                    "BACKTEST COMPLETE | days=%d tested=%d errors=%d signals=%d duration=%.2fs",
                     days,
-                    state["tested"],
-                    state["errors"],
+                    int(state["tested"]),
+                    int(state["errors"]),
                     len(trades),
                     time.monotonic() - started,
                 )
@@ -1014,15 +922,19 @@ class BacktestRunner:
 
             except asyncio.CancelledError:
                 LOGGER.warning(
-                    "BACKTEST CANCELLED | "
-                    "days=%d duration=%.2fs",
+                    "BACKTEST CANCELLED | days=%d duration=%.2fs",
                     days,
                     time.monotonic() - started,
                 )
                 raise
 
             finally:
-                # Stop heartbeat cleanly.
+                if workers:
+                    for task in workers:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+
                 heartbeat_stop.set()
 
                 if heartbeat_task is not None:
@@ -1041,30 +953,64 @@ class BacktestRunner:
         period_start: int,
         period_end: int,
     ) -> SymbolHistory:
-        c4_start = (
-            period_start
-            - MIN_4H_WARMUP_MS
-        )
+        c4_start = period_start - MIN_4H_WARMUP_MS
+        c1_start = period_start - MIN_1H_WARMUP_MS
+        c15_start = period_start - MIN_15M_WARMUP_MS
+        c5_start = period_start - MIN_5M_WARMUP_MS
+        c1d_start = period_start - MIN_1D_WARMUP_MS
 
-        c1_start = (
-            period_start
-            - MIN_1H_WARMUP_MS
-        )
-
-        c15_start = (
-            period_start
-            - MIN_15M_WARMUP_MS
-        )
-
-        c5_start = (
-            period_start
-            - MIN_5M_WARMUP_MS
-        )
-
-        c1d_start = (
-            period_start
-            - MIN_1D_WARMUP_MS
-        )
+        tasks = [
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "4H",
+                    INTERVALS["4h"],
+                    c4_start,
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "1H",
+                    INTERVALS["1h"],
+                    c1_start,
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "15M",
+                    INTERVALS["15m"],
+                    c15_start,
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "5M",
+                    INTERVALS["5m"],
+                    c5_start,
+                    period_end,
+                )
+            ),
+            asyncio.create_task(
+                _fetch_timeframe(
+                    self.client,
+                    symbol,
+                    "1D",
+                    INTERVALS["1d"],
+                    c1d_start,
+                    period_end,
+                )
+            ),
+        ]
 
         try:
             (
@@ -1073,48 +1019,20 @@ class BacktestRunner:
                 c15m,
                 c5m,
                 c1d,
-            ) = await asyncio.gather(
-                _fetch_range(
-                    self.client,
-                    symbol,
-                    INTERVALS["4h"],
-                    c4_start,
-                    period_end,
-                ),
-                _fetch_range(
-                    self.client,
-                    symbol,
-                    INTERVALS["1h"],
-                    c1_start,
-                    period_end,
-                ),
-                _fetch_range(
-                    self.client,
-                    symbol,
-                    INTERVALS["15m"],
-                    c15_start,
-                    period_end,
-                ),
-                _fetch_range(
-                    self.client,
-                    symbol,
-                    INTERVALS["5m"],
-                    c5_start,
-                    period_end,
-                ),
-                _fetch_range(
-                    self.client,
-                    symbol,
-                    INTERVALS["1d"],
-                    c1d_start,
-                    period_end,
-                ),
-            )
+            ) = await asyncio.gather(*tasks)
 
         except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
         except Exception as exc:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise RuntimeError(
                 f"{symbol}: historical data fetch failed: "
                 f"{type(exc).__name__}: {exc}"
@@ -1150,17 +1068,11 @@ class BacktestRunner:
         period_start: int,
         period_end: int,
         btc_history: SymbolHistory,
-        btc_engine: tuple[
-            list,
-            list,
-            list,
-        ] | None = None,
+        btc_engine: tuple[list, list, list] | None = None,
     ) -> list[SimulatedTrade]:
 
         # -------------------------------------------------------------------
         # RAW MEXC CANDLES
-        #
-        # Keep raw rows because simulator supports raw MEXC OHLCV.
         # -------------------------------------------------------------------
 
         raw_c4 = history.candles_4h
@@ -1173,35 +1085,11 @@ class BacktestRunner:
         # ENGINE CANDLES
         # -------------------------------------------------------------------
 
-        c4 = _convert_for_engine(
-            raw_c4,
-            history.symbol,
-            "4H",
-        )
-
-        c1 = _convert_for_engine(
-            raw_c1,
-            history.symbol,
-            "1H",
-        )
-
-        c15 = _convert_for_engine(
-            raw_c15,
-            history.symbol,
-            "15M",
-        )
-
-        c5 = _convert_for_engine(
-            raw_c5,
-            history.symbol,
-            "5M",
-        )
-
-        c1d = _convert_for_engine(
-            raw_c1d,
-            history.symbol,
-            "1D",
-        )
+        c4 = _convert_for_engine(raw_c4, history.symbol, "4H")
+        c1 = _convert_for_engine(raw_c1, history.symbol, "1H")
+        c15 = _convert_for_engine(raw_c15, history.symbol, "15M")
+        c5 = _convert_for_engine(raw_c5, history.symbol, "5M")
+        c1d = _convert_for_engine(raw_c1d, history.symbol, "1D")
 
         # -------------------------------------------------------------------
         # BTC ENGINE CANDLES
@@ -1213,19 +1101,16 @@ class BacktestRunner:
                 "BTC_USDT",
                 "4H",
             )
-
             btc_c1_engine = _convert_for_engine(
                 btc_history.candles_1h,
                 "BTC_USDT",
                 "1H",
             )
-
             btc_c15_engine = _convert_for_engine(
                 btc_history.candles_15m,
                 "BTC_USDT",
                 "15M",
             )
-
         else:
             (
                 btc_c4_engine,
@@ -1239,76 +1124,39 @@ class BacktestRunner:
 
         if len(c4) < 205:
             raise ValueError(
-                f"{history.symbol}: insufficient 4H candles "
-                f"({len(c4)} < 205)"
+                f"{history.symbol}: insufficient 4H candles ({len(c4)} < 205)"
             )
 
         if len(c1) < 205:
             raise ValueError(
-                f"{history.symbol}: insufficient 1H candles "
-                f"({len(c1)} < 205)"
+                f"{history.symbol}: insufficient 1H candles ({len(c1)} < 205)"
             )
 
         if len(c15) < 80:
             raise ValueError(
-                f"{history.symbol}: insufficient 15M candles "
-                f"({len(c15)} < 80)"
+                f"{history.symbol}: insufficient 15M candles ({len(c15)} < 80)"
             )
 
         if len(c5) < 30:
             raise ValueError(
-                f"{history.symbol}: insufficient 5M candles "
-                f"({len(c5)} < 30)"
+                f"{history.symbol}: insufficient 5M candles ({len(c5)} < 30)"
             )
 
         # ---------------------------------------------------------------
         # Timestamp indexes
         # ---------------------------------------------------------------
 
-        c4_times = [
-            _row_time(row)
-            for row in c4
-        ]
+        c4_times = [_row_time(row) for row in c4]
+        c1_times = [_row_time(row) for row in c1]
+        c15_times = [_row_time(row) for row in c15]
+        c5_times = [_row_time(row) for row in c5]
+        c1d_times = [_row_time(row) for row in c1d]
 
-        c1_times = [
-            _row_time(row)
-            for row in c1
-        ]
+        btc4_times = [_row_time(row) for row in btc_c4_engine]
+        btc1_times = [_row_time(row) for row in btc_c1_engine]
+        btc15_times = [_row_time(row) for row in btc_c15_engine]
 
-        c15_times = [
-            _row_time(row)
-            for row in c15
-        ]
-
-        c5_times = [
-            _row_time(row)
-            for row in c5
-        ]
-
-        c1d_times = [
-            _row_time(row)
-            for row in c1d
-        ]
-
-        btc4_times = [
-            _row_time(row)
-            for row in btc_c4_engine
-        ]
-
-        btc1_times = [
-            _row_time(row)
-            for row in btc_c1_engine
-        ]
-
-        btc15_times = [
-            _row_time(row)
-            for row in btc_c15_engine
-        ]
-
-        raw_c5_times = [
-            int(float(row[0]))
-            for row in raw_c5
-        ]
+        raw_c5_times = [int(float(row[0])) for row in raw_c5]
 
         # ---------------------------------------------------------------
         # Candidate generation
@@ -1316,28 +1164,22 @@ class BacktestRunner:
 
         candidate_times: set[int] = set()
 
-        for side in (
-            "LONG",
-            "SHORT",
-        ):
+        for side in ("LONG", "SHORT"):
             try:
                 bos_events = _bos_events(
                     c15,
                     side,
                     lookback=len(c15),
                 )
-
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST BOS failed | "
-                    "%s | side=%s",
+                    "BACKTEST BOS failed | %s | side=%s",
                     history.symbol,
                     side,
                 )
                 continue
 
             for bos in bos_events:
-
                 try:
                     retest = _pullback_retest(
                         c15,
@@ -1345,46 +1187,25 @@ class BacktestRunner:
                         bos,
                         MAX_SETUP_AGE_15M,
                     )
-
                 except Exception:
                     LOGGER.exception(
-                        "BACKTEST RETEST failed | "
-                        "%s | side=%s",
+                        "BACKTEST RETEST failed | %s | side=%s",
                         history.symbol,
                         side,
                     )
                     continue
 
-                if not retest.get(
-                    "valid"
-                ):
+                if not retest.get("valid"):
                     continue
 
                 try:
-                    retest_time = int(
-                        retest["time"]
-                    )
-
-                    bos_time = int(
-                        bos["time"]
-                    )
-
-                    setup_level = float(
-                        bos["level"]
-                    )
-
-                except (
-                    TypeError,
-                    ValueError,
-                    KeyError,
-                ):
+                    retest_time = int(retest["time"])
+                    bos_time = int(bos["time"])
+                    setup_level = float(bos["level"])
+                except (TypeError, ValueError, KeyError):
                     continue
 
-                if (
-                    retest_time
-                    + M15_MS
-                    < period_start
-                ):
+                if retest_time + M15_MS < period_start:
                     continue
 
                 if retest_time > period_end:
@@ -1404,14 +1225,10 @@ class BacktestRunner:
 
                 trigger_end = min(
                     period_end - M5_MS,
-                    retest_time
-                    + 30 * 60 * 1000,
+                    retest_time + 30 * 60 * 1000,
                 )
 
-                if (
-                    trigger_start
-                    > trigger_end
-                ):
+                if trigger_start > trigger_end:
                     continue
 
                 first_index = bisect_right(
@@ -1424,50 +1241,30 @@ class BacktestRunner:
                     trigger_end,
                 )
 
-                for index in range(
-                    first_index,
-                    last_index,
-                ):
-                    trigger_open = _row_time(
-                        c5[index]
-                    )
+                for index in range(first_index, last_index):
+                    trigger_open = _row_time(c5[index])
+                    trigger_close = trigger_open + M5_MS
 
-                    trigger_close = (
-                        trigger_open
-                        + M5_MS
-                    )
-
-                    if (
-                        trigger_close
-                        > period_end
-                    ):
+                    if trigger_close > period_end:
                         continue
 
                     try:
-                        trigger = (
-                            _five_minute_trigger(
-                                c5[: index + 1],
-                                side,
-                                setup_level,
-                            )
+                        trigger = _five_minute_trigger(
+                            c5[: index + 1],
+                            side,
+                            setup_level,
                         )
-
                     except Exception:
                         LOGGER.exception(
-                            "BACKTEST TRIGGER failed | "
-                            "%s | side=%s | index=%d",
+                            "BACKTEST TRIGGER failed | %s | side=%s | index=%d",
                             history.symbol,
                             side,
                             index,
                         )
                         continue
 
-                    if trigger.get(
-                        "ready"
-                    ):
-                        candidate_times.add(
-                            trigger_close
-                        )
+                    if trigger.get("ready"):
+                        candidate_times.add(trigger_close)
 
         if not candidate_times:
             return []
@@ -1476,20 +1273,10 @@ class BacktestRunner:
         # Historical simulation
         # ---------------------------------------------------------------
 
-        trades: list[
-            SimulatedTrade
-        ] = []
+        trades: list[SimulatedTrade] = []
 
-        for signal_close_time in sorted(
-            candidate_times
-        ):
-
-            if (
-                signal_close_time
-                < period_start
-                or signal_close_time
-                > period_end
-            ):
+        for signal_close_time in sorted(candidate_times):
+            if signal_close_time < period_start or signal_close_time > period_end:
                 continue
 
             # -----------------------------------------------------------
@@ -1497,56 +1284,23 @@ class BacktestRunner:
             # -----------------------------------------------------------
 
             if trades:
+                previous_trade = trades[-1]
 
-                previous_trade = (
-                    trades[-1]
-                )
-
-                if (
-                    previous_trade.exit_time_ms
-                    is None
-                ):
+                if previous_trade.exit_time_ms is None:
                     continue
 
-                if (
-                    signal_close_time
-                    <= previous_trade.exit_time_ms
-                ):
+                if signal_close_time <= previous_trade.exit_time_ms:
                     continue
 
             # -----------------------------------------------------------
             # Point-in-time historical slices
             # -----------------------------------------------------------
 
-            c4_slice = _closed_slice(
-                c4,
-                M4H_MS,
-                signal_close_time,
-            )
-
-            c1_slice = _closed_slice(
-                c1,
-                M1H_MS,
-                signal_close_time,
-            )
-
-            c15_slice = _closed_slice(
-                c15,
-                M15_MS,
-                signal_close_time,
-            )
-
-            c5_slice = _closed_slice(
-                c5,
-                M5_MS,
-                signal_close_time,
-            )
-
-            c1d_slice = _closed_slice(
-                c1d,
-                M1D_MS,
-                signal_close_time,
-            )
+            c4_slice = _closed_slice(c4, M4H_MS, signal_close_time)
+            c1_slice = _closed_slice(c1, M1H_MS, signal_close_time)
+            c15_slice = _closed_slice(c15, M15_MS, signal_close_time)
+            c5_slice = _closed_slice(c5, M5_MS, signal_close_time)
+            c1d_slice = _closed_slice(c1d, M1D_MS, signal_close_time)
 
             # -----------------------------------------------------------
             # Same deterministic engine used by live technical analysis
@@ -1562,106 +1316,66 @@ class BacktestRunner:
                     c1d_slice,
                     now_ms=signal_close_time,
                 )
-
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST ENGINE failed | "
-                    "%s | signal=%d",
+                    "BACKTEST ENGINE failed | %s | signal=%d",
                     history.symbol,
                     signal_close_time,
                 )
                 continue
 
-            if not analysis.get(
-                "technical_candidate"
-            ):
+            if not analysis.get("technical_candidate"):
                 continue
 
-            side = str(
-                analysis.get(
-                    "setup"
-                )
-                or ""
-            ).upper()
+            side = str(analysis.get("setup") or "").upper()
 
-            if side not in {
-                "LONG",
-                "SHORT",
-            }:
+            if side not in {"LONG", "SHORT"}:
                 continue
 
             # -----------------------------------------------------------
             # Historical BTC filter
             # -----------------------------------------------------------
 
-            if (
-                history.symbol.upper()
-                == "BTC_USDT"
-            ):
+            if history.symbol.upper() == "BTC_USDT":
                 btc_ok = True
-
             else:
                 btc_c4_end = bisect_right(
                     btc4_times,
-                    signal_close_time
-                    - M4H_MS,
+                    signal_close_time - M4H_MS,
                 )
 
                 btc_c1_end = bisect_right(
                     btc1_times,
-                    signal_close_time
-                    - M1H_MS,
+                    signal_close_time - M1H_MS,
                 )
 
                 btc_c15_end = bisect_right(
                     btc15_times,
-                    signal_close_time
-                    - M15_MS,
+                    signal_close_time - M15_MS,
                 )
 
-                btc_c4_slice = (
-                    btc_c4_engine[
-                        :btc_c4_end
-                    ]
-                )
-
-                btc_c1_slice = (
-                    btc_c1_engine[
-                        :btc_c1_end
-                    ]
-                )
-
-                btc_c15_slice = (
-                    btc_c15_engine[
-                        :btc_c15_end
-                    ]
-                )
+                btc_c4_slice = btc_c4_engine[:btc_c4_end]
+                btc_c1_slice = btc_c1_engine[:btc_c1_end]
+                btc_c15_slice = btc_c15_engine[:btc_c15_end]
 
                 try:
-                    btc_context = (
-                        build_btc_context(
-                            btc_c4_slice,
-                            btc_c1_slice,
-                            btc_c15_slice,
-                        )
+                    btc_context = build_btc_context(
+                        btc_c4_slice,
+                        btc_c1_slice,
+                        btc_c15_slice,
                     )
 
-                    btc_ok, _ = (
-                        btc_filter_ok(
-                            side,
-                            btc_context,
-                            is_btc=False,
-                        )
+                    btc_ok, _ = btc_filter_ok(
+                        side,
+                        btc_context,
+                        is_btc=False,
                     )
-
                 except Exception:
                     LOGGER.exception(
-                        "BACKTEST BTC filter failed | "
-                        "%s | signal=%d",
+                        "BACKTEST BTC filter failed | %s | signal=%d",
                         history.symbol,
                         signal_close_time,
                     )
-
                     btc_ok = False
 
             if not btc_ok:
@@ -1681,16 +1395,10 @@ class BacktestRunner:
                 period_end - 1,
             )
 
-            if (
-                future_start
-                >= future_end
-            ):
+            if future_start >= future_end:
                 continue
 
-            future_candles = raw_c5[
-                future_start:
-                future_end
-            ]
+            future_candles = raw_c5[future_start:future_end]
 
             if not future_candles:
                 continue
@@ -1703,15 +1411,11 @@ class BacktestRunner:
                 trade = simulate_trade(
                     analysis,
                     future_candles,
-                    signal_close_time_ms=(
-                        signal_close_time
-                    ),
+                    signal_close_time_ms=signal_close_time,
                 )
-
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST SIMULATION failed | "
-                    "%s | signal=%d",
+                    "BACKTEST SIMULATION failed | %s | signal=%d",
                     history.symbol,
                     signal_close_time,
                 )
@@ -1720,8 +1424,6 @@ class BacktestRunner:
             if trade is None:
                 continue
 
-            trades.append(
-                trade
-            )
+            trades.append(trade)
 
         return trades

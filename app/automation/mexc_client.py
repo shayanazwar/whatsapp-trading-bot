@@ -766,6 +766,109 @@ class MexcClient:
             ):
         ]
 
+    async def get_klines_range(
+        self,
+        symbol: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        limit: int = 2000,
+    ) -> list[list[float | int]]:
+        """Fetch one bounded historical kline window.
+
+        Unlike ``get_klines()``, this method never derives the request
+        window from the current clock. It is intended for historical
+        backtesting and returns candles whose opening timestamps fall
+        inside the requested inclusive range.
+        """
+
+        interval_seconds = {
+            "Min1": 60,
+            "Min5": 300,
+            "Min15": 900,
+            "Min30": 1800,
+            "Min60": 3600,
+            "Hour4": 14400,
+            "Hour8": 28800,
+            "Day1": 86400,
+            "Week1": 604800,
+            "Month1": 2592000,
+        }.get(interval)
+
+        if interval_seconds is None:
+            raise ValueError(
+                f"Unsupported MEXC interval: {interval}"
+            )
+
+        start_ms = int(start_ms)
+        end_ms = int(end_ms)
+        if end_ms < start_ms:
+            return []
+
+        points = max(10, min(int(limit), 2000))
+        start_sec = max(0, start_ms // 1000)
+        end_sec = max(start_sec, end_ms // 1000)
+
+        data = await self._request(
+            "GET",
+            f"/api/v1/contract/kline/{symbol}",
+            params={
+                "interval": interval,
+                "start": start_sec,
+                "end": end_sec,
+            },
+        )
+
+        if not isinstance(data, dict):
+            raise MexcAPIError(
+                "Unexpected MEXC kline response "
+                f"shape: {type(data).__name__}"
+            )
+
+        keys = (
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "vol",
+        )
+
+        if not all(key in data for key in keys):
+            raise MexcAPIError(
+                "MEXC kline response is missing required arrays"
+            )
+
+        arrays = [data[key] for key in keys]
+        size = min(len(values) for values in arrays)
+        if size == 0:
+            return []
+
+        rows: list[list[float | int]] = []
+
+        for i in range(size):
+            ts = _normalize_timestamp_ms(arrays[0][i])
+            if ts < start_ms or ts > end_ms:
+                continue
+            rows.append(
+                [
+                    ts,
+                    float(arrays[1][i]),
+                    float(arrays[2][i]),
+                    float(arrays[3][i]),
+                    float(arrays[4][i]),
+                    float(arrays[5][i]),
+                ]
+            )
+
+        rows.sort(key=lambda row: int(row[0]))
+
+        dedup: dict[int, list[float | int]] = {}
+        for row in rows:
+            dedup[int(row[0])] = row
+
+        return [dedup[ts] for ts in sorted(dedup)]
+
     # ==================================================================
     # ACCOUNT ASSETS
     # ==================================================================

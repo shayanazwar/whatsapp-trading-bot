@@ -50,10 +50,17 @@ def make_signal_key(
 def _ms(value: Any) -> int | None:
     try:
         v = int(float(value))
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         return None
 
-    return v * 1000 if v < 10**12 else v
+    return (
+        v * 1000
+        if v < 10**12
+        else v
+    )
 
 
 def validate_signal(
@@ -62,11 +69,18 @@ def validate_signal(
     min_confluence: int,
     min_rr: float,
     require_increasing_volume: bool,
-) -> tuple[ValidatedSignal | None, list[str]]:
+) -> tuple[
+    ValidatedSignal | None,
+    list[str],
+]:
 
-    # ---------------------------------------------------------
+    # =========================================================
     # PRIMARY ANALYSIS VALIDATION
-    # ---------------------------------------------------------
+    #
+    # setup_filter.py owns the technical gates:
+    # score, RR, families, engine flags, BTC filter,
+    # target path, volatility, etc.
+    # =========================================================
 
     ok, reasons = validate_analysis(
         data,
@@ -78,30 +92,64 @@ def validate_signal(
     if not ok:
         return None, reasons
 
-    # ---------------------------------------------------------
+    # =========================================================
     # SIDE
-    # ---------------------------------------------------------
+    # =========================================================
 
-    side = str(data["setup"]).upper()
+    side = str(
+        data.get("setup")
+        or ""
+    ).upper()
 
-    if side not in {"LONG", "SHORT"}:
-        return None, ["Invalid LONG/SHORT setup"]
+    if side not in {
+        "LONG",
+        "SHORT",
+    }:
+        return None, [
+            "Invalid LONG/SHORT setup"
+        ]
 
-    # ---------------------------------------------------------
+    # =========================================================
+    # SYMBOL
+    # =========================================================
+
+    symbol = str(
+        data.get("symbol")
+        or ""
+    ).strip()
+
+    if not symbol:
+        return None, [
+            "Missing symbol"
+        ]
+
+    symbol = symbol.upper()
+
+    # =========================================================
     # CANDLE TIMESTAMPS
-    # ---------------------------------------------------------
+    #
+    # The engine's 15M setup and 5M trigger must belong to
+    # the same current setup window.
+    # =========================================================
 
     fifteen = _ms(
         data.get("candle_time")
     )
 
     five = _ms(
-        data.get("closed_5m_candle_time")
+        data.get(
+            "closed_5m_candle_time"
+        )
     )
 
-    if fifteen is None or five is None:
+    if fifteen is None:
         return None, [
-            "Missing normalized candle timestamps"
+            "Missing normalized 15M candle timestamp"
+        ]
+
+    if five is None:
+        return None, [
+            "Missing normalized 5M candle timestamp"
         ]
 
     if five < fifteen:
@@ -109,9 +157,12 @@ def validate_signal(
             "5M trigger belongs to an earlier 15M candle"
         ]
 
+    # A 5M trigger may occur during the current 15M candle
+    # or within the immediately adjacent setup window.
     if (
         five - fifteen
-        > FIFTEEN_MINUTE_MS + FIVE_MINUTE_MS
+        > FIFTEEN_MINUTE_MS
+        + FIVE_MINUTE_MS
     ):
         return None, [
             "5M trigger is stale relative to 15M setup"
@@ -122,55 +173,138 @@ def validate_signal(
             "5M trigger timestamp is not 5M-aligned"
         ]
 
-    # ---------------------------------------------------------
+    # =========================================================
     # SIGNAL FRESHNESS
-    # ---------------------------------------------------------
+    # =========================================================
 
-    now = int(time.time() * 1000)
-
-    max_age = int(
-        float(
-            data.get(
-                "max_signal_age_seconds",
-                DEFAULT_MAX_SIGNAL_AGE_MS / 1000,
-            )
-            or DEFAULT_MAX_SIGNAL_AGE_MS / 1000
-        )
-        * 1000
+    now = int(
+        time.time() * 1000
     )
 
+    configured_age_seconds = data.get(
+        "max_signal_age_seconds"
+    )
+
+    try:
+        max_age = int(
+            float(
+                configured_age_seconds
+                if configured_age_seconds is not None
+                else DEFAULT_MAX_SIGNAL_AGE_MS / 1000
+            )
+            * 1000
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        max_age = DEFAULT_MAX_SIGNAL_AGE_MS
+
+    # Future timestamp protection.
     if five > now + FIVE_MINUTE_MS:
         return None, [
             "5M trigger timestamp is in the future"
         ]
 
-    if now - five > max_age:
+    signal_age = now - five
+
+    if signal_age > max_age:
         return None, [
             f"5M trigger age exceeds "
             f"{max_age / 1000:.0f}s"
         ]
 
-    # ---------------------------------------------------------
+    if signal_age < 0:
+        return None, [
+            "5M trigger timestamp is unexpectedly in the future"
+        ]
+
+    # =========================================================
     # TRADE LEVELS
-    # ---------------------------------------------------------
+    # =========================================================
 
     try:
-        entry = float(data["entry"])
-        stop_loss = float(data["stop_loss"])
-        tp1 = float(data["tp1"])
-        tp2 = float(data["tp2"])
-    except (KeyError, TypeError, ValueError):
+        entry = float(
+            data["entry"]
+        )
+
+        stop_loss = float(
+            data["stop_loss"]
+        )
+
+        tp1 = float(
+            data["tp1"]
+        )
+
+        tp2 = float(
+            data["tp2"]
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
         return None, [
             "Invalid or missing trade levels"
         ]
 
-    # ---------------------------------------------------------
+    # Basic numerical sanity.
+    if (
+        entry <= 0
+        or stop_loss <= 0
+        or tp1 <= 0
+        or tp2 <= 0
+    ):
+        return None, [
+            "Trade levels must be positive"
+        ]
+
+    # =========================================================
+    # SIDE-SPECIFIC LEVEL VALIDATION
+    #
+    # Do a small independent sanity check before constructing
+    # the final TradePlan.
+    # =========================================================
+
+    if side == "LONG":
+        if stop_loss >= entry:
+            return None, [
+                "LONG stop loss must be below entry"
+            ]
+
+        if tp1 <= entry:
+            return None, [
+                "LONG TP1 must be above entry"
+            ]
+
+        if tp2 <= entry:
+            return None, [
+                "LONG TP2 must be above entry"
+            ]
+
+    else:
+        if stop_loss <= entry:
+            return None, [
+                "SHORT stop loss must be above entry"
+            ]
+
+        if tp1 >= entry:
+            return None, [
+                "SHORT TP1 must be below entry"
+            ]
+
+        if tp2 >= entry:
+            return None, [
+                "SHORT TP2 must be below entry"
+            ]
+
+    # =========================================================
     # INDEPENDENT RR CALCULATION
     #
-    # IMPORTANT:
-    # Do NOT trust data["rr"].
-    # RR is recalculated from Entry / SL / TP2.
-    # ---------------------------------------------------------
+    # Never trust data["rr"].
+    # Recalculate from Entry / SL / TP2.
+    # =========================================================
 
     try:
         calculated_rr = calculate_rr(
@@ -179,14 +313,28 @@ def validate_signal(
             stop_loss=stop_loss,
             target=tp2,
         )
-    except (TypeError, ValueError) as exc:
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
         return None, [
             f"Invalid trade levels: {exc}"
         ]
 
-    # ---------------------------------------------------------
+    if calculated_rr < max(
+        MIN_RR,
+        float(min_rr),
+    ):
+        return None, [
+            f"Calculated RR "
+            f"{calculated_rr:.2f} < required "
+            f"{max(MIN_RR, float(min_rr)):.2f}"
+        ]
+
+    # =========================================================
     # TRADE PLAN
-    # ---------------------------------------------------------
+    # =========================================================
 
     plan = TradePlan(
         side=side,
@@ -197,9 +345,9 @@ def validate_signal(
         rr=calculated_rr,
     )
 
-    # ---------------------------------------------------------
-    # FINAL LEVEL + RR VALIDATION
-    # ---------------------------------------------------------
+    # =========================================================
+    # FINAL LEVEL VALIDATION
+    # =========================================================
 
     level_ok, level_reason = validate_levels(
         plan,
@@ -210,22 +358,15 @@ def validate_signal(
     )
 
     if not level_ok:
-        return None, [level_reason]
+        return None, [
+            level_reason
+        ]
 
-    # ---------------------------------------------------------
-    # SYMBOL
-    # ---------------------------------------------------------
-
-    symbol = str(
-        data.get("symbol") or ""
-    ).strip()
-
-    if not symbol:
-        return None, ["Missing symbol"]
-
-    # ---------------------------------------------------------
+    # =========================================================
     # SIGNAL KEY
-    # ---------------------------------------------------------
+    #
+    # One signal per symbol + side + 5M candle.
+    # =========================================================
 
     key = make_signal_key(
         symbol,
@@ -233,14 +374,14 @@ def validate_signal(
         five,
     )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # VALIDATED SIGNAL
-    # ---------------------------------------------------------
+    # =========================================================
 
     return (
         ValidatedSignal(
             key=key,
-            symbol=symbol.upper(),
+            symbol=symbol,
             side=side,
             candle_time=five,
             analysis=data,

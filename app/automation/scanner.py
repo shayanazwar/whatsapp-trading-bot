@@ -40,25 +40,25 @@ class MexcScanner:
     Scanner responsibilities:
 
         MEXC DATA
-            ↓
+            â†“
         ENGINE ANALYSIS
-            ↓
+            â†“
         TECHNICAL DIAGNOSTICS
-            ↓
+            â†“
         BTC FILTER
-            ↓
+            â†“
         LIVE QUOTE
-            ↓
+            â†“
         EXECUTION QUALITY
-            ↓
+            â†“
         FUTURES CONTEXT
-            ↓
+            â†“
         SAFE LEVEL REPRICING
-            ↓
+            â†“
         FINAL TECHNICAL SYNCHRONIZATION
-            ↓
+            â†“
         SIGNAL VALIDATOR
-            ↓
+            â†“
         PUBLISH / EXECUTE
 
     IMPORTANT:
@@ -1388,7 +1388,7 @@ class MexcScanner:
         )
 
         sl_ok = (
-            0.50 <= sl_atr <= 1.80
+            0.50 <= sl_atr <= 2.00
         )
 
         candidate = bool(

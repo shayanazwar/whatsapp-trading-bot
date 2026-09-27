@@ -847,6 +847,16 @@ class MexcScanner:
 
                 # -------------------------------------------------
                 # ENTRY DRIFT
+                #
+                # IMPORTANT:
+                # Drift is recorded for diagnostics.
+                #
+                # We DO NOT reject here.
+                #
+                # The executable MEXC price is now passed through
+                # safe level repricing first. Final RR, SL, TP,
+                # technical candidate, and signal validation remain
+                # hard gates.
                 # -------------------------------------------------
 
                 drift = (
@@ -869,13 +879,11 @@ class MexcScanner:
                     max_entry_drift
                 )
 
-                if drift > max_entry_drift:
-                    return self._reject(
-                        symbol,
-                        "Executable entry drift exceeds limit",
-                        stage="EXECUTION_QUALITY",
-                        analysis=analysis,
-                    )
+                analysis[
+                    "entry_drift_within_configured_limit"
+                ] = bool(
+                    drift <= max_entry_drift
+                )
 
                 # -------------------------------------------------
                 # SAFE LEVEL REPRICING
@@ -1060,19 +1068,6 @@ class MexcScanner:
     def _synchronize_technical_diagnostics(
         analysis: dict[str, Any],
     ) -> None:
-        """
-        Synchronize diagnostics with the engine.
-
-        This function NEVER creates a setup.
-
-        Critical rule:
-        A 5M trigger failure is reported ONLY when the engine
-        actually selected a LONG or SHORT trigger side and the
-        trigger was not ready.
-
-        trigger_side=NONE therefore cannot produce:
-            failures=['5M trigger']
-        """
 
         setup = str(
             analysis.get("setup")
@@ -1096,16 +1091,11 @@ class MexcScanner:
             if name not in failures:
                 failures.append(name)
 
-        # ---------------------------------------------------------
-        # NO TRADE
-        # ---------------------------------------------------------
-
         if setup not in {
             "LONG",
             "SHORT",
         }:
 
-            # Engine's directional decision.
             direction_ok = bool(
                 analysis.get(
                     "direction_ok",
@@ -1170,11 +1160,6 @@ class MexcScanner:
                 )
             )
 
-            # -----------------------------------------------------
-            # IMPORTANT:
-            # Direction failure is upstream of 5M.
-            # -----------------------------------------------------
-
             if not direction_ok:
                 add_failure(
                     "1H alignment"
@@ -1184,12 +1169,6 @@ class MexcScanner:
                 add_failure(
                     "15M structure"
                 )
-
-            # -----------------------------------------------------
-            # 5M TRIGGER
-            #
-            # ONLY report it if a direction was actually selected.
-            # -----------------------------------------------------
 
             if (
                 trigger_side in {
@@ -1201,10 +1180,6 @@ class MexcScanner:
                 add_failure(
                     "5M trigger"
                 )
-
-            # -----------------------------------------------------
-            # Other technical families.
-            # -----------------------------------------------------
 
             if not momentum_ok:
                 add_failure(
@@ -1231,10 +1206,6 @@ class MexcScanner:
                     "risk/RR"
                 )
 
-            # -----------------------------------------------------
-            # Never allow NO TRADE to have empty diagnostics.
-            # -----------------------------------------------------
-
             if not failures:
                 add_failure(
                     "No LONG/SHORT setup selected by engine"
@@ -1258,11 +1229,6 @@ class MexcScanner:
 
             return
 
-        # ---------------------------------------------------------
-        # Setup exists.
-        # Do not invent new technical failures here.
-        # ---------------------------------------------------------
-
         analysis[
             "technical_gate_failures"
         ] = failures
@@ -1275,13 +1241,6 @@ class MexcScanner:
     def _synchronize_final_candidate(
         analysis: dict[str, Any],
     ) -> None:
-        """
-        Rebuild final technical_candidate after live context and
-        level repricing.
-
-        BTC filter is a real external gate.
-        Futures context is supporting evidence only.
-        """
 
         side = str(
             analysis.get("setup")
@@ -1458,10 +1417,6 @@ class MexcScanner:
         analysis[
             "technical_candidate"
         ] = candidate
-
-        # ---------------------------------------------------------
-        # Diagnostics.
-        # ---------------------------------------------------------
 
         raw = analysis.get(
             "technical_gate_failures"

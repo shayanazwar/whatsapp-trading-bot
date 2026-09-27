@@ -14,6 +14,7 @@ from ..analysis.engine import (
     analyze_candles,
     build_btc_context,
     btc_filter_ok,
+    convert_candles,
 )
 from ..automation.mexc_client import MexcClient
 from ..automation.universe import MexcUniverse
@@ -64,6 +65,9 @@ class BacktestAlreadyRunning(RuntimeError):
 @dataclass(frozen=True)
 class SymbolHistory:
     symbol: str
+
+    # Raw MEXC rows:
+    # [timestamp_ms, open, high, low, close, volume, ...]
     candles_4h: list[list[float | int]]
     candles_1h: list[list[float | int]]
     candles_15m: list[list[float | int]]
@@ -82,7 +86,7 @@ def _align_5m_timestamp(timestamp_ms: int) -> int:
 
 def _valid_candle(row: object) -> bool:
     """
-    Validate the normalized candle format expected by the engine.
+    Validate raw MEXC candle format.
 
     Expected:
         [timestamp_ms, open, high, low, close, volume, ...]
@@ -94,7 +98,7 @@ def _valid_candle(row: object) -> bool:
         return False
 
     try:
-        timestamp = int(row[0])
+        timestamp = int(float(row[0]))
         float(row[1])
         float(row[2])
         float(row[3])
@@ -112,7 +116,7 @@ def _normalize_rows(
     end_ms: int,
 ) -> list[list[float | int]]:
     """
-    Normalize, validate, filter and deduplicate historical candles.
+    Normalize, validate, filter and deduplicate raw MEXC candles.
     """
     start_ms = int(start_ms)
     end_ms = int(end_ms)
@@ -123,21 +127,38 @@ def _normalize_rows(
         if not _valid_candle(row):
             continue
 
-        timestamp = int(row[0])
+        timestamp = int(float(row[0]))
 
         if timestamp < start_ms or timestamp > end_ms:
             continue
 
         result[timestamp] = list(row)
 
-    return [result[timestamp] for timestamp in sorted(result)]
+    return [
+        result[timestamp]
+        for timestamp in sorted(result)
+    ]
+
+
+def _row_time(row: object) -> int:
+    """
+    Return candle timestamp from either:
+
+        raw MEXC list row
+        or
+        engine Candle/dict
+    """
+    if isinstance(row, dict):
+        return int(row["time"])
+
+    return int(float(row[0]))
 
 
 def _closed_slice(
-    rows: list[list[float | int]],
+    rows: list,
     timeframe_ms: int,
     now_ms: int,
-) -> list[list[float | int]]:
+) -> list:
     """
     Return candles that were completely closed by now_ms.
 
@@ -153,11 +174,55 @@ def _closed_slice(
 
     cutoff = int(now_ms) - int(timeframe_ms)
 
-    times = [int(row[0]) for row in rows]
+    times = [
+        _row_time(row)
+        for row in rows
+    ]
 
-    end_index = bisect_right(times, cutoff)
+    end_index = bisect_right(
+        times,
+        cutoff,
+    )
 
     return rows[:end_index]
+
+
+def _convert_for_engine(
+    rows: list[list[float | int]],
+    symbol: str,
+    timeframe: str,
+) -> list:
+    """
+    Convert raw MEXC list candles into the exact Candle/dict format
+    expected by the deterministic analysis engine.
+
+    This is the critical backtest adapter.
+
+    Raw:
+        [time, open, high, low, close, volume]
+
+    Engine:
+        {
+            "time": ...,
+            "open": ...,
+            "high": ...,
+            "low": ...,
+            "close": ...,
+            "volume": ...
+        }
+    """
+    converted = convert_candles(rows)
+
+    if rows and not converted:
+        LOGGER.warning(
+            "BACKTEST CONVERSION | %s | %s | "
+            "raw=%d converted=0",
+            symbol,
+            timeframe,
+            len(rows),
+        )
+
+    return converted
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +239,9 @@ async def _fetch_range(
     """
     Fetch a complete historical range using <=2000 candles per request.
 
-    The returned candles are:
+    Returned candles are:
         - validated
-        - filtered to the requested range
+        - filtered
         - deduplicated
         - sorted chronologically
     """
@@ -192,7 +257,9 @@ async def _fetch_range(
     try:
         interval_ms = interval_sizes[interval]
     except KeyError as exc:
-        raise ValueError(f"Unsupported backtest interval: {interval}") from exc
+        raise ValueError(
+            f"Unsupported backtest interval: {interval}"
+        ) from exc
 
     start_ms = int(start_ms)
     end_ms = int(end_ms)
@@ -200,15 +267,23 @@ async def _fetch_range(
     if end_ms < start_ms:
         return []
 
-    # Align request boundaries to candle openings.
-    cursor = (start_ms // interval_ms) * interval_ms
-    final = (end_ms // interval_ms) * interval_ms
+    cursor = (
+        start_ms // interval_ms
+    ) * interval_ms
 
-    result: dict[int, list[float | int]] = {}
+    final = (
+        end_ms // interval_ms
+    ) * interval_ms
 
-    # 2000 candles maximum per request.
-    # Using 1999 intervals gives a safe non-overlapping progression.
-    page_span = interval_ms * (MAX_KLINE_POINTS - 1)
+    result: dict[
+        int,
+        list[float | int],
+    ] = {}
+
+    page_span = (
+        interval_ms
+        * (MAX_KLINE_POINTS - 1)
+    )
 
     request_count = 0
 
@@ -233,7 +308,8 @@ async def _fetch_range(
 
         if not isinstance(rows, list):
             raise ValueError(
-                f"{symbol} {interval}: invalid MEXC kline response type "
+                f"{symbol} {interval}: invalid MEXC "
+                f"kline response type "
                 f"{type(rows).__name__}"
             )
 
@@ -241,32 +317,47 @@ async def _fetch_range(
             if not _valid_candle(row):
                 continue
 
-            timestamp = int(row[0])
+            timestamp = int(
+                float(row[0])
+            )
 
             if cursor <= timestamp <= page_end:
                 result[timestamp] = list(row)
 
         if not rows:
-            cursor = page_end + interval_ms
+            cursor = (
+                page_end
+                + interval_ms
+            )
             continue
 
         valid_timestamps = [
-            int(row[0])
+            int(float(row[0]))
             for row in rows
             if _valid_candle(row)
         ]
 
         if not valid_timestamps:
-            cursor = page_end + interval_ms
+            cursor = (
+                page_end
+                + interval_ms
+            )
             continue
 
-        last_timestamp = max(valid_timestamps)
+        last_timestamp = max(
+            valid_timestamps
+        )
 
-        next_cursor = last_timestamp + interval_ms
+        next_cursor = (
+            last_timestamp
+            + interval_ms
+        )
 
-        # Safety against an API response that does not advance.
         if next_cursor <= cursor:
-            next_cursor = page_end + interval_ms
+            next_cursor = (
+                page_end
+                + interval_ms
+            )
 
         cursor = next_cursor
 
@@ -277,7 +368,8 @@ async def _fetch_range(
 
     if request_count > 1:
         LOGGER.debug(
-            "BACKTEST DATA | %s | %s | requests=%d candles=%d",
+            "BACKTEST DATA | %s | %s | "
+            "requests=%d candles=%d",
             symbol,
             interval,
             request_count,
@@ -326,26 +418,37 @@ class BacktestRunner:
     # Main backtest
     # -----------------------------------------------------------------------
 
-    async def run(self, days: int) -> BacktestSummary:
+    async def run(
+        self,
+        days: int,
+    ) -> BacktestSummary:
         days = int(days)
 
-        if days not in {7, 30, 90}:
+        if days not in {
+            7,
+            30,
+            90,
+        }:
             raise ValueError(
                 "Supported backtests: 7D, 30D, 90D"
             )
 
         if self._lock.locked():
             raise BacktestAlreadyRunning(
-                "A backtest is already running. Please wait for it to finish."
+                "A backtest is already running. "
+                "Please wait for it to finish."
             )
 
         async with self._lock:
             started = time.monotonic()
 
-            now_ms = int(time.time() * 1000)
+            now_ms = int(
+                time.time() * 1000
+            )
 
-            # The backtest ends at the most recent 5M candle boundary.
-            period_end = _align_5m_timestamp(now_ms)
+            period_end = _align_5m_timestamp(
+                now_ms
+            )
 
             period_start = (
                 period_end
@@ -358,16 +461,19 @@ class BacktestRunner:
 
             symbols = await self.universe.refresh()
 
-            symbols = list(symbols[:300])
+            symbols = list(
+                symbols[:300]
+            )
 
             if not symbols:
                 raise RuntimeError(
-                    "No eligible MEXC Futures symbols are available "
-                    "for backtesting."
+                    "No eligible MEXC Futures symbols "
+                    "are available for backtesting."
                 )
 
             LOGGER.info(
-                "BACKTEST START | days=%d symbols=%d start=%d end=%d",
+                "BACKTEST START | days=%d symbols=%d "
+                "start=%d end=%d",
                 days,
                 len(symbols),
                 period_start,
@@ -383,7 +489,9 @@ class BacktestRunner:
                 period_end,
             )
 
-            trades: list[SimulatedTrade] = []
+            trades: list[
+                SimulatedTrade
+            ] = []
 
             errors = 0
             tested = 0
@@ -401,17 +509,21 @@ class BacktestRunner:
             ]:
                 async with semaphore:
                     try:
-                        history = await self._fetch_symbol_history(
-                            symbol,
-                            period_start,
-                            period_end,
+                        history = (
+                            await self._fetch_symbol_history(
+                                symbol,
+                                period_start,
+                                period_end,
+                            )
                         )
 
-                        symbol_trades = self._backtest_symbol(
-                            history,
-                            period_start,
-                            period_end,
-                            btc_history,
+                        symbol_trades = (
+                            self._backtest_symbol(
+                                history,
+                                period_start,
+                                period_end,
+                                btc_history,
+                            )
                         )
 
                         return (
@@ -420,11 +532,10 @@ class BacktestRunner:
                             None,
                         )
 
-                    except Exception as exc:  # noqa: BLE001
-                        # IMPORTANT:
-                        # LOGGER.exception() prints the complete traceback.
+                    except Exception as exc:
                         LOGGER.exception(
-                            "BACKTEST symbol failed: %s | %s",
+                            "BACKTEST symbol failed: "
+                            "%s | %s",
                             symbol,
                             exc,
                         )
@@ -435,8 +546,6 @@ class BacktestRunner:
                             f"{type(exc).__name__}: {exc}",
                         )
 
-            # Process in small batches so we don't create hundreds
-            # of simultaneous tasks.
             batch_size = self.max_concurrency
 
             for offset in range(
@@ -445,7 +554,8 @@ class BacktestRunner:
                 batch_size,
             ):
                 batch = symbols[
-                    offset : offset + batch_size
+                    offset:
+                    offset + batch_size
                 ]
 
                 results = await asyncio.gather(
@@ -460,11 +570,13 @@ class BacktestRunner:
                     symbol_trades,
                     error,
                 ) in results:
+
                     if error:
                         errors += 1
 
                         LOGGER.error(
-                            "BACKTEST DATA ERROR | %s | %s",
+                            "BACKTEST DATA ERROR | "
+                            "%s | %s",
                             symbol,
                             error,
                         )
@@ -472,11 +584,14 @@ class BacktestRunner:
                         continue
 
                     tested += 1
-                    trades.extend(symbol_trades)
+                    trades.extend(
+                        symbol_trades
+                    )
 
                 LOGGER.info(
-                    "BACKTEST PROGRESS | days=%d processed=%d/%d "
-                    "tested=%d errors=%d signals=%d",
+                    "BACKTEST PROGRESS | days=%d "
+                    "processed=%d/%d tested=%d "
+                    "errors=%d signals=%d",
                     days,
                     min(
                         offset + batch_size,
@@ -493,7 +608,8 @@ class BacktestRunner:
             # ---------------------------------------------------------------
 
             trades.sort(
-                key=lambda trade: trade.signal_time_ms
+                key=lambda trade:
+                trade.signal_time_ms
             )
 
             summary = summarize(
@@ -505,8 +621,9 @@ class BacktestRunner:
             )
 
             LOGGER.info(
-                "BACKTEST COMPLETE | days=%d tested=%d "
-                "errors=%d signals=%d duration=%.2fs",
+                "BACKTEST COMPLETE | days=%d "
+                "tested=%d errors=%d signals=%d "
+                "duration=%.2fs",
                 days,
                 tested,
                 errors,
@@ -526,6 +643,7 @@ class BacktestRunner:
         period_start: int,
         period_end: int,
     ) -> SymbolHistory:
+
         c4_start = (
             period_start
             - MIN_4H_WARMUP_MS
@@ -634,11 +752,75 @@ class BacktestRunner:
         btc_history: SymbolHistory,
     ) -> list[SimulatedTrade]:
 
-        c4 = history.candles_4h
-        c1 = history.candles_1h
-        c15 = history.candles_15m
-        c5 = history.candles_5m
-        c1d = history.candles_1d
+        # -------------------------------------------------------------------
+        # RAW MEXC CANDLES
+        #
+        # These stay as lists because the simulator uses the raw OHLCV
+        # representation.
+        # -------------------------------------------------------------------
+
+        raw_c4 = history.candles_4h
+        raw_c1 = history.candles_1h
+        raw_c15 = history.candles_15m
+        raw_c5 = history.candles_5m
+        raw_c1d = history.candles_1d
+
+        # -------------------------------------------------------------------
+        # ENGINE CANDLES
+        #
+        # CRITICAL FIX:
+        # MEXC returns list rows, while the engine expects Candle/dict rows.
+        # Convert once at the backtest boundary.
+        # -------------------------------------------------------------------
+
+        c4 = _convert_for_engine(
+            raw_c4,
+            history.symbol,
+            "4H",
+        )
+
+        c1 = _convert_for_engine(
+            raw_c1,
+            history.symbol,
+            "1H",
+        )
+
+        c15 = _convert_for_engine(
+            raw_c15,
+            history.symbol,
+            "15M",
+        )
+
+        c5 = _convert_for_engine(
+            raw_c5,
+            history.symbol,
+            "5M",
+        )
+
+        c1d = _convert_for_engine(
+            raw_c1d,
+            history.symbol,
+            "1D",
+        )
+
+        # BTC engine-format candles.
+        btc_c4_engine = _convert_for_engine(
+            btc_history.candles_4h,
+            "BTC_USDT",
+            "4H",
+        )
+
+        btc_c1_engine = _convert_for_engine(
+            btc_history.candles_1h,
+            "BTC_USDT",
+            "1H",
+        )
+
+        btc_c15_engine = _convert_for_engine(
+            btc_history.candles_15m,
+            "BTC_USDT",
+            "15M",
+        )
 
         # ---------------------------------------------------------------
         # Minimum data requirements
@@ -673,12 +855,12 @@ class BacktestRunner:
         # ---------------------------------------------------------------
 
         c5_times = [
-            int(row[0])
+            _row_time(row)
             for row in c5
         ]
 
         c15_times = [
-            int(row[0])
+            _row_time(row)
             for row in c15
         ]
 
@@ -688,7 +870,10 @@ class BacktestRunner:
 
         candidate_times: set[int] = set()
 
-        for side in ("LONG", "SHORT"):
+        for side in (
+            "LONG",
+            "SHORT",
+        ):
 
             try:
                 bos_events = _bos_events(
@@ -696,9 +881,11 @@ class BacktestRunner:
                     side,
                     lookback=len(c15),
                 )
+
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST BOS failed | %s | side=%s",
+                    "BACKTEST BOS failed | %s | "
+                    "side=%s",
                     history.symbol,
                     side,
                 )
@@ -713,15 +900,19 @@ class BacktestRunner:
                         bos,
                         MAX_SETUP_AGE_15M,
                     )
+
                 except Exception:
                     LOGGER.exception(
-                        "BACKTEST RETEST failed | %s | side=%s",
+                        "BACKTEST RETEST failed | "
+                        "%s | side=%s",
                         history.symbol,
                         side,
                     )
                     continue
 
-                if not retest.get("valid"):
+                if not retest.get(
+                    "valid"
+                ):
                     continue
 
                 try:
@@ -732,6 +923,7 @@ class BacktestRunner:
                     bos_time = int(
                         bos["time"]
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -766,7 +958,10 @@ class BacktestRunner:
                     + 30 * 60 * 1000,
                 )
 
-                if trigger_start > trigger_end:
+                if (
+                    trigger_start
+                    > trigger_end
+                ):
                     continue
 
                 first_index = bisect_right(
@@ -783,6 +978,7 @@ class BacktestRunner:
                     setup_level = float(
                         bos["level"]
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -794,8 +990,9 @@ class BacktestRunner:
                     first_index,
                     last_index,
                 ):
-                    trigger_open = int(
-                        c5[index][0]
+
+                    trigger_open = _row_time(
+                        c5[index]
                     )
 
                     trigger_close = (
@@ -803,21 +1000,35 @@ class BacktestRunner:
                         + M5_MS
                     )
 
-                    if trigger_close > period_end:
+                    if (
+                        trigger_close
+                        > period_end
+                    ):
                         continue
 
                     try:
-                        trigger = _five_minute_trigger(
-                            c5[: index + 1],
-                            side,
-                            setup_level,
+                        trigger = (
+                            _five_minute_trigger(
+                                c5[: index + 1],
+                                side,
+                                setup_level,
+                            )
                         )
+
                     except Exception:
-                        # Individual trigger calculation failures must
-                        # not kill the complete symbol backtest.
+                        LOGGER.exception(
+                            "BACKTEST TRIGGER failed | "
+                            "%s | side=%s | "
+                            "index=%d",
+                            history.symbol,
+                            side,
+                            index,
+                        )
                         continue
 
-                    if trigger.get("ready"):
+                    if trigger.get(
+                        "ready"
+                    ):
                         candidate_times.add(
                             trigger_close
                         )
@@ -830,57 +1041,62 @@ class BacktestRunner:
         # ---------------------------------------------------------------
 
         c4_times = [
-            int(row[0])
+            _row_time(row)
             for row in c4
         ]
 
         c1_times = [
-            int(row[0])
+            _row_time(row)
             for row in c1
         ]
 
         c15_times = [
-            int(row[0])
+            _row_time(row)
             for row in c15
         ]
 
         c5_times = [
-            int(row[0])
+            _row_time(row)
             for row in c5
         ]
 
         c1d_times = [
-            int(row[0])
+            _row_time(row)
             for row in c1d
         ]
 
         btc4_times = [
-            int(row[0])
-            for row in btc_history.candles_4h
+            _row_time(row)
+            for row in btc_c4_engine
         ]
 
         btc1_times = [
-            int(row[0])
-            for row in btc_history.candles_1h
+            _row_time(row)
+            for row in btc_c1_engine
         ]
 
         btc15_times = [
-            int(row[0])
-            for row in btc_history.candles_15m
+            _row_time(row)
+            for row in btc_c15_engine
         ]
 
         # ---------------------------------------------------------------
         # Simulate signals
         # ---------------------------------------------------------------
 
-        trades: list[SimulatedTrade] = []
+        trades: list[
+            SimulatedTrade
+        ] = []
 
         for signal_close_time in sorted(
             candidate_times
         ):
+
             if (
-                signal_close_time < period_start
-                or signal_close_time > period_end
+                signal_close_time
+                < period_start
+                or signal_close_time
+                > period_end
             ):
                 continue
 
@@ -889,6 +1105,7 @@ class BacktestRunner:
             # -----------------------------------------------------------
 
             if trades:
+
                 previous_trade = trades[-1]
 
                 if (
@@ -905,9 +1122,6 @@ class BacktestRunner:
 
             # -----------------------------------------------------------
             # Point-in-time historical slices
-            #
-            # Every timeframe only receives candles that were already
-            # completely closed at the signal timestamp.
             # -----------------------------------------------------------
 
             c4_slice = _closed_slice(
@@ -957,8 +1171,8 @@ class BacktestRunner:
 
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST ENGINE failed | %s | "
-                    "signal=%d",
+                    "BACKTEST ENGINE failed | "
+                    "%s | signal=%d",
                     history.symbol,
                     signal_close_time,
                 )
@@ -970,7 +1184,8 @@ class BacktestRunner:
                 continue
 
             side = str(
-                analysis.get("setup") or ""
+                analysis.get("setup")
+                or ""
             ).upper()
 
             if side not in {
@@ -990,47 +1205,51 @@ class BacktestRunner:
                 btc_ok = True
 
             else:
-                btc_c4 = (
-                    btc_history.candles_4h[
-                        :bisect_right(
-                            btc4_times,
-                            signal_close_time
-                            - M4H_MS,
-                        )
-                    ]
+                btc_c4_end = bisect_right(
+                    btc4_times,
+                    signal_close_time
+                    - M4H_MS,
                 )
 
-                btc_c1 = (
-                    btc_history.candles_1h[
-                        :bisect_right(
-                            btc1_times,
-                            signal_close_time
-                            - M1H_MS,
-                        )
-                    ]
+                btc_c1_end = bisect_right(
+                    btc1_times,
+                    signal_close_time
+                    - M1H_MS,
                 )
 
-                btc_c15 = (
-                    btc_history.candles_15m[
-                        :bisect_right(
-                            btc15_times,
-                            signal_close_time
-                            - M15_MS,
-                        )
-                    ]
+                btc_c15_end = bisect_right(
+                    btc15_times,
+                    signal_close_time
+                    - M15_MS,
                 )
+
+                btc_c4 = btc_c4_engine[
+                    :btc_c4_end
+                ]
+
+                btc_c1 = btc_c1_engine[
+                    :btc_c1_end
+                ]
+
+                btc_c15 = btc_c15_engine[
+                    :btc_c15_end
+                ]
 
                 try:
-                    btc_context = build_btc_context(
-                        btc_c4,
-                        btc_c1,
-                        btc_c15,
+                    btc_context = (
+                        build_btc_context(
+                            btc_c4,
+                            btc_c1,
+                            btc_c15,
+                        )
                     )
 
-                    btc_ok, _ = btc_filter_ok(
-                        side,
-                        btc_context,
-                        is_btc=False,
+                    btc_ok, _ = (
+                        btc_filter_ok(
+                            side,
+                            btc_context,
+                            is_btc=False,
+                        )
                     )
 
                 except Exception:
@@ -1048,25 +1267,34 @@ class BacktestRunner:
             # -----------------------------------------------------------
             # Future candles
             #
-            # Start strictly AFTER the signal candle.
-            # Never include candles after the requested backtest period.
+            # IMPORTANT:
+            # Simulator continues to receive RAW MEXC rows.
             # -----------------------------------------------------------
 
+            raw_c5_times = [
+                int(float(row[0]))
+                for row in raw_c5
+            ]
+
             future_start = bisect_right(
-                c5_times,
+                raw_c5_times,
                 signal_close_time - 1,
             )
 
             future_end = bisect_right(
-                c5_times,
+                raw_c5_times,
                 period_end - 1,
             )
 
-            if future_start >= future_end:
+            if (
+                future_start
+                >= future_end
+            ):
                 continue
 
-            future_candles = c5[
-                future_start:future_end
+            future_candles = raw_c5[
+                future_start:
+                future_end
             ]
 
             if not future_candles:
@@ -1085,8 +1313,8 @@ class BacktestRunner:
 
             except Exception:
                 LOGGER.exception(
-                    "BACKTEST SIMULATION failed | %s | "
-                    "signal=%d",
+                    "BACKTEST SIMULATION failed | "
+                    "%s | signal=%d",
                     history.symbol,
                     signal_close_time,
                 )
@@ -1095,6 +1323,8 @@ class BacktestRunner:
             if trade is None:
                 continue
 
-            trades.append(trade)
+            trades.append(
+                trade
+            )
 
         return trades

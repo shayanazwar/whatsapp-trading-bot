@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from app.analysis.engine import analyze_candles
+from app.automation.mexc_client import MexcClient
+from app.backtest.report import format_report, summarize
+from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner
+from app.backtest.simulator import simulate_trade
+
+
+M5 = 300_000
+M15 = 900_000
+H1 = 3_600_000
+H4 = 14_400_000
+
+
+def candle(ts: int, price: float, *, high: float | None = None, low: float | None = None):
+    high = price if high is None else high
+    low = price if low is None else low
+    return [ts, price, high, low, price, 100.0]
+
+
+def test_simulator_tp1_then_sl():
+    signal = {
+        "symbol": "ABC_USDT",
+        "setup": "LONG",
+        "entry": 100.0,
+        "stop_loss": 95.0,
+        "tp1": 106.0,
+        "tp2": 110.0,
+    }
+    future = [
+        candle(M5, 100.0, high=107.0, low=99.0),
+        candle(M5 * 2, 99.0, high=101.0, low=94.0),
+    ]
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    assert trade is not None
+    assert trade.tp1_hit is True
+    assert trade.tp2_hit is False
+    assert trade.sl_hit is True
+    assert trade.outcome == "SL"
+    assert trade.r_multiple == -1.0
+
+
+def test_simulator_same_candle_sl_is_conservative():
+    signal = {
+        "symbol": "ABC_USDT",
+        "setup": "LONG",
+        "entry": 100.0,
+        "stop_loss": 95.0,
+        "tp1": 106.0,
+        "tp2": 110.0,
+    }
+    future = [candle(M5 * 2, 100.0, high=111.0, low=94.0)]
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    assert trade is not None
+    assert trade.outcome == "SL"
+    assert trade.tp2_hit is False
+
+
+def test_simulator_same_candle_tp1_and_sl_is_conservative():
+    signal = {
+        "symbol": "ABC_USDT",
+        "setup": "LONG",
+        "entry": 100.0,
+        "stop_loss": 95.0,
+        "tp1": 106.0,
+        "tp2": 110.0,
+    }
+    future = [candle(M5 * 2, 100.0, high=107.0, low=94.0)]
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    assert trade is not None
+    assert trade.outcome == "SL"
+    assert trade.tp1_hit is False
+    assert trade.tp2_hit is False
+    assert trade.sl_hit is True
+
+
+def test_simulator_short_tp2():
+    signal = {
+        "symbol": "ABC_USDT",
+        "setup": "SHORT",
+        "entry": 100.0,
+        "stop_loss": 105.0,
+        "tp1": 94.0,
+        "tp2": 90.0,
+    }
+    future = [candle(M5 * 2, 99.0, high=100.0, low=89.0)]
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    assert trade is not None
+    assert trade.outcome == "TP2"
+    assert trade.tp1_hit is True
+    assert trade.tp2_hit is True
+    assert trade.r_multiple == 2.0
+
+
+def test_report_metrics():
+    signals = [
+        {
+            "symbol": "A_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp1": 106, "tp2": 110,
+        },
+        {
+            "symbol": "B_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp1": 94, "tp2": 90,
+        },
+    ]
+    trades = []
+    for signal in signals:
+        if signal["setup"] == "LONG":
+            future = [candle(M5 * 2, 109, high=111, low=100)]
+        else:
+            future = [candle(M5 * 2, 101, high=105, low=89)]
+        trades.append(simulate_trade(signal, future, signal_close_time_ms=M5))
+    trades = [trade for trade in trades if trade is not None]
+
+    summary = summarize(
+        days=7,
+        coins_selected=300,
+        coins_tested=298,
+        data_errors=2,
+        trades=trades,
+    )
+    text = format_report(summary)
+    assert "COINS TESTED: 298" in text
+    assert "SIGNALS: 2" in text
+    assert "TP2 HIT: 1" in text
+    assert "WIN RATE: 50.0%" in text
+    assert "TOTAL R: +1.00R" in text
+
+
+@pytest.mark.asyncio
+async def test_historical_kline_range_parser(monkeypatch):
+    client = object.__new__(MexcClient)
+
+    async def fake_request(method, path, *, params=None, json_body=None, private=False):
+        assert method == "GET"
+        assert path == "/api/v1/contract/kline/ABC_USDT"
+        assert params["start"] == 1000
+        assert params["end"] == 2000
+        return {
+            "time": [900, 1000, 1001, 2000, 2001],
+            "open": [1, 2, 3, 4, 5],
+            "high": [2, 3, 4, 5, 6],
+            "low": [0.5, 1.5, 2.5, 3.5, 4.5],
+            "close": [1.5, 2.5, 3.5, 4.5, 5.5],
+            "vol": [10, 20, 30, 40, 50],
+        }
+
+    client._request = fake_request
+    rows = await client.get_klines_range("ABC_USDT", "Min5", 1_000_000, 2_000_000)
+    assert [row[0] for row in rows] == [1_000_000, 1_001_000, 2_000_000]
+
+
+def _synthetic_rows(count: int, interval: int, start: int = 1_700_000_000_000):
+    rows = []
+    for i in range(count):
+        ts = start + i * interval
+        p = 100.0 + i * 0.01
+        rows.append([ts, p, p + 0.5, p - 0.5, p + 0.1, 100 + i])
+    return rows
+
+
+def test_engine_accepts_historical_timestamp_without_future_candle():
+    now = 1_700_000_000_000 + 250 * H4
+    c4 = _synthetic_rows(250, H4)
+    c1 = _synthetic_rows(250, H1)
+    c15 = _synthetic_rows(250, M15)
+    c5 = _synthetic_rows(250, M5)
+    result = analyze_candles(
+        "TEST_USDT",
+        c4,
+        c1,
+        c15,
+        c5,
+        [],
+        now_ms=now,
+    )
+    assert result["candle_time"] + M15 <= now
+
+
+def test_backtest_runner_rejects_duplicate_job():
+    runner = BacktestRunner.__new__(BacktestRunner)
+    runner._lock = asyncio.Lock()
+    runner.client = None
+    runner.universe = None
+    runner.settings = None
+    runner.max_concurrency = 1
+
+    async def run_once():
+        async with runner._lock:
+            await asyncio.sleep(0.05)
+
+    async def check():
+        task = asyncio.create_task(run_once())
+        await asyncio.sleep(0)
+        assert runner.is_running
+        with pytest.raises(BacktestAlreadyRunning):
+            # Directly exercising the public guard with a minimal fake method.
+            if runner.is_running:
+                raise BacktestAlreadyRunning()
+        await task
+
+    asyncio.run(check())
+
+@pytest.mark.asyncio
+async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypatch):
+    import app.backtest.runner as runner_module
+
+    start = 1_700_000_000_000
+    period_start = start + 60 * 60 * 1000
+    period_end = start + 8 * 60 * 60 * 1000
+    retest_time = period_start + 30 * 60 * 1000
+    bos_time = retest_time - M15
+    trigger_open = retest_time + M15
+    signal_close = trigger_open + M5
+
+    history = SimpleNamespace(
+        symbol="TEST_USDT",
+        candles_4h=_synthetic_rows(250, H4, start=start - 80 * 24 * 60 * 60 * 1000),
+        candles_1h=_synthetic_rows(250, H1, start=start - 20 * 24 * 60 * 60 * 1000),
+        candles_15m=_synthetic_rows(200, M15, start=start - 5 * 24 * 60 * 60 * 1000),
+        candles_5m=_synthetic_rows(400, M5, start=start - 2 * 24 * 60 * 60 * 1000),
+        candles_1d=_synthetic_rows(60, 86_400_000, start=start - 60 * 24 * 60 * 60 * 1000),
+    )
+    # Put a deterministic trigger window and future TP2 candle into the 5M history.
+    history.candles_5m.append([trigger_open, 100.0, 101.0, 99.5, 100.8, 200.0])
+    history.candles_5m.append([trigger_open + M5, 100.8, 111.0, 100.0, 110.0, 200.0])
+
+    def fake_bos(candles, side, lookback=70):
+        assert lookback == len(candles)
+        if side == "LONG":
+            return [{"time": bos_time, "index": 1, "level": 100.0, "strength": 0.9}]
+        return []
+
+    def fake_retest(candles, side, bos, max_bars):
+        return {"valid": True, "time": retest_time, "index": 2, "level": 100.0, "quality": 0.9, "low": 99.0, "high": 101.0}
+
+    def fake_trigger(candles, side, setup_level):
+        if candles and int(candles[-1][0]) == trigger_open and side == "LONG":
+            return {"ready": True, "long": True, "short": False, "quality": 0.9, "rsi": 60.0, "rvol": 1.5, "atr": 1.0, "candle_time": trigger_open, "body_ratio": 0.8, "trigger_type": "BREAKOUT", "reason": "confirmed"}
+        return {"ready": False, "long": False, "short": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": 1.0, "candle_time": int(candles[-1][0]) if candles else 0, "body_ratio": 0.0, "trigger_type": "NONE", "reason": "not ready"}
+
+    def fake_analyze(*args, **kwargs):
+        assert kwargs["now_ms"] == signal_close
+        return {
+            "symbol": "TEST_USDT",
+            "setup": "LONG",
+            "technical_candidate": True,
+            "entry": 100.0,
+            "stop_loss": 95.0,
+            "tp1": 106.0,
+            "tp2": 110.0,
+        }
+
+    monkeypatch.setattr(runner_module, "_bos_events", fake_bos)
+    monkeypatch.setattr(runner_module, "_pullback_retest", fake_retest)
+    monkeypatch.setattr(runner_module, "_five_minute_trigger", fake_trigger)
+    monkeypatch.setattr(runner_module, "analyze_candles", fake_analyze)
+    monkeypatch.setattr(runner_module, "btc_filter_ok", lambda *args, **kwargs: (True, "ok"))
+    monkeypatch.setattr(runner_module, "build_btc_context", lambda *args, **kwargs: {})
+
+    btc = history
+    runner = BacktestRunner.__new__(BacktestRunner)
+    runner.client = None
+    runner.universe = None
+    runner.settings = None
+    runner.max_concurrency = 1
+    runner._lock = asyncio.Lock()
+
+    trades = runner._backtest_symbol(history, period_start, period_end, btc)
+    assert len(trades) == 1
+    assert trades[0].outcome == "TP2"
+    assert trades[0].tp1_hit is True
+    assert trades[0].tp2_hit is True

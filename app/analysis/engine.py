@@ -549,6 +549,25 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
     tp1=tp1_level["price"]
     tp2_level=next((x for x in ordered if ((x["price"]>tp1+clearance) if side=="LONG" else (x["price"]<tp1-clearance)) and (((x["price"]-entry) if side=="LONG" else (entry-x["price"]))>=min2)),None)
     if not tp2_level:
+        # Safe TP2 fallback: when the nearest confirmed structural level is
+        # already >= 2R, there is no nearer structural obstacle. In that
+        # specific case use 1.20R as the partial-profit TP1 and keep the
+        # confirmed structural level as TP2. TP2 remains fully structural;
+        # we never fabricate a structural level.
+        first_distance = ((ordered[0]["price"] - entry) if side == "LONG" else (entry - ordered[0]["price"]))
+        if first_distance >= min2:
+            tp1_fallback = entry + min1 if side == "LONG" else entry - min1
+            base.update({
+                "ok":True,
+                "tp1":tp1_fallback,
+                "tp2":ordered[0]["price"],
+                "reason":"single structural target beyond 2.00R; TP1 at 1.20R and TP2 at confirmed structural target",
+                "structural":True,
+                "tp1_level":None,
+                "tp2_level":ordered[0],
+                "target_levels":ordered[:8],
+            })
+            return base
         base.update({"tp1":tp1,"reason":"no second structural target reaches 2.00R","structural":True,"tp1_level":tp1_level,"target_levels":ordered[:8]})
         return base
     base.update({"ok":True,"tp1":tp1,"tp2":tp2_level["price"],"reason":"two distinct structural targets","structural":True,
@@ -678,6 +697,7 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
         failures.append("5M trigger")
     if setup in {"LONG","SHORT"}:
         if not momentum_ok: failures.append("momentum")
+        if not volume_ok: failures.append("volume/RVOL")
         if not location_ok: failures.append("target path/location")
         if not risk_ok: failures.append("risk/RR")
         if not volatility_ok: failures.append("volatility")
@@ -744,11 +764,7 @@ def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m
     volatility_ok=bool(atr15>0 and MIN_ATR_PERCENTILE<=atr_rank<=MAX_ATR_PERCENTILE and 0.0005<=atr_pct<=0.05)
     macd_line,macd_signal,macd_hist=_macd(close15)
     momentum_ok=bool((setup=="LONG" and 50<r15<78 and macd_hist>=0) or (setup=="SHORT" and 22<r15<50 and macd_hist<=0))
-    # 15M volume/RVOL is NOT a hard rejection gate.
-    # The 5M trigger already requires minimum RVOL, so confirmed entries
-    # retain volume participation without cancelling a good structure setup
-    # because the 15M RVOL is temporarily weak.
-    volume_ok=bool(trigger["rvol"]>=MIN_TRIGGER_RVOL)
+    volume_ok=bool(rv15>=0.90 and trigger["rvol"]>=0.90)
 
     levels=calculate_trade_levels({"setup":setup,"price":price,"atr":atr15,
         "protected_low":protected.get("protected_low"),"protected_high":protected.get("protected_high"),
@@ -770,7 +786,7 @@ def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m
         trigger_quality=_num(trigger.get("quality")),rvol=rv15,bos_quality=_num((active_bos or {}).get("strength")),
         retest_quality=_num((active_retest or {}).get("quality")))
     technical_candidate=bool(setup in {"LONG","SHORT"} and direction_ok and structure_ok and setup_ok and momentum_ok and
-                              location_ok and volatility_ok and risk_ok and rr is not None and rr>=MIN_RR and
+                              volume_ok and location_ok and volatility_ok and risk_ok and rr is not None and rr>=MIN_RR and
                               score>=MIN_SCORE and families>=MIN_FAMILIES)
     failures=_diagnostic_failures(regime,alignment,long_candidate,short_candidate,bos_long,bos_short,ret_long,ret_short,
                                   trigger_side,trigger,setup,momentum_ok,volume_ok,location_ok,risk_ok,volatility_ok,score,families)

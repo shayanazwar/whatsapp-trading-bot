@@ -678,7 +678,6 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
         failures.append("5M trigger")
     if setup in {"LONG","SHORT"}:
         if not momentum_ok: failures.append("momentum")
-        if not volume_ok: failures.append("volume/RVOL")
         if not location_ok: failures.append("target path/location")
         if not risk_ok: failures.append("risk/RR")
         if not volatility_ok: failures.append("volatility")
@@ -745,7 +744,11 @@ def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m
     volatility_ok=bool(atr15>0 and MIN_ATR_PERCENTILE<=atr_rank<=MAX_ATR_PERCENTILE and 0.0005<=atr_pct<=0.05)
     macd_line,macd_signal,macd_hist=_macd(close15)
     momentum_ok=bool((setup=="LONG" and 50<r15<78 and macd_hist>=0) or (setup=="SHORT" and 22<r15<50 and macd_hist<=0))
-    volume_ok=bool(rv15>=0.90 and trigger["rvol"]>=0.90)
+    # 15M volume/RVOL is NOT a hard rejection gate.
+    # The 5M trigger already requires minimum RVOL, so confirmed entries
+    # retain volume participation without cancelling a good structure setup
+    # because the 15M RVOL is temporarily weak.
+    volume_ok=bool(trigger["rvol"]>=MIN_TRIGGER_RVOL)
 
     levels=calculate_trade_levels({"setup":setup,"price":price,"atr":atr15,
         "protected_low":protected.get("protected_low"),"protected_high":protected.get("protected_high"),
@@ -767,7 +770,7 @@ def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m
         trigger_quality=_num(trigger.get("quality")),rvol=rv15,bos_quality=_num((active_bos or {}).get("strength")),
         retest_quality=_num((active_retest or {}).get("quality")))
     technical_candidate=bool(setup in {"LONG","SHORT"} and direction_ok and structure_ok and setup_ok and momentum_ok and
-                              volume_ok and location_ok and volatility_ok and risk_ok and rr is not None and rr>=MIN_RR and
+                              location_ok and volatility_ok and risk_ok and rr is not None and rr>=MIN_RR and
                               score>=MIN_SCORE and families>=MIN_FAMILIES)
     failures=_diagnostic_failures(regime,alignment,long_candidate,short_candidate,bos_long,bos_short,ret_long,ret_short,
                                   trigger_side,trigger,setup,momentum_ok,volume_ok,location_ok,risk_ok,volatility_ok,score,families)

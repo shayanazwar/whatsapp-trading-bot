@@ -56,7 +56,7 @@ def validate_analysis(
         volatility
         trade levels
 
-    This filter only performs the final consistency checks.
+    This filter only performs final consistency checks.
     """
 
     reasons: list[str] = []
@@ -124,11 +124,6 @@ def validate_analysis(
 
     # =========================================================
     # CORE ENGINE GATES
-    #
-    # These are the gates that define whether the engine
-    # considers the setup technically valid.
-    #
-    # Do NOT add duplicate RSI/RVOL/5M gates below.
     # =========================================================
 
     hard_gates = (
@@ -177,9 +172,6 @@ def validate_analysis(
 
     # =========================================================
     # ENGINE TECHNICAL CANDIDATE
-    #
-    # If the engine explicitly says this is not a technical
-    # candidate, do not allow this layer to resurrect it.
     # =========================================================
 
     if not bool(
@@ -208,20 +200,6 @@ def validate_analysis(
 
     # =========================================================
     # CONFIRMATION FAMILIES
-    #
-    # Six families:
-    #
-    # 1. Direction
-    # 2. Structure
-    # 3. Setup
-    # 4. Momentum
-    # 5. Volume
-    # 6. Location
-    #
-    # Minimum = 5/6.
-    #
-    # Futures context is intentionally NOT included because
-    # it is a supporting 5-point context family in the scanner.
     # =========================================================
 
     families = int(
@@ -242,10 +220,6 @@ def validate_analysis(
 
     # =========================================================
     # 5M TRIGGER CONSISTENCY
-    #
-    # The engine already determines the trigger.
-    # We only verify that its reported state is internally
-    # consistent with the selected side.
     # =========================================================
 
     trigger_ready = bool(
@@ -295,12 +269,6 @@ def validate_analysis(
 
     # =========================================================
     # TRIGGER QUALITY
-    #
-    # This remains a consistency check, but we do not create
-    # another separate RSI/RVOL hard gate here.
-    #
-    # The engine's setup/score logic already incorporates
-    # trigger quality.
     # =========================================================
 
     trigger_q = _f(
@@ -318,12 +286,6 @@ def validate_analysis(
 
     # =========================================================
     # VOLUME REQUIREMENT
-    #
-    # Only enforce increasing volume if explicitly enabled
-    # by configuration.
-    #
-    # Normal RVOL remains part of the engine's volume family
-    # rather than becoming a second hidden hard gate.
     # =========================================================
 
     if (
@@ -384,8 +346,11 @@ def validate_analysis(
     # =========================================================
     # MEXC EXECUTION QUALITY
     #
-    # These values may be unavailable before live-context
-    # enrichment. Defaults therefore remain permissive.
+    # Spread remains a hard execution-quality check.
+    #
+    # Entry drift is intentionally NOT a rejection gate.
+    # The scanner reprices the trade levels to the executable
+    # market price before final validation.
     # =========================================================
 
     spread = _f(
@@ -407,24 +372,21 @@ def validate_analysis(
             "MEXC spread gate failed"
         )
 
-    drift = _f(
+    # Entry drift is recorded for diagnostics only.
+    # It must NOT reject an otherwise valid setup.
+    _ = _f(
         data.get(
             "entry_drift_pct",
         ),
         0.0,
     )
 
-    max_drift = _f(
+    _ = _f(
         data.get(
             "max_entry_drift_pct",
         ),
         0.002,
     )
-
-    if drift > max_drift:
-        reasons.append(
-            "Entry drift gate failed"
-        )
 
     # =========================================================
     # TRADE LEVELS
@@ -459,12 +421,6 @@ def validate_analysis(
     # FUTURES CONTEXT
     #
     # futures_ok is deliberately NOT an independent hard gate.
-    #
-    # Missing futures flow must not erase an otherwise valid
-    # technical setup.
-    #
-    # It contributes supporting context/score through the
-    # scanner.
     # =========================================================
 
     # No direct rejection for futures_ok=False.

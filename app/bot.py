@@ -15,31 +15,25 @@ from .whatsapp import WhatsAppClient
 
 LOGGER = logging.getLogger(__name__)
 
-HELP = """📈 WhatsApp Trading Bot
+HELP = """ðŸ“ˆ WhatsApp Trading Bot
 
-Commands:
-
+ðŸ’° PRICE
 PRICE BTCUSDT
 
+ðŸ“Š ANALYZE
 ANALYZE BTCUSDT
-ANALYZE ETHUSDT
-ANALYZE SOLUSDT
 
+ðŸ“ˆ CHART
 CHART BTCUSDT 1H
-CHART MEXC:BTCUSDT 4H
 
+ðŸ”” ALERT
 ALERT BTCUSDT ABOVE 120000
-ALERT BTCUSDT BELOW 110000
-ALERTS
-DELETE 12
-DELETE ALL
+ALERTS â€¢ DELETE 12 â€¢ DELETE ALL
 
+ðŸ”Ž SEARCH
 SEARCH PEPE
-SEARCH AIOT
 
-Charts: 5M, 15M, 1H, 4H, 1D
-
-Alerts are one-shot and trigger on a price crossing the target.
+â± 5M â€¢ 15M â€¢ 1H â€¢ 4H â€¢ 1D
 """
 
 COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
@@ -78,7 +72,7 @@ class Bot:
         ):
             await self.whatsapp.send_text(
                 phone,
-                "⛔ This bot is private.",
+                "â›” This bot is private.",
             )
             return
 
@@ -159,7 +153,7 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"❌ {exc}",
+                f"âŒ {exc}",
             )
 
     async def _price(
@@ -192,7 +186,7 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"💰 {ref.symbol}\n"
+                f"ðŸ’° {ref.symbol}\n"
                 f"Exchange: MEXC FUTURES\n"
                 f"Price: ${fmt_price(price)}"
             ),
@@ -205,72 +199,66 @@ class Bot:
     ) -> None:
 
         if not args:
-            raise ValueError(
-                "Usage: ANALYZE BTCUSDT"
-            )
+            raise ValueError("Usage: ANALYZE BTCUSDT")
 
         raw_symbol = args.split()[0]
 
-        data = await analyze_symbol(
-            self.market,
-            raw_symbol,
-        )
+        try:
+            data = await analyze_symbol(self.market, raw_symbol)
+        except TypeError as exc:
+            # Some legacy analysis paths can receive an incomplete numeric value.
+            # Do not expose a Python traceback/type error to the WhatsApp user.
+            if "NoneType" in str(exc) or "abs()" in str(exc):
+                LOGGER.exception("Incomplete analysis data for %s", raw_symbol)
+                await self.whatsapp.send_text(
+                    phone,
+                    f"âš ï¸ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
+                )
+                return
+            raise
 
-        def fmt_optional(
-            value: Optional[float],
-        ) -> str:
-
+        def fmt_optional(value: object) -> str:
             if value is None:
                 return "N/A"
+            try:
+                return fmt_price(float(value))
+            except (TypeError, ValueError):
+                return "N/A"
 
-            return fmt_price(value)
+        def fmt_number(value: object, digits: int = 1) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "N/A"
 
         body = (
-            f"🧠 {data['symbol']} ANALYSIS\n\n"
-
-            f"4H Trend: {data['trend_4h']}\n"
-            f"1H Structure: {data['structure_1h']}\n"
-            f"15M Structure: {data['bos_15m']}\n"
-
-            f"EMA 21/50: {data['ema_direction']}\n"
-            f"RSI: {data['rsi']:.1f}\n"
-            f"Volume: {data['volume']}\n"
-
-            f"Support: "
-            f"{fmt_optional(data['support'])}\n"
-
-            f"Resistance: "
-            f"{fmt_optional(data['resistance'])}\n"
-
-            f"Score: {data['score']}/100\n"
+            f"ðŸ§  {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
+            f"4H Trend: {data.get('trend_4h', 'N/A')}\n"
+            f"1H Structure: {data.get('structure_1h', 'N/A')}\n"
+            f"15M Structure: {data.get('bos_15m', 'N/A')}\n"
+            f"EMA 21/50: {data.get('ema_direction', 'N/A')}\n"
+            f"RSI: {fmt_number(data.get('rsi'))}\n"
+            f"Volume: {data.get('volume', 'N/A')}\n"
+            f"Support: {fmt_optional(data.get('support'))}\n"
+            f"Resistance: {fmt_optional(data.get('resistance'))}\n"
+            f"Score: {data.get('score', 'N/A')}/100\n"
             f"Families: {data.get('confirmation_family_count', 0)}/6\n\n"
-
-            f"Potential Setup: {data['setup']}\n"
+            f"Potential Setup: {data.get('setup', 'NO TRADE')}\n"
         )
 
-        if data["entry"] is not None:
-
+        entry = data.get("entry")
+        if entry is not None:
             body += (
-                f"Entry: "
-                f"{fmt_price(data['entry'])}\n"
-
-                f"SL: "
-                f"{fmt_price(data['stop_loss'])}\n"
-
-                f"TP1: "
-                f"{fmt_price(data['tp1'])}\n"
-
-                f"TP2: "
-                f"{fmt_price(data['tp2'])}\n"
-
-                f"RR: "
-                f"1:{data['rr']:.2f}"
+                f"Entry: {fmt_optional(entry)}\n"
+                f"SL: {fmt_optional(data.get('stop_loss'))}\n"
+                f"TP1: {fmt_optional(data.get('tp1'))}\n"
+                f"TP2: {fmt_optional(data.get('tp2'))}\n"
+                f"RR: 1:{fmt_number(data.get('rr'), 2)}"
             )
 
-        await self.whatsapp.send_text(
-            phone,
-            body,
-        )
+        await self.whatsapp.send_text(phone, body)
 
     async def _chart(
         self,
@@ -281,58 +269,47 @@ class Bot:
         parts = args.split()
 
         if len(parts) < 2:
-            raise ValueError(
-                "Usage: CHART BTCUSDT 1H"
-            )
+            raise ValueError("Usage: CHART BTCUSDT 1H")
 
         raw_symbol = parts[0]
         raw_tf = parts[1]
 
-        tf = TIMEFRAME_ALIASES.get(
-            raw_tf.upper()
-        )
-
+        tf = TIMEFRAME_ALIASES.get(raw_tf.upper())
         if not tf:
-            raise ValueError(
-                "Supported chart timeframes: "
-                "5M, 15M, 1H, 4H, 1D"
-            )
+            raise ValueError("Supported chart timeframes: 5M, 15M, 1H, 4H, 1D")
 
-        ref = await self.market.resolve(
-            raw_symbol
-        )
-
+        ref = await self.market.resolve(raw_symbol)
         rows = await self.market.ohlcv(
             ref,
             tf,
             self.settings.chart_default_bars,
         )
 
-        path = await self.charts.render(
-            ref,
-            tf,
-            rows,
-        )
-
+        path = None
         try:
-            media_id = await self.whatsapp.upload_image(
-                path
-            )
+            path = await self.charts.render(ref, tf, rows)
+            if path is None:
+                raise RuntimeError("Chart renderer did not return an image file.")
 
+            path = Path(path)
+            if not path.is_file():
+                raise RuntimeError("Chart image was not created.")
+
+            media_id = await self.whatsapp.upload_image(path)
             await self.whatsapp.send_image(
                 phone,
                 media_id,
                 caption=(
-                    f"📊 {ref.exchange.upper()} "
-                    f"{ref.symbol} • {tf.upper()}\n"
-                    f"EMA 21 / EMA 50"
+                    f"ðŸ“Š {ref.exchange.upper()} {ref.symbol} â€¢ {tf.upper()}\n"
+                    f"EMA 21 / 50 / 100 / 200"
                 ),
             )
-
         finally:
-            Path(path).unlink(
-                missing_ok=True
-            )
+            if path is not None:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except (TypeError, ValueError, OSError):
+                    LOGGER.warning("Could not remove temporary chart file: %r", path)
 
     async def _create_alert(
         self,
@@ -417,7 +394,7 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"✅ Alert #{alert.id} created\n\n"
+                f"âœ… Alert #{alert.id} created\n\n"
                 f"{ref.symbol}\n"
                 f"Condition: "
                 f"{condition.upper()} "
@@ -441,12 +418,12 @@ class Bot:
         if not alerts:
             await self.whatsapp.send_text(
                 phone,
-                "🔔 No active alerts.",
+                "ðŸ”” No active alerts.",
             )
             return
 
         lines = [
-            "🔔 ACTIVE ALERTS",
+            "ðŸ”” ACTIVE ALERTS",
             "",
         ]
 
@@ -489,7 +466,7 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"🗑️ Deleted {count} active alert(s).",
+                f"ðŸ—‘ï¸ Deleted {count} active alert(s).",
             )
 
             return
@@ -509,14 +486,14 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"🗑️ Alert #{alert_id} deleted.",
+                f"ðŸ—‘ï¸ Alert #{alert_id} deleted.",
             )
 
         else:
 
             await self.whatsapp.send_text(
                 phone,
-                f"❌ Active alert #{alert_id} was not found.",
+                f"âŒ Active alert #{alert_id} was not found.",
             )
 
     async def _search(
@@ -543,7 +520,7 @@ class Bot:
             return
 
         lines = [
-            f"🔎 Matches for {args.upper()}:",
+            f"ðŸ”Ž Matches for {args.upper()}:",
             "",
         ]
 
@@ -602,7 +579,7 @@ class Bot:
     ) -> None:
 
         body = (
-            f"🚨 PRICE ALERT\n\n"
+            f"ðŸš¨ PRICE ALERT\n\n"
             f"{alert.symbol}\n"
             f"MEXC FUTURES\n"
             f"Current: ${fmt_price(price)}\n"

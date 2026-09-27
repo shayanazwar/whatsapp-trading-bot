@@ -227,8 +227,11 @@ class MexcScanner:
                     return self._reject(symbol, "Invalid planned entry", stage="LEVELS", analysis=analysis)
                 drift = abs(executable - planned_entry) / planned_entry
                 analysis["entry_drift_pct"] = drift
+                # Entry drift is recorded for diagnostics, but it must not
+                # cancel an otherwise valid technical setup. Levels are
+                # repriced to the executable bid/ask and RR is recalculated.
                 if drift > float(getattr(self.settings, "max_entry_drift_pct", 0.002)):
-                    return self._reject(symbol, "Executable entry drift exceeds limit", stage="EXECUTION_QUALITY", analysis=analysis)
+                    analysis["entry_drift_warning"] = "Executable price differs materially from planned entry"
                 self._reprice_levels(analysis, executable)
                 self._update_confirmation_families(analysis)
                 analysis["score"], analysis["score_groups"] = self._recalculate_score(analysis)

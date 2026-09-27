@@ -1069,4 +1069,4 @@ async def analyze_symbol(market, symbol: str) -> Dict[str, Any]:
     c1h = await market.ohlcv(ref, "1H", 250)
     c15 = await market.ohlcv(ref, "15M", 250)
     c5 = await market.ohlcv(ref, "5M", 250)
-    return analyze_candles(ref.symbol, c4h, c1h, c15, c5, c1d)k
+    return analyze_candles(ref.symbol, c4h, c1h, c15, c5, c1d)

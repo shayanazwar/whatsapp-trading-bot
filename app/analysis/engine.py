@@ -50,7 +50,7 @@ RETEST_TOLERANCE_ATR = 0.45
 RETEST_PENETRATION_ATR = 0.90
 MIN_TP1_R = 1.20
 MIN_TP2_R = 2.00
-ENGINE_VERSION = "gold-v1.7-deterministic"
+ENGINE_VERSION = "gold-v1.7-fixed-deterministic"
 
 
 class Candle(dict):
@@ -475,14 +475,19 @@ def _five_minute_trigger(candles: List[Candle], side: str, setup_level: Optional
     breakout_short=close<o and close<pl and short_level
     reclaim_long=close>o and long_level and (setup_level is None or l<=setup_level)
     reclaim_short=close<o and short_level and (setup_level is None or h>=setup_level)
+    # A confirmed 15M BOS/retest does not require the next 5M candle to
+    # retouch the BOS level or break the immediately preceding 5M high/low.
+    # Continuation after the retest is also a valid execution trigger.
+    continuation_long=close>o and close>float(prev["close"]) and long_level
+    continuation_short=close<o and close<float(prev["close"]) and short_level
     mom_long=r>=51 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY
     mom_short=r<=49 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY
-    long_ok=(breakout_long or reclaim_long) and mom_long
-    short_ok=(breakout_short or reclaim_short) and mom_short
+    long_ok=(breakout_long or reclaim_long or continuation_long) and mom_long
+    short_ok=(breakout_short or reclaim_short or continuation_short) and mom_short
     if side=="LONG":
-        ready, q, t = long_ok, _clamp((r-50)/15,0,1), "BREAKOUT" if breakout_long else "RECLAIM" if reclaim_long else "NONE"
+        ready, q, t = long_ok, _clamp((r-50)/15,0,1), "BREAKOUT" if breakout_long else "RECLAIM" if reclaim_long else "CONTINUATION" if continuation_long else "NONE"
     elif side=="SHORT":
-        ready, q, t = short_ok, _clamp((50-r)/15,0,1), "BREAKDOWN" if breakout_short else "RECLAIM" if reclaim_short else "NONE"
+        ready, q, t = short_ok, _clamp((50-r)/15,0,1), "BREAKDOWN" if breakout_short else "RECLAIM" if reclaim_short else "CONTINUATION" if continuation_short else "NONE"
     else:
         ready,q,t=False,0.0,"NONE"
     quality=_clamp(0.35*_clamp(body/0.70,0,1)+0.30*_clamp(rv/1.50,0,1)+0.35*q,0,1)

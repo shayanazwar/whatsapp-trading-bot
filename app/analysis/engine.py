@@ -50,7 +50,7 @@ RETEST_TOLERANCE_ATR = 0.45
 RETEST_PENETRATION_ATR = 0.90
 MIN_TP1_R = 1.20
 MIN_TP2_R = 2.00
-ENGINE_VERSION = "gold-v1.7-fixed-deterministic"
+ENGINE_VERSION = "gold-v1.7-deterministic"
 
 
 class Candle(dict):
@@ -475,19 +475,14 @@ def _five_minute_trigger(candles: List[Candle], side: str, setup_level: Optional
     breakout_short=close<o and close<pl and short_level
     reclaim_long=close>o and long_level and (setup_level is None or l<=setup_level)
     reclaim_short=close<o and short_level and (setup_level is None or h>=setup_level)
-    # A confirmed 15M BOS/retest does not require the next 5M candle to
-    # retouch the BOS level or break the immediately preceding 5M high/low.
-    # Continuation after the retest is also a valid execution trigger.
-    continuation_long=close>o and close>float(prev["close"]) and long_level
-    continuation_short=close<o and close<float(prev["close"]) and short_level
     mom_long=r>=51 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY
     mom_short=r<=49 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY
-    long_ok=(breakout_long or reclaim_long or continuation_long) and mom_long
-    short_ok=(breakout_short or reclaim_short or continuation_short) and mom_short
+    long_ok=(breakout_long or reclaim_long) and mom_long
+    short_ok=(breakout_short or reclaim_short) and mom_short
     if side=="LONG":
-        ready, q, t = long_ok, _clamp((r-50)/15,0,1), "BREAKOUT" if breakout_long else "RECLAIM" if reclaim_long else "CONTINUATION" if continuation_long else "NONE"
+        ready, q, t = long_ok, _clamp((r-50)/15,0,1), "BREAKOUT" if breakout_long else "RECLAIM" if reclaim_long else "NONE"
     elif side=="SHORT":
-        ready, q, t = short_ok, _clamp((50-r)/15,0,1), "BREAKDOWN" if breakout_short else "RECLAIM" if reclaim_short else "CONTINUATION" if continuation_short else "NONE"
+        ready, q, t = short_ok, _clamp((50-r)/15,0,1), "BREAKDOWN" if breakout_short else "RECLAIM" if reclaim_short else "NONE"
     else:
         ready,q,t=False,0.0,"NONE"
     quality=_clamp(0.35*_clamp(body/0.70,0,1)+0.30*_clamp(rv/1.50,0,1)+0.35*q,0,1)
@@ -554,9 +549,11 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
     tp1=tp1_level["price"]
     tp2_level=next((x for x in ordered if ((x["price"]>tp1+clearance) if side=="LONG" else (x["price"]<tp1-clearance)) and (((x["price"]-entry) if side=="LONG" else (entry-x["price"]))>=min2)),None)
     if not tp2_level:
-        # TP2-only fix: if the nearest confirmed structural target already
-        # reaches 2R, keep that real structural level as TP2 and use 1.20R
-        # as the partial-profit TP1. No synthetic structural TP2 is created.
+        # Safe TP2 fallback: when the nearest confirmed structural level is
+        # already >= 2R, there is no nearer structural obstacle. In that
+        # specific case use 1.20R as the partial-profit TP1 and keep the
+        # confirmed structural level as TP2. TP2 remains fully structural;
+        # we never fabricate a structural level.
         first_distance = ((ordered[0]["price"] - entry) if side == "LONG" else (entry - ordered[0]["price"]))
         if first_distance >= min2:
             tp1_fallback = entry + min1 if side == "LONG" else entry - min1
@@ -700,6 +697,7 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
         failures.append("5M trigger")
     if setup in {"LONG","SHORT"}:
         if not momentum_ok: failures.append("momentum")
+        if not volume_ok: failures.append("volume/RVOL")
         if not location_ok: failures.append("target path/location")
         if not risk_ok: failures.append("risk/RR")
         if not volatility_ok: failures.append("volatility")
@@ -766,11 +764,7 @@ def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m
     volatility_ok=bool(atr15>0 and MIN_ATR_PERCENTILE<=atr_rank<=MAX_ATR_PERCENTILE and 0.0005<=atr_pct<=0.05)
     macd_line,macd_signal,macd_hist=_macd(close15)
     momentum_ok=bool((setup=="LONG" and 50<r15<78 and macd_hist>=0) or (setup=="SHORT" and 22<r15<50 and macd_hist<=0))
-    # 15M volume/RVOL is NOT a hard rejection gate.
-    # The 5M trigger already requires minimum RVOL, so confirmed entries
-    # retain volume participation without cancelling a good structure setup
-    # because the 15M RVOL is temporarily weak.
-    volume_ok=bool(trigger["rvol"]>=MIN_TRIGGER_RVOL)
+    volume_ok=bool(rv15>=0.90 and trigger["rvol"]>=0.90)
 
     levels=calculate_trade_levels({"setup":setup,"price":price,"atr":atr15,
         "protected_low":protected.get("protected_low"),"protected_high":protected.get("protected_high"),
@@ -792,7 +786,7 @@ def analyze_candles(symbol: str, candles_4h: List, candles_1h: List, candles_15m
         trigger_quality=_num(trigger.get("quality")),rvol=rv15,bos_quality=_num((active_bos or {}).get("strength")),
         retest_quality=_num((active_retest or {}).get("quality")))
     technical_candidate=bool(setup in {"LONG","SHORT"} and direction_ok and structure_ok and setup_ok and momentum_ok and
-                              location_ok and volatility_ok and risk_ok and rr is not None and rr>=MIN_RR and
+                              volume_ok and location_ok and volatility_ok and risk_ok and rr is not None and rr>=MIN_RR and
                               score>=MIN_SCORE and families>=MIN_FAMILIES)
     failures=_diagnostic_failures(regime,alignment,long_candidate,short_candidate,bos_long,bos_short,ret_long,ret_short,
                                   trigger_side,trigger,setup,momentum_ok,volume_ok,location_ok,risk_ok,volatility_ok,score,families)

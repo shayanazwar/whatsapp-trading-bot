@@ -22,6 +22,7 @@ from ..config import Settings
 from .report import BacktestSummary, summarize
 from .simulator import SimulatedTrade, simulate_trade
 
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -62,22 +63,44 @@ INTERVALS = {
 # Backtest execution safety
 # ---------------------------------------------------------------------------
 
-# MexcClient's underlying HTTP client uses a 20-second timeout.
-# This outer timeout also covers waiting for the client's public rate limiter.
+# Hard timeout around ONE historical MEXC range request.
+#
+# This covers:
+#   - MEXC HTTP request
+#   - MEXC client's public request limiter
+#   - retry waits
+#
+# If the request cannot complete within this period, the current symbol
+# fails cleanly and the rolling worker continues with the next symbol.
 REQUEST_TIMEOUT_SECONDS = 30
 
-# A small controlled concurrency protects the production Render instance
-# while still allowing historical data requests to overlap.
+
+# Maximum number of symbols being processed concurrently.
 #
-# Each symbol fetches 5 timeframes concurrently, so 2 symbols means at most
-# about 10 public requests in flight from the backtest.
+# Each symbol fetches five timeframes concurrently:
+#   4H / 1H / 15M / 5M / 1D
+#
+# Therefore max 2 symbols means approximately 10 historical requests can
+# be active/queued by the backtest at one time.
 MAX_SYMBOL_CONCURRENCY = 2
 
-# Maximum time allowed for fetching all 5 timeframes for one symbol.
+
+# Hard maximum for ALL historical data fetching for one symbol.
+#
+# This is deliberately larger than REQUEST_TIMEOUT_SECONDS because one
+# symbol can require multiple paginated 5M requests.
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 
-# Maximum time allowed for refreshing the backtest universe.
+
+# Maximum time allowed for the backtest universe refresh.
 UNIVERSE_REFRESH_TIMEOUT_SECONDS = 60
+
+
+# Independent heartbeat interval.
+#
+# This does NOT change the backtest logic.
+# It only makes long waits visible in Render logs.
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 class BacktestAlreadyRunning(RuntimeError):
@@ -156,7 +179,10 @@ def _normalize_rows(
 
         result[timestamp] = list(row)
 
-    return [result[timestamp] for timestamp in sorted(result)]
+    return [
+        result[timestamp]
+        for timestamp in sorted(result)
+    ]
 
 
 def _row_time(row: object) -> int:
@@ -253,6 +279,8 @@ async def _fetch_range(
         - filtered
         - deduplicated
         - sorted chronologically
+
+    Every individual range request has a hard timeout.
     """
 
     interval_sizes = {
@@ -305,7 +333,8 @@ async def _fetch_range(
         request_count += 1
 
         LOGGER.debug(
-            "BACKTEST REQUEST | %s | %s | start=%d end=%d page=%d",
+            "BACKTEST REQUEST | %s | %s | "
+            "start=%d end=%d page=%d",
             symbol,
             interval,
             cursor,
@@ -324,11 +353,21 @@ async def _fetch_range(
                 ),
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
+
         except asyncio.TimeoutError as exc:
             raise TimeoutError(
                 f"{symbol} {interval}: MEXC range request timed out "
                 f"after {REQUEST_TIMEOUT_SECONDS}s "
                 f"(start={cursor}, end={page_end})"
+            ) from exc
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            raise RuntimeError(
+                f"{symbol} {interval}: MEXC range request failed: "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
 
         if rows is None:
@@ -352,11 +391,13 @@ async def _fetch_range(
 
             if cursor <= timestamp <= page_end:
                 result[timestamp] = list(row)
+
                 valid_timestamps.append(
                     timestamp
                 )
 
-        # Empty response: safely advance beyond this page.
+        # Empty response:
+        # safely advance beyond this page.
         if not rows:
             cursor = (
                 page_end
@@ -396,7 +437,8 @@ async def _fetch_range(
     ]
 
     LOGGER.debug(
-        "BACKTEST DATA | %s | %s | requests=%d candles=%d",
+        "BACKTEST DATA | %s | %s | "
+        "requests=%d candles=%d",
         symbol,
         interval,
         request_count,
@@ -450,6 +492,55 @@ class BacktestRunner:
         return self._lock.locked()
 
     # -----------------------------------------------------------------------
+    # Heartbeat
+    # -----------------------------------------------------------------------
+
+    async def _heartbeat(
+        self,
+        *,
+        days: int,
+        total: int,
+        state: dict[str, int],
+        started: float,
+        stop_event: asyncio.Event,
+    ) -> None:
+        """
+        Independent backtest heartbeat.
+
+        This task never performs trading work.
+        It only reports progress so a long-running/stalled backtest is
+        observable in Render logs.
+        """
+
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=HEARTBEAT_INTERVAL_SECONDS,
+                )
+                break
+
+            except asyncio.TimeoutError:
+                elapsed = (
+                    time.monotonic()
+                    - started
+                )
+
+                LOGGER.info(
+                    "BACKTEST HEARTBEAT | "
+                    "days=%d processed=%d/%d "
+                    "tested=%d errors=%d signals=%d "
+                    "elapsed=%.1fs",
+                    days,
+                    state["processed"],
+                    total,
+                    state["tested"],
+                    state["errors"],
+                    state["signals"],
+                    elapsed,
+                )
+
+    # -----------------------------------------------------------------------
     # Main backtest
     # -----------------------------------------------------------------------
 
@@ -476,6 +567,9 @@ class BacktestRunner:
 
         async with self._lock:
             started = time.monotonic()
+
+            heartbeat_stop = asyncio.Event()
+            heartbeat_task: asyncio.Task | None = None
 
             try:
                 now_ms = int(
@@ -513,6 +607,7 @@ class BacktestRunner:
                         self.universe.refresh(),
                         timeout=UNIVERSE_REFRESH_TIMEOUT_SECONDS,
                     )
+
                 except asyncio.TimeoutError as exc:
                     raise TimeoutError(
                         "MEXC backtest universe refresh timed out "
@@ -540,9 +635,12 @@ class BacktestRunner:
 
                 LOGGER.info(
                     "BACKTEST UNIVERSE READY | "
-                    "symbols=%d concurrency=%d",
+                    "symbols=%d concurrency=%d "
+                    "request_timeout=%ss symbol_timeout=%ss",
                     len(symbols),
                     self.max_concurrency,
+                    REQUEST_TIMEOUT_SECONDS,
+                    SYMBOL_FETCH_TIMEOUT_SECONDS,
                 )
 
                 # -----------------------------------------------------------
@@ -583,9 +681,6 @@ class BacktestRunner:
                 )
 
                 # BTC filter uses only 4H / 1H / 15M engine candles.
-                # Keep this as a local immutable tuple and explicitly pass
-                # it to worker threads. Do not store it as shared mutable
-                # runner state.
                 btc_engine_cache = (
                     _convert_for_engine(
                         btc_history.candles_4h,
@@ -624,223 +719,264 @@ class BacktestRunner:
                     SimulatedTrade
                 ] = []
 
-                errors = 0
-                tested = 0
-                processed = 0
+                state = {
+                    "processed": 0,
+                    "tested": 0,
+                    "errors": 0,
+                    "signals": 0,
+                }
 
-                semaphore = asyncio.Semaphore(
-                    self.max_concurrency
+                # -----------------------------------------------------------
+                # Heartbeat starts BEFORE symbol processing.
+                # -----------------------------------------------------------
+
+                heartbeat_task = asyncio.create_task(
+                    self._heartbeat(
+                        days=days,
+                        total=len(symbols),
+                        state=state,
+                        started=started,
+                        stop_event=heartbeat_stop,
+                    ),
+                    name="backtest-heartbeat",
                 )
 
-                async def worker(
-                    symbol: str,
-                ) -> tuple[
-                    str,
-                    list[SimulatedTrade],
-                    str | None,
-                ]:
-                    async with semaphore:
-                        fetch_started = time.monotonic()
+                # -----------------------------------------------------------
+                # Rolling worker pool
+                # -----------------------------------------------------------
+                #
+                # IMPORTANT:
+                # Only max_concurrency tasks are active at once.
+                #
+                # We do NOT create 300 network-heavy worker tasks.
+                # This keeps the historical request pressure controlled.
+                # -----------------------------------------------------------
 
-                        LOGGER.info(
-                            "BACKTEST FETCH START | symbol=%s",
-                            symbol,
-                        )
+                symbol_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+                for symbol in symbols:
+                    await symbol_queue.put(
+                        symbol
+                    )
+
+                for _ in range(
+                    self.max_concurrency
+                ):
+                    await symbol_queue.put(
+                        None
+                    )
+
+                state_lock = asyncio.Lock()
+
+                async def worker(
+                    worker_id: int,
+                ) -> None:
+                    while True:
+                        symbol = await symbol_queue.get()
 
                         try:
-                            history = await asyncio.wait_for(
-                                self._fetch_symbol_history(
+                            if symbol is None:
+                                return
+
+                            fetch_started = time.monotonic()
+
+                            LOGGER.info(
+                                "BACKTEST FETCH START | "
+                                "worker=%d symbol=%s",
+                                worker_id,
+                                symbol,
+                            )
+
+                            try:
+                                history = await asyncio.wait_for(
+                                    self._fetch_symbol_history(
+                                        symbol,
+                                        period_start,
+                                        period_end,
+                                    ),
+                                    timeout=SYMBOL_FETCH_TIMEOUT_SECONDS,
+                                )
+
+                                LOGGER.info(
+                                    "BACKTEST FETCH DONE | "
+                                    "worker=%d symbol=%s | "
+                                    "4H=%d 1H=%d 15M=%d "
+                                    "5M=%d 1D=%d | "
+                                    "seconds=%.2f",
+                                    worker_id,
                                     symbol,
+                                    len(
+                                        history.candles_4h
+                                    ),
+                                    len(
+                                        history.candles_1h
+                                    ),
+                                    len(
+                                        history.candles_15m
+                                    ),
+                                    len(
+                                        history.candles_5m
+                                    ),
+                                    len(
+                                        history.candles_1d
+                                    ),
+                                    time.monotonic()
+                                    - fetch_started,
+                                )
+
+                                LOGGER.info(
+                                    "BACKTEST ANALYSIS START | "
+                                    "worker=%d symbol=%s",
+                                    worker_id,
+                                    symbol,
+                                )
+
+                                # CPU-heavy historical analysis runs outside
+                                # the Uvicorn event loop.
+                                symbol_trades = await asyncio.to_thread(
+                                    self._backtest_symbol,
+                                    history,
                                     period_start,
                                     period_end,
-                                ),
-                                timeout=SYMBOL_FETCH_TIMEOUT_SECONDS,
-                            )
+                                    btc_history,
+                                    btc_engine_cache,
+                                )
 
-                            LOGGER.info(
-                                "BACKTEST FETCH DONE | "
-                                "symbol=%s | "
-                                "4H=%d 1H=%d 15M=%d "
-                                "5M=%d 1D=%d | "
-                                "seconds=%.2f",
-                                symbol,
-                                len(
-                                    history.candles_4h
-                                ),
-                                len(
-                                    history.candles_1h
-                                ),
-                                len(
-                                    history.candles_15m
-                                ),
-                                len(
-                                    history.candles_5m
-                                ),
-                                len(
-                                    history.candles_1d
-                                ),
-                                time.monotonic()
-                                - fetch_started,
-                            )
+                                LOGGER.info(
+                                    "BACKTEST ANALYSIS DONE | "
+                                    "worker=%d symbol=%s | signals=%d",
+                                    worker_id,
+                                    symbol,
+                                    len(symbol_trades),
+                                )
 
-                            LOGGER.info(
-                                "BACKTEST ANALYSIS START | "
-                                "symbol=%s",
-                                symbol,
-                            )
+                                trades.extend(
+                                    symbol_trades
+                                )
 
-                            # _backtest_symbol() is synchronous and contains
-                            # CPU-heavy historical indicator/structure work.
-                            #
-                            # Running it in a worker thread is critical:
-                            # without this, a large backtest can monopolize
-                            # Uvicorn's event loop and cause /health and
-                            # WhatsApp webhooks to time out.
-                            symbol_trades = await asyncio.to_thread(
-                                self._backtest_symbol,
-                                history,
-                                period_start,
-                                period_end,
-                                btc_history,
-                                btc_engine_cache,
-                            )
+                                async with state_lock:
+                                    state["tested"] += 1
+                                    state["signals"] = len(
+                                        trades
+                                    )
 
-                            LOGGER.info(
-                                "BACKTEST ANALYSIS DONE | "
-                                "symbol=%s | signals=%d",
-                                symbol,
-                                len(symbol_trades),
-                            )
+                            except asyncio.CancelledError:
+                                LOGGER.warning(
+                                    "BACKTEST SYMBOL CANCELLED | "
+                                    "worker=%d symbol=%s",
+                                    worker_id,
+                                    symbol,
+                                )
+                                raise
 
-                            return (
-                                symbol,
-                                symbol_trades,
-                                None,
-                            )
+                            except Exception as exc:
+                                async with state_lock:
+                                    state["errors"] += 1
 
-                        except asyncio.CancelledError:
-                            LOGGER.warning(
-                                "BACKTEST SYMBOL CANCELLED | %s",
-                                symbol,
-                            )
-                            raise
+                                LOGGER.exception(
+                                    "BACKTEST symbol failed: "
+                                    "%s | %s",
+                                    symbol,
+                                    exc,
+                                )
 
-                        except Exception as exc:
-                            LOGGER.exception(
-                                "BACKTEST symbol failed: "
-                                "%s | %s",
-                                symbol,
-                                exc,
-                            )
+                                LOGGER.error(
+                                    "BACKTEST DATA ERROR | "
+                                    "%s | %s: %s",
+                                    symbol,
+                                    type(exc).__name__,
+                                    exc,
+                                )
 
-                            return (
-                                symbol,
-                                [],
-                                f"{type(exc).__name__}: {exc}",
-                            )
+                            finally:
+                                async with state_lock:
+                                    state["processed"] += 1
 
-                # -----------------------------------------------------------
-                # Controlled rolling processing
-                # -----------------------------------------------------------
-                #
-                # Create lightweight tasks for all selected symbols.
-                # The semaphore limits actual work to max_concurrency.
-                #
-                # as_completed() means every finished symbol is reported
-                # immediately instead of waiting for a slower symbol.
-                # -----------------------------------------------------------
+                                    processed = (
+                                        state["processed"]
+                                    )
+                                    tested = (
+                                        state["tested"]
+                                    )
+                                    errors = (
+                                        state["errors"]
+                                    )
+                                    signal_count = (
+                                        state["signals"]
+                                    )
 
-                tasks = [
+                                LOGGER.info(
+                                    "BACKTEST SYMBOL COMPLETE | "
+                                    "processed=%d/%d | "
+                                    "tested=%d | "
+                                    "errors=%d | "
+                                    "signals=%d | "
+                                    "symbol=%s",
+                                    processed,
+                                    len(symbols),
+                                    tested,
+                                    errors,
+                                    signal_count,
+                                    symbol,
+                                )
+
+                                LOGGER.info(
+                                    "BACKTEST PROGRESS | "
+                                    "days=%d "
+                                    "processed=%d/%d "
+                                    "tested=%d "
+                                    "errors=%d "
+                                    "signals=%d",
+                                    days,
+                                    processed,
+                                    len(symbols),
+                                    tested,
+                                    errors,
+                                    signal_count,
+                                )
+
+                                # Explicit event-loop scheduling opportunity.
+                                await asyncio.sleep(0)
+
+                        finally:
+                            symbol_queue.task_done()
+
+                workers = [
                     asyncio.create_task(
-                        worker(symbol),
+                        worker(worker_id),
                         name=(
-                            f"backtest-symbol-{symbol}"
+                            f"backtest-worker-{worker_id}"
                         ),
                     )
-                    for symbol in symbols
+                    for worker_id in range(
+                        self.max_concurrency
+                    )
                 ]
 
                 try:
-                    for completed in asyncio.as_completed(
-                        tasks
-                    ):
-                        (
-                            symbol,
-                            symbol_trades,
-                            error,
-                        ) = await completed
-
-                        processed += 1
-
-                        if error:
-                            errors += 1
-
-                            LOGGER.error(
-                                "BACKTEST DATA ERROR | "
-                                "%s | %s",
-                                symbol,
-                                error,
-                            )
-                        else:
-                            tested += 1
-
-                            trades.extend(
-                                symbol_trades
-                            )
-
-                        LOGGER.info(
-                            "BACKTEST SYMBOL COMPLETE | "
-                            "processed=%d/%d | "
-                            "tested=%d | "
-                            "errors=%d | "
-                            "signals=%d | "
-                            "symbol=%s",
-                            processed,
-                            len(symbols),
-                            tested,
-                            errors,
-                            len(trades),
-                            symbol,
-                        )
-
-                        LOGGER.info(
-                            "BACKTEST PROGRESS | "
-                            "days=%d "
-                            "processed=%d/%d "
-                            "tested=%d "
-                            "errors=%d "
-                            "signals=%d",
-                            days,
-                            processed,
-                            len(symbols),
-                            tested,
-                            errors,
-                            len(trades),
-                        )
-
-                        # Give health/webhook/alerts/scanner an explicit
-                        # scheduling opportunity between completed results.
-                        await asyncio.sleep(0)
+                    await asyncio.gather(
+                        *workers
+                    )
 
                 except asyncio.CancelledError:
-                    for task in tasks:
+                    for task in workers:
                         if not task.done():
                             task.cancel()
 
                     await asyncio.gather(
-                        *tasks,
+                        *workers,
                         return_exceptions=True,
                     )
 
                     raise
 
                 except Exception:
-                    for task in tasks:
+                    for task in workers:
                         if not task.done():
                             task.cancel()
 
                     await asyncio.gather(
-                        *tasks,
+                        *workers,
                         return_exceptions=True,
                     )
 
@@ -858,8 +994,8 @@ class BacktestRunner:
                 summary = summarize(
                     days=days,
                     coins_selected=len(symbols),
-                    coins_tested=tested,
-                    data_errors=errors,
+                    coins_tested=state["tested"],
+                    data_errors=state["errors"],
                     trades=trades,
                 )
 
@@ -868,8 +1004,8 @@ class BacktestRunner:
                     "days=%d tested=%d errors=%d "
                     "signals=%d duration=%.2fs",
                     days,
-                    tested,
-                    errors,
+                    state["tested"],
+                    state["errors"],
                     len(trades),
                     time.monotonic() - started,
                 )
@@ -884,6 +1020,16 @@ class BacktestRunner:
                     time.monotonic() - started,
                 )
                 raise
+
+            finally:
+                # Stop heartbeat cleanly.
+                heartbeat_stop.set()
+
+                if heartbeat_task is not None:
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
 
     # -----------------------------------------------------------------------
     # Historical data
@@ -1010,10 +1156,11 @@ class BacktestRunner:
             list,
         ] | None = None,
     ) -> list[SimulatedTrade]:
+
         # -------------------------------------------------------------------
         # RAW MEXC CANDLES
         #
-        # Keep these raw rows because the simulator supports raw MEXC OHLCV.
+        # Keep raw rows because simulator supports raw MEXC OHLCV.
         # -------------------------------------------------------------------
 
         raw_c4 = history.candles_4h
@@ -1024,9 +1171,6 @@ class BacktestRunner:
 
         # -------------------------------------------------------------------
         # ENGINE CANDLES
-        #
-        # MEXC returns list rows.
-        # The deterministic engine expects Candle/dict rows.
         # -------------------------------------------------------------------
 
         c4 = _convert_for_engine(
@@ -1061,12 +1205,6 @@ class BacktestRunner:
 
         # -------------------------------------------------------------------
         # BTC ENGINE CANDLES
-        #
-        # During a real run these are passed explicitly so the same converted
-        # BTC data is reused across symbols.
-        #
-        # Direct unit tests using the original four-argument interface still
-        # work through the fallback conversion.
         # -------------------------------------------------------------------
 
         if btc_engine is None:
@@ -1087,6 +1225,7 @@ class BacktestRunner:
                 "BTC_USDT",
                 "15M",
             )
+
         else:
             (
                 btc_c4_engine,
@@ -1174,16 +1313,6 @@ class BacktestRunner:
         # ---------------------------------------------------------------
         # Candidate generation
         # ---------------------------------------------------------------
-        #
-        # Use FULL historical 15M lookback to discover BOS events throughout
-        # the requested test period.
-        #
-        # Important:
-        # The final decision is NOT made here.
-        #
-        # Every discovered trigger is later passed through the real
-        # analyze_candles() engine at the exact historical signal time.
-        # ---------------------------------------------------------------
 
         candidate_times: set[int] = set()
 
@@ -1251,7 +1380,6 @@ class BacktestRunner:
                 ):
                     continue
 
-                # Retest must be relevant to requested test period.
                 if (
                     retest_time
                     + M15_MS
@@ -1262,7 +1390,6 @@ class BacktestRunner:
                 if retest_time > period_end:
                     continue
 
-                # BOS must happen before its retest.
                 if bos_time > retest_time:
                     continue
 
@@ -1310,7 +1437,6 @@ class BacktestRunner:
                         + M5_MS
                     )
 
-                    # Trigger candle must be fully inside test period.
                     if (
                         trigger_close
                         > period_end
@@ -1376,15 +1502,12 @@ class BacktestRunner:
                     trades[-1]
                 )
 
-                # An unresolved previous trade remains active until the
-                # end of the test period, so don't open another one.
                 if (
                     previous_trade.exit_time_ms
                     is None
                 ):
                     continue
 
-                # No same-time re-entry.
                 if (
                     signal_close_time
                     <= previous_trade.exit_time_ms
@@ -1546,16 +1669,6 @@ class BacktestRunner:
 
             # -----------------------------------------------------------
             # Future 5M candles for paper simulation
-            # -----------------------------------------------------------
-            #
-            # Begin AFTER the signal candle has closed.
-            #
-            # Stop BEFORE the period_end opening timestamp, preventing
-            # candles outside the requested test window from leaking into
-            # the result.
-            #
-            # IMPORTANT:
-            # Simulator receives RAW MEXC rows.
             # -----------------------------------------------------------
 
             future_start = bisect_right(

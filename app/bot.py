@@ -8,6 +8,7 @@ from typing import Optional
 from .charts import ChartRenderer
 from .formatting import fmt_price
 from .analysis.engine import analyze_symbol
+from .backtest.runner import BacktestAlreadyRunning, BacktestRunner
 from .config import Settings
 from .database import Alert, Database
 from .market import MarketData, MarketRef, TIMEFRAME_ALIASES
@@ -15,25 +16,30 @@ from .whatsapp import WhatsAppClient
 
 LOGGER = logging.getLogger(__name__)
 
-HELP = """ðŸ“ˆ WhatsApp Trading Bot
+HELP = """📈 WhatsApp Trading Bot
 
-ðŸ’° PRICE
+💰 PRICE
 PRICE BTCUSDT
 
-ðŸ“Š ANALYZE
+📊 ANALYZE
 ANALYZE BTCUSDT
 
-ðŸ“ˆ CHART
+📈 CHART
 CHART BTCUSDT 1H
 
-ðŸ”” ALERT
+🔔 ALERT
 ALERT BTCUSDT ABOVE 120000
-ALERTS â€¢ DELETE 12 â€¢ DELETE ALL
+ALERTS • DELETE 12 • DELETE ALL
 
-ðŸ”Ž SEARCH
+🔎 SEARCH
 SEARCH PEPE
 
-â± 5M â€¢ 15M â€¢ 1H â€¢ 4H â€¢ 1D
+🧪 BACKTEST
+BACKTEST 7D
+BACKTEST 30D
+BACKTEST 90D
+
+⏱ 5M • 15M • 1H • 4H • 1D
 """
 
 COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
@@ -59,6 +65,10 @@ class Bot:
         self.market = market
         self.whatsapp = whatsapp
         self.charts = charts
+        self.backtest_runner: BacktestRunner | None = None
+
+    def set_backtest_runner(self, runner: BacktestRunner) -> None:
+        self.backtest_runner = runner
 
     async def handle(self, phone: str, text: str) -> None:
         cleaned = text.strip()
@@ -72,7 +82,7 @@ class Bot:
         ):
             await self.whatsapp.send_text(
                 phone,
-                "â›” This bot is private.",
+                "⛔ This bot is private.",
             )
             return
 
@@ -136,6 +146,12 @@ class Bot:
                     args,
                 )
 
+            elif command == "BACKTEST":
+                await self._backtest(
+                    phone,
+                    args,
+                )
+
             else:
                 # Friendly shortcut:
                 # "BTCUSDT 1H" means chart
@@ -153,7 +169,7 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"âŒ {exc}",
+                f"❌ {exc}",
             )
 
     async def _price(
@@ -186,7 +202,7 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"ðŸ’° {ref.symbol}\n"
+                f"💰 {ref.symbol}\n"
                 f"Exchange: MEXC FUTURES\n"
                 f"Price: ${fmt_price(price)}"
             ),
@@ -212,7 +228,7 @@ class Bot:
                 LOGGER.exception("Incomplete analysis data for %s", raw_symbol)
                 await self.whatsapp.send_text(
                     phone,
-                    f"âš ï¸ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
+                    f"⚠️ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
                 )
                 return
             raise
@@ -234,7 +250,7 @@ class Bot:
                 return "N/A"
 
         body = (
-            f"ðŸ§  {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
+            f"🧠 {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
             f"4H Trend: {data.get('trend_4h', 'N/A')}\n"
             f"1H Structure: {data.get('structure_1h', 'N/A')}\n"
             f"15M Structure: {data.get('bos_15m', 'N/A')}\n"
@@ -300,7 +316,7 @@ class Bot:
                 phone,
                 media_id,
                 caption=(
-                    f"ðŸ“Š {ref.exchange.upper()} {ref.symbol} â€¢ {tf.upper()}\n"
+                    f"📊 {ref.exchange.upper()} {ref.symbol} • {tf.upper()}\n"
                     f"EMA 21 / 50 / 100 / 200"
                 ),
             )
@@ -394,7 +410,7 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"âœ… Alert #{alert.id} created\n\n"
+                f"✅ Alert #{alert.id} created\n\n"
                 f"{ref.symbol}\n"
                 f"Condition: "
                 f"{condition.upper()} "
@@ -418,12 +434,12 @@ class Bot:
         if not alerts:
             await self.whatsapp.send_text(
                 phone,
-                "ðŸ”” No active alerts.",
+                "🔔 No active alerts.",
             )
             return
 
         lines = [
-            "ðŸ”” ACTIVE ALERTS",
+            "🔔 ACTIVE ALERTS",
             "",
         ]
 
@@ -466,7 +482,7 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"ðŸ—‘ï¸ Deleted {count} active alert(s).",
+                f"🗑️ Deleted {count} active alert(s).",
             )
 
             return
@@ -486,14 +502,14 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"ðŸ—‘ï¸ Alert #{alert_id} deleted.",
+                f"🗑️ Alert #{alert_id} deleted.",
             )
 
         else:
 
             await self.whatsapp.send_text(
                 phone,
-                f"âŒ Active alert #{alert_id} was not found.",
+                f"❌ Active alert #{alert_id} was not found.",
             )
 
     async def _search(
@@ -520,7 +536,7 @@ class Bot:
             return
 
         lines = [
-            f"ðŸ”Ž Matches for {args.upper()}:",
+            f"🔎 Matches for {args.upper()}:",
             "",
         ]
 
@@ -538,6 +554,71 @@ class Bot:
             phone,
             "\n".join(lines),
         )
+
+    async def _backtest(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
+        if self.backtest_runner is None:
+            raise RuntimeError(
+                "Backtest service is not configured."
+            )
+
+        period = args.strip().upper()
+        periods = {
+            "7D": 7,
+            "30D": 30,
+            "90D": 90,
+        }
+
+        if period not in periods:
+            raise ValueError(
+                "Usage: BACKTEST 7D, BACKTEST 30D, or BACKTEST 90D"
+            )
+
+        if self.backtest_runner.is_running:
+            await self.whatsapp.send_text(
+                phone,
+                "⏳ A backtest is already running. Please wait for it to finish.",
+            )
+            return
+
+        days = periods[period]
+
+        await self.whatsapp.send_text(
+            phone,
+            (
+                f"⏳ BACKTEST {period} STARTED\n\n"
+                "Up to 300 eligible MEXC Futures coins will be tested.\n"
+                "No real trades will be executed.\n\n"
+                "I'll send the report here when finished."
+            ),
+        )
+
+        try:
+            summary = await self.backtest_runner.run(days)
+            from .backtest.report import format_report
+
+            await self.whatsapp.send_text(
+                phone,
+                format_report(summary),
+            )
+        except BacktestAlreadyRunning:
+            await self.whatsapp.send_text(
+                phone,
+                "⏳ A backtest is already running. Please wait for it to finish.",
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "BACKTEST %s failed",
+                period,
+            )
+            await self.whatsapp.send_text(
+                phone,
+                f"❌ BACKTEST {period} failed: {exc}",
+            )
 
     async def _shortcut(
         self,
@@ -579,7 +660,7 @@ class Bot:
     ) -> None:
 
         body = (
-            f"ðŸš¨ PRICE ALERT\n\n"
+            f"🚨 PRICE ALERT\n\n"
             f"{alert.symbol}\n"
             f"MEXC FUTURES\n"
             f"Current: ${fmt_price(price)}\n"

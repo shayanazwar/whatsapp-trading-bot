@@ -37,7 +37,7 @@ def test_simulator_tp1_then_sl():
         candle(M5, 100.0, high=107.0, low=99.0),
         candle(M5 * 2, 99.0, high=101.0, low=94.0),
     ]
-    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
     assert trade.tp1_hit is True
     assert trade.tp2_hit is False
@@ -56,7 +56,7 @@ def test_simulator_same_candle_sl_is_conservative():
         "tp2": 110.0,
     }
     future = [candle(M5 * 2, 100.0, high=111.0, low=94.0)]
-    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
     assert trade.outcome == "SL"
     assert trade.tp2_hit is False
@@ -72,7 +72,7 @@ def test_simulator_same_candle_tp1_and_sl_is_conservative():
         "tp2": 110.0,
     }
     future = [candle(M5 * 2, 100.0, high=107.0, low=94.0)]
-    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
     assert trade.outcome == "SL"
     assert trade.tp1_hit is False
@@ -90,7 +90,7 @@ def test_simulator_short_tp2():
         "tp2": 90.0,
     }
     future = [candle(M5 * 2, 99.0, high=100.0, low=89.0)]
-    trade = simulate_trade(signal, future, signal_close_time_ms=M5)
+    trade = simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
     assert trade.outcome == "TP2"
     assert trade.tp1_hit is True
@@ -113,7 +113,7 @@ def test_report_metrics():
             future = [candle(M5 * 2, 109, high=111, low=100)]
         else:
             future = [candle(M5 * 2, 101, high=105, low=89)]
-        trades.append(simulate_trade(signal, future, signal_close_time_ms=M5))
+        trades.append(simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0))
     trades = [trade for trade in trades if trade is not None]
 
     summary = summarize(
@@ -214,8 +214,7 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
     period_end = start + 8 * 60 * 60 * 1000
     retest_time = period_start + 30 * 60 * 1000
     bos_time = retest_time - M15
-    trigger_open = retest_time + M15
-    signal_close = trigger_open + M5
+    signal_close = retest_time + M15
 
     history = SimpleNamespace(
         symbol="TEST_USDT",
@@ -224,10 +223,12 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
         candles_15m=_synthetic_rows(200, M15, start=start - 5 * 24 * 60 * 60 * 1000),
         candles_5m=_synthetic_rows(400, M5, start=start - 2 * 24 * 60 * 60 * 1000),
         candles_1d=_synthetic_rows(60, 86_400_000, start=start - 60 * 24 * 60 * 60 * 1000),
+        diagnostics={},
     )
-    # Put a deterministic trigger window and future TP2 candle into the 5M history.
-    history.candles_5m.append([trigger_open, 100.0, 101.0, 99.5, 100.8, 200.0])
-    history.candles_5m.append([trigger_open + M5, 100.8, 111.0, 100.0, 110.0, 200.0])
+    history.candles_15m.append([retest_time, 100.0, 101.0, 99.0, 100.5, 200.0])
+    history.candles_15m.append([signal_close, 100.5, 101.0, 100.0, 100.8, 200.0])
+    history.candles_5m.append([signal_close, 100.0, 101.0, 99.5, 100.8, 200.0])
+    history.candles_5m.append([signal_close + M5, 100.8, 111.0, 100.0, 110.0, 200.0])
 
     def fake_bos(candles, side, lookback=70):
         assert lookback == len(candles)
@@ -238,10 +239,8 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
     def fake_retest(candles, side, bos, max_bars):
         return {"valid": True, "time": retest_time, "index": 2, "level": 100.0, "quality": 0.9, "low": 99.0, "high": 101.0}
 
-    def fake_trigger(candles, side, setup_level):
-        if candles and int(candles[-1][0]) == trigger_open and side == "LONG":
-            return {"ready": True, "long": True, "short": False, "quality": 0.9, "rsi": 60.0, "rvol": 1.5, "atr": 1.0, "candle_time": trigger_open, "body_ratio": 0.8, "trigger_type": "BREAKOUT", "reason": "confirmed"}
-        return {"ready": False, "long": False, "short": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": 1.0, "candle_time": int(candles[-1][0]) if candles else 0, "body_ratio": 0.0, "trigger_type": "NONE", "reason": "not ready"}
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("runner prefilter must not call the 5M trigger")
 
     def fake_analyze(*args, **kwargs):
         assert kwargs["now_ms"] == signal_close
@@ -253,25 +252,44 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
             "stop_loss": 95.0,
             "tp1": 106.0,
             "tp2": 110.0,
+            "trend_4h": "BULLISH",
+            "regime": "BULLISH",
+            "setup_bos_time": bos_time,
+            "setup_retest_time": retest_time,
+            "technical_gate_failures": [],
+            "intraday_max_hold_minutes": 360,
         }
 
     monkeypatch.setattr(runner_module, "_bos_events", fake_bos)
     monkeypatch.setattr(runner_module, "_pullback_retest", fake_retest)
-    monkeypatch.setattr(runner_module, "_five_minute_trigger", fake_trigger)
+    monkeypatch.setattr(runner_module, "_five_minute_trigger", fail_if_called)
     monkeypatch.setattr(runner_module, "analyze_candles", fake_analyze)
     monkeypatch.setattr(runner_module, "btc_filter_ok", lambda *args, **kwargs: (True, "ok"))
     monkeypatch.setattr(runner_module, "build_btc_context", lambda *args, **kwargs: {})
 
-    btc = history
     runner = BacktestRunner.__new__(BacktestRunner)
     runner.client = None
     runner.universe = None
-    runner.settings = None
+    runner.settings = SimpleNamespace(backtest_fee_rate=0.0, backtest_slippage_bps=0.0)
     runner.max_concurrency = 1
     runner._lock = asyncio.Lock()
 
-    trades = runner._backtest_symbol(history, period_start, period_end, btc)
+    trades = runner._backtest_symbol(history, period_start, period_end, history, {})
     assert len(trades) == 1
     assert trades[0].outcome == "TP2"
     assert trades[0].tp1_hit is True
     assert trades[0].tp2_hit is True
+
+
+def test_runner_prefilter_does_not_depend_on_5m_trigger(monkeypatch):
+    import app.backtest.runner as runner_module
+
+    c15 = _synthetic_rows(120, M15)
+    diagnostics = {}
+
+    monkeypatch.setattr(runner_module, "_bos_events", lambda candles, side, lookback: [] )
+    monkeypatch.setattr(runner_module, "_pullback_retest", lambda *args, **kwargs: {"valid": False})
+    monkeypatch.setattr(runner_module, "_five_minute_trigger", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("5M trigger used")))
+
+    out = runner_module.BacktestRunner._find_15m_setup_windows(c15, 1_700_000_000_000, 1_800_000_000_000, diagnostics)
+    assert out == ()

@@ -60,30 +60,9 @@ IMPORTANT:
 4_USDT is a legitimate MEXC Futures contract and is intentionally NOT blacklisted.
 Live trading remains disabled.
 
-
-MEXC PUBLIC RATE-LIMIT PROTECTION — 2026-09-28
-
-REPLACE:
-app/automation/mexc_client.py
-app/automation/scanner.py
-app/config.py
-tests/test_automation.py
-.env.example
-PROJECT_STATE.md
-FINAL_CODE_AUDIT.md
-
-KEY FIXES:
-- Shared public MEXC request pacing across concurrent tasks.
-- 0.20s minimum default interval and 8-request/2s rolling window.
-- HTTP 418/429/503 + JSON rate-limit detection.
-- Bounded exponential backoff with Retry-After and jitter.
-- Shared cooldown to stop retry stampedes.
-- Scanner symbol concurrency capped at 4.
-- No strategy thresholds changed.
-
-VERIFICATION:
-pytest -q -> 37 passed
-python -m compileall -q app tests -> OK
-
-RENDER ACTION:
-No new secret is required. Existing Render environment variables continue to work; new rate-limit settings have safe defaults.
+Final combined hardening package (2026-09-28):
+- app/automation/mexc_client.py — shared MEXC public REST throttle, bounded backoff/retry, jitter, Retry-After support.
+- app/automation/scanner.py — concurrency cap 4 + staged 4H/1H/15M technical prefilter before 5M/1D fetches.
+- app/config.py — configurable rate-limit controls, scan concurrency default 4.
+- tests/test_automation.py — rate-limit retry regression coverage.
+- .env.example — rate-limit environment controls.

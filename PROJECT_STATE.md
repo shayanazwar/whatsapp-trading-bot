@@ -75,32 +75,22 @@ Live trading remains disabled. No strategy thresholds were weakened to manufactu
 
 ```text
 pytest -q
-37 passed
+35 passed
 python -m compileall -q app tests
 OK
 ```
 
+## Finalized MEXC live scanner performance + rate-limit hardening — 2026-09-28
 
-## Finalized MEXC public-request rate-limit protection — 2026-09-28
+Applied fixes:
+- Shared public MEXC request throttle with bounded retry/backoff/jitter and Retry-After handling.
+- Symbol-level scanner concurrency capped at 4.
+- Live scanner now stages requests: 4H/1H/15M first; 5M/1D only after mandatory 4H/1H/15M gates and exact 15M entry confirmation pass.
+- Full `analyze_candles()` remains authoritative; the new scanner prefilter only rejects symbols that cannot produce a LONG/SHORT setup under the same mandatory gates.
+- Existing backtest performance fixes remain in `app/backtest/runner.py`.
+- Existing look-ahead protection remains enabled for historical closed candles.
+- Existing deterministic strategy thresholds remain unchanged: `MIN_CONFLUENCE=82`, `MIN_RR=2.0`.
+- Live execution remains disabled by default: `AUTO_TRADE_ENABLED=false`, `ALLOW_LIVE_EXECUTION=false`.
 
-The Render scanner log exposed a real MEXC public API rate-limit response (`Requests are too frequent`) during concurrent symbol scanning. The trading rules were left unchanged.
-
-Implemented protection:
-
-- A single shared limiter now paces every public MEXC REST request across concurrent scanner/backtest tasks.
-- Default pacing is conservative: at least 0.20 seconds between public request starts and no more than 8 requests in a rolling 2-second window.
-- HTTP 418/429/503 and MEXC JSON rate-limit responses are detected before normal API-error handling.
-- Rate-limit retries use bounded exponential backoff, optional `Retry-After`, and small jitter.
-- Backoff creates a shared pause so concurrent tasks do not immediately stampede the endpoint again.
-- Symbol-level scanner concurrency is capped at 4 even if an older Render `SCAN_CONCURRENCY` value is higher.
-- All rate-limit values are configurable through `MEXC_PUBLIC_*` and `MEXC_RATE_LIMIT_*` environment variables; no strategy thresholds were changed.
-
-Verification for this replacement release:
-
-```text
-pytest -q
-37 passed in 1.35s
-
-python -m compileall -q app tests
-OK
-```
+Verification target for this package: `pytest -q` and `python -m compileall -q app tests` must both pass before deployment.
+- Latest verification: `38 passed`; `compileall` OK.

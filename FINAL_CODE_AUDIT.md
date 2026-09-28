@@ -18,7 +18,7 @@ Audited against the uploaded complete project ZIP and the Render logs supplied i
 - Funding presence is not treated as a directional confirmation by itself.
 - Scanner records rejection stages and technical gate failures.
 - Ticker freshness now fails closed when the exchange timestamp is missing or stale.
-- MEXC public calls use a shared conservative pacing/window limiter with rate-limit detection, bounded exponential backoff, `Retry-After` support, jitter, and a shared cooldown across concurrent tasks.
+- MEXC public calls use a rolling 20-request/2-second limiter with retry handling.
 - Futures risk sizing uses documented USDT `equity` as total Futures equity; legacy `0.01` configuration is normalized to `1.0%` and the hard auto-trade cap remains 1%.
 - Signal cooldown/re-entry logic is retained and signal statistics only count an actual successful WhatsApp delivery as `sent`.
 - Scheduler is driven by new 5-minute candle boundaries and prevents overlapping scans.
@@ -67,24 +67,10 @@ The finalized release addresses all six issues without lowering the signal thres
 
 The `4_USDT` symbol observed in Render is a legitimate MEXC Futures perpetual contract, so no symbol-format blacklist was added.
 
+## Finalized live scanner hardening — 2026-09-28
 
-## MEXC public API rate-limit audit — 2026-09-28
+The live MEXC scanner was hardened after intermittent MEXC request-throttling was observed. Public REST requests now share a conservative throttle and bounded rate-limit recovery. Symbol fan-out is capped at four.
 
-The supplied Render log contained a concrete MEXC Futures public API error: `Requests are too frequent, please try again later` while fetching BTC_USDT klines. The surrounding requests were otherwise returning HTTP 200, so this is a rate-management issue rather than an API credential failure.
+To reduce avoidable request volume without changing strategy semantics, the scanner now fetches 4H/1H/15M first, evaluates the same mandatory higher-timeframe and 15M confirmation gates, and only then fetches 5M/1D for symbols that qualify for full engine analysis. The authoritative `analyze_candles()` path and trading thresholds remain unchanged.
 
-Replacement changes:
-
-- `MexcClient` now applies a shared public-request pacing gate before every public REST request.
-- Default pacing is 0.20 seconds between request starts plus an 8-request/2-second rolling window.
-- MEXC rate-limit responses are detected from HTTP status and JSON message/code forms.
-- Retries are bounded and use exponential backoff, `Retry-After` when supplied, and jitter.
-- A shared pause prevents concurrent scanner tasks from retrying simultaneously.
-- Scanner concurrency is hard-capped at 4 to prevent excessive task fan-out even when an older environment variable requests more.
-- Trading strategy thresholds, setup definitions, score requirements, RR requirements, and live-trading safety flags are unchanged.
-
-Verification:
-
-```text
-pytest -q -> 37 passed
-python -m compileall -q app tests -> OK
-```
+Latest verification after combined hardening: `38 passed`; Python compilation passed.

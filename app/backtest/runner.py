@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+import sys
 import time
 from bisect import bisect_right
 from collections import defaultdict
@@ -134,6 +135,24 @@ def _closed_slice(rows: list, interval_ms: int, close_time_ms: int) -> list:
     return rows[:count]
 
 
+def _closed_prefix_count(times: list[int], interval_ms: int, close_time_ms: int) -> int:
+    if not times:
+        return 0
+    return bisect_right(times, int(close_time_ms) - int(interval_ms))
+
+
+def _recent_closed_slice(
+    rows: list,
+    times: list[int],
+    interval_ms: int,
+    close_time_ms: int,
+    max_bars: int,
+) -> list:
+    end = _closed_prefix_count(times, interval_ms, close_time_ms)
+    start = max(0, end - int(max_bars))
+    return rows[start:end]
+
+
 async def _fetch_range(
     client: MexcClient,
     symbol: str,
@@ -254,15 +273,37 @@ class BacktestRunner:
             else DEFAULT_MAX_HOLDING_MINUTES
         )
 
-        ctx = multiprocessing.get_context("spawn")
+        # Render runs on Linux. Fork avoids repeatedly paying the very large
+        # spawn/import/pickling cost observed in the backtest logs (25-40s per
+        # analysis-process startup). The process is short-lived and performs only
+        # synchronous, CPU-bound analysis; no client/network object is shared.
+        if sys.platform != "win32":
+            try:
+                ctx = multiprocessing.get_context("fork")
+            except ValueError:
+                ctx = multiprocessing.get_context("spawn")
+        else:
+            ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
+        # The symbol analysis reads only BTC 4H/1H/15M history. Keep the
+        # child payload small on the spawn fallback.
+        compact_btc_history = SymbolHistory(
+            "BTC_USDT",
+            list(btc_history.candles_4h),
+            list(btc_history.candles_1h),
+            list(btc_history.candles_15m),
+            [],
+            [],
+            (),
+            {},
+        )
         process = ctx.Process(
             target=_isolated_backtest_symbol,
             args=(
                 history,
                 start,
                 end,
-                btc_history,
+                compact_btc_history,
                 fee_rate,
                 slippage_bps,
                 default_max_hold_minutes,
@@ -282,7 +323,10 @@ class BacktestRunner:
                 "BACKTEST ANALYSIS PROCESS START | symbol=%s",
                 history.symbol,
             )
-            await asyncio.to_thread(process.start)
+            if ctx.get_start_method() == "fork":
+                process.start()
+            else:
+                await asyncio.to_thread(process.start)
             child_conn.close()
 
             LOGGER.info(
@@ -500,12 +544,23 @@ class BacktestRunner:
         if btc_context_cache is None:
             btc_context_cache = {}
 
-        c5_times = [_row_time(r) for r in history.candles_5m]
+        c4_times = [_row_time(r) for r in c4]
+        c1_times = [_row_time(r) for r in c1]
+        c15_times = [_row_time(r) for r in c15]
+        c5_times = [_row_time(r) for r in c5]
+        c1d_times = [_row_time(r) for r in c1d]
         trades: list[SimulatedTrade] = []
         previous_exit_time: int | None = None
         seen_structures: set[tuple[Any, Any, Any]] = set()
         regime_cache: dict[int, dict[str, Any]] = {}
         alignment_cache: dict[tuple[int, str], dict[str, Any]] = {}
+        engine_cache: dict[str, Any] = {}
+        analysis_loop_started = time.monotonic()
+        full_engine_calls = 0
+        LOGGER.info(
+            "BACKTEST SYMBOL ANALYSIS BEGIN | symbol=%s candidates=%d",
+            history.symbol, len(candidates),
+        )
 
         for signal_close_time, setup_hint in candidates:
             signal_close_time = int(signal_close_time)
@@ -515,29 +570,27 @@ class BacktestRunner:
                 diagnostics["OVERLAPPING_SIGNAL_SKIPPED"] = diagnostics.get("OVERLAPPING_SIGNAL_SKIPPED", 0) + 1
                 continue
 
-            c4s = _closed_slice(c4, H4_MS, signal_close_time)
-            c1s = _closed_slice(c1, H1_MS, signal_close_time)
-            c15s = _closed_slice(c15, M15_MS, signal_close_time)
-            c5s = _closed_slice(c5, M5_MS, signal_close_time)
-            c1ds = _closed_slice(c1d, D1_MS, signal_close_time)
+            c4_end = _closed_prefix_count(c4_times, H4_MS, signal_close_time)
+            c1_end = _closed_prefix_count(c1_times, H1_MS, signal_close_time)
+            c15_end = _closed_prefix_count(c15_times, M15_MS, signal_close_time)
 
             # Cheap, cached higher-timeframe gate. The full engine remains
             # authoritative, but most 15M windows can be discarded here without
             # running the expensive complete indicator/target calculation.
             side_hint = str((setup_hint or {}).get("side") or "").upper()
-            if side_hint not in {"LONG", "SHORT"} or len(c4s) < 205 or len(c1s) < 205:
+            if side_hint not in {"LONG", "SHORT"} or c4_end < 205 or c1_end < 205:
                 diagnostics["HTF_PREFILTER_REJECT"] = diagnostics.get("HTF_PREFILTER_REJECT", 0) + 1
                 continue
-            h4_key = _row_time(c4s[-1])
+            h4_key = c4_times[c4_end - 1]
             regime = regime_cache.get(h4_key)
             if regime is None:
-                regime = _four_hour_regime(c4s)
+                regime = _four_hour_regime(c4[:c4_end])
                 regime_cache[h4_key] = regime
-            h1_key = _row_time(c1s[-1])
+            h1_key = c1_times[c1_end - 1]
             align_key = (h1_key, str(regime.get("regime") or "NO_TRADE"))
             alignment = alignment_cache.get(align_key)
             if alignment is None:
-                alignment = _one_hour_alignment(c1s, regime)
+                alignment = _one_hour_alignment(c1[:c1_end], regime)
                 alignment_cache[align_key] = alignment
             if not ((side_hint == "LONG" and regime.get("bull") and alignment.get("long")) or (side_hint == "SHORT" and regime.get("bear") and alignment.get("short"))):
                 diagnostics["HTF_PREFILTER_REJECT"] = diagnostics.get("HTF_PREFILTER_REJECT", 0) + 1
@@ -548,8 +601,11 @@ class BacktestRunner:
             # is therefore a semantics-preserving prefilter, not a strategy
             # shortcut. It avoids running expensive target/score calculations on
             # candles that the authoritative engine will necessarily reject.
+            c15_recent = _recent_closed_slice(
+                c15, c15_times, M15_MS, signal_close_time, 40,
+            )
             entry_check = _fifteen_minute_entry_confirmation(
-                c15s,
+                c15_recent,
                 side_hint,
                 float((setup_hint or {}).get("bos_level")),
                 int((setup_hint or {}).get("retest_time")),
@@ -558,10 +614,33 @@ class BacktestRunner:
                 diagnostics["ENTRY_PREFILTER_REJECT"] = diagnostics.get("ENTRY_PREFILTER_REJECT", 0) + 1
                 continue
 
-            diagnostics["FULL_ENGINE_CANDIDATES"] += 1
+            c4s = c4[:c4_end]
+            c1s = c1[:c1_end]
+            c15s = c15[:c15_end]
+            c5s = _recent_closed_slice(c5, c5_times, M5_MS, signal_close_time, 40)
+            c1ds = c1d[:_closed_prefix_count(c1d_times, D1_MS, signal_close_time)]
 
+            diagnostics["FULL_ENGINE_CANDIDATES"] += 1
+            full_engine_calls += 1
+            if full_engine_calls == 1 or full_engine_calls % 25 == 0:
+                LOGGER.info(
+                    "BACKTEST ENGINE PROGRESS | symbol=%s full_engine_calls=%d elapsed=%.1fs",
+                    history.symbol, full_engine_calls, time.monotonic() - analysis_loop_started,
+                )
+
+            engine_started = time.monotonic()
             try:
-                analysis = analyze_candles(history.symbol, c4s, c1s, c15s, c5s, c1ds, now_ms=signal_close_time)
+                analysis = analyze_candles(
+                    history.symbol, c4s, c1s, c15s, c5s, c1ds,
+                    now_ms=signal_close_time,
+                    cache=engine_cache,
+                )
+                engine_elapsed = time.monotonic() - engine_started
+                if engine_elapsed >= 5.0:
+                    LOGGER.warning(
+                        "BACKTEST ENGINE SLOW | symbol=%s signal=%d seconds=%.2f",
+                        history.symbol, signal_close_time, engine_elapsed,
+                    )
             except Exception:
                 diagnostics["ENGINE_ERRORS"] = diagnostics.get("ENGINE_ERRORS", 0) + 1
                 diagnostics["ENGINE_EXCEPTION"] = diagnostics.get("ENGINE_EXCEPTION", 0) + 1
@@ -647,6 +726,10 @@ class BacktestRunner:
                 diagnostics["EXPIRY"] = diagnostics.get("EXPIRY", 0) + 1
             previous_exit_time = trade.exit_time_ms
 
+        LOGGER.info(
+            "BACKTEST SYMBOL ANALYSIS END | symbol=%s candidates=%d full_engine_calls=%d trades=%d elapsed=%.2fs",
+            history.symbol, len(candidates), full_engine_calls, len(trades), time.monotonic() - analysis_loop_started,
+        )
         return trades
 
     async def run(self, days: int) -> BacktestSummary:

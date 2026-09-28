@@ -11,6 +11,9 @@ from typing import Any
 from ..analysis.engine import (
     _bos_events,
     _five_minute_trigger,  # compatibility export only; NOT used by the prefilter
+    _fifteen_minute_entry_confirmation,
+    _four_hour_regime,
+    _one_hour_alignment,
     _pullback_retest,
     analyze_candles,
     build_btc_context,
@@ -39,7 +42,7 @@ D1_MS = 86_400_000
 INTERVALS = {"4h": "Hour4", "1h": "Min60", "15m": "Min15", "5m": "Min5", "1d": "Day1"}
 MAX_KLINE_POINTS = 2000
 REQUEST_TIMEOUT_SECONDS = 30
-MAX_SYMBOL_CONCURRENCY = 1
+MAX_SYMBOL_CONCURRENCY = 4
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 HEARTBEAT_INTERVAL_SECONDS = 30
 MIN_4H_WARMUP_MS = 45 * 24 * 60 * 60 * 1000
@@ -74,7 +77,8 @@ def _closed_slice(rows: list, interval_ms: int, close_time_ms: int) -> list:
     if not rows:
         return []
     cutoff = int(close_time_ms) - int(interval_ms)
-    return rows[: bisect_right(rows, cutoff, key=_row_time) + 1]
+    count = bisect_right(rows, cutoff, key=_row_time)
+    return rows[:count]
 
 
 async def _fetch_range(
@@ -150,8 +154,9 @@ async def _fetch_timeframe(client: MexcClient, symbol: str, timeframe: str, inte
 class BacktestRunner:
     """Intraday historical runner with an authoritative full-engine decision path.
 
-    The only prefilter operation is locating 15M BOS/retest windows. It does
-    not decide direction, score, momentum, volume, SL, TP, RR, or 5M validity.
+    The prefilter locates 15M BOS/retest windows and applies only a cached
+    higher-timeframe eligibility gate. It does not decide score, momentum,
+    volume, SL, TP, RR, futures context, or the final signal.
     The full engine is always authoritative at every candidate timestamp.
     """
 
@@ -203,11 +208,24 @@ class BacktestRunner:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        return SymbolHistory("BTC_USDT", *rows)
+        c4, c1, c15, c5, c1d = rows
+        c4 = [r for r in c4 if _row_time(r) + H4_MS <= end]
+        c1 = [r for r in c1 if _row_time(r) + H1_MS <= end]
+        c15 = [r for r in c15 if _row_time(r) + M15_MS <= end]
+        c5 = [r for r in c5 if _row_time(r) + M5_MS <= end]
+        c1d = [r for r in c1d if _row_time(r) + D1_MS <= end]
+        return SymbolHistory("BTC_USDT", c4, c1, c15, c5, c1d)
 
     @staticmethod
     def _find_15m_setup_windows(c15: list, period_start: int, period_end: int, diagnostics: dict[str, int]) -> tuple[tuple[int, Any], ...]:
-        candidates: set[int] = set()
+        """Find only structurally eligible 15M windows.
+
+        This remains a prefilter: the full analysis engine is authoritative.
+        Candidate metadata carries the originating BOS/retest so the runner can
+        cheaply verify higher-timeframe alignment before invoking the full engine.
+        """
+        candidates: dict[tuple[int, str], dict[str, Any]] = {}
+        open_times = [_row_time(row) for row in c15]
         for side in ("LONG", "SHORT"):
             bos_events = _bos_events(c15, side, lookback=len(c15))
             diagnostics[f"BOS_{side}"] = diagnostics.get(f"BOS_{side}", 0) + len(bos_events)
@@ -217,18 +235,21 @@ class BacktestRunner:
                     continue
                 diagnostics[f"RETEST_{side}"] = diagnostics.get(f"RETEST_{side}", 0) + 1
                 retest_time = int(retest["time"])
-                # Locate every later 15M close in the short active setup window.
-                for row in c15:
-                    close_time = _row_time(row) + M15_MS
-                    if close_time <= retest_time or close_time < period_start:
+                first_index = bisect_right(open_times, retest_time)
+                last_close_time = min(period_end, retest_time + MAX_SETUP_AGE_15M * M15_MS)
+                last_index = bisect_right(open_times, last_close_time - M15_MS)
+                for index in range(first_index, min(last_index + 1, len(c15))):
+                    close_time = open_times[index] + M15_MS
+                    if close_time < period_start or close_time > period_end:
                         continue
-                    if close_time > period_end:
-                        break
-                    if close_time > retest_time + MAX_SETUP_AGE_15M * M15_MS:
-                        break
-                    candidates.add(close_time)
+                    candidates.setdefault((close_time, side), {
+                        "side": side,
+                        "bos_level": float(bos["level"]),
+                        "bos_time": int(bos["time"]),
+                        "retest_time": retest_time,
+                    })
         diagnostics["SETUP_WINDOWS_15M"] = diagnostics.get("SETUP_WINDOWS_15M", 0) + len(candidates)
-        return tuple((timestamp, None) for timestamp in sorted(candidates))
+        return tuple((timestamp, meta) for (timestamp, _side), meta in sorted(candidates.items(), key=lambda item: (item[0][0], item[0][1])))
 
     async def _prepare_symbol_history(self, symbol: str, start: int, end: int) -> SymbolHistory:
         starts = {
@@ -252,7 +273,9 @@ class BacktestRunner:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-        c4 = convert_candles(c4_raw); c1 = convert_candles(c1_raw); c15 = convert_candles(c15_raw)
+        c4 = [c for c in convert_candles(c4_raw) if int(c["time"]) + H4_MS <= end]
+        c1 = [c for c in convert_candles(c1_raw) if int(c["time"]) + H1_MS <= end]
+        c15 = [c for c in convert_candles(c15_raw) if int(c["time"]) + M15_MS <= end]
         if len(c4) < 205:
             raise ValueError(f"{symbol}: insufficient 4H candles ({len(c4)} < 205)")
         if len(c1) < 205:
@@ -306,8 +329,10 @@ class BacktestRunner:
         trades: list[SimulatedTrade] = []
         previous_exit_time: int | None = None
         seen_structures: set[tuple[Any, Any, Any]] = set()
+        regime_cache: dict[int, dict[str, Any]] = {}
+        alignment_cache: dict[tuple[int, str], dict[str, Any]] = {}
 
-        for signal_close_time, _setup_hint in candidates:
+        for signal_close_time, setup_hint in candidates:
             signal_close_time = int(signal_close_time)
             if signal_close_time < start or signal_close_time > end:
                 continue
@@ -320,6 +345,44 @@ class BacktestRunner:
             c15s = _closed_slice(c15, M15_MS, signal_close_time)
             c5s = _closed_slice(c5, M5_MS, signal_close_time)
             c1ds = _closed_slice(c1d, D1_MS, signal_close_time)
+
+            # Cheap, cached higher-timeframe gate. The full engine remains
+            # authoritative, but most 15M windows can be discarded here without
+            # running the expensive complete indicator/target calculation.
+            side_hint = str((setup_hint or {}).get("side") or "").upper()
+            if side_hint not in {"LONG", "SHORT"} or len(c4s) < 205 or len(c1s) < 205:
+                diagnostics["HTF_PREFILTER_REJECT"] = diagnostics.get("HTF_PREFILTER_REJECT", 0) + 1
+                continue
+            h4_key = _row_time(c4s[-1])
+            regime = regime_cache.get(h4_key)
+            if regime is None:
+                regime = _four_hour_regime(c4s)
+                regime_cache[h4_key] = regime
+            h1_key = _row_time(c1s[-1])
+            align_key = (h1_key, str(regime.get("regime") or "NO_TRADE"))
+            alignment = alignment_cache.get(align_key)
+            if alignment is None:
+                alignment = _one_hour_alignment(c1s, regime)
+                alignment_cache[align_key] = alignment
+            if not ((side_hint == "LONG" and regime.get("bull") and alignment.get("long")) or (side_hint == "SHORT" and regime.get("bear") and alignment.get("short"))):
+                diagnostics["HTF_PREFILTER_REJECT"] = diagnostics.get("HTF_PREFILTER_REJECT", 0) + 1
+                continue
+
+            # The full engine cannot produce LONG/SHORT unless the same 15M
+            # entry-confirmation gate is ready. Evaluating this exact gate here
+            # is therefore a semantics-preserving prefilter, not a strategy
+            # shortcut. It avoids running expensive target/score calculations on
+            # candles that the authoritative engine will necessarily reject.
+            entry_check = _fifteen_minute_entry_confirmation(
+                c15s,
+                side_hint,
+                float((setup_hint or {}).get("bos_level")),
+                int((setup_hint or {}).get("retest_time")),
+            )
+            if not entry_check.get("ready"):
+                diagnostics["ENTRY_PREFILTER_REJECT"] = diagnostics.get("ENTRY_PREFILTER_REJECT", 0) + 1
+                continue
+
             diagnostics["FULL_ENGINE_CANDIDATES"] += 1
 
             try:
@@ -432,6 +495,9 @@ class BacktestRunner:
                 "signals": 0,
                 "worker": "-",
                 "symbol": "-",
+                "last_symbol_seconds": 0.0,
+                "data_seconds": 0.0,
+                "analysis_seconds": 0.0,
             }
             heartbeat = asyncio.create_task(
                 self._heartbeat(state, started, stop_event, days),
@@ -481,6 +547,7 @@ class BacktestRunner:
                             state["symbol"] = symbol
                             state["phase"] = "PREFILTER"
 
+                            data_started = time.monotonic()
                             try:
                                 history = btc_history if str(symbol).upper() == "BTC_USDT" else await self._prepare_symbol_history(symbol, period_start, period_end)
                                 for key, value in history.diagnostics.items():
@@ -494,7 +561,11 @@ class BacktestRunner:
                                 LOGGER.exception("BACKTEST DATA ERROR | %s | %s", symbol, exc)
                                 continue
 
+                            data_seconds = time.monotonic() - data_started
+                            async with state_lock:
+                                state["data_seconds"] += data_seconds
                             state["phase"] = "ANALYSIS"
+                            analysis_started = time.monotonic()
                             try:
                                 # No wait_for around to_thread: cancellation of the
                                 # Future cannot kill the underlying Python worker.
@@ -515,6 +586,10 @@ class BacktestRunner:
                                 LOGGER.exception("BACKTEST ANALYSIS ERROR | %s | %s", symbol, exc)
                                 continue
 
+                            analysis_seconds = time.monotonic() - analysis_started
+                            async with state_lock:
+                                state["analysis_seconds"] += analysis_seconds
+                                state["last_symbol_seconds"] = data_seconds + analysis_seconds
                             trades.extend(symbol_trades)
                             async with state_lock:
                                 state["tested"] += 1

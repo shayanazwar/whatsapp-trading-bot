@@ -128,8 +128,8 @@ def validate_signal(
     # =========================================================
     # CANDLE TIMESTAMPS
     #
-    # The engine's 15M setup and 5M trigger must belong to
-    # the same current setup window.
+    # The engine's primary 15M setup uses the latest closed 5M candle only
+    # as a freshness clock when 15M is the authoritative entry timeframe.
     # =========================================================
 
     fifteen = _ms(
@@ -147,26 +147,31 @@ def validate_signal(
             "Missing normalized 15M candle timestamp"
         ]
 
+    primary_tf = str(data.get("primary_entry_timeframe") or "5M").upper()
+
     if five is None:
         return None, [
-            "Missing normalized 5M candle timestamp"
+            "Missing normalized 5M freshness timestamp"
         ]
 
-    if five < fifteen:
-        return None, [
-            "5M trigger belongs to an earlier 15M candle"
-        ]
-
-    # A 5M trigger may occur during the current 15M candle
-    # or within the immediately adjacent setup window.
-    if (
-        five - fifteen
-        > FIFTEEN_MINUTE_MS
-        + FIVE_MINUTE_MS
-    ):
-        return None, [
-            "5M trigger is stale relative to 15M setup"
-        ]
+    if primary_tf == "15M":
+        if five + FIVE_MINUTE_MS < fifteen:
+            return None, [
+                "5M freshness timestamp is older than the primary 15M setup"
+            ]
+        if five - fifteen > FIFTEEN_MINUTE_MS + FIVE_MINUTE_MS:
+            return None, [
+                "5M freshness timestamp is stale relative to 15M setup"
+            ]
+    else:
+        if five < fifteen:
+            return None, [
+                "5M trigger belongs to an earlier 15M candle"
+            ]
+        if five - fifteen > FIFTEEN_MINUTE_MS + FIVE_MINUTE_MS:
+            return None, [
+                "5M trigger is stale relative to 15M setup"
+            ]
 
     if five % FIVE_MINUTE_MS != 0:
         return None, [

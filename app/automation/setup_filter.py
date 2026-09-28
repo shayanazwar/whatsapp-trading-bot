@@ -6,8 +6,10 @@ from typing import Any
 MIN_SCORE = 82
 MIN_RR = 2.0
 
-MIN_SL_ATR = 0.50
-MAX_SL_ATR = 1.80
+MIN_SL_ATR = 0.60
+MAX_SL_ATR = 2.25
+MIN_STOP_DISTANCE_PCT = 0.0075
+MAX_STOP_DISTANCE_PCT = 0.0350
 
 MIN_CONFIRMATION_FAMILIES = 5
 
@@ -48,8 +50,8 @@ def validate_analysis(
     The engine remains responsible for:
         4H regime
         1H alignment
-        15M structure/setup
-        5M trigger
+        15M structure/setup/entry confirmation
+        5M optional refinement
         momentum
         volume
         location
@@ -219,70 +221,36 @@ def validate_analysis(
         )
 
     # =========================================================
-    # 5M TRIGGER CONSISTENCY
+    # PRIMARY ENTRY TIMEFRAME CONSISTENCY
     # =========================================================
 
-    trigger_ready = bool(
-        data.get(
-            "five_minute_ready",
-            False,
-        )
-    )
+    primary_tf = str(data.get("primary_entry_timeframe") or "5M").upper()
+    trigger_ready = bool(data.get("five_minute_ready", False))
+    trigger_long = bool(data.get("five_minute_long", False))
+    trigger_short = bool(data.get("five_minute_short", False))
 
-    trigger_long = bool(
-        data.get(
-            "five_minute_long",
-            False,
-        )
-    )
-
-    trigger_short = bool(
-        data.get(
-            "five_minute_short",
-            False,
-        )
-    )
-
-    if side in {
-        "LONG",
-        "SHORT",
-    }:
-        if not trigger_ready:
-            reasons.append(
-                "5M trigger is not ready"
-            )
-
-        if side == "LONG" and not trigger_long:
-            reasons.append(
-                "5M LONG trigger is not confirmed"
-            )
-
-        if side == "SHORT" and not trigger_short:
-            reasons.append(
-                "5M SHORT trigger is not confirmed"
-            )
-
-    if trigger_long and trigger_short:
-        reasons.append(
-            "Conflicting 5M triggers"
-        )
-
-    # =========================================================
-    # TRIGGER QUALITY
-    # =========================================================
-
-    trigger_q = _f(
-        data.get(
-            "trigger_quality_5m",
-        ),
-        0.0,
-    )
-
-    if trigger_q < 0.55:
-        reasons.append(
-            f"5M trigger quality "
-            f"{trigger_q:.2f} < 0.55"
-        )
+    if primary_tf == "15M":
+        entry_ready = bool(data.get("entry_15m_ready", False))
+        if not entry_ready:
+            reasons.append("15M entry confirmation is not ready")
+        trigger_q = _f(data.get("trigger_quality_15m"), 0.0)
+        if trigger_q < 0.55:
+            reasons.append(f"15M entry quality {trigger_q:.2f} < 0.55")
+        if trigger_long and trigger_short:
+            reasons.append("Conflicting 5M refinement signals")
+    else:
+        if side in {"LONG", "SHORT"}:
+            if not trigger_ready:
+                reasons.append("5M trigger is not ready")
+            if side == "LONG" and not trigger_long:
+                reasons.append("5M LONG trigger is not confirmed")
+            if side == "SHORT" and not trigger_short:
+                reasons.append("5M SHORT trigger is not confirmed")
+        if trigger_long and trigger_short:
+            reasons.append("Conflicting 5M triggers")
+        trigger_q = _f(data.get("trigger_quality_5m"), 0.0)
+        if trigger_q < 0.55:
+            reasons.append(f"5M trigger quality {trigger_q:.2f} < 0.55")
 
     # =========================================================
     # VOLUME REQUIREMENT
@@ -301,7 +269,7 @@ def validate_analysis(
         )
 
     # =========================================================
-    # SL / ATR
+    # SL / INTRADAY GEOMETRY
     # =========================================================
 
     sl_atr = _f(
@@ -322,6 +290,19 @@ def validate_analysis(
             f"SL distance {sl_atr:.2f} ATR "
             f"> maximum {MAX_SL_ATR:.2f}"
         )
+
+    stop_pct = _f(data.get("stop_distance_pct"), 0.0)
+    if side in {"LONG", "SHORT"} and stop_pct > 0 and stop_pct < MIN_STOP_DISTANCE_PCT:
+        reasons.append(
+            f"Stop distance {stop_pct * 100:.2f}% < intraday minimum {MIN_STOP_DISTANCE_PCT * 100:.2f}%"
+        )
+    if side in {"LONG", "SHORT"} and stop_pct > MAX_STOP_DISTANCE_PCT:
+        reasons.append(
+            f"Stop distance {stop_pct * 100:.2f}% > intraday maximum {MAX_STOP_DISTANCE_PCT * 100:.2f}%"
+        )
+    geometry_flag = data.get("trade_geometry_ok")
+    if side in {"LONG", "SHORT"} and geometry_flag is False:
+        reasons.append("Intraday trade geometry gate failed")
 
     # =========================================================
     # ATR VOLATILITY PERCENTILE

@@ -16,7 +16,6 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .indicators import atr, ema, rsi, volume_status
-from .structure import get_structure, get_support_resistance
 
 TIMEFRAME_MS = {
     "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
@@ -136,7 +135,11 @@ def closed_candle_rows(candles: Iterable[Any] | None, timeframe_ms: Any,
                        now_ms: Optional[int] = None) -> List[Candle]:
     interval = _timeframe_ms(timeframe_ms)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    return [c for c in convert_candles(candles) if int(c["time"]) + interval <= now]
+    if isinstance(candles, list) and (not candles or isinstance(candles[0], Candle)):
+        source = candles
+    else:
+        source = convert_candles(candles)
+    return [c for c in source if int(c["time"]) + interval <= now]
 
 
 def _safe_ema(values: List[float], period: int) -> Optional[float]:
@@ -283,6 +286,67 @@ def _macd(values: List[float]) -> Tuple[float, float, float]:
     return line, signal, line - signal
 
 
+def _swing_points(candles: List[Candle], left: int = 2, right: int = 2) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    """Return swing highs/lows in one pass with no temporary neighbor lists."""
+    highs: List[Tuple[int, float]] = []
+    lows: List[Tuple[int, float]] = []
+    stop = len(candles) - right
+    for i in range(left, stop):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        high_ok = True
+        low_ok = True
+        for j in range(i - left, i):
+            other_high = float(candles[j]["high"])
+            other_low = float(candles[j]["low"])
+            if high <= other_high:
+                high_ok = False
+            if low >= other_low:
+                low_ok = False
+            if not high_ok and not low_ok:
+                break
+        if high_ok:
+            for j in range(i + 1, i + right + 1):
+                if high <= float(candles[j]["high"]):
+                    high_ok = False
+                    break
+        if low_ok:
+            for j in range(i + 1, i + right + 1):
+                if low >= float(candles[j]["low"]):
+                    low_ok = False
+                    break
+        if high_ok:
+            highs.append((i, high))
+        if low_ok:
+            lows.append((i, low))
+    return highs, lows
+
+
+def _structure_from_swings(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> str:
+    if len(highs) < 2 or len(lows) < 2:
+        return "UNKNOWN"
+    ph, lh = highs[-2][1], highs[-1][1]
+    pl, ll = lows[-2][1], lows[-1][1]
+    if lh > ph and ll > pl:
+        return "HH/HL"
+    if lh < ph and ll < pl:
+        return "LH/LL"
+    return "RANGE"
+
+
+def _support_resistance_from_swings(
+    candles: List[Candle],
+    highs: List[Tuple[int, float]],
+    lows: List[Tuple[int, float]],
+) -> Tuple[Optional[float], Optional[float]]:
+    if not candles:
+        return None, None
+    current = float(candles[-1]["close"])
+    support = max((price for _, price in lows if price < current), default=None)
+    resistance = min((price for _, price in highs if price > current), default=None)
+    return support, resistance
+
+
 def _swing_highs(candles: List[Candle], left: int = 2, right: int = 2) -> List[Tuple[int, float]]:
     result = []
     for i in range(left, len(candles) - right):
@@ -303,8 +367,11 @@ def _swing_lows(candles: List[Candle], left: int = 2, right: int = 2) -> List[Tu
     return result
 
 
-def _protected_structure(candles: List[Candle]) -> Dict[str, Any]:
-    highs, lows = _swing_highs(candles), _swing_lows(candles)
+def _protected_structure(
+    candles: List[Candle],
+    swings: Optional[Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]] = None,
+) -> Dict[str, Any]:
+    highs, lows = swings if swings is not None else _swing_points(candles)
     ph = highs[-1][1] if highs else None
     pl = lows[-1][1] if lows else None
     if len(highs) < 2 or len(lows) < 2:
@@ -315,9 +382,13 @@ def _protected_structure(candles: List[Candle]) -> Dict[str, Any]:
     return {"state":state,"protected_high":ph,"protected_low":pl}
 
 
-def _recent_swing_direction(candles: List[Candle], lookback: int = 60) -> Dict[str, Any]:
+def _recent_swing_direction(
+    candles: List[Candle],
+    lookback: int = 60,
+    swings: Optional[Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]] = None,
+) -> Dict[str, Any]:
     sample = candles[-lookback:] if len(candles) > lookback else candles
-    highs, lows = _swing_highs(sample), _swing_lows(sample)
+    highs, lows = swings if swings is not None else _swing_points(sample)
     result = {"bull_higher_high":False,"bull_higher_low":False,
               "bear_lower_high":False,"bear_lower_low":False,
               "bull_score":0,"bear_score":0}
@@ -336,22 +407,23 @@ def _four_hour_regime(candles: List[Candle]) -> Dict[str, Any]:
     close = [float(c["close"]) for c in candles]
     e21, e50, e100, e200 = (_safe_ema(close, p) for p in (21,50,100,200))
     a, adx, slope = _safe_atr(candles), _adx(candles), _ema_slope(close, 50)
-    protected, swings = _protected_structure(candles), _recent_swing_direction(candles, 80)
+    swings = _swing_points(candles)
+    protected = _protected_structure(candles, swings)
+    recent_sample = candles[-80:] if len(candles) > 80 else candles
+    recent_swings = _swing_points(recent_sample)
+    recent = _recent_swing_direction(recent_sample, len(recent_sample), recent_swings)
     base = {"bull":False,"bear":False,"regime":"NO_TRADE","e21":e21,"e50":e50,
             "e100":e100,"e200":e200,"atr":a,"adx":adx,"slope":slope,
-            "protected":protected,"swings":swings,"bull_votes":0,"bear_votes":0}
+            "protected":protected,"swings":recent,"bull_votes":0,"bear_votes":0}
     if None in (e21,e50,e100,e200) or not close:
         return base
     current = close[-1]
-
-    # Six directional votes. ADX is a trend-strength gate, not a directional vote.
     bull_votes = sum((current > e200, e21 >= e50, e50 >= e100,
                       slope > 0.0, protected["state"] == "BULLISH",
-                      swings["bull_score"] >= 1))
+                      recent["bull_score"] >= 1))
     bear_votes = sum((current < e200, e21 <= e50, e50 <= e100,
                       slope < 0.0, protected["state"] == "BEARISH",
-                      swings["bear_score"] >= 1))
-
+                      recent["bear_score"] >= 1))
     bull = bool(current > e200 and e21 >= e50 and adx >= ADX_TREND_MIN and
                 bull_votes >= 4 and bull_votes > bear_votes)
     bear = bool(current < e200 and e21 <= e50 and adx >= ADX_TREND_MIN and
@@ -365,26 +437,26 @@ def _one_hour_alignment(candles: List[Candle], regime4: Dict[str, Any]) -> Dict[
     close = [float(c["close"]) for c in candles]
     price = close[-1]
     e21, e50, e200 = _safe_ema(close,21), _safe_ema(close,50), _safe_ema(close,200)
-    structure, protected, swings = get_structure(candles), _protected_structure(candles), _recent_swing_direction(candles,70)
+    full_swings = _swing_points(candles)
+    structure = _structure_from_swings(*full_swings)
+    protected = _protected_structure(candles, full_swings)
+    recent_sample = candles[-70:] if len(candles) > 70 else candles
+    recent = _recent_swing_direction(recent_sample, len(recent_sample))
     slope, r, a = _ema_slope(close,50), _safe_rsi(close), _safe_atr(candles)
-    base = {"long":False,"short":False,"structure":structure,"protected":protected,"swings":swings,
+    base = {"long":False,"short":False,"structure":structure,"protected":protected,"swings":recent,
             "e21":e21,"e50":e50,"e200":e200,"slope":slope,"rsi":r,"atr":a,
             "long_votes":0,"short_votes":0}
     if e21 is None or e50 is None:
         return base
     tolerance = price * EMA_TOLERANCE_PCT
-
-    # Four independent evidence groups. Slope is only counted in GROUP 4.
     long_ema = price >= e50 - tolerance and e21 >= e50
     short_ema = price <= e50 + tolerance and e21 <= e50
-    long_structure = structure == "HH/HL" or protected["state"] == "BULLISH" or swings["bull_score"] >= 1
-    short_structure = structure == "LH/LL" or protected["state"] == "BEARISH" or swings["bear_score"] >= 1
+    long_structure = structure == "HH/HL" or protected["state"] == "BULLISH" or recent["bull_score"] >= 1
+    short_structure = structure == "LH/LL" or protected["state"] == "BEARISH" or recent["bear_score"] >= 1
     long_momentum = r >= 50.0 and (e200 is None or price >= e200 * 0.995)
     short_momentum = r <= 50.0 and (e200 is None or price <= e200 * 1.005)
-    # Small counter-slope is allowed so a single noisy 1H candle does not kill alignment.
     long_slope = slope >= -0.0010
     short_slope = slope <= 0.0010
-
     lv, sv = sum((long_ema,long_structure,long_momentum,long_slope)), sum((short_ema,short_structure,short_momentum,short_slope))
     long = bool(regime4.get("bull") and lv >= 3 and lv > sv)
     short = bool(regime4.get("bear") and sv >= 3 and sv > lv)
@@ -406,7 +478,9 @@ def _bos_strength(candle: Candle, level: float, atr_value: float) -> float:
 def _bos_events(candles: List[Candle], side: str, lookback: int = 70) -> List[Dict[str, Any]]:
     if len(candles) < 10 or side not in {"LONG","SHORT"}:
         return []
-    atr_values, pivots = _atr_series(candles,14), (_swing_highs(candles) if side=="LONG" else _swing_lows(candles))
+    atr_values = _atr_series(candles,14)
+    swing_highs, swing_lows = _swing_points(candles)
+    pivots = swing_highs if side == "LONG" else swing_lows
     events = []
     start = max(1, len(candles)-lookback)
     for i in range(start,len(candles)):
@@ -618,15 +692,15 @@ def _collect_structural_levels(frames, atr_value: float, entry: float, max_swing
     for timeframe, candles in frames:
         if not candles:
             continue
-        for idx, p in _swing_highs(candles)[-max_swings_per_frame:]:
+        highs, lows = _swing_points(candles)
+        for idx, p in highs[-max_swings_per_frame:]:
             if p > entry:
                 raw.append({"price": float(p), "timeframe": timeframe, "index": idx, "kind": "RESISTANCE"})
-        for idx, p in _swing_lows(candles)[-max_swings_per_frame:]:
+        for idx, p in lows[-max_swings_per_frame:]:
             if p < entry:
                 raw.append({"price": float(p), "timeframe": timeframe, "index": idx, "kind": "SUPPORT"})
     if not raw:
         return []
-
     tol = max(atr_value * 0.15, entry * 0.0005)
     raw.sort(key=lambda x: x["price"])
     priority = {"1D": 4, "4H": 3, "1H": 2, "15M": 1}
@@ -637,7 +711,6 @@ def _collect_structural_levels(frames, atr_value: float, entry: float, max_swing
         elif priority.get(level["timeframe"], 0) > priority.get(clusters[-1]["timeframe"], 0):
             clusters[-1] = level.copy()
     return clusters
-
 
 
 def _target_path(frames, side: str, entry: float, stop: float, atr_value: float):
@@ -966,6 +1039,7 @@ def analyze_candles(
     candles_5m: Optional[List] = None,
     candles_1d: Optional[List] = None,
     now_ms: Optional[int] = None,
+    cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     c4 = closed_candle_rows(candles_4h, "4h", now)
@@ -983,8 +1057,23 @@ def analyze_candles(
     close15 = [float(c["close"]) for c in c15]
     price = close15[-1]
 
-    regime = _four_hour_regime(c4)
-    alignment = _one_hour_alignment(c1, regime)
+    cache = cache if cache is not None else {}
+
+    def _cache_key(tag: str, candles: List[Candle], extra: Any = None):
+        last = candles[-1] if candles else None
+        return (tag, len(candles), int(last["time"]) if last else 0, float(last["close"]) if last else 0.0, extra)
+
+    regime_key = _cache_key("REGIME4", c4)
+    regime = cache.get(regime_key)
+    if regime is None:
+        regime = _four_hour_regime(c4)
+        cache[regime_key] = regime
+
+    align_key = _cache_key("ALIGN1", c1, str(regime.get("regime") or "NO_TRADE"))
+    alignment = cache.get(align_key)
+    if alignment is None:
+        alignment = _one_hour_alignment(c1, regime)
+        cache[align_key] = alignment
     protected = alignment["protected"]
     structure1 = alignment["structure"]
     e21_1, e50_1 = alignment["e21"], alignment["e50"]
@@ -996,8 +1085,16 @@ def analyze_candles(
     # Compute BOS event sets once per analysis. The previous implementation
     # recomputed the same O(n*swings) scan multiple times for selection and
     # diagnostics, which became a major backtest CPU cost.
-    bos_events_long = _bos_events(c15, "LONG")
-    bos_events_short = _bos_events(c15, "SHORT")
+    bos_long_key = _cache_key("BOS15_LONG", c15)
+    bos_events_long = cache.get(bos_long_key)
+    if bos_events_long is None:
+        bos_events_long = _bos_events(c15, "LONG")
+        cache[bos_long_key] = bos_events_long
+    bos_short_key = _cache_key("BOS15_SHORT", c15)
+    bos_events_short = cache.get(bos_short_key)
+    if bos_events_short is None:
+        bos_events_short = _bos_events(c15, "SHORT")
+        cache[bos_short_key] = bos_events_short
     bos_long, ret_long = _select_latest_bos_with_retest(c15, "LONG", bos_events_long)
     bos_short, ret_short = _select_latest_bos_with_retest(c15, "SHORT", bos_events_short)
     long_candidate = bool(alignment["long"] and bos_long and ret_long["valid"])
@@ -1039,15 +1136,21 @@ def analyze_candles(
 
     setup = trigger_side if entry_15m.get("ready") else "NO TRADE"
 
-    support, resistance = _level_clusters(c15, atr15)
-    try:
-        sr_support, sr_resistance = get_support_resistance(c15)
+    sr_key = _cache_key("SR15", c15)
+    if sr_key in cache:
+        support, resistance = cache[sr_key]
+    else:
+        # Preserve the existing precedence exactly: level-cluster values are
+        # the baseline, and confirmed swing S/R replaces a side only when it
+        # actually exists.
+        support, resistance = _level_clusters(c15, atr15)
+        sr_highs, sr_lows = _swing_points(c15)
+        sr_support, sr_resistance = _support_resistance_from_swings(c15, sr_highs, sr_lows)
         if sr_support is not None:
             support = sr_support
         if sr_resistance is not None:
             resistance = sr_resistance
-    except Exception:
-        pass
+        cache[sr_key] = (support, resistance)
 
     atr_pct = _atr_percent(price, atr15)
     atr_rank = _atr_percentile(c15)
@@ -1205,7 +1308,7 @@ def analyze_candles(
         reasons.append("Technical hard gate failed")
 
     ema21_15, ema50_15 = _safe_ema(close15, 21), _safe_ema(close15, 50)
-    daily_structure = get_structure(c1d) if len(c1d) >= 20 else "UNAVAILABLE"
+    daily_structure = _structure_from_swings(*_swing_points(c1d)) if len(c1d) >= 20 else "UNAVAILABLE"
     ema_direction = (
         "BULLISH" if (ema21_15 or 0) > (ema50_15 or 0)
         else "BEARISH" if (ema21_15 or 0) < (ema50_15 or 0)

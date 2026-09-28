@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
 import time
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from ..analysis.engine import (
@@ -44,6 +46,7 @@ MAX_KLINE_POINTS = 2000
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_SYMBOL_CONCURRENCY = 4
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
+SYMBOL_ANALYSIS_TIMEOUT_SECONDS = 90
 HEARTBEAT_INTERVAL_SECONDS = 30
 MIN_4H_WARMUP_MS = 45 * 24 * 60 * 60 * 1000
 MIN_1H_WARMUP_MS = 21 * 24 * 60 * 60 * 1000
@@ -55,6 +58,56 @@ MAX_SETUP_AGE_15M = 8
 
 class BacktestAlreadyRunning(RuntimeError):
     pass
+
+
+def _isolated_backtest_symbol(
+    history: "SymbolHistory",
+    start: int,
+    end: int,
+    btc_history: "SymbolHistory",
+    fee_rate: float,
+    slippage_bps: float,
+    default_max_hold_minutes: float,
+    conn: Any,
+) -> None:
+    """
+    Execute one CPU-bound symbol analysis in a separate process.
+
+    This is intentionally isolated from the asyncio event loop. A hung
+    analyze/structure/simulation path can therefore be terminated by the
+    parent worker instead of blocking a worker thread forever.
+    """
+    try:
+        settings = SimpleNamespace(
+            backtest_fee_rate=fee_rate,
+            backtest_slippage_bps=slippage_bps,
+            backtest_max_holding_minutes=default_max_hold_minutes,
+        )
+        runner = BacktestRunner(
+            client=None,
+            universe=None,
+            settings=settings,
+            max_concurrency=1,
+        )
+        # BTC context is memoization only; use a fresh child-local cache.
+        symbol_trades = runner._backtest_symbol(
+            history,
+            start,
+            end,
+            btc_history,
+            {},
+        )
+        conn.send(("ok", symbol_trades, dict(history.diagnostics)))
+    except BaseException as exc:
+        try:
+            conn.send(("error", type(exc).__name__, str(exc)))
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -184,6 +237,113 @@ class BacktestRunner:
                     state.get("simulation_errors", 0), state.get("signals", 0), state.get("worker", "-"),
                     state.get("symbol", "-"), time.monotonic() - started,
                 )
+
+    async def _run_symbol_analysis_with_timeout(
+        self,
+        history: SymbolHistory,
+        start: int,
+        end: int,
+        btc_history: SymbolHistory,
+    ) -> tuple[list[SimulatedTrade], dict[str, int]]:
+        """Run CPU-bound symbol analysis in a killable child process."""
+        fee_rate = float(getattr(self.settings, "backtest_fee_rate", DEFAULT_FEE_RATE) if self.settings is not None else DEFAULT_FEE_RATE)
+        slippage_bps = float(getattr(self.settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS) if self.settings is not None else DEFAULT_SLIPPAGE_BPS)
+        default_max_hold_minutes = float(
+            getattr(self.settings, "backtest_max_holding_minutes", DEFAULT_MAX_HOLDING_MINUTES)
+            if self.settings is not None
+            else DEFAULT_MAX_HOLDING_MINUTES
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process = ctx.Process(
+            target=_isolated_backtest_symbol,
+            args=(
+                history,
+                start,
+                end,
+                btc_history,
+                fee_rate,
+                slippage_bps,
+                default_max_hold_minutes,
+                child_conn,
+            ),
+            name=f"backtest-analysis-{history.symbol}",
+        )
+
+        started = time.monotonic()
+        try:
+            process.start()
+            child_conn.close()
+
+            deadline = started + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
+            payload = None
+
+            while True:
+                if parent_conn.poll(0):
+                    payload = parent_conn.recv()
+                    break
+
+                if not process.is_alive():
+                    # Child exited without sending a result.
+                    break
+
+                if time.monotonic() >= deadline:
+                    LOGGER.error(
+                        "BACKTEST ANALYSIS TIMEOUT | symbol=%s | timeout=%ss",
+                        history.symbol,
+                        SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
+                    )
+                    process.terminate()
+                    await asyncio.to_thread(process.join, 5.0)
+                    if process.is_alive():
+                        process.kill()
+                        await asyncio.to_thread(process.join, 2.0)
+                    raise TimeoutError(
+                        f"{history.symbol}: analysis exceeded "
+                        f"{SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
+                    )
+
+                await asyncio.sleep(0.20)
+
+            await asyncio.to_thread(process.join, 5.0)
+
+            if payload is None and parent_conn.poll(0):
+                payload = parent_conn.recv()
+
+            if payload is None:
+                raise RuntimeError(
+                    f"{history.symbol}: analysis subprocess exited without a result "
+                    f"(exitcode={process.exitcode})"
+                )
+
+            if payload[0] == "error":
+                raise RuntimeError(
+                    f"{history.symbol}: isolated analysis failed: "
+                    f"{payload[1]}: {payload[2]}"
+                )
+
+            return payload[1], payload[2]
+        except asyncio.CancelledError:
+            if process.is_alive():
+                process.terminate()
+                await asyncio.to_thread(process.join, 5.0)
+                if process.is_alive():
+                    process.kill()
+                    await asyncio.to_thread(process.join, 2.0)
+            raise
+        finally:
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+            if process.is_alive():
+                process.terminate()
+                await asyncio.to_thread(process.join, 2.0)
 
     async def _fetch_btc_history(self, start: int, end: int) -> SymbolHistory:
         starts = {
@@ -566,24 +726,32 @@ class BacktestRunner:
                                 state["data_seconds"] += data_seconds
                             state["phase"] = "ANALYSIS"
                             analysis_started = time.monotonic()
+                            pre_analysis_diag = dict(history.diagnostics)
                             try:
-                                # No wait_for around to_thread: cancellation of the
-                                # Future cannot kill the underlying Python worker.
-                                symbol_trades = await asyncio.to_thread(
-                                    self._backtest_symbol,
+                                symbol_trades, symbol_diag = await self._run_symbol_analysis_with_timeout(
                                     history,
                                     period_start,
                                     period_end,
                                     btc_history,
-                                    btc_context_cache,
                                 )
+                                # The isolated process mutates a private copy of history.
+                                # Merge only the delta produced during analysis so the
+                                # prefilter diagnostics already counted above are not doubled.
+                                for key, value in symbol_diag.items():
+                                    delta = int(value) - int(pre_analysis_diag.get(key, 0))
+                                    if delta > 0:
+                                        diagnostics[key] += delta
                             except asyncio.CancelledError:
                                 raise
                             except Exception as exc:
                                 async with state_lock:
                                     state["engine_errors"] += 1
                                 diagnostics[f"ANALYSIS_ERROR_{type(exc).__name__}"] += 1
-                                LOGGER.exception("BACKTEST ANALYSIS ERROR | %s | %s", symbol, exc)
+                                if isinstance(exc, TimeoutError):
+                                    diagnostics["ANALYSIS_TIMEOUT"] += 1
+                                    LOGGER.error("BACKTEST ANALYSIS TIMEOUT | %s | %s", symbol, exc)
+                                else:
+                                    LOGGER.exception("BACKTEST ANALYSIS ERROR | %s | %s", symbol, exc)
                                 continue
 
                             analysis_seconds = time.monotonic() - analysis_started

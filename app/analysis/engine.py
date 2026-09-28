@@ -454,8 +454,8 @@ def _pullback_retest(candles: List[Candle], side: str, bos: Optional[Dict[str,An
     return invalid
 
 
-def _select_latest_bos_with_retest(candles: List[Candle], side: str):
-    events = _bos_events(candles,side)
+def _select_latest_bos_with_retest(candles: List[Candle], side: str, events: Optional[List[Dict[str, Any]]] = None):
+    events = events if events is not None else _bos_events(candles, side)
     latest = len(candles)-1
     for bos in reversed(events):
         if latest-int(bos["index"]) > MAX_SETUP_AGE_15M+2: continue
@@ -993,8 +993,13 @@ def analyze_candles(
     rv15 = _relative_volume(c15)
     vol15 = volume_status(c15)
 
-    bos_long, ret_long = _select_latest_bos_with_retest(c15, "LONG")
-    bos_short, ret_short = _select_latest_bos_with_retest(c15, "SHORT")
+    # Compute BOS event sets once per analysis. The previous implementation
+    # recomputed the same O(n*swings) scan multiple times for selection and
+    # diagnostics, which became a major backtest CPU cost.
+    bos_events_long = _bos_events(c15, "LONG")
+    bos_events_short = _bos_events(c15, "SHORT")
+    bos_long, ret_long = _select_latest_bos_with_retest(c15, "LONG", bos_events_long)
+    bos_short, ret_short = _select_latest_bos_with_retest(c15, "SHORT", bos_events_short)
     long_candidate = bool(alignment["long"] and bos_long and ret_long["valid"])
     short_candidate = bool(alignment["short"] and bos_short and ret_short["valid"])
 
@@ -1228,8 +1233,8 @@ def analyze_candles(
         "bos_15m_strength": _num((active_bos or {}).get("strength")),
         "long_bos_level": bos_long.get("level") if bos_long else None,
         "short_bos_level": bos_short.get("level") if bos_short else None,
-        "long_bos_event_count": len(_bos_events(c15, "LONG")),
-        "short_bos_event_count": len(_bos_events(c15, "SHORT")),
+        "long_bos_event_count": len(bos_events_long),
+        "short_bos_event_count": len(bos_events_short),
         "long_retest": bool(ret_long.get("valid")),
         "short_retest": bool(ret_short.get("valid")),
         "long_retest_time": ret_long.get("time"),

@@ -52,11 +52,30 @@ The scanner is deterministic, but a target win rate such as 70–80% is not guar
 
 Live execution is deliberately disabled. Missing live-trading components still include post-fill reconciliation, protective-order verification, partial TP/break-even management, portfolio exposure controls and emergency recovery.
 
+## Finalized backtest/performance fixes — 2026-09-28
+
+The backtest path was audited against Render behavior showing only 2/300 symbols after ~769 seconds. The root causes were confirmed in `app/backtest/runner.py` and `app/analysis/engine.py`.
+
+Implemented fixes:
+
+- Backtest symbol concurrency is now effectively 4 instead of being hard-capped at 1.
+- Historical backtest slices no longer include the next/open candle; the previous `+1` slice introduced a look-ahead candle.
+- Historical BTC/symbol histories are explicitly trimmed to closed candles at the backtest end boundary.
+- 15M BOS/retest candidate-window generation now uses indexed/binary-search ranges instead of repeatedly scanning the complete candle history.
+- Candidate metadata preserves LONG and SHORT candidates independently when both occur at the same timestamp.
+- A cached 4H/1H higher-timeframe prefilter rejects candidates that the authoritative engine must reject anyway.
+- The exact authoritative 15M entry-confirmation gate is used as a semantics-preserving prefilter before expensive full-engine analysis.
+- Repeated BOS calculations inside `analyze_candles()` were reduced by computing each side's BOS event set once and reusing it for selection and diagnostics.
+- Backtest timing/progress instrumentation records data and analysis duration per symbol.
+- `4_USDT` is not treated as malformed: it is a real MEXC USDT perpetual contract and remains eligible subject to the normal contract filters.
+
+Live trading remains disabled. No strategy thresholds were weakened to manufacture signals.
+
 ## Verification
 
 ```text
 pytest -q
-17 passed
+35 passed
 python -m compileall -q app tests
 OK
 ```

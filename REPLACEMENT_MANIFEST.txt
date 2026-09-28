@@ -30,3 +30,32 @@ LIVE TRADING:
 AUTO_TRADE_ENABLED=false
 ALLOW_LIVE_EXECUTION=false
 LIVE_IMPLEMENTED=false
+
+
+FINALIZED PERFORMANCE REPLACEMENTS — 2026-09-28
+
+REPLACE:
+app/backtest/runner.py
+app/analysis/engine.py
+tests/test_backtest_feature.py
+PROJECT_STATE.md
+FINAL_CODE_AUDIT.md
+REPLACEMENT_MANIFEST.txt
+
+KEY FIXES:
+- Backtest concurrency cap 4.
+- Closed-candle look-ahead correction.
+- Efficient 15M candidate indexing.
+- LONG/SHORT candidate preservation.
+- Cached 4H/1H prefilter.
+- Exact 15M entry-confirmation prefilter.
+- Single BOS computation per side per full analysis.
+- Backtest timing instrumentation.
+
+VERIFICATION:
+pytest -q -> 35 passed
+python -m compileall -q app tests -> OK
+
+IMPORTANT:
+4_USDT is a legitimate MEXC Futures contract and is intentionally NOT blacklisted.
+Live trading remains disabled.

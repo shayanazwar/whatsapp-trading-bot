@@ -50,3 +50,19 @@ OK
 The supplied Render scan log showed the previous positional-candle crash had been removed; the service reached a clean completed scan with 120 symbols and zero scanner errors, but zero valid signals. fileciteturn59file0L290-L300
 
 The current release adds explicit technical rejection diagnostics so the next Render cycle can show which gate is stopping candidates instead of only reporting `NO TRADE`.
+
+
+## Finalized backtest performance audit — 2026-09-28
+
+The supplied Render logs showed the backtest remaining at `0/300` for several minutes and reaching only `2/300` after approximately 769 seconds. The source audit identified several concrete causes in the backtest path:
+
+1. `MAX_SYMBOL_CONCURRENCY` was hard-capped at `1` even though the application constructed the runner with `max_concurrency=4`.
+2. `_closed_slice()` used `bisect_right(...)+1`, which could include the next candle and create historical look-ahead.
+3. The 15M prefilter generated large overlapping candidate sets and rescanned candle history for each retest.
+4. The full engine was being invoked for candidates that could already be rejected by the 4H/1H hard direction gates.
+5. The full engine's 15M entry-confirmation requirement was available as an exact semantics-preserving prefilter but was not used before expensive target/score calculations.
+6. `analyze_candles()` recomputed identical BOS event sets multiple times per analysis.
+
+The finalized release addresses all six issues without lowering the signal threshold, RR requirement, or higher-timeframe gates.
+
+The `4_USDT` symbol observed in Render is a legitimate MEXC Futures perpetual contract, so no symbol-format blacklist was added.

@@ -159,3 +159,53 @@ def test_public_request_retries_http_429_and_honors_bounded_retry_count():
     assert response.status_code == 200
     assert client._public_rate_limit_events == 1
     asyncio.run(client.close())
+
+
+def test_live_scanner_stages_5m_and_1d_after_technical_prefilter(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        async def get_klines(self, symbol, interval, limit):
+            self.calls.append((symbol, interval))
+            step = {"Hour4": 14_400_000, "Min60": 3_600_000, "Min15": 900_000, "Min5": 300_000, "Day1": 86_400_000}[interval]
+            end = int(time.time() * 1000)
+            base = end - 259 * step
+            return [[base + i * step, 100, 101, 99, 100, 1000] for i in range(260)]
+
+    class FakeUniverse:
+        async def refresh(self):
+            return ["X_USDT"]
+
+    class FakeSignals:
+        pass
+
+    old_helpers = (
+        __import__("app.automation.scanner", fromlist=["_four_hour_regime"])._four_hour_regime,
+        __import__("app.automation.scanner", fromlist=["_one_hour_alignment"])._one_hour_alignment,
+        __import__("app.automation.scanner", fromlist=["_bos_events"])._bos_events,
+        __import__("app.automation.scanner", fromlist=["_select_latest_bos_with_retest"])._select_latest_bos_with_retest,
+        __import__("app.automation.scanner", fromlist=["_fifteen_minute_entry_confirmation"])._fifteen_minute_entry_confirmation,
+        __import__("app.automation.scanner", fromlist=["analyze_candles"]).analyze_candles,
+    )
+    import app.automation.scanner as scanner_module
+
+    def install(force_pass):
+        monkeypatch.setattr(scanner_module, "_four_hour_regime", lambda c: {"bull": force_pass, "bear": False, "regime": "BULLISH" if force_pass else "NO_TRADE"})
+        monkeypatch.setattr(scanner_module, "_one_hour_alignment", lambda c, r: {"long": force_pass, "short": False, "long_votes": 4 if force_pass else 0, "short_votes": 0})
+        monkeypatch.setattr(scanner_module, "_bos_events", lambda c, side: [{"level": 100, "time": c[-2]["time"], "strength": 1}] if side == "LONG" else [])
+        monkeypatch.setattr(scanner_module, "_select_latest_bos_with_retest", lambda c, side, events: ({"level": 100, "strength": 1}, {"valid": force_pass, "time": c[-2]["time"]}) if side == "LONG" else (None, {"valid": False}))
+        monkeypatch.setattr(scanner_module, "_fifteen_minute_entry_confirmation", lambda *args: {"ready": force_pass, "quality": 1})
+        monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: {"setup": "NO TRADE"})
+
+    async def run(force_pass):
+        client = FakeClient()
+        install(force_pass)
+        scanner = MexcScanner(settings=Settings(scan_concurrency=4), client=client, universe=FakeUniverse(), signal_manager=FakeSignals())
+        await scanner.scan_once()
+        return [interval for symbol, interval in client.calls if symbol == "X_USDT"]
+
+    rejected = asyncio.run(run(False))
+    passed = asyncio.run(run(True))
+    assert rejected == ["Hour4", "Min60", "Min15"]
+    assert passed == ["Hour4", "Min60", "Min15", "Min5", "Day1"]

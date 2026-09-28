@@ -227,8 +227,9 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
     )
     history.candles_15m.append([retest_time, 100.0, 101.0, 99.0, 100.5, 200.0])
     history.candles_15m.append([signal_close, 100.5, 101.0, 100.0, 100.8, 200.0])
-    history.candles_5m.append([signal_close, 100.0, 101.0, 99.5, 100.8, 200.0])
-    history.candles_5m.append([signal_close + M5, 100.8, 111.0, 100.0, 110.0, 200.0])
+    actual_candidate = retest_time + 2 * M15
+    history.candles_5m.append([actual_candidate, 100.0, 101.0, 99.5, 100.8, 200.0])
+    history.candles_5m.append([actual_candidate + M5, 100.8, 111.0, 100.0, 110.0, 200.0])
 
     def fake_bos(candles, side, lookback=70):
         assert lookback == len(candles)
@@ -243,7 +244,7 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
         raise AssertionError("runner prefilter must not call the 5M trigger")
 
     def fake_analyze(*args, **kwargs):
-        assert kwargs["now_ms"] == signal_close
+        assert kwargs["now_ms"] > retest_time
         return {
             "symbol": "TEST_USDT",
             "setup": "LONG",
@@ -266,6 +267,9 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
     monkeypatch.setattr(runner_module, "analyze_candles", fake_analyze)
     monkeypatch.setattr(runner_module, "btc_filter_ok", lambda *args, **kwargs: (True, "ok"))
     monkeypatch.setattr(runner_module, "build_btc_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(runner_module, "_four_hour_regime", lambda *args, **kwargs: {"bull": True, "bear": False, "regime": "BULLISH"})
+    monkeypatch.setattr(runner_module, "_one_hour_alignment", lambda *args, **kwargs: {"long": True, "short": False})
+    monkeypatch.setattr(runner_module, "_fifteen_minute_entry_confirmation", lambda *args, **kwargs: {"ready": True})
 
     runner = BacktestRunner.__new__(BacktestRunner)
     runner.client = None
@@ -279,6 +283,15 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
     assert trades[0].outcome == "TP2"
     assert trades[0].tp1_hit is True
     assert trades[0].tp2_hit is True
+
+
+def test_backtest_closed_slice_excludes_open_candle():
+    import app.backtest.runner as runner_module
+    rows = _synthetic_rows(5, M15)
+    close_time = rows[3][0] + M15
+    sliced = runner_module._closed_slice(rows, M15, close_time)
+    assert [row[0] for row in sliced] == [rows[0][0], rows[1][0], rows[2][0], rows[3][0]]
+    assert rows[4] not in sliced
 
 
 def test_runner_prefilter_does_not_depend_on_5m_trigger(monkeypatch):

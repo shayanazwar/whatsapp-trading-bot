@@ -75,7 +75,32 @@ Live trading remains disabled. No strategy thresholds were weakened to manufactu
 
 ```text
 pytest -q
-35 passed
+37 passed
+python -m compileall -q app tests
+OK
+```
+
+
+## Finalized MEXC public-request rate-limit protection — 2026-09-28
+
+The Render scanner log exposed a real MEXC public API rate-limit response (`Requests are too frequent`) during concurrent symbol scanning. The trading rules were left unchanged.
+
+Implemented protection:
+
+- A single shared limiter now paces every public MEXC REST request across concurrent scanner/backtest tasks.
+- Default pacing is conservative: at least 0.20 seconds between public request starts and no more than 8 requests in a rolling 2-second window.
+- HTTP 418/429/503 and MEXC JSON rate-limit responses are detected before normal API-error handling.
+- Rate-limit retries use bounded exponential backoff, optional `Retry-After`, and small jitter.
+- Backoff creates a shared pause so concurrent tasks do not immediately stampede the endpoint again.
+- Symbol-level scanner concurrency is capped at 4 even if an older Render `SCAN_CONCURRENCY` value is higher.
+- All rate-limit values are configurable through `MEXC_PUBLIC_*` and `MEXC_RATE_LIMIT_*` environment variables; no strategy thresholds were changed.
+
+Verification for this replacement release:
+
+```text
+pytest -q
+37 passed in 1.35s
+
 python -m compileall -q app tests
 OK
 ```

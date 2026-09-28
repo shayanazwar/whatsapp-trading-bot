@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -110,13 +111,24 @@ class MexcClient:
         self._server_offset_initialized = False
 
         # --------------------------------------------------------------
-        # PUBLIC API RATE LIMITER
+        # SHARED PUBLIC API THROTTLE / RATE-LIMIT RECOVERY
         # --------------------------------------------------------------
-
+        # Keep all public REST calls behind one limiter so concurrent symbol
+        # scans cannot burst the MEXC endpoint. The defaults are deliberately
+        # conservative and configurable via environment variables.
         self._public_request_lock = asyncio.Lock()
         self._public_request_times: list[float] = []
-        self._public_window_seconds = 2.0
-        self._public_window_limit = 20
+        self._public_last_request_at = 0.0
+        self._public_pause_until = 0.0
+        self._public_min_interval_seconds = max(0.0, float(getattr(settings, "mexc_public_min_interval_seconds", 0.20)))
+        self._public_window_seconds = max(0.1, float(getattr(settings, "mexc_public_window_seconds", 2.0)))
+        self._public_window_limit = max(1, int(getattr(settings, "mexc_public_window_limit", 8)))
+        self._public_max_retries = max(0, int(getattr(settings, "mexc_rate_limit_max_retries", 4)))
+        self._public_backoff_base_seconds = max(0.1, float(getattr(settings, "mexc_rate_limit_backoff_seconds", 2.0)))
+        self._public_backoff_cap_seconds = max(self._public_backoff_base_seconds, float(getattr(settings, "mexc_rate_limit_backoff_cap_seconds", 20.0)))
+        self._public_backoff_jitter_seconds = max(0.0, float(getattr(settings, "mexc_rate_limit_jitter_seconds", 0.25)))
+        self._public_rate_limit_events = 0
+        self._public_retry_events = 0
 
     # ==================================================================
     # CONNECTION
@@ -130,8 +142,11 @@ class MexcClient:
     # ==================================================================
 
     async def _server_time_ms(self) -> int:
-        response = await self.http.get(
-            f"{self.base_url}/api/v1/contract/ping"
+        response = await self._public_request(
+            {
+                "method": "GET",
+                "url": f"{self.base_url}/api/v1/contract/ping",
+            }
         )
 
         response.raise_for_status()
@@ -175,41 +190,155 @@ class MexcClient:
     # PUBLIC REQUEST HANDLER
     # ==================================================================
 
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float | None:
+        value = response.headers.get("Retry-After")
+        if value is None:
+            return None
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, delay)
+
+    @staticmethod
+    def _response_payload(response: httpx.Response) -> Any:
+        try:
+            return response.json()
+        except ValueError:
+            return None
+
+    @classmethod
+    def _is_rate_limited_response(cls, response: httpx.Response, payload: Any) -> bool:
+        if response.status_code in {418, 429, 503}:
+            return True
+        if not isinstance(payload, dict):
+            return False
+        message = str(payload.get("message") or "").lower()
+        code = str(payload.get("code") or "").lower()
+        markers = (
+            "too frequent",
+            "rate limit",
+            "rate-limit",
+            "too many request",
+            "requests are too frequent",
+            "request too frequent",
+        )
+        return (
+            payload.get("success") is False
+            and (any(marker in message for marker in markers) or code in {"429", "418", "rate_limit"})
+        )
+
     async def _acquire_public_slot(self) -> None:
         while True:
             async with self._public_request_lock:
                 now = time.monotonic()
                 cutoff = now - self._public_window_seconds
-                self._public_request_times = [t for t in self._public_request_times if t > cutoff]
-                if len(self._public_request_times) < self._public_window_limit:
+                self._public_request_times = [
+                    t for t in self._public_request_times if t > cutoff
+                ]
+
+                waits = [max(0.0, self._public_pause_until - now)]
+
+                if self._public_last_request_at > 0.0:
+                    waits.append(
+                        max(
+                            0.0,
+                            self._public_last_request_at
+                            + self._public_min_interval_seconds
+                            - now,
+                        )
+                    )
+
+                if len(self._public_request_times) >= self._public_window_limit:
+                    waits.append(
+                        max(
+                            0.0,
+                            self._public_request_times[0]
+                            + self._public_window_seconds
+                            - now,
+                        )
+                    )
+
+                wait = max(waits, default=0.0)
+                if wait <= 0.0:
+                    now = time.monotonic()
                     self._public_request_times.append(now)
+                    self._public_last_request_at = now
                     return
-                wait = max(0.01, self._public_request_times[0] + self._public_window_seconds - now)
+
             await asyncio.sleep(wait)
 
+    async def _apply_rate_limit_backoff(
+        self,
+        attempt: int,
+        response: httpx.Response,
+    ) -> None:
+        retry_after = self._retry_after_seconds(response)
+        exponential = min(
+            self._public_backoff_cap_seconds,
+            self._public_backoff_base_seconds * (2 ** attempt),
+        )
+        jitter = (
+            random.uniform(0.0, self._public_backoff_jitter_seconds)
+            if self._public_backoff_jitter_seconds > 0
+            else 0.0
+        )
+        delay = min(
+            self._public_backoff_cap_seconds,
+            max(retry_after or 0.0, exponential) + jitter,
+        )
+        async with self._public_request_lock:
+            self._public_pause_until = max(
+                self._public_pause_until,
+                time.monotonic() + delay,
+            )
+            self._public_rate_limit_events += 1
+            self._public_retry_events += 1
+        LOGGER.warning(
+            "MEXC public rate limit encountered; backing off %.2fs (attempt %s/%s)",
+            delay,
+            attempt + 1,
+            self._public_max_retries,
+        )
+
     async def _public_request(self, request_kwargs: dict[str, Any]) -> httpx.Response:
-        max_attempts = 4
+        max_attempts = self._public_max_retries + 1
+        last_rate_limited: httpx.Response | None = None
+
         for attempt in range(max_attempts):
             await self._acquire_public_slot()
             try:
                 response = await self.http.request(**request_kwargs)
             except httpx.HTTPError as exc:
-                raise MexcAPIError(f"MEXC HTTP request failed: {exc}") from exc
-            if response.status_code == 429:
-                if attempt >= max_attempts - 1:
-                    raise MexcAPIError(f"MEXC HTTP 429: {response.text}", status_code=429)
-                await asyncio.sleep(float(attempt + 1))
+                raise MexcAPIError(
+                    f"MEXC HTTP request failed: {exc}"
+                ) from exc
+
+            payload = self._response_payload(response)
+            if self._is_rate_limited_response(response, payload):
+                last_rate_limited = response
+                if attempt >= self._public_max_retries:
+                    message = (
+                        str(payload.get("message"))
+                        if isinstance(payload, dict) and payload.get("message")
+                        else f"MEXC HTTP {response.status_code}: {response.text}"
+                    )
+                    raise MexcAPIError(
+                        message,
+                        code=(payload.get("code") if isinstance(payload, dict) else None),
+                        status_code=response.status_code if response.status_code in {418, 429, 503} else None,
+                    )
+                await self._apply_rate_limit_backoff(attempt, response)
                 continue
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict) and payload.get("success") is False and "too frequent" in str(payload.get("message") or "").lower():
-                if attempt >= max_attempts - 1:
-                    raise MexcAPIError(str(payload.get("message") or "MEXC request rate limited"), code=payload.get("code"))
-                await asyncio.sleep(float(attempt + 1))
-                continue
+
             return response
+
+        if last_rate_limited is not None:
+            raise MexcAPIError(
+                f"MEXC public request rate limited after {max_attempts} attempts",
+                status_code=last_rate_limited.status_code if last_rate_limited.status_code in {418, 429, 503} else None,
+            )
         raise MexcAPIError("MEXC public request failed after retries")
 
     # ==================================================================

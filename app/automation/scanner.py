@@ -45,7 +45,12 @@ class MexcScanner:
             return {"symbols": 0, "valid": 0, "sent": 0, "errors": 0}
 
         await self._refresh_btc_context()
-        concurrency = max(1, int(getattr(self.settings, "scan_concurrency", 8)))
+        # Keep symbol-level fan-out bounded even if an older Render env var
+        # still specifies a larger value. The MEXC client has a shared public
+        # request throttle, but limiting waiting tasks prevents unnecessary
+        # pressure and keeps scan latency predictable.
+        configured_concurrency = int(getattr(self.settings, "scan_concurrency", 4))
+        concurrency = max(1, min(4, configured_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
         results = await asyncio.gather(*(self._scan_one(symbol, semaphore) for symbol in symbols), return_exceptions=True)
 

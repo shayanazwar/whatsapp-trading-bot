@@ -6,6 +6,11 @@ import time
 from typing import Any
 
 from ..analysis.engine import (
+    _bos_events,
+    _fifteen_minute_entry_confirmation,
+    _four_hour_regime,
+    _one_hour_alignment,
+    _select_latest_bos_with_retest,
     analyze_candles,
     btc_filter_ok,
     build_btc_context,
@@ -45,10 +50,6 @@ class MexcScanner:
             return {"symbols": 0, "valid": 0, "sent": 0, "errors": 0}
 
         await self._refresh_btc_context()
-        # Keep symbol-level fan-out bounded even if an older Render env var
-        # still specifies a larger value. The MEXC client has a shared public
-        # request throttle, but limiting waiting tasks prevents unnecessary
-        # pressure and keeps scan latency predictable.
         configured_concurrency = int(getattr(self.settings, "scan_concurrency", 4))
         concurrency = max(1, min(4, configured_concurrency))
         semaphore = asyncio.Semaphore(concurrency)
@@ -129,20 +130,100 @@ class MexcScanner:
         async with semaphore:
             try:
                 limit = max(250, int(getattr(self.settings, "candle_limit", 250)))
-                raw4, raw1, raw15, raw5 = await asyncio.gather(
+
+                # Stage 1: fetch only the minimum technical timeframes. Most
+                # symbols fail the higher-timeframe / 15M setup gates, so there
+                # is no reason to spend additional MEXC requests on 5M/1D data
+                # unless the exact prerequisite gates are satisfied.
+                raw4, raw1, raw15 = await asyncio.gather(
                     self.client.get_klines(symbol, MEXC_INTERVALS["4H"], limit),
                     self.client.get_klines(symbol, MEXC_INTERVALS["1H"], limit),
                     self.client.get_klines(symbol, MEXC_INTERVALS["15M"], limit),
-                    self.client.get_klines(symbol, MEXC_INTERVALS["5M"], limit),
                 )
-                c4 = closed_candle_rows(raw4, "4h"); c1 = closed_candle_rows(raw1, "1h"); c15 = closed_candle_rows(raw15, "15m"); c5 = closed_candle_rows(raw5, "5m")
-                for candles, minimum, label in ((c4, 205, "4H"), (c1, 205, "1H"), (c15, 80, "15M"), (c5, 30, "5M")):
+                c4 = closed_candle_rows(raw4, "4h")
+                c1 = closed_candle_rows(raw1, "1h")
+                c15 = closed_candle_rows(raw15, "15m")
+                for candles, minimum, label in ((c4, 205, "4H"), (c1, 205, "1H"), (c15, 80, "15M")):
                     if len(candles) < minimum:
                         return self._reject(symbol, f"Insufficient closed {label} candles", stage="DATA", analysis={})
 
-                # 1D is fetched only after the core 4H/1H/15M/5M data are usable.
-                raw1d = await self.client.get_klines(symbol, MEXC_INTERVALS["1D"], 60)
+                # Semantics-preserving technical prefilter. These are the same
+                # mandatory gates used by analyze_candles(); the full engine
+                # remains authoritative after this prefilter.
+                regime = _four_hour_regime(c4)
+                alignment = _one_hour_alignment(c1, regime)
+                bos_events_long = _bos_events(c15, "LONG")
+                bos_events_short = _bos_events(c15, "SHORT")
+                bos_long, ret_long = _select_latest_bos_with_retest(c15, "LONG", bos_events_long)
+                bos_short, ret_short = _select_latest_bos_with_retest(c15, "SHORT", bos_events_short)
+                long_candidate = bool(alignment.get("long") and bos_long and ret_long.get("valid"))
+                short_candidate = bool(alignment.get("short") and bos_short and ret_short.get("valid"))
+
+                if not (
+                    (regime.get("bull") and long_candidate)
+                    or (regime.get("bear") and short_candidate)
+                ):
+                    return self._reject(
+                        symbol,
+                        "Mandatory 4H/1H/15M technical gates not satisfied",
+                        stage="TECHNICAL",
+                        analysis={
+                            "trend_4h": "BULLISH" if regime.get("bull") else "BEARISH" if regime.get("bear") else "NO_TRADE",
+                            "one_hour_long_votes": alignment.get("long_votes", 0),
+                            "one_hour_short_votes": alignment.get("short_votes", 0),
+                            "long_bos_event_count": len(bos_events_long),
+                            "short_bos_event_count": len(bos_events_short),
+                            "long_retest": bool(ret_long.get("valid")),
+                            "short_retest": bool(ret_short.get("valid")),
+                        },
+                    )
+
+                if long_candidate and not short_candidate:
+                    trigger_side = "LONG"
+                elif short_candidate and not long_candidate:
+                    trigger_side = "SHORT"
+                else:
+                    trigger_side = (
+                        "LONG"
+                        if float((bos_long or {}).get("strength") or 0.0) >= float((bos_short or {}).get("strength") or 0.0)
+                        else "SHORT"
+                    )
+                active_bos = bos_long if trigger_side == "LONG" else bos_short
+                active_retest = ret_long if trigger_side == "LONG" else ret_short
+                trigger_level = float(active_bos["level"])
+                retest_time = int(active_retest["time"])
+                entry_check = _fifteen_minute_entry_confirmation(
+                    c15, trigger_side, trigger_level, retest_time
+                )
+                if not entry_check.get("ready"):
+                    return self._reject(
+                        symbol,
+                        "15M entry confirmation not satisfied",
+                        stage="TECHNICAL",
+                        analysis={
+                            "setup": "NO TRADE",
+                            "trigger_side": trigger_side,
+                            "entry_15m_ready": False,
+                            "entry_15m_type": entry_check.get("trigger_type", "NONE"),
+                            "entry_15m_reason": entry_check.get("reason", "not ready"),
+                            "long_bos_event_count": len(bos_events_long),
+                            "short_bos_event_count": len(bos_events_short),
+                            "long_retest": bool(ret_long.get("valid")),
+                            "short_retest": bool(ret_short.get("valid")),
+                        },
+                    )
+
+                # Stage 2: only qualifying technical candidates need the costly
+                # 5M refinement and 1D target context.
+                raw5, raw1d = await asyncio.gather(
+                    self.client.get_klines(symbol, MEXC_INTERVALS["5M"], limit),
+                    self.client.get_klines(symbol, MEXC_INTERVALS["1D"], 60),
+                )
+                c5 = closed_candle_rows(raw5, "5m")
                 c1d = closed_candle_rows(raw1d, "1d")
+                if len(c5) < 30:
+                    return self._reject(symbol, "Insufficient closed 5M candles", stage="DATA", analysis={})
+
                 analysis = analyze_candles(symbol, c4, c1, c15, c5, c1d)
                 analysis.update({"mexc_4h_rows": c4, "mexc_1h_rows": c1, "mexc_15m_rows": c15, "mexc_5m_rows": c5, "mexc_1d_rows": c1d, "closed_4h_candles": len(c4), "closed_1h_candles": len(c1), "closed_15m_candles": len(c15), "closed_5m_candles": len(c5), "closed_5m_candle_time": int(c5[-1]["time"])})
 

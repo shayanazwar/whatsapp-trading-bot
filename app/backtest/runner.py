@@ -78,6 +78,15 @@ UNIVERSE_REFRESH_TIMEOUT_SECONDS = 60
 ANALYSIS_TIMEOUT_SECONDS = 90
 HEARTBEAT_INTERVAL_SECONDS = 30
 
+# Backtest realism: this is an intraday/swing validation, not an unlimited
+# hold simulation. A signal is allowed to resolve for at most 72 hours.
+MAX_HOLDING_HOURS = 72
+MAX_HOLDING_MS = MAX_HOLDING_HOURS * 60 * 60 * 1000
+
+# A backtest should not count extremely tight stops as valid swing-style
+# trades. We reject them rather than artificially widening the stop.
+MIN_BACKTEST_SL_DISTANCE_PCT = 0.0075
+
 # Keep a reference to the real engine trigger. Tests can monkeypatch the
 # imported _five_minute_trigger; production uses the optimized path while
 # patched/custom trigger tests use the compatibility path.
@@ -615,6 +624,51 @@ def _cheap_15m_directional_filters(
 # ---------------------------------------------------------------------------
 
 
+def _backtest_trade_geometry_ok(analysis: dict) -> tuple[bool, str]:
+    """Validate trade geometry before historical simulation.
+
+    This is deliberately a validation gate, not a stop/target rewriter.
+    The production engine remains the source of the levels; the backtest
+    refuses levels that are incompatible with the requested intraday/swing
+    style instead of fabricating a wider stop or a nearer target.
+    """
+    try:
+        entry = float(analysis.get("entry"))
+        stop = float(analysis.get("stop_loss"))
+        tp1 = float(analysis.get("tp1"))
+        tp2 = float(analysis.get("tp2"))
+    except (TypeError, ValueError):
+        return False, "missing_or_non_numeric_levels"
+
+    if entry <= 0 or stop <= 0 or tp1 <= 0 or tp2 <= 0:
+        return False, "non_positive_levels"
+
+    side = str(analysis.get("setup") or "").upper()
+    if side == "LONG" and not (stop < entry < tp1 < tp2):
+        return False, "invalid_long_level_order"
+    if side == "SHORT" and not (stop > entry > tp1 > tp2):
+        return False, "invalid_short_level_order"
+    if side not in {"LONG", "SHORT"}:
+        return False, "invalid_side"
+
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return False, "zero_risk"
+
+    sl_distance_pct = risk / entry
+    if sl_distance_pct < MIN_BACKTEST_SL_DISTANCE_PCT:
+        return False, (
+            f"stop_too_tight:{sl_distance_pct * 100:.3f}%"
+            f"<{MIN_BACKTEST_SL_DISTANCE_PCT * 100:.3f}%"
+        )
+
+    planned_rr = abs(tp2 - entry) / risk
+    if planned_rr < 2.0:
+        return False, f"rr_below_min:{planned_rr:.2f}R"
+
+    return True, f"sl={sl_distance_pct * 100:.3f}% rr={planned_rr:.2f}R"
+
+
 def _align_5m_timestamp(timestamp_ms: int) -> int:
     return (int(timestamp_ms) // M5_MS) * M5_MS
 
@@ -935,6 +989,8 @@ class BacktestRunner:
                 "processed": 0,
                 "tested": 0,
                 "errors": 0,
+                "data_errors": 0,
+                "analysis_errors": 0,
                 "signals": 0,
                 "worker": "-",
                 "current_symbol": "-",
@@ -1101,10 +1157,12 @@ class BacktestRunner:
                             )
 
                             symbol_started = time.monotonic()
+
+                            # -------------------------------------------------
+                            # Historical data stage. Keep data failures
+                            # separate from engine/simulation failures.
+                            # -------------------------------------------------
                             try:
-                                # BTC was already fetched for global BTC context.
-                                # Reuse it instead of making the same five API
-                                # requests again.
                                 if str(symbol).upper() == "BTC_USDT":
                                     history = btc_history
                                     LOGGER.info(
@@ -1127,7 +1185,38 @@ class BacktestRunner:
                                         ),
                                         timeout=SYMBOL_FETCH_TIMEOUT_SECONDS + ANALYSIS_TIMEOUT_SECONDS,
                                     )
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                async with state_lock:
+                                    state["errors"] = int(state["errors"]) + 1
+                                    state["data_errors"] = int(state["data_errors"]) + 1
+                                LOGGER.exception(
+                                    "BACKTEST DATA STAGE FAILED | worker=%d symbol=%s",
+                                    worker_id,
+                                    symbol,
+                                )
+                                LOGGER.error(
+                                    "BACKTEST DATA ERROR | %s | %s: %s",
+                                    symbol,
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                                continue
 
+                            # -------------------------------------------------
+                            # CPU-bound engine stage. IMPORTANT: do not wrap
+                            # to_thread() directly in wait_for(). Cancelling
+                            # wait_for() cannot reliably stop an already-running
+                            # Python thread. That old pattern allowed timed-out
+                            # analyses to keep consuming the single Render CPU
+                            # while the queue moved on.
+                            #
+                            # We therefore use a shielded task. If the warning
+                            # timeout is reached, we WAIT for that same task to
+                            # finish instead of creating orphaned CPU workers.
+                            # -------------------------------------------------
+                            try:
                                 touch(
                                     phase="ANALYSIS",
                                     symbol=symbol,
@@ -1140,8 +1229,7 @@ class BacktestRunner:
                                 )
 
                                 analysis_started = time.monotonic()
-
-                                symbol_trades = await asyncio.wait_for(
+                                analysis_task = asyncio.create_task(
                                     asyncio.to_thread(
                                         self._backtest_symbol,
                                         history,
@@ -1152,8 +1240,24 @@ class BacktestRunner:
                                         btc_engine_times,
                                         btc_context_cache,
                                     ),
-                                    timeout=ANALYSIS_TIMEOUT_SECONDS,
+                                    name=f"backtest-analysis-{symbol}",
                                 )
+
+                                try:
+                                    symbol_trades = await asyncio.wait_for(
+                                        asyncio.shield(analysis_task),
+                                        timeout=ANALYSIS_TIMEOUT_SECONDS,
+                                    )
+                                except asyncio.TimeoutError:
+                                    LOGGER.warning(
+                                        "BACKTEST ANALYSIS SLOW | worker=%d symbol=%s "
+                                        "elapsed=%.1fs timeout=%ss | waiting for the existing CPU task instead of spawning another",
+                                        worker_id,
+                                        symbol,
+                                        time.monotonic() - analysis_started,
+                                        ANALYSIS_TIMEOUT_SECONDS,
+                                    )
+                                    symbol_trades = await analysis_task
 
                                 LOGGER.info(
                                     "BACKTEST ANALYSIS DONE | worker=%d symbol=%s "
@@ -1177,19 +1281,21 @@ class BacktestRunner:
                                     worker_id,
                                     symbol,
                                 )
+                                if not analysis_task.done():
+                                    analysis_task.cancel()
+                                    await asyncio.gather(analysis_task, return_exceptions=True)
                                 raise
-
                             except Exception as exc:
                                 async with state_lock:
                                     state["errors"] = int(state["errors"]) + 1
-
+                                    state["analysis_errors"] = int(state["analysis_errors"]) + 1
                                 LOGGER.exception(
-                                    "BACKTEST symbol failed: %s | %s",
+                                    "BACKTEST ANALYSIS FAILED | worker=%d symbol=%s",
+                                    worker_id,
                                     symbol,
-                                    exc,
                                 )
                                 LOGGER.error(
-                                    "BACKTEST DATA ERROR | %s | %s: %s",
+                                    "BACKTEST ANALYSIS ERROR | %s | %s: %s",
                                     symbol,
                                     type(exc).__name__,
                                     exc,
@@ -1263,15 +1369,18 @@ class BacktestRunner:
                     days=days,
                     coins_selected=len(symbols),
                     coins_tested=int(state["tested"]),
-                    data_errors=int(state["errors"]),
+                    data_errors=int(state["data_errors"]),
                     trades=trades,
                 )
 
                 LOGGER.info(
-                    "BACKTEST COMPLETE | days=%d tested=%d errors=%d signals=%d duration=%.2fs",
+                    "BACKTEST COMPLETE | days=%d tested=%d total_errors=%d "
+                    "data_errors=%d analysis_errors=%d signals=%d duration=%.2fs",
                     days,
                     int(state["tested"]),
                     int(state["errors"]),
+                    int(state["data_errors"]),
+                    int(state["analysis_errors"]),
                     len(trades),
                     time.monotonic() - started,
                 )
@@ -2154,6 +2263,16 @@ class BacktestRunner:
             if side != expected_setup.side:
                 continue
 
+            geometry_ok, geometry_reason = _backtest_trade_geometry_ok(analysis)
+            if not geometry_ok:
+                LOGGER.info(
+                    "BACKTEST TRADE REJECT | %s | signal=%d | reason=%s",
+                    history.symbol,
+                    signal_close_time,
+                    geometry_reason,
+                )
+                continue
+
             symbol_upper = history.symbol.upper()
             if symbol_upper == "BTC_USDT":
                 btc_ok = True
@@ -2208,9 +2327,13 @@ class BacktestRunner:
                 raw_c5_times,
                 signal_close_time - 1,
             )
+            holding_end = min(
+                period_end - 1,
+                signal_close_time + MAX_HOLDING_MS,
+            )
             future_end = bisect_right(
                 raw_c5_times,
-                period_end - 1,
+                holding_end,
             )
             if future_start >= future_end:
                 continue
@@ -2432,6 +2555,16 @@ class BacktestRunner:
             if side not in {"LONG", "SHORT"}:
                 continue
 
+            geometry_ok, geometry_reason = _backtest_trade_geometry_ok(analysis)
+            if not geometry_ok:
+                LOGGER.info(
+                    "BACKTEST TRADE REJECT | %s | signal=%d | reason=%s",
+                    history.symbol,
+                    signal_close_time,
+                    geometry_reason,
+                )
+                continue
+
             if history.symbol.upper() == "BTC_USDT":
                 btc_ok = True
             else:
@@ -2471,7 +2604,11 @@ class BacktestRunner:
                 continue
 
             future_start = bisect_right(raw_c5_times, signal_close_time - 1)
-            future_end = bisect_right(raw_c5_times, period_end - 1)
+            holding_end = min(
+                period_end - 1,
+                signal_close_time + MAX_HOLDING_MS,
+            )
+            future_end = bisect_right(raw_c5_times, holding_end)
             if future_start >= future_end:
                 continue
 

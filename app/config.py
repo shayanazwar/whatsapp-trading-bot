@@ -50,7 +50,16 @@ class Settings(BaseSettings):
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(default=300, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")
-    scan_concurrency: int = Field(default=8, alias="SCAN_CONCURRENCY")
+    scan_concurrency: int = Field(default=4, alias="SCAN_CONCURRENCY")
+    # Conservative shared limiter for all public MEXC REST calls. These are
+    # client-side safety controls; MEXC may impose additional limits.
+    mexc_public_min_interval_seconds: float = Field(default=0.20, alias="MEXC_PUBLIC_MIN_INTERVAL_SECONDS")
+    mexc_public_window_seconds: float = Field(default=2.0, alias="MEXC_PUBLIC_WINDOW_SECONDS")
+    mexc_public_window_limit: int = Field(default=8, alias="MEXC_PUBLIC_WINDOW_LIMIT")
+    mexc_rate_limit_max_retries: int = Field(default=4, alias="MEXC_RATE_LIMIT_MAX_RETRIES")
+    mexc_rate_limit_backoff_seconds: float = Field(default=2.0, alias="MEXC_RATE_LIMIT_BACKOFF_SECONDS")
+    mexc_rate_limit_backoff_cap_seconds: float = Field(default=20.0, alias="MEXC_RATE_LIMIT_BACKOFF_CAP_SECONDS")
+    mexc_rate_limit_jitter_seconds: float = Field(default=0.25, alias="MEXC_RATE_LIMIT_JITTER_SECONDS")
     candle_limit: int = Field(default=250, alias="CANDLE_LIMIT")
     min_confluence: int = Field(default=82, alias="MIN_CONFLUENCE")
     min_rr: float = Field(default=2.0, alias="MIN_RR")

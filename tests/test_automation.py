@@ -78,3 +78,84 @@ def test_signal_format_uses_score_100():
     text = format_signal(signal)
     assert "Score: 100/100" in text
     assert "Families: 6/6" in text
+
+
+class _FakeHeaders(dict):
+    def get(self, key, default=None):
+        return super().get(key, default)
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None, text="", headers=None):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text or str(payload or "")
+        self.headers = _FakeHeaders(headers or {})
+        self.is_error = status_code >= 400
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def test_public_request_rate_limit_retries_with_shared_backoff():
+    settings = Settings(
+        mexc_public_min_interval_seconds=0,
+        mexc_public_window_seconds=10,
+        mexc_public_window_limit=100,
+        mexc_rate_limit_max_retries=2,
+        mexc_rate_limit_backoff_seconds=0.01,
+        mexc_rate_limit_backoff_cap_seconds=0.02,
+        mexc_rate_limit_jitter_seconds=0,
+    )
+    client = MexcClient(settings)
+    responses = [
+        _FakeResponse(200, {"success": False, "message": "Requests are too frequent", "code": "429"}),
+        _FakeResponse(200, {"success": True, "data": {"ok": True}}),
+    ]
+    calls = []
+
+    async def fake_request(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    async def run():
+        client.http.request = fake_request
+        return await client._public_request({"method": "GET", "url": "https://example.test"})
+
+    response = asyncio.run(run())
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert client._public_rate_limit_events == 1
+    assert client._public_retry_events == 1
+    asyncio.run(client.close())
+
+
+def test_public_request_retries_http_429_and_honors_bounded_retry_count():
+    settings = Settings(
+        mexc_public_min_interval_seconds=0,
+        mexc_public_window_seconds=10,
+        mexc_public_window_limit=100,
+        mexc_rate_limit_max_retries=1,
+        mexc_rate_limit_backoff_seconds=0.01,
+        mexc_rate_limit_backoff_cap_seconds=0.02,
+        mexc_rate_limit_jitter_seconds=0,
+    )
+    client = MexcClient(settings)
+    responses = [
+        _FakeResponse(429, {"message": "too many requests"}, headers={"Retry-After": "0"}),
+        _FakeResponse(200, {"success": True, "data": {"ok": True}}),
+    ]
+
+    async def fake_request(**kwargs):
+        return responses.pop(0)
+
+    async def run():
+        client.http.request = fake_request
+        return await client._public_request({"method": "GET", "url": "https://example.test"})
+
+    response = asyncio.run(run())
+    assert response.status_code == 200
+    assert client._public_rate_limit_events == 1
+    asyncio.run(client.close())

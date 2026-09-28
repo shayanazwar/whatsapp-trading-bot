@@ -273,10 +273,25 @@ class BacktestRunner:
 
         started = time.monotonic()
         try:
-            process.start()
+            # multiprocessing.Process.start() is synchronous and can spend
+            # significant time spawning/pickling under a constrained Render
+            # instance. Never call it directly from the asyncio event loop.
+            # Keep the event loop alive so the heartbeat and HTTP health
+            # endpoint continue running while the child process starts.
+            LOGGER.info(
+                "BACKTEST ANALYSIS PROCESS START | symbol=%s",
+                history.symbol,
+            )
+            await asyncio.to_thread(process.start)
             child_conn.close()
 
-            deadline = started + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
+            LOGGER.info(
+                "BACKTEST ANALYSIS PROCESS STARTED | symbol=%s | pid=%s",
+                history.symbol,
+                process.pid,
+            )
+
+            deadline = time.monotonic() + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
             payload = None
 
             while True:

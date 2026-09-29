@@ -526,6 +526,7 @@ def _bos_events(
     *,
     atr_values: Optional[List[float]] = None,
     swings: Optional[Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]] = None,
+    progress_callback: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Find BOS events without rebuilding the pivot list inside every candle.
 
@@ -548,7 +549,22 @@ def _bos_events(
     # Pivots are already sorted by index. For each event candle, binary-search
     # the last pivot that is confirmed by that candle, instead of rebuilding
     # ``[(idx, p) for ... if ...]`` on every iteration.
-    for i in range(start, len(candles)):
+    for loop_offset, i in enumerate(range(start, len(candles)), start=1):
+        if progress_callback is not None and (
+            loop_offset == 1 or loop_offset % 250 == 0
+        ):
+            try:
+                progress_callback(
+                    "BOS_PROGRESS",
+                    {
+                        "side": side,
+                        "processed": loop_offset,
+                        "total": max(0, len(candles) - start),
+                    },
+                )
+            except Exception:
+                pass
+
         a = float(atr_values[i]) if i < len(atr_values) else 0.0
         if a <= 0:
             continue
@@ -582,29 +598,60 @@ def _bos_events(
     return events
 
 
-def _build_15m_backtest_context(candles: List[Candle]) -> Dict[str, Any]:
+def _build_15m_backtest_context(
+    candles: List[Candle],
+    progress_callback: Optional[Any] = None,
+) -> Dict[str, Any]:
     """Precompute reusable 15M structures for point-in-time backtests.
 
     Every stored value is derived from the complete historical array but is
     consumed only up to the candidate prefix, so causal boundaries remain
     identical to the ordinary per-prefix engine path.
+
+    ``progress_callback`` is diagnostic-only. It never changes the calculations
+    or trading decisions and allows the isolated backtest worker to report which
+    CPU stage is currently active.
     """
+    def report(stage: str, detail: Any = None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage, detail)
+        except Exception:
+            pass
+
+    report("CONTEXT_ATR_START", {"candles": len(candles)})
     atr_values = _atr_series(candles, 14)
+    report("CONTEXT_ATR_DONE", {"candles": len(candles)})
+
+    report("CONTEXT_SWINGS_START", {"candles": len(candles)})
     swings = _swing_points(candles)
+    report(
+        "CONTEXT_SWINGS_DONE",
+        {"highs": len(swings[0]), "lows": len(swings[1])},
+    )
+
+    report("CONTEXT_BOS_LONG_START", {"candles": len(candles)})
     bos_long = _bos_events(
         candles,
         "LONG",
         lookback=len(candles),
         atr_values=atr_values,
         swings=swings,
+        progress_callback=progress_callback,
     )
+    report("CONTEXT_BOS_LONG_DONE", {"events": len(bos_long)})
+
+    report("CONTEXT_BOS_SHORT_START", {"candles": len(candles)})
     bos_short = _bos_events(
         candles,
         "SHORT",
         lookback=len(candles),
         atr_values=atr_values,
         swings=swings,
+        progress_callback=progress_callback,
     )
+    report("CONTEXT_BOS_SHORT_DONE", {"events": len(bos_short)})
     return {
         "count": len(candles),
         "last_time": int(candles[-1]["time"]) if candles else 0,

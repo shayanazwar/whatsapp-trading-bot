@@ -13,6 +13,7 @@ This module never places orders.
 
 import math
 import time
+from bisect import bisect_right
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .indicators import atr, ema, rsi, volume_status
@@ -259,14 +260,19 @@ def _relative_volume(candles: List[Candle], lookback: int = 20) -> float:
     return current / average if average > 0 else 0.0
 
 
-def _atr_percentile(candles: List[Candle], period: int = 14, lookback: int = 100) -> float:
-    values = _atr_series(candles, period)
+def _atr_percentile_from_series(
+    candles: List[Candle],
+    values: List[float],
+    period: int = 14,
+    lookback: int = 100,
+) -> float:
     if len(candles) < period + 10:
         return 50.0
-    start = max(period, len(candles) - lookback)
-    ratios = []
-    for i in range(start, len(candles)):
-        price, a = float(candles[i]["close"]), values[i]
+    end = min(len(candles), len(values))
+    start = max(period, end - lookback)
+    ratios: List[float] = []
+    for i in range(start, end):
+        price, a = float(candles[i]["close"]), float(values[i])
         if price > 0 and a > 0:
             ratios.append(a / price)
     if not ratios:
@@ -275,34 +281,53 @@ def _atr_percentile(candles: List[Candle], period: int = 14, lookback: int = 100
     return 100.0 * sum(x <= current for x in ratios) / len(ratios)
 
 
-def _macd(values: List[float]) -> Tuple[float, float, float]:
+def _atr_percentile(
+    candles: List[Candle],
+    period: int = 14,
+    lookback: int = 100,
+) -> float:
+    return _atr_percentile_from_series(
+        candles,
+        _atr_series(candles, period),
+        period,
+        lookback,
+    )
+
+
+def _macd_components(values: List[float]) -> Tuple[float, float, float, float]:
+    """Return MACD line, signal, histogram and normalized histogram delta."""
     fast, slow = _ema_series(values, 12), _ema_series(values, 26)
     if not fast or not slow:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
+
     n = min(len(fast), len(slow))
     line_series = [fast[-n + i] - slow[-n + i] for i in range(n)]
     signal_series = _ema_series(line_series, 9)
+
     line = line_series[-1]
     signal = signal_series[-1] if signal_series else 0.0
-    return line, signal, line - signal
+    histogram = line - signal
+
+    delta = 0.0
+    if len(signal_series) >= 2:
+        current = line_series[-1] - signal_series[-1]
+        previous = line_series[-2] - signal_series[-2]
+        scale = max(abs(current), abs(previous), 1e-12)
+        delta = (current - previous) / scale
+
+    return line, signal, histogram, delta
+
+
+def _macd(values: List[float]) -> Tuple[float, float, float]:
+    line, signal, histogram, _ = _macd_components(values)
+    return line, signal, histogram
 
 
 def _macd_histogram_delta(values: List[float]) -> float:
-    """Return the one-candle normalized MACD histogram change in one pass."""
+    """Return the one-candle normalized MACD histogram change."""
     if len(values) < 40:
         return 0.0
-    fast, slow = _ema_series(values, 12), _ema_series(values, 26)
-    if not fast or not slow:
-        return 0.0
-    n = min(len(fast), len(slow))
-    line_series = [fast[-n + i] - slow[-n + i] for i in range(n)]
-    signal_series = _ema_series(line_series, 9)
-    if len(signal_series) < 2:
-        return 0.0
-    current = line_series[-1] - signal_series[-1]
-    previous = line_series[-2] - signal_series[-2]
-    scale = max(abs(current), abs(previous), 1e-12)
-    return (current - previous) / scale
+    return _macd_components(values)[3]
 
 
 def _swing_points(candles: List[Candle], left: int = 2, right: int = 2) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
@@ -494,27 +519,119 @@ def _bos_strength(candle: Candle, level: float, atr_value: float) -> float:
     return _clamp(0.5*_clamp(body/0.55,0,1)+0.5*_clamp(displacement/0.50,0,1),0,1)
 
 
-def _bos_events(candles: List[Candle], side: str, lookback: int = 70) -> List[Dict[str, Any]]:
-    if len(candles) < 10 or side not in {"LONG","SHORT"}:
+def _bos_events(
+    candles: List[Candle],
+    side: str,
+    lookback: int = 70,
+    *,
+    atr_values: Optional[List[float]] = None,
+    swings: Optional[Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]] = None,
+) -> List[Dict[str, Any]]:
+    """Find BOS events without rebuilding the pivot list inside every candle.
+
+    The event semantics are unchanged: the latest confirmed swing at each
+    candle is tested first, the swing must satisfy ``idx + 2 <= i``, and the
+    ATR/buffer are taken from the event candle.
+    """
+    if len(candles) < 10 or side not in {"LONG", "SHORT"}:
         return []
-    atr_values = _atr_series(candles,14)
-    swing_highs, swing_lows = _swing_points(candles)
+
+    atr_values = atr_values if atr_values is not None else _atr_series(candles, 14)
+    swings = swings if swings is not None else _swing_points(candles)
+    swing_highs, swing_lows = swings
     pivots = swing_highs if side == "LONG" else swing_lows
-    events = []
-    start = max(1, len(candles)-lookback)
-    for i in range(start,len(candles)):
-        a = atr_values[i]
-        if a <= 0: continue
-        close, prev = float(candles[i]["close"]), float(candles[i-1]["close"])
-        buffer = max(a*BOS_BUFFER_ATR, close*BOS_BUFFER_PCT)
-        for swing_index, level in reversed([(idx,p) for idx,p in pivots if idx+2 <= i]):
-            level = float(level)
-            crossed = (prev <= level+buffer and close > level+buffer) if side=="LONG" else (prev >= level-buffer and close < level-buffer)
+    pivot_indices = [idx for idx, _ in pivots]
+
+    events: List[Dict[str, Any]] = []
+    start = max(1, len(candles) - lookback)
+
+    # Pivots are already sorted by index. For each event candle, binary-search
+    # the last pivot that is confirmed by that candle, instead of rebuilding
+    # ``[(idx, p) for ... if ...]`` on every iteration.
+    for i in range(start, len(candles)):
+        a = float(atr_values[i]) if i < len(atr_values) else 0.0
+        if a <= 0:
+            continue
+
+        close = float(candles[i]["close"])
+        prev = float(candles[i - 1]["close"])
+        buffer = max(a * BOS_BUFFER_ATR, close * BOS_BUFFER_PCT)
+        last_eligible_pos = bisect_right(pivot_indices, i - 2) - 1
+        if last_eligible_pos < 0:
+            continue
+
+        for pos in range(last_eligible_pos, -1, -1):
+            swing_index, raw_level = pivots[pos]
+            level = float(raw_level)
+            if side == "LONG":
+                crossed = prev <= level + buffer and close > level + buffer
+            else:
+                crossed = prev >= level - buffer and close < level - buffer
+
             if crossed:
-                events.append({"index":i,"time":int(candles[i]["time"]),"level":level,"atr":a,
-                                "strength":_bos_strength(candles[i],level,a),"swing_index":swing_index})
+                events.append({
+                    "index": i,
+                    "time": int(candles[i]["time"]),
+                    "level": level,
+                    "atr": a,
+                    "strength": _bos_strength(candles[i], level, a),
+                    "swing_index": swing_index,
+                })
                 break
+
     return events
+
+
+def _build_15m_backtest_context(candles: List[Candle]) -> Dict[str, Any]:
+    """Precompute reusable 15M structures for point-in-time backtests.
+
+    Every stored value is derived from the complete historical array but is
+    consumed only up to the candidate prefix, so causal boundaries remain
+    identical to the ordinary per-prefix engine path.
+    """
+    atr_values = _atr_series(candles, 14)
+    swings = _swing_points(candles)
+    bos_long = _bos_events(
+        candles,
+        "LONG",
+        lookback=len(candles),
+        atr_values=atr_values,
+        swings=swings,
+    )
+    bos_short = _bos_events(
+        candles,
+        "SHORT",
+        lookback=len(candles),
+        atr_values=atr_values,
+        swings=swings,
+    )
+    return {
+        "count": len(candles),
+        "last_time": int(candles[-1]["time"]) if candles else 0,
+        "last_close": float(candles[-1]["close"]) if candles else 0.0,
+        "atr": atr_values,
+        "swings": swings,
+        "bos_long": bos_long,
+        "bos_short": bos_short,
+    }
+
+
+def _slice_backtest_bos_events(
+    context: Dict[str, Any],
+    prefix_count: int,
+    lookback: int = 70,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return exactly the BOS window visible to a candidate prefix."""
+    start = max(1, int(prefix_count) - int(lookback))
+    long_events = [
+        event for event in context.get("bos_long", [])
+        if start <= int(event.get("index", -1)) < prefix_count
+    ]
+    short_events = [
+        event for event in context.get("bos_short", [])
+        if start <= int(event.get("index", -1)) < prefix_count
+    ]
+    return long_events, short_events
 
 
 def _pullback_retest(candles: List[Candle], side: str, bos: Optional[Dict[str,Any]], max_bars: int=8) -> Dict[str,Any]:
@@ -564,6 +681,10 @@ def _fifteen_minute_entry_confirmation(
     side: str,
     setup_level: Optional[float],
     retest_time: Optional[int],
+    *,
+    rsi_value: Optional[float] = None,
+    rvol_value: Optional[float] = None,
+    atr_value: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Primary intraday entry confirmation on the closed 15M candle.
 
@@ -596,9 +717,9 @@ def _fifteen_minute_entry_confirmation(
     rng = max(h - l, 1e-12)
     body = abs(close - o) / rng
     closes = [float(c["close"]) for c in candles]
-    r = _safe_rsi(closes)
-    rv = _relative_volume(candles)
-    a = _safe_atr(candles)
+    r = float(rsi_value) if rsi_value is not None else _safe_rsi(closes)
+    rv = float(rvol_value) if rvol_value is not None else _relative_volume(candles)
+    a = float(atr_value) if atr_value is not None else _safe_atr(candles)
 
     if retest_time is not None and int(cur["time"]) <= int(retest_time):
         empty.update({"candle_time": int(cur["time"]), "rsi": r, "rvol": rv, "atr": a, "body_ratio": body,
@@ -1114,24 +1235,65 @@ def analyze_candles(
     protected = alignment["protected"]
     structure1 = alignment["structure"]
     e21_1, e50_1 = alignment["e21"], alignment["e50"]
-    atr15 = _safe_atr(c15)
+
+    # Reuse one ATR/swing pass for all 15M consumers in this analysis. A
+    # backtest may additionally provide a full-history context; in that mode
+    # BOS events are filtered to the causal prefix rather than rescanned.
+    bt15 = cache.get("_BACKTEST_15M")
+    prefix_count_15 = len(c15)
+    full_context_matches = bool(
+        isinstance(bt15, dict)
+        and int(bt15.get("count", -1)) >= prefix_count_15
+        and prefix_count_15 > 0
+    )
+
+    if full_context_matches:
+        atr_full = bt15.get("atr") or []
+        atr15 = float(atr_full[prefix_count_15 - 1]) if len(atr_full) >= prefix_count_15 else _safe_atr(c15)
+        swing_full = bt15.get("swings")
+        if isinstance(swing_full, tuple) and len(swing_full) == 2:
+            full_highs, full_lows = swing_full
+            max_visible = prefix_count_15 - 3
+            swings15 = (
+                [item for item in full_highs if item[0] <= max_visible],
+                [item for item in full_lows if item[0] <= max_visible],
+            )
+        else:
+            swings15 = _swing_points(c15)
+        bos_events_long, bos_events_short = _slice_backtest_bos_events(
+            bt15,
+            prefix_count_15,
+            70,
+        )
+    else:
+        atr15_values = _atr_series(c15, 14)
+        atr15 = float(atr15_values[-1]) if atr15_values else 0.0
+        swings15 = _swing_points(c15)
+
+        bos_long_key = _cache_key("BOS15_LONG", c15)
+        bos_events_long = cache.get(bos_long_key)
+        if bos_events_long is None:
+            bos_events_long = _bos_events(
+                c15,
+                "LONG",
+                atr_values=atr15_values,
+                swings=swings15,
+            )
+            cache[bos_long_key] = bos_events_long
+        bos_short_key = _cache_key("BOS15_SHORT", c15)
+        bos_events_short = cache.get(bos_short_key)
+        if bos_events_short is None:
+            bos_events_short = _bos_events(
+                c15,
+                "SHORT",
+                atr_values=atr15_values,
+                swings=swings15,
+            )
+            cache[bos_short_key] = bos_events_short
+
     r15 = _safe_rsi(close15)
     rv15 = _relative_volume(c15)
     vol15 = volume_status(c15)
-
-    # Compute BOS event sets once per analysis. The previous implementation
-    # recomputed the same O(n*swings) scan multiple times for selection and
-    # diagnostics, which became a major backtest CPU cost.
-    bos_long_key = _cache_key("BOS15_LONG", c15)
-    bos_events_long = cache.get(bos_long_key)
-    if bos_events_long is None:
-        bos_events_long = _bos_events(c15, "LONG")
-        cache[bos_long_key] = bos_events_long
-    bos_short_key = _cache_key("BOS15_SHORT", c15)
-    bos_events_short = cache.get(bos_short_key)
-    if bos_events_short is None:
-        bos_events_short = _bos_events(c15, "SHORT")
-        cache[bos_short_key] = bos_events_short
     bos_long, ret_long = _select_latest_bos_with_retest(c15, "LONG", bos_events_long)
     bos_short, ret_short = _select_latest_bos_with_retest(c15, "SHORT", bos_events_short)
     long_candidate = bool(alignment["long"] and bos_long and ret_long["valid"])
@@ -1172,6 +1334,9 @@ def analyze_candles(
         trigger_side,
         trigger_level,
         retest_time,
+        rsi_value=r15,
+        rvol_value=rv15,
+        atr_value=atr15,
     )
 
     # 5M is execution refinement only. It can improve quality but can never
@@ -1191,7 +1356,7 @@ def analyze_candles(
         # the baseline, and confirmed swing S/R replaces a side only when it
         # actually exists.
         support, resistance = _level_clusters(c15, atr15)
-        sr_highs, sr_lows = _swing_points(c15)
+        sr_highs, sr_lows = swings15
         sr_support, sr_resistance = _support_resistance_from_swings(c15, sr_highs, sr_lows)
         if sr_support is not None:
             support = sr_support
@@ -1200,14 +1365,16 @@ def analyze_candles(
         cache[sr_key] = (support, resistance)
 
     atr_pct = _atr_percent(price, atr15)
-    atr_rank = _atr_percentile(c15)
+    if full_context_matches and isinstance(bt15, dict):
+        atr_rank = _atr_percentile_from_series(c15, bt15.get("atr") or [])
+    else:
+        atr_rank = _atr_percentile(c15)
     volatility_ok = bool(
         atr15 > 0
         and MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE
         and 0.0005 <= atr_pct <= 0.05
     )
-    macd_line, macd_signal, macd_hist = _macd(close15)
-    macd_hist_delta = _macd_histogram_delta(close15)
+    macd_line, macd_signal, macd_hist, macd_hist_delta = _macd_components(close15)
     momentum_ok = bool(
         (setup == "LONG" and 55.0 <= r15 <= 72.0 and macd_hist > 0 and macd_hist_delta >= 0.0)
         or (setup == "SHORT" and 28.0 <= r15 <= 45.0 and macd_hist < 0 and macd_hist_delta <= 0.0)

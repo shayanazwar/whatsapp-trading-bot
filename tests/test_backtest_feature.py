@@ -8,7 +8,7 @@ import pytest
 from app.analysis.engine import analyze_candles
 from app.automation.mexc_client import MexcClient
 from app.backtest.report import format_report, summarize
-from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner
+from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner, MAX_BACKTEST_SYMBOLS
 from app.backtest.simulator import simulate_trade
 
 
@@ -181,6 +181,12 @@ def test_engine_accepts_historical_timestamp_without_future_candle():
     assert result["candle_time"] + M15 <= now
 
 
+def test_backtest_universe_is_capped_at_200_symbols():
+    import app.backtest.runner as runner_module
+
+    assert runner_module.MAX_BACKTEST_SYMBOLS == 200
+
+
 def test_backtest_runner_rejects_duplicate_job():
     runner = BacktestRunner.__new__(BacktestRunner)
     runner._lock = asyncio.Lock()
@@ -245,6 +251,9 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
 
     def fake_analyze(*args, **kwargs):
         assert kwargs["now_ms"] > retest_time
+        assert len(args) >= 6
+        assert args[5]
+        assert args[5][-1]["time"] <= retest_time
         return {
             "symbol": "TEST_USDT",
             "setup": "LONG",

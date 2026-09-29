@@ -52,7 +52,7 @@ def test_too_tight_stop_is_rejected_instead_of_inflating_rr():
 def test_target_path_does_not_skip_a_near_obstacle_and_requires_major_tp2(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
         {"price": 103.5, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
-        {"price": 106.5, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
+        {"price": 104.0, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
     ])
     levels = calculate_trade_levels({
         "setup": "LONG", "price": 100.0, "atr": 1.0,
@@ -62,9 +62,24 @@ def test_target_path_does_not_skip_a_near_obstacle_and_requires_major_tp2(monkey
     })
     assert levels["trade_geometry_ok"] is True
     assert levels["tp1"] == pytest.approx(103.5)
-    assert levels["tp2"] == pytest.approx(106.5)
+    assert levels["tp2"] == pytest.approx(104.0)
     assert levels["tp2_distance_atr"] >= 1.5
     assert levels["rr"] >= 2.0
+
+
+def test_high_precision_target_path_rejects_excessively_far_tp2(monkeypatch):
+    monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
+        {"price": 103.5, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
+        {"price": 106.5, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
+    ])
+    levels = calculate_trade_levels({
+        "setup": "LONG", "price": 100.0, "atr": 1.0,
+        "retest": {"low": 98.5, "high": 101.0},
+        "protected_low": 98.5,
+        "target_frames": [("15M", []), ("1H", [])],
+    })
+    assert levels["trade_geometry_ok"] is False
+    assert "too far" in str(levels.get("geometry_reason"))
 
 
 def test_15m_entry_confirmation_is_primary_and_mirrored(monkeypatch):
@@ -87,6 +102,14 @@ def test_15m_entry_confirmation_is_primary_and_mirrored(monkeypatch):
     mirror_result = engine._fifteen_minute_entry_confirmation(engine.convert_candles(mirror), "SHORT", 100.0, retest_time=27 * 900_000)
     assert mirror_result["ready"] is True
     assert mirror_result["trigger_type"] in {"BREAKDOWN", "RECLAIM"}
+
+
+def test_high_precision_trigger_rejects_weak_5m_confirmation(monkeypatch):
+    candles = [_candle(i * 300_000, 100.0, 100.4, 99.6, 100.1, 1000) for i in range(30)]
+    candles[-1] = _candle(29 * 300_000, 100.0, 100.7, 99.9, 100.5, 1050)
+    result = engine._five_minute_trigger(engine.convert_candles(candles), "LONG", 100.0)
+    assert result["ready"] is False
+    assert "volume" in result["reason"] or "body" in result["reason"] or "close" in result["reason"]
 
 
 def test_live_geometry_keeps_structural_stop_and_targets(monkeypatch):

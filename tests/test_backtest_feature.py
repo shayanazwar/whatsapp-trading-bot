@@ -238,10 +238,10 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
         return []
 
     def fake_retest(candles, side, bos, max_bars):
-        return {"valid": True, "time": retest_time, "index": 2, "level": 100.0, "quality": 0.9, "low": 99.0, "high": 101.0}
+        return {"valid": True, "time": retest_time, "index": 2, "level": 100.0, "quality": 0.9, "rejection": True, "low": 99.0, "high": 101.0}
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("runner prefilter must not call the 5M trigger")
+    def fake_5m(*args, **kwargs):
+        return {"ready": True, "quality": 0.9, "rvol": 1.5, "rsi": 60}
 
     def fake_analyze(*args, **kwargs):
         assert kwargs["now_ms"] > retest_time
@@ -263,7 +263,7 @@ async def test_runner_symbol_integration_uses_full_engine_and_simulator(monkeypa
 
     monkeypatch.setattr(runner_module, "_bos_events", fake_bos)
     monkeypatch.setattr(runner_module, "_pullback_retest", fake_retest)
-    monkeypatch.setattr(runner_module, "_five_minute_trigger", fail_if_called)
+    monkeypatch.setattr(runner_module, "_five_minute_trigger", fake_5m)
     monkeypatch.setattr(runner_module, "analyze_candles", fake_analyze)
     monkeypatch.setattr(runner_module, "btc_filter_ok", lambda *args, **kwargs: (True, "ok"))
     monkeypatch.setattr(runner_module, "build_btc_context", lambda *args, **kwargs: {})
@@ -294,7 +294,7 @@ def test_backtest_closed_slice_excludes_open_candle():
     assert rows[4] not in sliced
 
 
-def test_runner_prefilter_does_not_depend_on_5m_trigger(monkeypatch):
+def test_runner_prefilter_skips_5m_trigger_when_no_15m_candidate(monkeypatch):
     import app.backtest.runner as runner_module
 
     c15 = _synthetic_rows(120, M15)
@@ -302,7 +302,7 @@ def test_runner_prefilter_does_not_depend_on_5m_trigger(monkeypatch):
 
     monkeypatch.setattr(runner_module, "_bos_events", lambda candles, side, lookback: [] )
     monkeypatch.setattr(runner_module, "_pullback_retest", lambda *args, **kwargs: {"valid": False})
-    monkeypatch.setattr(runner_module, "_five_minute_trigger", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("5M trigger used")))
+    monkeypatch.setattr(runner_module, "_five_minute_trigger", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("5M trigger should not run without a 15M candidate")))
 
     out = runner_module.BacktestRunner._find_15m_setup_windows(c15, 1_700_000_000_000, 1_800_000_000_000, diagnostics)
     assert out == ()

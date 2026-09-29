@@ -86,6 +86,12 @@ class BacktestAlreadyRunning(RuntimeError):
     pass
 
 
+class BacktestDataError(RuntimeError):
+    """Historical-data failure isolated from engine/analysis failures."""
+
+    pass
+
+
 
 def _child_send(conn: Any, payload: tuple[Any, ...]) -> None:
     """Best-effort status/result send from the isolated child."""
@@ -109,65 +115,57 @@ def _isolated_backtest_symbol(
     fee_rate: float,
     slippage_bps: float,
     default_max_hold_minutes: float,
+    mexc_api_base_url: str,
     conn: Any,
     child_done: Any,
 ) -> None:
-    """Run one symbol in an isolated process using a file-backed payload.
+    """Fetch and analyze one symbol entirely inside the isolated child.
 
-    Keeping the large candle payload out of multiprocessing ``spawn`` avoids
-    serializing hundreds of thousands of Python objects through Process.start.
-
-    The child emits low-level status markers over the Pipe so the parent can
-    distinguish interpreter/startup/pickle delays from actual engine work.
+    The parent asyncio loop never performs symbol-history preparation or
+    CPU-bound candidate generation. A stalled MEXC request or expensive
+    historical calculation is therefore contained by the child watchdog.
     """
     pid = multiprocessing.current_process().pid
+    client: MexcClient | None = None
 
-    # This is intentionally the FIRST executable operation in the child.
-    # If this marker never reaches the parent, the child did not get through
-    # the spawned target entrypoint.
+    # The first operation remains an IPC marker so the parent can distinguish
+    # spawn/import delay from all later phases.
     _child_send(conn, ("status", "BOOT", int(pid or 0)))
 
     try:
         _child_send(conn, ("status", "PICKLE_LOAD_START", int(pid or 0)))
-
         with open(payload_path, "rb") as handle:
-            history, btc_history = pickle.load(handle)
-
+            symbol, btc_history = pickle.load(handle)
+        symbol = str(symbol)
         _child_send(
             conn,
-            (
-                "status",
-                "PICKLE_LOAD_DONE",
-                int(pid or 0),
-                str(getattr(history, "symbol", "?")),
-            ),
+            ("status", "PICKLE_LOAD_DONE", int(pid or 0), symbol),
         )
 
         LOGGER.info(
-            "BACKTEST CHILD START | symbol=%s candidates=%d pid=%s",
-            history.symbol,
-            len(getattr(history, "prefilter_candidates", ()) or ()),
+            "BACKTEST CHILD START | symbol=%s pid=%s",
+            symbol,
             pid,
         )
 
         _child_send(
             conn,
-            (
-                "status",
-                "RUNNER_INIT_START",
-                int(pid or 0),
-                history.symbol,
-            ),
+            ("status", "RUNNER_INIT_START", int(pid or 0), symbol),
         )
 
         settings = SimpleNamespace(
             backtest_fee_rate=fee_rate,
             backtest_slippage_bps=slippage_bps,
             backtest_max_holding_minutes=default_max_hold_minutes,
+            mexc_api_base_url=mexc_api_base_url,
         )
 
+        # Public historical data needs only the API base URL. Credentials are
+        # intentionally not copied into the child payload.
+        client = MexcClient(settings)
+
         runner = BacktestRunner(
-            client=None,
+            client=client,
             universe=None,
             settings=settings,
             max_concurrency=1,
@@ -175,26 +173,65 @@ def _isolated_backtest_symbol(
 
         _child_send(
             conn,
-            (
-                "status",
-                "RUNNER_INIT_DONE",
-                int(pid or 0),
-                history.symbol,
-            ),
+            ("status", "RUNNER_INIT_DONE", int(pid or 0), symbol),
         )
 
-        started = time.monotonic()
+        _child_send(
+            conn,
+            ("status", "FETCH_START", int(pid or 0), symbol),
+        )
+
+        # asyncio.run creates a child-local event loop. Symbol fetches, HTTP
+        # parsing, and candidate preparation cannot block the Render main loop.
+        try:
+            history = asyncio.run(
+                runner._prepare_symbol_history(
+                    symbol,
+                    start,
+                    end,
+                )
+            )
+        except BaseException as exc:
+            LOGGER.exception(
+                "BACKTEST CHILD DATA ERROR | symbol=%s | type=%s message=%s",
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            _child_send(
+                conn,
+                (
+                    "data_error",
+                    type(exc).__name__,
+                    str(exc),
+                ),
+            )
+            return
+
+        # Network I/O is complete. Close the child-local AsyncClient before
+        # entering synchronous analysis; the engine itself does not need it.
+        try:
+            asyncio.run(client.close())
+        finally:
+            client = None
 
         _child_send(
             conn,
             (
                 "status",
-                "ANALYSIS_START",
+                "FETCH_DONE",
                 int(pid or 0),
-                history.symbol,
+                symbol,
+                len(getattr(history, "prefilter_candidates", ()) or ()),
             ),
         )
 
+        _child_send(
+            conn,
+            ("status", "PREFILTER_ANALYSIS_START", int(pid or 0), symbol),
+        )
+
+        started = time.monotonic()
         symbol_trades = runner._backtest_symbol(
             history,
             start,
@@ -202,7 +239,6 @@ def _isolated_backtest_symbol(
             btc_history,
             {},
         )
-
         elapsed = time.monotonic() - started
 
         _child_send(
@@ -211,7 +247,7 @@ def _isolated_backtest_symbol(
                 "status",
                 "ANALYSIS_DONE",
                 int(pid or 0),
-                history.symbol,
+                symbol,
                 float(elapsed),
                 len(symbol_trades),
             ),
@@ -219,7 +255,7 @@ def _isolated_backtest_symbol(
 
         LOGGER.info(
             "BACKTEST CHILD COMPLETE | symbol=%s trades=%d seconds=%.2f",
-            history.symbol,
+            symbol,
             len(symbol_trades),
             elapsed,
         )
@@ -239,7 +275,6 @@ def _isolated_backtest_symbol(
             type(exc).__name__,
             exc,
         )
-
         _child_send(
             conn,
             (
@@ -248,13 +283,19 @@ def _isolated_backtest_symbol(
                 str(exc),
             ),
         )
-
     finally:
+        if client is not None:
+            try:
+                asyncio.run(client.close())
+            except Exception:
+                LOGGER.exception(
+                    "BACKTEST CHILD CLIENT CLOSE FAILED | pid=%s",
+                    pid,
+                )
         try:
             child_done.set()
         except Exception:
             pass
-
         try:
             conn.close()
         except Exception:
@@ -668,7 +709,7 @@ class BacktestRunner:
 
     async def _run_symbol_analysis_with_timeout(
         self,
-        history: SymbolHistory,
+        symbol: str,
         start: int,
         end: int,
         btc_history: SymbolHistory,
@@ -727,7 +768,7 @@ class BacktestRunner:
             if process.is_alive():
                 LOGGER.error(
                     "BACKTEST CHILD TERMINATING | symbol=%s | pid=%s | reason=%s",
-                    history.symbol,
+                    symbol,
                     process.pid,
                     reason,
                 )
@@ -737,7 +778,7 @@ class BacktestRunner:
                 except Exception:
                     LOGGER.exception(
                         "BACKTEST CHILD TERMINATE FAILED | symbol=%s | pid=%s",
-                        history.symbol,
+                        symbol,
                         process.pid,
                     )
                     return
@@ -747,7 +788,7 @@ class BacktestRunner:
                 except Exception:
                     LOGGER.exception(
                         "BACKTEST CHILD JOIN FAILED | symbol=%s | pid=%s",
-                        history.symbol,
+                        symbol,
                         process.pid,
                     )
 
@@ -757,7 +798,7 @@ class BacktestRunner:
                     except Exception:
                         LOGGER.exception(
                             "BACKTEST CHILD KILL FAILED | symbol=%s | pid=%s",
-                            history.symbol,
+                            symbol,
                             process.pid,
                         )
 
@@ -766,13 +807,13 @@ class BacktestRunner:
                     except Exception:
                         LOGGER.exception(
                             "BACKTEST CHILD FINAL JOIN FAILED | symbol=%s | pid=%s",
-                            history.symbol,
+                            symbol,
                             process.pid,
                         )
 
             LOGGER.error(
                 "BACKTEST CHILD TERMINATED | symbol=%s | pid=%s | exitcode=%s | reason=%s",
-                history.symbol,
+                symbol,
                 process.pid,
                 process.exitcode,
                 reason,
@@ -781,17 +822,29 @@ class BacktestRunner:
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb",
-                prefix=f"pta-backtest-{history.symbol}-",
+                prefix=f"pta-backtest-{symbol}-",
                 suffix=".pkl",
                 delete=False,
             ) as handle:
                 payload_path = handle.name
                 pickle.dump(
-                    (history, btc_history),
+                    (symbol, btc_history),
                     handle,
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
                 handle.flush()
+
+            mexc_api_base_url = str(
+                getattr(
+                    self.client,
+                    "base_url",
+                    getattr(
+                        self.settings,
+                        "mexc_api_base_url",
+                        "https://api.mexc.com",
+                    ),
+                )
+            )
 
             process = ctx.Process(
                 target=_isolated_backtest_symbol,
@@ -802,10 +855,11 @@ class BacktestRunner:
                     fee_rate,
                     slippage_bps,
                     default_max_hold_minutes,
+                    mexc_api_base_url,
                     child_conn,
                     child_done,
                 ),
-                name=f"backtest-analysis-{history.symbol}",
+                name=f"backtest-analysis-{symbol}",
             )
             process.daemon = True
 
@@ -816,13 +870,12 @@ class BacktestRunner:
             )
 
             LOGGER.info(
-                "BACKTEST ANALYSIS CANDIDATES | symbol=%s candidates=%d",
-                history.symbol,
-                len(getattr(history, "prefilter_candidates", ()) or ()),
+                "BACKTEST ANALYSIS PREP DEFERRED | symbol=%s | fetch+candidate-generation=child",
+                symbol,
             )
             LOGGER.info(
                 "BACKTEST ANALYSIS PROCESS START | symbol=%s | payload_kb=%.1f",
-                history.symbol,
+                symbol,
                 payload_kb,
             )
 
@@ -836,7 +889,7 @@ class BacktestRunner:
 
             LOGGER.info(
                 "BACKTEST ANALYSIS PROCESS STARTED | symbol=%s | pid=%s | method=spawn | payload=FILE",
-                history.symbol,
+                symbol,
                 process.pid,
             )
 
@@ -868,7 +921,7 @@ class BacktestRunner:
                     if not isinstance(message, tuple) or not message:
                         LOGGER.warning(
                             "BACKTEST CHILD INVALID MESSAGE | symbol=%s | message=%r",
-                            history.symbol,
+                            symbol,
                             message,
                         )
                         continue
@@ -888,7 +941,7 @@ class BacktestRunner:
 
                         LOGGER.info(
                             "BACKTEST CHILD STATUS | symbol=%s | pid=%s | phase=%s",
-                            history.symbol,
+                            symbol,
                             process.pid,
                             status,
                         )
@@ -903,7 +956,7 @@ class BacktestRunner:
                 if not child_ready and now >= boot_deadline:
                     LOGGER.error(
                         "BACKTEST CHILD BOOT TIMEOUT | symbol=%s | pid=%s | timeout=%ss | phase=%s",
-                        history.symbol,
+                        symbol,
                         process.pid,
                         CHILD_BOOT_TIMEOUT_SECONDS,
                         child_phase,
@@ -911,7 +964,7 @@ class BacktestRunner:
                     _terminate_process("child_boot_timeout")
 
                     raise TimeoutError(
-                        f"{history.symbol}: child failed to reach "
+                        f"{symbol}: child failed to reach "
                         f"BACKTEST CHILD BOOT within "
                         f"{CHILD_BOOT_TIMEOUT_SECONDS}s "
                         f"(phase={child_phase})"
@@ -920,7 +973,7 @@ class BacktestRunner:
                 if now >= analysis_deadline:
                     LOGGER.error(
                         "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | timeout=%ss | phase=%s",
-                        history.symbol,
+                        symbol,
                         process.pid,
                         SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
                         child_phase,
@@ -928,7 +981,7 @@ class BacktestRunner:
                     _terminate_process("symbol_analysis_timeout")
 
                     raise TimeoutError(
-                        f"{history.symbol}: analysis exceeded "
+                        f"{symbol}: analysis exceeded "
                         f"{SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s "
                         f"(phase={child_phase})"
                     )
@@ -946,7 +999,7 @@ class BacktestRunner:
                         break
 
                     raise RuntimeError(
-                        f"{history.symbol}: analysis subprocess exited "
+                        f"{symbol}: analysis subprocess exited "
                         f"without a result "
                         f"(exitcode={process.exitcode}, phase={child_phase})"
                     )
@@ -955,18 +1008,24 @@ class BacktestRunner:
 
             if payload is None:
                 raise RuntimeError(
-                    f"{history.symbol}: analysis subprocess returned no payload"
+                    f"{symbol}: analysis subprocess returned no payload"
+                )
+
+            if payload[0] == "data_error":
+                raise BacktestDataError(
+                    f"{symbol}: historical data preparation failed: "
+                    f"{payload[1]}: {payload[2]}"
                 )
 
             if payload[0] == "error":
                 raise RuntimeError(
-                    f"{history.symbol}: isolated analysis failed: "
+                    f"{symbol}: isolated analysis failed: "
                     f"{payload[1]}: {payload[2]}"
                 )
 
             if payload[0] != "ok":
                 raise RuntimeError(
-                    f"{history.symbol}: invalid analysis subprocess payload: "
+                    f"{symbol}: invalid analysis subprocess payload: "
                     f"{payload[0]!r}"
                 )
 
@@ -1005,7 +1064,7 @@ class BacktestRunner:
                 except Exception:
                     LOGGER.warning(
                         "BACKTEST TEMP PAYLOAD CLEANUP FAILED | symbol=%s | path=%s",
-                        history.symbol,
+                        symbol,
                         payload_path,
                     )
 
@@ -1181,56 +1240,56 @@ class BacktestRunner:
         )
 
     @staticmethod
-    @staticmethod
     def _find_15m_setup_windows(
         c15: list,
         period_start: int,
         period_end: int,
         diagnostics: dict[str, int],
+        *,
+        context: dict[str, Any] | None = None,
     ) -> tuple[
         tuple[int, Any],
-        ...,
+        ...
     ]:
-        """Build candidates equivalent to analyze_candles() at each point in time.
+        """Build candidates with the same causal BOS/retest rules as the engine.
 
-        The authoritative engine uses:
-          1. _bos_events(..., lookback=70)
-          2. newest BOS no older than MAX_SETUP_AGE_15M + 2 candles
-          3. a valid post-BOS retest no older than MAX_SETUP_AGE_15M
+        Important execution rule: this function is CPU-bound and must run only
+        inside the isolated backtest child. It is never called from the parent
+        asyncio worker during normal symbol preparation.
 
-        The previous Runner incorrectly allowed any BOS inside the 70-candle
-        window as long as its retest was recent. That produced ~1,100 candidates
-        per symbol, while the engine rejected nearly all of them. This function
-        mirrors the engine's actual latest-BOS selection rules.
+        The engine's authoritative selection semantics are preserved exactly:
+          1. BOS events are computed causally from confirmed swings.
+          2. At candidate prefix index ``i``, only BOS events in the last 70
+             candles are visible.
+          3. The newest BOS is selected only when its first valid retest has
+             already occurred and both BOS/retest age limits are satisfied.
+
+        ``context`` is the engine's reusable 15M backtest context so BOS/ATR/swing
+        calculations are performed once per symbol and reused by both candidate
+        generation and every authoritative engine call.
         """
-        candidates: dict[
-            tuple[int, str],
-            dict[str, Any],
-        ] = {}
+        if not c15:
+            return ()
 
-        open_times = [
-            _row_time(row)
-            for row in c15
-        ]
+        if context is None:
+            context = _build_15m_backtest_context(c15)
 
+        bos_by_side = {
+            "LONG": list(context.get("bos_long") or []),
+            "SHORT": list(context.get("bos_short") or []),
+        }
+
+        candidates: dict[tuple[int, str], dict[str, Any]] = {}
+
+        # First compute the first valid retest for every BOS exactly once.
         setup_by_side: dict[str, list[dict[str, Any]]] = {}
+        setup_indices: dict[str, list[int]] = {}
 
-        # Keep the one full-history BOS scan for performance. BOS events are
-        # point-in-time causal: ATR at event i uses candles through i, and the
-        # swing used by BOS is constrained by idx + 2 <= i.
         for side in ("LONG", "SHORT"):
-            bos_events = _bos_events(
-                c15,
-                side,
-                lookback=len(c15),
-            )
-
-            diagnostics[f"BOS_{side}"] = (
-                diagnostics.get(f"BOS_{side}", 0)
-                + len(bos_events)
-            )
-
             setups: list[dict[str, Any]] = []
+            bos_events = bos_by_side[side]
+
+            diagnostics[f"BOS_{side}"] += len(bos_events)
 
             for bos in bos_events:
                 retest = _pullback_retest(
@@ -1242,148 +1301,94 @@ class BacktestRunner:
                 if not retest.get("valid"):
                     continue
 
-                diagnostics[f"RETEST_{side}"] = (
-                    diagnostics.get(f"RETEST_{side}", 0)
-                    + 1
-                )
+                diagnostics[f"RETEST_{side}"] += 1
 
                 setups.append(
                     {
                         "bos_index": int(bos["index"]),
                         "bos_time": int(bos["time"]),
                         "bos_level": float(bos["level"]),
-                        "bos_strength": _safe_float(
-                            bos.get("strength"),
-                            0.0,
-                        ),
+                        "bos_strength": _safe_float(bos.get("strength"), 0.0),
                         "retest_index": int(retest["index"]),
                         "retest_time": int(retest["time"]),
-                        "retest_quality": _safe_float(
-                            retest.get("quality"),
-                            0.0,
-                        ),
-                        "retest_rejection": bool(
-                            retest.get("rejection")
-                        ),
+                        "retest_quality": _safe_float(retest.get("quality"), 0.0),
+                        "retest_rejection": bool(retest.get("rejection")),
                     }
                 )
 
-            setups.sort(
-                key=lambda item: (
-                    int(item["bos_index"]),
-                    int(item["retest_index"]),
-                )
-            )
+            setups.sort(key=lambda item: (
+                int(item["bos_index"]),
+                int(item["retest_index"]),
+            ))
             setup_by_side[side] = setups
+            setup_indices[side] = [int(item["bos_index"]) for item in setups]
 
-        # This exactly matches _select_latest_bos_with_retest():
-        # latest BOS age <= MAX_SETUP_AGE_15M + 2, then retest age <= MAX_SETUP_AGE_15M.
+        open_times = [_row_time(row) for row in c15]
         max_bos_age = MAX_SETUP_AGE_15M + 2
 
+        # The engine evaluates only closed 15M candles and uses candle-index age
+        # for BOS/retest freshness. Use the same exact index semantics here rather
+        # than timestamp deltas so gaps in historical data cannot change candidate
+        # eligibility relative to analyze_candles().
         for index, open_time in enumerate(open_times):
             close_time = int(open_time) + M15_MS
 
-            if (
-                close_time < period_start
-                or close_time > period_end
-            ):
+            if close_time < period_start or close_time > period_end:
                 continue
 
             for side in ("LONG", "SHORT"):
+                setups = setup_by_side[side]
+                indices = setup_indices[side]
+                if not setups:
+                    continue
+
+                # Only a maximum of ``MAX_SETUP_AGE_15M + 1`` BOS positions can
+                # possibly survive the age gate, so this backward search is bounded
+                # and avoids repeatedly walking the complete setup list.
+                pos = bisect_right(indices, index) - 1
                 active_setup: dict[str, Any] | None = None
 
-                for setup in reversed(setup_by_side[side]):
+                while pos >= 0:
+                    setup = setups[pos]
                     bos_index = int(setup["bos_index"])
                     retest_index = int(setup["retest_index"])
-                    bos_time = int(setup["bos_time"])
-                    retest_time = int(setup["retest_time"])
 
-                    if bos_index > index:
+                    bos_age = index - bos_index
+                    if bos_age < 0:
+                        pos -= 1
                         continue
-
-                    # Use candle timestamps for the final age test. This is
-                    # equivalent to the engine's candle-index logic on regular
-                    # MEXC candles and is robust to synthetic/test fixtures whose
-                    # mocked indexes may not match their timestamps.
-                    bos_close_time = bos_time + M15_MS
-                    bos_age_ms = close_time - bos_close_time
-
-                    if bos_age_ms < 0:
-                        continue
-
-                    if bos_age_ms > max_bos_age * M15_MS:
+                    if bos_age > max_bos_age:
                         break
 
-                    if retest_index > index:
-                        continue
+                    if retest_index <= index:
+                        retest_age = index - retest_index
+                        if 0 <= retest_age <= MAX_SETUP_AGE_15M:
+                            active_setup = setup
+                            break
 
-                    retest_close_time = retest_time + M15_MS
-                    retest_age_ms = close_time - retest_close_time
-
-                    if retest_age_ms < 0:
-                        continue
-
-                    if retest_age_ms > MAX_SETUP_AGE_15M * M15_MS:
-                        continue
-
-                    active_setup = setup
-                    break
+                    pos -= 1
 
                 if active_setup is None:
                     continue
 
-                candidates[
-                    (
-                        close_time,
-                        side,
-                    )
-                ] = {
+                candidates[(close_time, side)] = {
                     "side": side,
-                    "bos_level": float(
-                        active_setup["bos_level"]
-                    ),
-                    "bos_time": int(
-                        active_setup["bos_time"]
-                    ),
-                    "bos_strength": float(
-                        active_setup["bos_strength"]
-                    ),
-                    "retest_time": int(
-                        active_setup["retest_time"]
-                    ),
-                    "retest_index": int(
-                        active_setup["retest_index"]
-                    ),
-                    "retest_quality": float(
-                        active_setup["retest_quality"]
-                    ),
-                    "retest_rejection": bool(
-                        active_setup["retest_rejection"]
-                    ),
+                    "bos_level": float(active_setup["bos_level"]),
+                    "bos_time": int(active_setup["bos_time"]),
+                    "bos_strength": float(active_setup["bos_strength"]),
+                    "retest_time": int(active_setup["retest_time"]),
+                    "retest_index": int(active_setup["retest_index"]),
+                    "retest_quality": float(active_setup["retest_quality"]),
+                    "retest_rejection": bool(active_setup["retest_rejection"]),
                 }
 
-        diagnostics["SETUP_WINDOWS_15M"] = (
-            diagnostics.get(
-                "SETUP_WINDOWS_15M",
-                0,
-            )
-            + len(candidates)
-        )
+        diagnostics["SETUP_WINDOWS_15M"] += len(candidates)
 
         return tuple(
-            (
-                timestamp,
-                meta,
-            )
-            for (
-                timestamp,
-                _side,
-            ), meta in sorted(
+            (timestamp, meta)
+            for (timestamp, _side), meta in sorted(
                 candidates.items(),
-                key=lambda item: (
-                    item[0][0],
-                    item[0][1],
-                ),
+                key=lambda item: (item[0][0], item[0][1]),
             )
         )
 
@@ -1393,241 +1398,78 @@ class BacktestRunner:
         start: int,
         end: int,
     ) -> SymbolHistory:
+        """Fetch one symbol's complete historical payload without CPU-bound analysis.
 
+        Candidate generation is deliberately deferred to the isolated analysis
+        child. The parent event loop therefore remains responsive throughout
+        preparation, and the child watchdog can enforce a hard upper bound on the
+        complete CPU workload.
+        """
         starts = {
-            "4h": (
-                start
-                - MIN_4H_WARMUP_MS
-            ),
-            "1h": (
-                start
-                - MIN_1H_WARMUP_MS
-            ),
-            "15m": (
-                start
-                - MIN_15M_WARMUP_MS
-            ),
-            "5m": (
-                start
-                - MIN_5M_WARMUP_MS
-            ),
-            "1d": (
-                start
-                - MIN_1D_WARMUP_MS
-            ),
+            "4h": start - MIN_4H_WARMUP_MS,
+            "1h": start - MIN_1H_WARMUP_MS,
+            "15m": start - MIN_15M_WARMUP_MS,
+            "5m": start - MIN_5M_WARMUP_MS,
+            "1d": start - MIN_1D_WARMUP_MS,
         }
 
         tasks = [
-            asyncio.create_task(
-                _fetch_timeframe(
-                    self.client,
-                    symbol,
-                    "4H",
-                    INTERVALS["4h"],
-                    starts["4h"],
-                    end,
-                )
-            ),
-            asyncio.create_task(
-                _fetch_timeframe(
-                    self.client,
-                    symbol,
-                    "1H",
-                    INTERVALS["1h"],
-                    starts["1h"],
-                    end,
-                )
-            ),
-            asyncio.create_task(
-                _fetch_timeframe(
-                    self.client,
-                    symbol,
-                    "15M",
-                    INTERVALS["15m"],
-                    starts["15m"],
-                    end,
-                )
-            ),
+            asyncio.create_task(_fetch_timeframe(
+                self.client, symbol, "4H", INTERVALS["4h"], starts["4h"], end
+            )),
+            asyncio.create_task(_fetch_timeframe(
+                self.client, symbol, "1H", INTERVALS["1h"], starts["1h"], end
+            )),
+            asyncio.create_task(_fetch_timeframe(
+                self.client, symbol, "15M", INTERVALS["15m"], starts["15m"], end
+            )),
+            asyncio.create_task(_fetch_timeframe(
+                self.client, symbol, "5M", INTERVALS["5m"], starts["5m"], end
+            )),
+            asyncio.create_task(_fetch_timeframe(
+                self.client, symbol, "1D", INTERVALS["1d"], starts["1d"], end
+            )),
         ]
 
         try:
-            (
-                c4_raw,
-                c1_raw,
-                c15_raw,
-            ) = await asyncio.wait_for(
+            c4_raw, c1_raw, c15_raw, c5_raw, c1d_raw = await asyncio.wait_for(
                 asyncio.gather(*tasks),
-                timeout=(
-                    SYMBOL_FETCH_TIMEOUT_SECONDS
-                ),
+                timeout=SYMBOL_FETCH_TIMEOUT_SECONDS,
             )
-
-        except BaseException:
-
+        except asyncio.CancelledError:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-
-            await asyncio.gather(
-                *tasks,
-                return_exceptions=True,
-            )
-
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
-
-        c4 = [
-            c
-            for c in convert_candles(
-                c4_raw
-            )
-            if (
-                int(c["time"])
-                + H4_MS
-                <= end
-            )
-        ]
-
-        c1 = [
-            c
-            for c in convert_candles(
-                c1_raw
-            )
-            if (
-                int(c["time"])
-                + H1_MS
-                <= end
-            )
-        ]
-
-        c15 = [
-            c
-            for c in convert_candles(
-                c15_raw
-            )
-            if (
-                int(c["time"])
-                + M15_MS
-                <= end
-            )
-        ]
-
-        if len(c4) < 205:
-            raise ValueError(
-                f"{symbol}: "
-                "insufficient 4H candles "
-                f"({len(c4)} < 205)"
-            )
-
-        if len(c1) < 205:
-            raise ValueError(
-                f"{symbol}: "
-                "insufficient 1H candles "
-                f"({len(c1)} < 205)"
-            )
-
-        if len(c15) < 80:
-            raise ValueError(
-                f"{symbol}: "
-                "insufficient 15M candles "
-                f"({len(c15)} < 80)"
-            )
-
-        diagnostics: dict[
-            str,
-            int,
-        ] = defaultdict(int)
-
-        candidate_times = (
-            self._find_15m_setup_windows(
-                c15,
-                start,
-                end,
-                diagnostics,
-            )
-        )
-
-        if not candidate_times:
-
-            diagnostics[
-                "FIVE_MIN_FETCH_SKIPPED"
-            ] += 1
-
-            diagnostics[
-                "ONE_D_FETCH_SKIPPED"
-            ] += 1
-
-            return SymbolHistory(
-                symbol,
-                c4_raw,
-                c1_raw,
-                c15_raw,
-                [],
-                [],
-                candidate_times,
-                dict(diagnostics),
-            )
-
-        t5 = asyncio.create_task(
-            _fetch_timeframe(
-                self.client,
-                symbol,
-                "5M",
-                INTERVALS["5m"],
-                starts["5m"],
-                end,
-            )
-        )
-
-        t1d = asyncio.create_task(
-            _fetch_timeframe(
-                self.client,
-                symbol,
-                "1D",
-                INTERVALS["1d"],
-                starts["1d"],
-                end,
-            )
-        )
-
-        try:
-            (
-                c5_raw,
-                c1d_raw,
-            ) = await asyncio.wait_for(
-                asyncio.gather(
-                    t5,
-                    t1d,
-                ),
-                timeout=(
-                    SYMBOL_FETCH_TIMEOUT_SECONDS
-                ),
-            )
-
         except BaseException:
-
-            for task in (
-                t5,
-                t1d,
-            ):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
-
-            await asyncio.gather(
-                t5,
-                t1d,
-                return_exceptions=True,
-            )
-
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-        diagnostics[
-            "FIVE_MIN_FETCH"
-        ] += 1
+        # Keep the parent-side validation cheap and causal; authoritative engine
+        # data-quality checks still happen on each point-in-time analysis prefix.
+        c4 = [c for c in convert_candles(c4_raw) if int(c["time"]) + H4_MS <= end]
+        c1 = [c for c in convert_candles(c1_raw) if int(c["time"]) + H1_MS <= end]
+        c15 = [c for c in convert_candles(c15_raw) if int(c["time"]) + M15_MS <= end]
 
-        diagnostics[
-            "ONE_D_FETCH"
-        ] += 1
+        if len(c4) < 205:
+            raise ValueError(f"{symbol}: insufficient 4H candles ({len(c4)} < 205)")
+        if len(c1) < 205:
+            raise ValueError(f"{symbol}: insufficient 1H candles ({len(c1)} < 205)")
+        if len(c15) < 80:
+            raise ValueError(f"{symbol}: insufficient 15M candles ({len(c15)} < 80)")
 
+        diagnostics: dict[str, int] = defaultdict(int)
+        diagnostics["FIVE_MIN_FETCH"] += 1
+        diagnostics["ONE_D_FETCH"] += 1
+        diagnostics["CANDIDATES_DEFERRED_TO_CHILD"] += 1
+
+        # ``prefilter_candidates`` is intentionally empty. The isolated child will
+        # build them from the reusable 15M engine context and then feed that exact
+        # context into analyze_candles().
         return SymbolHistory(
             symbol,
             c4_raw,
@@ -1635,7 +1477,7 @@ class BacktestRunner:
             c15_raw,
             c5_raw,
             c1d_raw,
-            candidate_times,
+            (),
             dict(diagnostics),
         )
 
@@ -1673,23 +1515,6 @@ class BacktestRunner:
             )
             or ()
         )
-
-        if not candidates:
-            local_diag = defaultdict(int)
-            candidates = self._find_15m_setup_windows(
-                c15,
-                start,
-                end,
-                local_diag,
-            )
-            history.diagnostics = {
-                **getattr(
-                    history,
-                    "diagnostics",
-                    {},
-                ),
-                **dict(local_diag),
-            }
 
         diagnostics: defaultdict[str, int] = defaultdict(
             int,
@@ -1738,9 +1563,29 @@ class BacktestRunner:
         # Reuse point-in-time engine calculations whose cache keys prove that
         # the underlying closed candle set is identical across candidates.
         # This preserves the engine logic while avoiding repeated 4H/1H work.
+        # Build the expensive 15M context exactly once. Candidate generation and
+        # all authoritative engine calls consume this same context, preventing the
+        # old duplicate BOS/ATR/swing pass.
+        backtest_15m_context = _build_15m_backtest_context(c15)
         engine_cache: dict[Any, Any] = {
-            "_BACKTEST_15M": _build_15m_backtest_context(c15),
+            "_BACKTEST_15M": backtest_15m_context,
         }
+
+        if not candidates:
+            local_diag = defaultdict(int)
+            candidates = self._find_15m_setup_windows(
+                c15,
+                start,
+                end,
+                local_diag,
+                context=backtest_15m_context,
+            )
+            for key, value in local_diag.items():
+                history.diagnostics[key] = (
+                    int(history.diagnostics.get(key, 0)) + int(value)
+                )
+            diagnostics["CANDIDATES_GENERATED_IN_CHILD"] = len(candidates)
+
         candidate_hints_by_time: dict[int, list[dict[str, Any]]] = defaultdict(list)
         prefilter_rsi_15m, prefilter_rvol_15m = _precompute_rsi_rvol(c15)
         prefilter_rsi_5m, prefilter_rvol_5m = _precompute_rsi_rvol(c5)
@@ -2383,273 +2228,86 @@ class BacktestRunner:
                 ) -> None:
 
                     while True:
-
-                        symbol = (
-                            await queue.get()
-                        )
-
+                        symbol = await queue.get()
                         try:
-
                             if symbol is None:
                                 return
 
-                            state[
-                                "worker"
-                            ] = worker_id
+                            state["worker"] = worker_id
+                            state["symbol"] = symbol
+                            state["phase"] = "ISOLATED_FETCH+ANALYSIS"
 
-                            state[
-                                "symbol"
-                            ] = symbol
-
-                            state[
-                                "phase"
-                            ] = "PREFILTER"
-
-                            data_started = (
-                                time.monotonic()
-                            )
+                            symbol_started = time.monotonic()
 
                             try:
+                                symbol_trades, symbol_diag = await self._run_symbol_analysis_with_timeout(
+                                    str(symbol),
+                                    period_start,
+                                    period_end,
+                                    btc_history,
+                                )
 
-                                if (
-                                    str(
-                                        symbol
-                                    ).upper()
-                                    == "BTC_USDT"
-                                ):
-                                    history = (
-                                        btc_history
-                                    )
+                                for key, value in symbol_diag.items():
+                                    diagnostics[key] += int(value)
 
-                                else:
-
-                                    history = (
-                                        await self._prepare_symbol_history(
-                                            symbol,
-                                            period_start,
-                                            period_end,
-                                        )
-                                    )
-
-                                for (
-                                    key,
-                                    value,
-                                ) in (
-                                    history
-                                    .diagnostics
-                                    .items()
-                                ):
-                                    diagnostics[
-                                        key
-                                    ] += int(
-                                        value
-                                    )
+                                state["simulation_errors"] += int(
+                                    symbol_diag.get("SIMULATION_ERRORS", 0)
+                                )
 
                             except asyncio.CancelledError:
                                 raise
 
-                            except Exception as exc:
-
-                                async with state_lock:
-                                    state[
-                                        "data_errors"
-                                    ] += 1
-
-                                diagnostics[
-                                    (
-                                        "DATA_ERROR_"
-                                        f"{type(exc).__name__}"
-                                    )
-                                ] += 1
-
-                                LOGGER.exception(
-                                    "BACKTEST DATA ERROR | "
-                                    "%s | %s",
+                            except BacktestDataError as exc:
+                                state["data_errors"] += 1
+                                diagnostics[f"DATA_ERROR_{type(exc).__name__}"] += 1
+                                LOGGER.error(
+                                    "BACKTEST DATA ERROR | %s | %s",
                                     symbol,
                                     exc,
                                 )
-
                                 continue
-
-                            data_seconds = (
-                                time.monotonic()
-                                - data_started
-                            )
-
-                            async with state_lock:
-
-                                state[
-                                    "data_seconds"
-                                ] += data_seconds
-
-                            state[
-                                "phase"
-                            ] = "ANALYSIS"
-
-                            analysis_started = (
-                                time.monotonic()
-                            )
-
-                            pre_analysis_diag = dict(
-                                history.diagnostics
-                            )
-
-                            try:
-
-                                (
-                                    symbol_trades,
-                                    symbol_diag,
-                                ) = (
-                                    await self._run_symbol_analysis_with_timeout(
-                                        history,
-                                        period_start,
-                                        period_end,
-                                        btc_history,
-                                    )
-                                )
-
-                                for (
-                                    key,
-                                    value,
-                                ) in (
-                                    symbol_diag.items()
-                                ):
-
-                                    delta = (
-                                        int(value)
-                                        - int(
-                                            pre_analysis_diag.get(
-                                                key,
-                                                0,
-                                            )
-                                        )
-                                    )
-
-                                    if delta > 0:
-                                        diagnostics[
-                                            key
-                                        ] += delta
-
-                            except asyncio.CancelledError:
-                                raise
 
                             except Exception as exc:
-
-                                async with state_lock:
-
-                                    state[
-                                        "engine_errors"
-                                    ] += 1
-
-                                diagnostics[
-                                    (
-                                        "ANALYSIS_ERROR_"
-                                        f"{type(exc).__name__}"
-                                    )
-                                ] += 1
-
-                                if isinstance(
-                                    exc,
-                                    TimeoutError,
-                                ):
-
-                                    diagnostics[
-                                        "ANALYSIS_TIMEOUT"
-                                    ] += 1
-
+                                state["engine_errors"] += 1
+                                diagnostics[f"ANALYSIS_ERROR_{type(exc).__name__}"] += 1
+                                if isinstance(exc, TimeoutError):
+                                    diagnostics["ANALYSIS_TIMEOUT"] += 1
                                     LOGGER.error(
-                                        "BACKTEST ANALYSIS "
-                                        "TIMEOUT | %s | %s",
+                                        "BACKTEST ANALYSIS TIMEOUT | %s | %s",
                                         symbol,
                                         exc,
                                     )
-
                                 else:
-
                                     LOGGER.exception(
-                                        "BACKTEST ANALYSIS "
-                                        "ERROR | %s | %s",
+                                        "BACKTEST ANALYSIS ERROR | %s | %s",
                                         symbol,
                                         exc,
                                     )
-
                                 continue
 
-                            analysis_seconds = (
-                                time.monotonic()
-                                - analysis_started
-                            )
-
-                            async with state_lock:
-
-                                state[
-                                    "analysis_seconds"
-                                ] += (
-                                    analysis_seconds
-                                )
-
-                                state[
-                                    "last_symbol_seconds"
-                                ] = (
-                                    data_seconds
-                                    + analysis_seconds
-                                )
-
-                            trades.extend(
-                                symbol_trades
-                            )
-
-                            async with state_lock:
-
-                                state[
-                                    "tested"
-                                ] += 1
-
-                                state[
-                                    "signals"
-                                ] = len(
-                                    trades
-                                )
+                            symbol_seconds = time.monotonic() - symbol_started
+                            state["analysis_seconds"] += symbol_seconds
+                            state["last_symbol_seconds"] = symbol_seconds
+                            trades.extend(symbol_trades)
+                            state["tested"] += 1
+                            state["signals"] = len(trades)
 
                             LOGGER.info(
-                                "BACKTEST PROGRESS | "
-                                "days=%d "
-                                "processed=%d/%d "
-                                "tested=%d "
-                                "data_errors=%d "
-                                "engine_errors=%d "
-                                "simulation_errors=%d "
-                                "signals=%d",
+                                "BACKTEST PROGRESS | days=%d processed=%d/%d tested=%d "
+                                "data_errors=%d engine_errors=%d simulation_errors=%d signals=%d",
                                 days,
-                                state[
-                                    "processed"
-                                ],
+                                state["processed"],
                                 len(symbols),
-                                state[
-                                    "tested"
-                                ],
-                                state[
-                                    "data_errors"
-                                ],
-                                state[
-                                    "engine_errors"
-                                ],
-                                state[
-                                    "simulation_errors"
-                                ],
+                                state["tested"],
+                                state["data_errors"],
+                                state["engine_errors"],
+                                state["simulation_errors"],
                                 len(trades),
                             )
 
                         finally:
-
-                            if symbol is not None:
-
-                                async with state_lock:
-
-                                    state[
-                                        "processed"
-                                    ] += 1
-
+                            async with state_lock:
+                                state["processed"] += 1
                             queue.task_done()
 
                 workers = [

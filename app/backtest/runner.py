@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
-import sys
+import threading
 import time
 from bisect import bisect_right
 from collections import defaultdict
@@ -45,7 +45,7 @@ D1_MS = 86_400_000
 INTERVALS = {"4h": "Hour4", "1h": "Min60", "15m": "Min15", "5m": "Min5", "1d": "Day1"}
 MAX_KLINE_POINTS = 2000
 REQUEST_TIMEOUT_SECONDS = 30
-MAX_SYMBOL_CONCURRENCY = 4
+MAX_SYMBOL_CONCURRENCY = 2
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 SYMBOL_ANALYSIS_TIMEOUT_SECONDS = 90
 HEARTBEAT_INTERVAL_SECONDS = 30
@@ -70,6 +70,7 @@ def _isolated_backtest_symbol(
     slippage_bps: float,
     default_max_hold_minutes: float,
     conn: Any,
+    child_done: Any,
 ) -> None:
     """
     Execute one CPU-bound symbol analysis in a separate process.
@@ -99,12 +100,20 @@ def _isolated_backtest_symbol(
             {},
         )
         conn.send(("ok", symbol_trades, dict(history.diagnostics)))
+        child_done.set()
     except BaseException as exc:
         try:
-            conn.send(("error", type(exc).__name__, str(exc)))
+            try:
+                conn.send(("error", type(exc).__name__, str(exc)))
+            finally:
+                child_done.set()
         except Exception:
             pass
     finally:
+        try:
+            child_done.set()
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:
@@ -133,24 +142,6 @@ def _closed_slice(rows: list, interval_ms: int, close_time_ms: int) -> list:
     cutoff = int(close_time_ms) - int(interval_ms)
     count = bisect_right(rows, cutoff, key=_row_time)
     return rows[:count]
-
-
-def _closed_prefix_count(times: list[int], interval_ms: int, close_time_ms: int) -> int:
-    if not times:
-        return 0
-    return bisect_right(times, int(close_time_ms) - int(interval_ms))
-
-
-def _recent_closed_slice(
-    rows: list,
-    times: list[int],
-    interval_ms: int,
-    close_time_ms: int,
-    max_bars: int,
-) -> list:
-    end = _closed_prefix_count(times, interval_ms, close_time_ms)
-    start = max(0, end - int(max_bars))
-    return rows[start:end]
 
 
 async def _fetch_range(
@@ -264,134 +255,154 @@ class BacktestRunner:
         end: int,
         btc_history: SymbolHistory,
     ) -> tuple[list[SimulatedTrade], dict[str, int]]:
-        """Run CPU-bound symbol analysis in a killable child process."""
-        fee_rate = float(getattr(self.settings, "backtest_fee_rate", DEFAULT_FEE_RATE) if self.settings is not None else DEFAULT_FEE_RATE)
-        slippage_bps = float(getattr(self.settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS) if self.settings is not None else DEFAULT_SLIPPAGE_BPS)
+        """Run one symbol in an isolated spawn process with an independent watchdog.
+
+        The watchdog lives in a daemon thread in the parent process, not in the
+        asyncio event loop. Therefore a delayed/stalled event loop cannot prevent
+        the 90-second child kill from happening. Spawn is used deliberately: the
+        live FastAPI/asyncio process is never forked.
+        """
+        fee_rate = float(
+            getattr(self.settings, "backtest_fee_rate", DEFAULT_FEE_RATE)
+            if self.settings is not None else DEFAULT_FEE_RATE
+        )
+        slippage_bps = float(
+            getattr(self.settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS)
+            if self.settings is not None else DEFAULT_SLIPPAGE_BPS
+        )
         default_max_hold_minutes = float(
             getattr(self.settings, "backtest_max_holding_minutes", DEFAULT_MAX_HOLDING_MINUTES)
-            if self.settings is not None
-            else DEFAULT_MAX_HOLDING_MINUTES
+            if self.settings is not None else DEFAULT_MAX_HOLDING_MINUTES
         )
 
-        # Render runs on Linux. Fork avoids repeatedly paying the very large
-        # spawn/import/pickling cost observed in the backtest logs (25-40s per
-        # analysis-process startup). The process is short-lived and performs only
-        # synchronous, CPU-bound analysis; no client/network object is shared.
-        if sys.platform != "win32":
-            try:
-                ctx = multiprocessing.get_context("fork")
-            except ValueError:
-                ctx = multiprocessing.get_context("spawn")
-        else:
-            ctx = multiprocessing.get_context("spawn")
+        ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
-        # The symbol analysis reads only BTC 4H/1H/15M history. Keep the
-        # child payload small on the spawn fallback.
-        compact_btc_history = SymbolHistory(
-            "BTC_USDT",
-            list(btc_history.candles_4h),
-            list(btc_history.candles_1h),
-            list(btc_history.candles_15m),
-            [],
-            [],
-            (),
-            {},
-        )
+        child_done = ctx.Event()
         process = ctx.Process(
             target=_isolated_backtest_symbol,
             args=(
                 history,
                 start,
                 end,
-                compact_btc_history,
+                btc_history,
                 fee_rate,
                 slippage_bps,
                 default_max_hold_minutes,
                 child_conn,
+                child_done,
             ),
             name=f"backtest-analysis-{history.symbol}",
         )
 
         started = time.monotonic()
+        watchdog_stop = threading.Event()
+        watchdog_timeout = threading.Event()
+
+        def watchdog() -> None:
+            if watchdog_stop.wait(SYMBOL_ANALYSIS_TIMEOUT_SECONDS):
+                return
+            if child_done.is_set() or not process.is_alive():
+                return
+            watchdog_timeout.set()
+            LOGGER.error(
+                "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | timeout=%ss",
+                history.symbol, process.pid, SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
+            )
+            try:
+                process.terminate()
+            except Exception:
+                LOGGER.exception("BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s", history.symbol)
+                return
+            try:
+                process.join(3.0)
+            except Exception:
+                LOGGER.exception("BACKTEST WATCHDOG JOIN FAILED | symbol=%s", history.symbol)
+            if process.is_alive():
+                try:
+                    process.kill()
+                    process.join(2.0)
+                except Exception:
+                    LOGGER.exception("BACKTEST WATCHDOG KILL FAILED | symbol=%s", history.symbol)
+            LOGGER.error(
+                "BACKTEST WATCHDOG KILLED | symbol=%s | pid=%s | exitcode=%s",
+                history.symbol, process.pid, process.exitcode,
+            )
+
+        watchdog_thread: threading.Thread | None = None
         try:
-            # multiprocessing.Process.start() is synchronous and can spend
-            # significant time spawning/pickling under a constrained Render
-            # instance. Never call it directly from the asyncio event loop.
-            # Keep the event loop alive so the heartbeat and HTTP health
-            # endpoint continue running while the child process starts.
-            LOGGER.info(
-                "BACKTEST ANALYSIS PROCESS START | symbol=%s",
-                history.symbol,
-            )
-            if ctx.get_start_method() == "fork":
-                process.start()
-            else:
-                await asyncio.to_thread(process.start)
+            LOGGER.info("BACKTEST ANALYSIS PROCESS START | symbol=%s", history.symbol)
+            # Never fork the live FastAPI/asyncio process. Spawn has clean state.
+            # Start it off the event loop because process.start() itself can block.
+            await asyncio.to_thread(process.start)
             child_conn.close()
-
             LOGGER.info(
-                "BACKTEST ANALYSIS PROCESS STARTED | symbol=%s | pid=%s",
-                history.symbol,
-                process.pid,
+                "BACKTEST ANALYSIS PROCESS STARTED | symbol=%s | pid=%s | method=spawn",
+                history.symbol, process.pid,
             )
 
-            deadline = time.monotonic() + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
-            payload = None
+            watchdog_thread = threading.Thread(
+                target=watchdog,
+                name=f"backtest-watchdog-{history.symbol}",
+                daemon=True,
+            )
+            watchdog_thread.start()
 
+            payload = None
             while True:
                 if parent_conn.poll(0):
-                    payload = parent_conn.recv()
+                    try:
+                        payload = parent_conn.recv()
+                    except (EOFError, OSError):
+                        payload = None
                     break
-
                 if not process.is_alive():
-                    # Child exited without sending a result.
                     break
-
-                if time.monotonic() >= deadline:
-                    LOGGER.error(
-                        "BACKTEST ANALYSIS TIMEOUT | symbol=%s | timeout=%ss",
-                        history.symbol,
-                        SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
-                    )
-                    process.terminate()
-                    await asyncio.to_thread(process.join, 5.0)
-                    if process.is_alive():
-                        process.kill()
-                        await asyncio.to_thread(process.join, 2.0)
+                if watchdog_timeout.is_set():
                     raise TimeoutError(
-                        f"{history.symbol}: analysis exceeded "
-                        f"{SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
+                        f"{history.symbol}: analysis exceeded {SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
                     )
-
                 await asyncio.sleep(0.20)
 
-            await asyncio.to_thread(process.join, 5.0)
+            if watchdog_timeout.is_set():
+                raise TimeoutError(
+                    f"{history.symbol}: analysis exceeded {SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
+                )
 
+            # The child may have exited between the last poll and this check.
             if payload is None and parent_conn.poll(0):
-                payload = parent_conn.recv()
+                try:
+                    payload = parent_conn.recv()
+                except (EOFError, OSError):
+                    payload = None
 
             if payload is None:
                 raise RuntimeError(
                     f"{history.symbol}: analysis subprocess exited without a result "
                     f"(exitcode={process.exitcode})"
                 )
-
             if payload[0] == "error":
                 raise RuntimeError(
-                    f"{history.symbol}: isolated analysis failed: "
-                    f"{payload[1]}: {payload[2]}"
+                    f"{history.symbol}: isolated analysis failed: {payload[1]}: {payload[2]}"
                 )
-
             return payload[1], payload[2]
         except asyncio.CancelledError:
             if process.is_alive():
-                process.terminate()
-                await asyncio.to_thread(process.join, 5.0)
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                await asyncio.to_thread(process.join, 3.0)
                 if process.is_alive():
-                    process.kill()
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
                     await asyncio.to_thread(process.join, 2.0)
             raise
         finally:
+            watchdog_stop.set()
+            if watchdog_thread is not None and watchdog_thread.is_alive():
+                watchdog_thread.join(timeout=1.0)
             try:
                 child_conn.close()
             except Exception:
@@ -401,8 +412,17 @@ class BacktestRunner:
             except Exception:
                 pass
             if process.is_alive():
-                process.terminate()
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
                 await asyncio.to_thread(process.join, 2.0)
+                if process.is_alive():
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    await asyncio.to_thread(process.join, 2.0)
 
     async def _fetch_btc_history(self, start: int, end: int) -> SymbolHistory:
         starts = {
@@ -544,23 +564,12 @@ class BacktestRunner:
         if btc_context_cache is None:
             btc_context_cache = {}
 
-        c4_times = [_row_time(r) for r in c4]
-        c1_times = [_row_time(r) for r in c1]
-        c15_times = [_row_time(r) for r in c15]
-        c5_times = [_row_time(r) for r in c5]
-        c1d_times = [_row_time(r) for r in c1d]
+        c5_times = [_row_time(r) for r in history.candles_5m]
         trades: list[SimulatedTrade] = []
         previous_exit_time: int | None = None
         seen_structures: set[tuple[Any, Any, Any]] = set()
         regime_cache: dict[int, dict[str, Any]] = {}
         alignment_cache: dict[tuple[int, str], dict[str, Any]] = {}
-        engine_cache: dict[str, Any] = {}
-        analysis_loop_started = time.monotonic()
-        full_engine_calls = 0
-        LOGGER.info(
-            "BACKTEST SYMBOL ANALYSIS BEGIN | symbol=%s candidates=%d",
-            history.symbol, len(candidates),
-        )
 
         for signal_close_time, setup_hint in candidates:
             signal_close_time = int(signal_close_time)
@@ -570,27 +579,29 @@ class BacktestRunner:
                 diagnostics["OVERLAPPING_SIGNAL_SKIPPED"] = diagnostics.get("OVERLAPPING_SIGNAL_SKIPPED", 0) + 1
                 continue
 
-            c4_end = _closed_prefix_count(c4_times, H4_MS, signal_close_time)
-            c1_end = _closed_prefix_count(c1_times, H1_MS, signal_close_time)
-            c15_end = _closed_prefix_count(c15_times, M15_MS, signal_close_time)
+            c4s = _closed_slice(c4, H4_MS, signal_close_time)
+            c1s = _closed_slice(c1, H1_MS, signal_close_time)
+            c15s = _closed_slice(c15, M15_MS, signal_close_time)
+            c5s = _closed_slice(c5, M5_MS, signal_close_time)
+            c1ds = _closed_slice(c1d, D1_MS, signal_close_time)
 
             # Cheap, cached higher-timeframe gate. The full engine remains
             # authoritative, but most 15M windows can be discarded here without
             # running the expensive complete indicator/target calculation.
             side_hint = str((setup_hint or {}).get("side") or "").upper()
-            if side_hint not in {"LONG", "SHORT"} or c4_end < 205 or c1_end < 205:
+            if side_hint not in {"LONG", "SHORT"} or len(c4s) < 205 or len(c1s) < 205:
                 diagnostics["HTF_PREFILTER_REJECT"] = diagnostics.get("HTF_PREFILTER_REJECT", 0) + 1
                 continue
-            h4_key = c4_times[c4_end - 1]
+            h4_key = _row_time(c4s[-1])
             regime = regime_cache.get(h4_key)
             if regime is None:
-                regime = _four_hour_regime(c4[:c4_end])
+                regime = _four_hour_regime(c4s)
                 regime_cache[h4_key] = regime
-            h1_key = c1_times[c1_end - 1]
+            h1_key = _row_time(c1s[-1])
             align_key = (h1_key, str(regime.get("regime") or "NO_TRADE"))
             alignment = alignment_cache.get(align_key)
             if alignment is None:
-                alignment = _one_hour_alignment(c1[:c1_end], regime)
+                alignment = _one_hour_alignment(c1s, regime)
                 alignment_cache[align_key] = alignment
             if not ((side_hint == "LONG" and regime.get("bull") and alignment.get("long")) or (side_hint == "SHORT" and regime.get("bear") and alignment.get("short"))):
                 diagnostics["HTF_PREFILTER_REJECT"] = diagnostics.get("HTF_PREFILTER_REJECT", 0) + 1
@@ -601,11 +612,8 @@ class BacktestRunner:
             # is therefore a semantics-preserving prefilter, not a strategy
             # shortcut. It avoids running expensive target/score calculations on
             # candles that the authoritative engine will necessarily reject.
-            c15_recent = _recent_closed_slice(
-                c15, c15_times, M15_MS, signal_close_time, 40,
-            )
             entry_check = _fifteen_minute_entry_confirmation(
-                c15_recent,
+                c15s,
                 side_hint,
                 float((setup_hint or {}).get("bos_level")),
                 int((setup_hint or {}).get("retest_time")),
@@ -614,33 +622,10 @@ class BacktestRunner:
                 diagnostics["ENTRY_PREFILTER_REJECT"] = diagnostics.get("ENTRY_PREFILTER_REJECT", 0) + 1
                 continue
 
-            c4s = c4[:c4_end]
-            c1s = c1[:c1_end]
-            c15s = c15[:c15_end]
-            c5s = _recent_closed_slice(c5, c5_times, M5_MS, signal_close_time, 40)
-            c1ds = c1d[:_closed_prefix_count(c1d_times, D1_MS, signal_close_time)]
-
             diagnostics["FULL_ENGINE_CANDIDATES"] += 1
-            full_engine_calls += 1
-            if full_engine_calls == 1 or full_engine_calls % 25 == 0:
-                LOGGER.info(
-                    "BACKTEST ENGINE PROGRESS | symbol=%s full_engine_calls=%d elapsed=%.1fs",
-                    history.symbol, full_engine_calls, time.monotonic() - analysis_loop_started,
-                )
 
-            engine_started = time.monotonic()
             try:
-                analysis = analyze_candles(
-                    history.symbol, c4s, c1s, c15s, c5s, c1ds,
-                    now_ms=signal_close_time,
-                    cache=engine_cache,
-                )
-                engine_elapsed = time.monotonic() - engine_started
-                if engine_elapsed >= 5.0:
-                    LOGGER.warning(
-                        "BACKTEST ENGINE SLOW | symbol=%s signal=%d seconds=%.2f",
-                        history.symbol, signal_close_time, engine_elapsed,
-                    )
+                analysis = analyze_candles(history.symbol, c4s, c1s, c15s, c5s, c1ds, now_ms=signal_close_time)
             except Exception:
                 diagnostics["ENGINE_ERRORS"] = diagnostics.get("ENGINE_ERRORS", 0) + 1
                 diagnostics["ENGINE_EXCEPTION"] = diagnostics.get("ENGINE_EXCEPTION", 0) + 1
@@ -726,10 +711,6 @@ class BacktestRunner:
                 diagnostics["EXPIRY"] = diagnostics.get("EXPIRY", 0) + 1
             previous_exit_time = trade.exit_time_ms
 
-        LOGGER.info(
-            "BACKTEST SYMBOL ANALYSIS END | symbol=%s candidates=%d full_engine_calls=%d trades=%d elapsed=%.2fs",
-            history.symbol, len(candidates), full_engine_calls, len(trades), time.monotonic() - analysis_loop_started,
-        )
         return trades
 
     async def run(self, days: int) -> BacktestSummary:

@@ -13,9 +13,9 @@ from .risk_manager import (
 from .setup_filter import validate_analysis
 
 
-MIN_SCORE = 82
+MIN_SCORE = 90
 MIN_RR = 2.0
-MIN_CONFIRMATION_FAMILIES = 5
+MIN_CONFIRMATION_FAMILIES = 6
 
 FIVE_MINUTE_MS = 300_000
 FIFTEEN_MINUTE_MS = 900_000

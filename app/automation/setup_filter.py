@@ -3,18 +3,18 @@ from __future__ import annotations
 from typing import Any
 
 
-MIN_SCORE = 82
+MIN_SCORE = 90
 MIN_RR = 2.0
 
-MIN_SL_ATR = 0.60
-MAX_SL_ATR = 2.25
+MIN_SL_ATR = 0.65
+MAX_SL_ATR = 2.00
 MIN_STOP_DISTANCE_PCT = 0.0075
-MAX_STOP_DISTANCE_PCT = 0.0350
+MAX_STOP_DISTANCE_PCT = 0.0300
 
-MIN_CONFIRMATION_FAMILIES = 5
+MIN_CONFIRMATION_FAMILIES = 6
 
-MAX_ATR_PERCENTILE = 95.0
-MIN_ATR_PERCENTILE = 20.0
+MAX_ATR_PERCENTILE = 90.0
+MIN_ATR_PERCENTILE = 25.0
 
 
 def _f(
@@ -161,6 +161,18 @@ def validate_analysis(
             "target_path_structural",
             "Targets are not backed by structural/liquidity levels",
         ),
+        (
+            "structure_quality_ok",
+            "BOS/retest quality failed",
+        ),
+        (
+            "ema_extension_ok",
+            "15M price is too extended from EMA21",
+        ),
+        (
+            "five_minute_ready",
+            "5M trigger confirmation is required",
+        ),
     )
 
     for key, message in hard_gates:
@@ -234,8 +246,17 @@ def validate_analysis(
         if not entry_ready:
             reasons.append("15M entry confirmation is not ready")
         trigger_q = _f(data.get("trigger_quality_15m"), 0.0)
-        if trigger_q < 0.55:
-            reasons.append(f"15M entry quality {trigger_q:.2f} < 0.55")
+        if trigger_q < 0.65:
+            reasons.append(f"15M entry quality {trigger_q:.2f} < 0.65")
+        if not trigger_ready:
+            reasons.append("5M trigger is required for high-precision mode")
+        elif side == "LONG" and not trigger_long:
+            reasons.append("5M LONG refinement is not confirmed")
+        elif side == "SHORT" and not trigger_short:
+            reasons.append("5M SHORT refinement is not confirmed")
+        trigger_5m_q = _f(data.get("trigger_quality_5m"), 0.0)
+        if trigger_5m_q < 0.65:
+            reasons.append(f"5M trigger quality {trigger_5m_q:.2f} < 0.65")
         if trigger_long and trigger_short:
             reasons.append("Conflicting 5M refinement signals")
     else:

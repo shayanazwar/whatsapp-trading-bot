@@ -15,8 +15,11 @@ from typing import Any
 
 from ..analysis.engine import (
     _bos_events,
+    _build_15m_backtest_context,
     _five_minute_trigger,
     _fifteen_minute_entry_confirmation,
+    MIN_TRIGGER_BODY,
+    MIN_TRIGGER_RVOL,
     _four_hour_regime,
     _one_hour_alignment,
     _pullback_retest,
@@ -55,7 +58,7 @@ INTERVALS = {
 
 MAX_KLINE_POINTS = 2000
 REQUEST_TIMEOUT_SECONDS = 30
-MAX_SYMBOL_CONCURRENCY = 2
+MAX_SYMBOL_CONCURRENCY = 1
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 
 # Emergency ceiling only. Normal symbols should finish far sooner.
@@ -295,6 +298,96 @@ def _closed_slice(
     )
 
     return rows[:count]
+
+
+def _precompute_rsi_rvol(
+    candles: list,
+    period: int = 14,
+    lookback: int = 20,
+) -> tuple[list[float], list[float]]:
+    """Precompute RSI and RVOL once for the conservative candidate prefilter."""
+    n = len(candles)
+    rsi_values = [50.0] * n
+    rvol_values = [0.0] * n
+    if n == 0:
+        return rsi_values, rvol_values
+
+    closes = [float(c["close"]) for c in candles]
+    volumes = [float(c["volume"]) for c in candles]
+
+    if n >= period + 1:
+        gains = [0.0] * (n - 1)
+        losses = [0.0] * (n - 1)
+        for i in range(1, n):
+            change = closes[i] - closes[i - 1]
+            gains[i - 1] = max(change, 0.0)
+            losses[i - 1] = max(-change, 0.0)
+
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        def current_rsi() -> float:
+            if avg_loss == 0.0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return 100.0 - (100.0 / (1.0 + rs))
+
+        rsi_values[period] = current_rsi()
+        for i in range(period + 1, n):
+            avg_gain = ((avg_gain * (period - 1)) + gains[i - 1]) / period
+            avg_loss = ((avg_loss * (period - 1)) + losses[i - 1]) / period
+            rsi_values[i] = current_rsi()
+
+    if n >= lookback + 1:
+        rolling = sum(volumes[:lookback])
+        for i in range(lookback, n):
+            average = rolling / lookback
+            rvol_values[i] = volumes[i] / average if average > 0.0 else 0.0
+            rolling += volumes[i]
+            rolling -= volumes[i - lookback]
+
+    return rsi_values, rvol_values
+
+
+def _fast_directional_entry_prefilter(
+    candles: list,
+    index: int,
+    side: str,
+    setup_level: Any,
+    retest_time: Any,
+    rsi_values: list[float],
+    rvol_values: list[float],
+    *,
+    require_5m: bool = False,
+) -> bool:
+    """Conservative O(1) necessary-condition check; engine stays authoritative."""
+    if side not in {"LONG", "SHORT"} or setup_level is None:
+        return False
+    if index < 1 or index >= len(candles):
+        return False
+
+    cur = candles[index]
+    o = float(cur["open"])
+    h = float(cur["high"])
+    l = float(cur["low"])
+    close = float(cur["close"])
+    rng = max(h - l, 1e-12)
+    body = abs(close - o) / rng
+    r = float(rsi_values[index])
+    rv = float(rvol_values[index])
+    level = float(setup_level)
+
+    if not require_5m and retest_time is not None:
+        if int(cur["time"]) <= int(retest_time):
+            return False
+
+    close_location = (close - l) / rng if side == "LONG" else (h - close) / rng
+    if body < float(MIN_TRIGGER_BODY) or rv < float(MIN_TRIGGER_RVOL) or close_location < 0.70:
+        return False
+
+    if side == "LONG":
+        return close > level and close > o and r >= 55.0
+    return close < level and close < o and r <= 45.0
 
 
 def _safe_int(
@@ -1556,10 +1649,9 @@ class BacktestRunner:
     ) -> list[SimulatedTrade]:
         """Backtest one symbol using the authoritative engine as the sole signal gate.
 
-        The Runner only supplies candidate timestamps from point-in-time BOS/retest
-        detection. It does not independently reject a setup on HTF, 15M entry,
-        5M trigger, score, momentum, volume, geometry, RR, or volatility. Those
-        decisions belong to analyze_candles().
+        The Runner supplies point-in-time BOS/retest candidates and applies only
+        conservative necessary-condition prefilters for 15M/5M entry. All
+        authoritative signal decisions belong to analyze_candles().
         """
         symbol_started = time.monotonic()
 
@@ -1646,8 +1738,14 @@ class BacktestRunner:
         # Reuse point-in-time engine calculations whose cache keys prove that
         # the underlying closed candle set is identical across candidates.
         # This preserves the engine logic while avoiding repeated 4H/1H work.
-        engine_cache: dict[Any, Any] = {}
+        engine_cache: dict[Any, Any] = {
+            "_BACKTEST_15M": _build_15m_backtest_context(c15),
+        }
         candidate_hints_by_time: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        prefilter_rsi_15m, prefilter_rvol_15m = _precompute_rsi_rvol(c15)
+        prefilter_rsi_5m, prefilter_rvol_5m = _precompute_rsi_rvol(c5)
+        c15_times = [_row_time(row) for row in c15]
+        c5_times = [_row_time(row) for row in c5]
         for candidate_time, candidate_hint in candidates:
             candidate_hints_by_time[int(candidate_time)].append(
                 candidate_hint if isinstance(candidate_hint, dict) else {}
@@ -1716,11 +1814,19 @@ class BacktestRunner:
                 diagnostics["ENGINE_WARMUP_REJECT"] += 1
                 continue
 
-            # Cheap point-in-time prefilters. The authoritative engine remains
-            # the final gate, but there is no reason to run the full multi-timeframe
-            # engine on candidates that already fail mandatory 15M/5M confirmation.
-            # These predicates are the same helpers used by analyze_candles().
+            # Fast point-in-time prefilters. These only test conditions that are
+            # mathematically necessary for the authoritative 15M/5M engine gates.
+            # All final signal decisions still come exclusively from analyze_candles().
             try:
+                c15_index = bisect_right(
+                    c15_times,
+                    signal_close_time - M15_MS,
+                ) - 1
+                c5_index = bisect_right(
+                    c5_times,
+                    signal_close_time - M5_MS,
+                ) - 1
+
                 prefilter_ready = False
                 for setup_hint in candidate_hints_by_time.get(
                     signal_close_time,
@@ -1732,23 +1838,32 @@ class BacktestRunner:
                     setup_level = (setup_hint or {}).get("bos_level")
                     retest_time = (setup_hint or {}).get("retest_time")
 
-                    entry_prefilter = _fifteen_minute_entry_confirmation(
-                        c15s,
+                    if not _fast_directional_entry_prefilter(
+                        c15,
+                        c15_index,
                         setup_side,
-                        float(setup_level) if setup_level is not None else None,
-                        int(retest_time) if retest_time is not None else None,
-                    )
-                    if not entry_prefilter.get("ready"):
+                        setup_level,
+                        retest_time,
+                        prefilter_rsi_15m,
+                        prefilter_rvol_15m,
+                        require_5m=False,
+                    ):
                         continue
 
-                    trigger_prefilter = _five_minute_trigger(
-                        c5s,
+                    if not _fast_directional_entry_prefilter(
+                        c5,
+                        c5_index,
                         setup_side,
-                        float(setup_level) if setup_level is not None else None,
-                    )
-                    if trigger_prefilter.get("ready"):
-                        prefilter_ready = True
-                        break
+                        setup_level,
+                        retest_time,
+                        prefilter_rsi_5m,
+                        prefilter_rvol_5m,
+                        require_5m=True,
+                    ):
+                        continue
+
+                    prefilter_ready = True
+                    break
 
                 if not prefilter_ready:
                     diagnostics["PREFILTER_REJECT"] += 1

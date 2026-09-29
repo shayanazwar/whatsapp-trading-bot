@@ -1301,6 +1301,16 @@ def analyze_candles(
     # backtest may additionally provide a full-history context; in that mode
     # BOS events are filtered to the causal prefix rather than rescanned.
     bt15 = cache.get("_BACKTEST_15M")
+    progress_callback = cache.get("_BACKTEST_PROGRESS_CALLBACK")
+
+    def report_progress(stage: str, details: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage, details or {})
+        except Exception:
+            pass
+
     prefix_count_15 = len(c15)
     full_context_matches = bool(
         isinstance(bt15, dict)
@@ -1327,9 +1337,11 @@ def analyze_candles(
             70,
         )
     else:
+        report_progress("ENGINE_15M_CONTEXT_START", {"candles": len(c15)})
         atr15_values = _atr_series(c15, 14)
         atr15 = float(atr15_values[-1]) if atr15_values else 0.0
         swings15 = _swing_points(c15)
+        report_progress("ENGINE_15M_CONTEXT_DONE", {"candles": len(c15)})
 
         bos_long_key = _cache_key("BOS15_LONG", c15)
         bos_events_long = cache.get(bos_long_key)
@@ -1339,6 +1351,7 @@ def analyze_candles(
                 "LONG",
                 atr_values=atr15_values,
                 swings=swings15,
+                progress_callback=progress_callback,
             )
             cache[bos_long_key] = bos_events_long
         bos_short_key = _cache_key("BOS15_SHORT", c15)
@@ -1349,6 +1362,7 @@ def analyze_candles(
                 "SHORT",
                 atr_values=atr15_values,
                 swings=swings15,
+                progress_callback=progress_callback,
             )
             cache[bos_short_key] = bos_events_short
 

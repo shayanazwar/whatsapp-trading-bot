@@ -617,6 +617,11 @@ class BacktestRunner:
                 else 0.0
             )
             LOGGER.info(
+                "BACKTEST ANALYSIS CANDIDATES | symbol=%s candidates=%d",
+                history.symbol,
+                len(getattr(history, "prefilter_candidates", ()) or ()),
+            )
+            LOGGER.info(
                 "BACKTEST ANALYSIS PROCESS START | symbol=%s | payload_kb=%.1f",
                 history.symbol,
                 payload_kb,
@@ -1497,6 +1502,10 @@ class BacktestRunner:
         simulation_seconds = 0.0
 
         evaluated_times: set[int] = set()
+        # Reuse point-in-time engine calculations whose cache keys prove that
+        # the underlying closed candle set is identical across candidates.
+        # This preserves the engine logic while avoiding repeated 4H/1H work.
+        engine_cache: dict[Any, Any] = {}
         candidate_hints_by_time: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for candidate_time, candidate_hint in candidates:
             candidate_hints_by_time[int(candidate_time)].append(
@@ -1616,6 +1625,12 @@ class BacktestRunner:
 
             engine_started = time.monotonic()
 
+            print(
+                f"BACKTEST ENGINE CALL START | symbol={history.symbol} "
+                f"candidate={candidate_index}/{len(candidates)} signal={signal_close_time}",
+                flush=True,
+            )
+
             try:
                 analysis = analyze_candles(
                     history.symbol,
@@ -1625,6 +1640,7 @@ class BacktestRunner:
                     c5s,
                     c1ds,
                     now_ms=signal_close_time,
+                    cache=engine_cache,
                 )
             except Exception:
                 diagnostics["ENGINE_ERRORS"] += 1
@@ -1641,6 +1657,13 @@ class BacktestRunner:
             elapsed_engine = time.monotonic() - engine_started
             engine_seconds += elapsed_engine
             engine_calls += 1
+
+            print(
+                f"BACKTEST ENGINE CALL DONE | symbol={history.symbol} "
+                f"candidate={candidate_index}/{len(candidates)} "
+                f"seconds={elapsed_engine:.3f}",
+                flush=True,
+            )
 
             diagnostics["ENGINE_CALLS"] = engine_calls
             diagnostics["ENGINE_TIME_MS"] += int(elapsed_engine * 1000)

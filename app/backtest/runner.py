@@ -57,6 +57,7 @@ INTERVALS = {
 MAX_KLINE_POINTS = 2000
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_SYMBOL_CONCURRENCY = 2
+MAX_BACKTEST_SYMBOLS = 200
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 CHILD_BOOT_TIMEOUT_SECONDS = 45
 
@@ -2135,7 +2136,7 @@ class BacktestRunner:
                             self.universe.refresh(),
                             timeout=60,
                         )
-                    )[:300]
+                    )[:MAX_BACKTEST_SYMBOLS]
 
                 except Exception:
 

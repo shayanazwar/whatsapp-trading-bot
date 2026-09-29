@@ -1497,6 +1497,11 @@ class BacktestRunner:
         simulation_seconds = 0.0
 
         evaluated_times: set[int] = set()
+        candidate_hints_by_time: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for candidate_time, candidate_hint in candidates:
+            candidate_hints_by_time[int(candidate_time)].append(
+                candidate_hint if isinstance(candidate_hint, dict) else {}
+            )
         last_progress = time.monotonic()
 
         for candidate_index, (signal_close_time, _setup_hint) in enumerate(
@@ -1511,8 +1516,9 @@ class BacktestRunner:
 
             # Long/short candidates can point to the same timestamp. The
             # authoritative engine chooses the direction from current HTF/15M
-            # evidence, so evaluating that timestamp once is equivalent and avoids
-            # duplicate full-engine work.
+            # evidence, so run the full engine only once per timestamp. The cheap
+            # prefilter below checks every side hint for that timestamp so a LONG
+            # hint can never suppress a valid SHORT engine result (or vice versa).
             if signal_close_time in evaluated_times:
                 diagnostics["DUPLICATE_TIMESTAMP_SKIPPED"] += 1
                 continue
@@ -1558,6 +1564,54 @@ class BacktestRunner:
                 or len(c5s) < 30
             ):
                 diagnostics["ENGINE_WARMUP_REJECT"] += 1
+                continue
+
+            # Cheap point-in-time prefilters. The authoritative engine remains
+            # the final gate, but there is no reason to run the full multi-timeframe
+            # engine on candidates that already fail mandatory 15M/5M confirmation.
+            # These predicates are the same helpers used by analyze_candles().
+            try:
+                prefilter_ready = False
+                for setup_hint in candidate_hints_by_time.get(
+                    signal_close_time,
+                    [_setup_hint],
+                ):
+                    setup_side = str(
+                        (setup_hint or {}).get("side") or ""
+                    ).upper()
+                    setup_level = (setup_hint or {}).get("bos_level")
+                    retest_time = (setup_hint or {}).get("retest_time")
+
+                    entry_prefilter = _fifteen_minute_entry_confirmation(
+                        c15s,
+                        setup_side,
+                        float(setup_level) if setup_level is not None else None,
+                        int(retest_time) if retest_time is not None else None,
+                    )
+                    if not entry_prefilter.get("ready"):
+                        continue
+
+                    trigger_prefilter = _five_minute_trigger(
+                        c5s,
+                        setup_side,
+                        float(setup_level) if setup_level is not None else None,
+                    )
+                    if trigger_prefilter.get("ready"):
+                        prefilter_ready = True
+                        break
+
+                if not prefilter_ready:
+                    diagnostics["PREFILTER_REJECT"] += 1
+                    continue
+            except Exception:
+                diagnostics["PREFILTER_ERRORS"] += 1
+                LOGGER.exception(
+                    "BACKTEST PREFILTER FAILED | symbol=%s | candidate=%d/%d | signal=%d",
+                    history.symbol,
+                    candidate_index,
+                    len(candidates),
+                    signal_close_time,
+                )
                 continue
 
             engine_started = time.monotonic()

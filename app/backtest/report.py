@@ -42,6 +42,7 @@ class BacktestSummary:
     direction_stats: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     regime_stats: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     diagnostics: Mapping[str, int] = field(default_factory=dict)
+    quality_stats: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
@@ -93,6 +94,35 @@ def _regime_group_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[s
             "expectancy_r": _expectancy(values),
             "total_r": sum(float(t.r_multiple) for t in resolved),
         }
+    return out
+
+
+def _quality_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[str, Any]]:
+    resolved = _resolved(trades)
+    definitions = (
+        ("score", (("90-94", 90.0, 94.999999), ("95-100", 95.0, 100.000001))),
+        ("bos_15m_strength", (("0.70-0.79", 0.70, 0.80), ("0.80-1.00", 0.80, 1.000001))),
+        ("retest_quality", (("0.80-0.89", 0.80, 0.90), ("0.90-1.00", 0.90, 1.000001))),
+        ("trigger_quality_5m", (("0.65-0.79", 0.65, 0.80), ("0.80-1.00", 0.80, 1.000001))),
+        ("rvol_15m", (("1.15-1.49", 1.15, 1.50), ("1.50+", 1.50, float("inf")))),
+        ("adx_4h", (("22-24.9", 22.0, 25.0), ("25+", 25.0, float("inf")))),
+    )
+    out: dict[str, Mapping[str, Any]] = {}
+    for feature, bands in definitions:
+        for label, low, high in bands:
+            values = [
+                t for t in resolved
+                if low <= float(t.quality.get(feature, -float("inf"))) < high
+            ]
+            wins = sum(t.outcome == "TP2" for t in values)
+            total = len(values)
+            out[f"{feature}:{label}"] = {
+                "signals": total,
+                "wins": wins,
+                "losses": sum(t.outcome == "SL" for t in values),
+                "win_rate": (100.0 * wins / total) if total else None,
+                "expectancy_r": _expectancy(values),
+            }
     return out
 
 
@@ -163,6 +193,7 @@ def summarize(*, days: int, coins_selected: int, coins_tested: int, data_errors:
         direction_stats=direction_stats,
         regime_stats=regime_stats,
         diagnostics=dict(diagnostics or {}),
+        quality_stats=_quality_stats(ordered),
     )
 
 
@@ -211,6 +242,18 @@ def format_report(summary: BacktestSummary) -> str:
         for key in sorted(summary.regime_stats):
             stat = summary.regime_stats[key]
             lines.append(f"{key}: n={stat['signals']} WR={_fmt(stat['win_rate'], 1, '%')} Exp={_fmt(stat['expectancy_r'])}R")
+    useful_quality = [
+        (key, stat) for key, stat in summary.quality_stats.items()
+        if int(stat.get("signals", 0) or 0) > 0
+    ]
+    if useful_quality:
+        lines.append("")
+        lines.append("FORENSIC QUALITY BUCKETS")
+        for key, stat in useful_quality[:8]:
+            lines.append(
+                f"{key}: n={stat['signals']} WR={_fmt(stat['win_rate'], 1, '%')} "
+                f"Exp={_fmt(stat['expectancy_r'])}R"
+            )
     if summary.diagnostics:
         top = sorted(summary.diagnostics.items(), key=lambda item: (-item[1], item[0]))[:8]
         if top:

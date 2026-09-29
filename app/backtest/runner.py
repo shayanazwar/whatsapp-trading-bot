@@ -1009,6 +1009,17 @@ class BacktestRunner:
                 if not retest.get("valid"):
                     continue
 
+                # Candidate generation is aligned with the engine's strict
+                # structure-quality gate. This only removes setups the
+                # authoritative engine would reject later.
+                if (
+                    _safe_float(bos.get("strength"), 0.0) < 0.70
+                    or _safe_float(retest.get("quality"), 0.0) < 0.80
+                    or not bool(retest.get("rejection"))
+                ):
+                    diagnostics["STRUCTURE_QUALITY_CANDIDATE_REJECT"] = diagnostics.get("STRUCTURE_QUALITY_CANDIDATE_REJECT", 0) + 1
+                    continue
+
                 diagnostics[
                     f"RETEST_{side}"
                 ] = (
@@ -1079,9 +1090,12 @@ class BacktestRunner:
                             "bos_time": int(
                                 bos["time"]
                             ),
+                            "bos_strength": _safe_float(bos.get("strength"), 0.0),
                             "retest_time": (
                                 retest_time
                             ),
+                            "retest_quality": _safe_float(retest.get("quality"), 0.0),
+                            "retest_rejection": bool(retest.get("rejection")),
                         },
                     )
 
@@ -1540,6 +1554,11 @@ class BacktestRunner:
             dict[str, Any],
         ] = {}
 
+        # Reuse engine-level HTF/BOS/SR computations across nearby 15M
+        # candidates. Cache keys include the final closed-candle timestamp,
+        # so historical semantics remain point-in-time safe.
+        engine_cache: dict[str, Any] = {}
+
         engine_calls = 0
         engine_seconds = 0.0
         btc_seconds = 0.0
@@ -1791,6 +1810,37 @@ class BacktestRunner:
                 "ENTRY_PREFILTER_ACCEPT"
             ] += 1
 
+            bos_quality = _safe_float(
+                (setup_hint or {}).get("bos_strength"),
+                0.0,
+            )
+            retest_quality = _safe_float(
+                (setup_hint or {}).get("retest_quality"),
+                0.0,
+            )
+            if bos_quality < 0.70 or retest_quality < 0.80 or not bool((setup_hint or {}).get("retest_rejection")):
+                diagnostics["STRUCTURE_QUALITY_PREFILTER_REJECT"] += 1
+                continue
+
+            try:
+                trigger_5m = _five_minute_trigger(
+                    c5s,
+                    side_hint,
+                    bos_level,
+                )
+            except Exception:
+                diagnostics["TRIGGER_5M_PREFILTER_ERRORS"] += 1
+                continue
+
+            if not trigger_5m.get("ready"):
+                diagnostics["TRIGGER_5M_PREFILTER_REJECT"] += 1
+                diagnostics[
+                    f"TRIGGER_5M_PREFILTER_REJECT_{side_hint}"
+                ] += 1
+                continue
+
+            diagnostics["TRIGGER_5M_PREFILTER_ACCEPT"] += 1
+
             diagnostics[
                 "FULL_ENGINE_CANDIDATES"
             ] += 1
@@ -1810,6 +1860,7 @@ class BacktestRunner:
                     now_ms=(
                         signal_close_time
                     ),
+                    cache=engine_cache,
                 )
 
             except Exception:

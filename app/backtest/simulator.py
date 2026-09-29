@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from typing import Iterable, Mapping, Any
 
@@ -34,6 +34,7 @@ class SimulatedTrade:
     exit_execution: float | None = None
     expired: bool = False
     regime: str | None = None
+    quality: Mapping[str, float] = field(default_factory=dict)
 
 
 def _number(value: Any) -> float | None:
@@ -136,6 +137,29 @@ def simulate_trade(
             fees_r = notional * fee_rate / risk_exec
             r_value = gross_r - fees_r
             slippage_r = (abs(entry_exec - entry) + abs(exit_exec - exit_price)) / risk_exec
+        quality_snapshot = {}
+        for key in (
+            "score", "confirmation_family_count", "bos_15m_strength",
+            "trigger_quality_15m", "trigger_quality_5m", "retest",
+            "rvol_15m", "rvol_5m", "rsi", "rsi_5m",
+            "adx_4h", "atr_percentile", "sl_atr", "stop_distance_pct",
+            "ema_extension_atr", "one_hour_long_votes", "one_hour_short_votes",
+            "macd_hist_delta",
+        ):
+            if key == "retest":
+                nested = signal.get("retest") or {}
+                value = nested.get("quality")
+                if value is not None:
+                    quality_snapshot["retest_quality"] = float(value)
+                continue
+            value = signal.get(key)
+            if value is None:
+                continue
+            try:
+                quality_snapshot[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+
         return SimulatedTrade(
             symbol=symbol,
             side=side,
@@ -158,6 +182,7 @@ def simulate_trade(
             exit_execution=exit_exec,
             expired=expired,
             regime=regime,
+            quality=quality_snapshot,
         )
 
     for candle in future_candles:

@@ -29,33 +29,34 @@ TIMEFRAME_ALIASES = {
     "1D":"1d","1DAY":"1d","1W":"1w","1WEEK":"1w",
 }
 
-MIN_SCORE = 82
+MIN_SCORE = 90
 MIN_RR = 2.0
-MIN_FAMILIES = 5
+MIN_FAMILIES = 6
 # Intraday geometry. These are hard safety gates, not score bonuses.
-MIN_SL_ATR = 0.60
-MAX_SL_ATR = 2.25
+MIN_SL_ATR = 0.65
+MAX_SL_ATR = 2.00
 MIN_STOP_DISTANCE_PCT = 0.0075   # 0.75% minimum stop distance
-MAX_STOP_DISTANCE_PCT = 0.0350   # 3.50% maximum stop distance
-MIN_ATR_PERCENTILE = 15.0
-MAX_ATR_PERCENTILE = 95.0
+MAX_STOP_DISTANCE_PCT = 0.0300   # 3.00% maximum stop distance
+MIN_ATR_PERCENTILE = 25.0
+MAX_ATR_PERCENTILE = 90.0
 MAX_SETUP_AGE_15M = 8
-MAX_ENTRY_DISTANCE_ATR = 1.50
-BOS_BUFFER_ATR = 0.08
-BOS_BUFFER_PCT = 0.0004
-BTC_SHOCK_ATR = 1.75
-ADX_TREND_MIN = 18.0
-EMA_TOLERANCE_PCT = 0.0040
-MIN_TRIGGER_RVOL = 0.90
-MIN_TRIGGER_BODY = 0.45
-RETEST_TOLERANCE_ATR = 0.45
-RETEST_PENETRATION_ATR = 0.90
+MAX_ENTRY_DISTANCE_ATR = 1.00
+BOS_BUFFER_ATR = 0.10
+BOS_BUFFER_PCT = 0.0005
+BTC_SHOCK_ATR = 1.50
+ADX_TREND_MIN = 22.0
+EMA_TOLERANCE_PCT = 0.0025
+MIN_TRIGGER_RVOL = 1.15
+MIN_TRIGGER_BODY = 0.55
+RETEST_TOLERANCE_ATR = 0.35
+RETEST_PENETRATION_ATR = 0.65
 MIN_TP1_R = 1.20
 MIN_TP2_R = 2.00
+MAX_TP2_R = 3.00
 MIN_TP1_ATR = 0.75
 MIN_TP2_ATR = 1.50
 INTRADAY_MAX_HOLD_MINUTES = 360
-ENGINE_VERSION = "gold-v2.0-intraday"
+ENGINE_VERSION = "gold-v3.0-high-precision"
 
 
 class Candle(dict):
@@ -286,6 +287,24 @@ def _macd(values: List[float]) -> Tuple[float, float, float]:
     return line, signal, line - signal
 
 
+def _macd_histogram_delta(values: List[float]) -> float:
+    """Return the one-candle normalized MACD histogram change in one pass."""
+    if len(values) < 40:
+        return 0.0
+    fast, slow = _ema_series(values, 12), _ema_series(values, 26)
+    if not fast or not slow:
+        return 0.0
+    n = min(len(fast), len(slow))
+    line_series = [fast[-n + i] - slow[-n + i] for i in range(n)]
+    signal_series = _ema_series(line_series, 9)
+    if len(signal_series) < 2:
+        return 0.0
+    current = line_series[-1] - signal_series[-1]
+    previous = line_series[-2] - signal_series[-2]
+    scale = max(abs(current), abs(previous), 1e-12)
+    return (current - previous) / scale
+
+
 def _swing_points(candles: List[Candle], left: int = 2, right: int = 2) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
     """Return swing highs/lows in one pass with no temporary neighbor lists."""
     highs: List[Tuple[int, float]] = []
@@ -425,9 +444,9 @@ def _four_hour_regime(candles: List[Candle]) -> Dict[str, Any]:
                       slope < 0.0, protected["state"] == "BEARISH",
                       recent["bear_score"] >= 1))
     bull = bool(current > e200 and e21 >= e50 and adx >= ADX_TREND_MIN and
-                bull_votes >= 4 and bull_votes > bear_votes)
+                bull_votes >= 5 and bull_votes > bear_votes)
     bear = bool(current < e200 and e21 <= e50 and adx >= ADX_TREND_MIN and
-                bear_votes >= 4 and bear_votes > bull_votes)
+                bear_votes >= 5 and bear_votes > bull_votes)
     base.update({"bull":bull,"bear":bear,"regime":"BULLISH" if bull else "BEARISH" if bear else "NO_TRADE",
                  "bull_votes":bull_votes,"bear_votes":bear_votes})
     return base
@@ -458,8 +477,8 @@ def _one_hour_alignment(candles: List[Candle], regime4: Dict[str, Any]) -> Dict[
     long_slope = slope >= -0.0010
     short_slope = slope <= 0.0010
     lv, sv = sum((long_ema,long_structure,long_momentum,long_slope)), sum((short_ema,short_structure,short_momentum,short_slope))
-    long = bool(regime4.get("bull") and lv >= 3 and lv > sv)
-    short = bool(regime4.get("bear") and sv >= 3 and sv > lv)
+    long = bool(regime4.get("bull") and lv == 4 and lv > sv)
+    short = bool(regime4.get("bear") and sv == 4 and sv > lv)
     base.update({"long":long,"short":short,"long_votes":lv,"short_votes":sv,
                  "long_ema":long_ema,"short_ema":short_ema,
                  "long_structure":long_structure,"short_structure":short_structure,
@@ -587,20 +606,21 @@ def _fifteen_minute_entry_confirmation(
         return empty
 
     buffer = max(a * 0.05, abs(setup_level) * 0.00025)
+    close_location = (close - l) / rng if side == "LONG" else (h - close) / rng
     if side == "LONG":
         breakout = close > setup_level + buffer and close > o and close > ph
         reclaim = close > setup_level + buffer and close > o and l <= setup_level + buffer
-        momentum = r >= 52.0
+        momentum = r >= 55.0
         trigger_type = "BREAKOUT" if breakout else "RECLAIM" if reclaim else "NONE"
-        ready = (breakout or reclaim) and momentum and rv >= 0.90 and body >= 0.45
-        momentum_quality = _clamp((r - 50.0) / 18.0, 0.0, 1.0)
+        ready = (breakout or reclaim) and momentum and rv >= MIN_TRIGGER_RVOL and body >= MIN_TRIGGER_BODY and close_location >= 0.70
+        momentum_quality = _clamp((r - 50.0) / 20.0, 0.0, 1.0)
     else:
         breakdown = close < setup_level - buffer and close < o and close < pl
         reclaim = close < setup_level - buffer and close < o and h >= setup_level - buffer
-        momentum = r <= 48.0
+        momentum = r <= 45.0
         trigger_type = "BREAKDOWN" if breakdown else "RECLAIM" if reclaim else "NONE"
-        ready = (breakdown or reclaim) and momentum and rv >= 0.90 and body >= 0.45
-        momentum_quality = _clamp((50.0 - r) / 18.0, 0.0, 1.0)
+        ready = (breakdown or reclaim) and momentum and rv >= MIN_TRIGGER_RVOL and body >= MIN_TRIGGER_BODY and close_location >= 0.70
+        momentum_quality = _clamp((50.0 - r) / 20.0, 0.0, 1.0)
 
     quality = _clamp(
         0.40 * _clamp(body / 0.70, 0.0, 1.0)
@@ -612,14 +632,16 @@ def _fifteen_minute_entry_confirmation(
 
     if ready:
         reason = "confirmed 15M intraday entry"
-    elif rv < 0.90:
-        reason = "15M RVOL below threshold"
-    elif body < 0.45:
+    elif rv < MIN_TRIGGER_RVOL:
+        reason = "15M RVOL below strict threshold"
+    elif body < MIN_TRIGGER_BODY:
         reason = "15M candle body too weak"
-    elif side == "LONG" and r < 52.0:
-        reason = "15M LONG momentum below threshold"
-    elif side == "SHORT" and r > 48.0:
-        reason = "15M SHORT momentum below threshold"
+    elif close_location < 0.70:
+        reason = "15M candle closed too far from directional extreme"
+    elif side == "LONG" and r < 55.0:
+        reason = "15M LONG momentum below strict threshold"
+    elif side == "SHORT" and r > 45.0:
+        reason = "15M SHORT momentum below strict threshold"
     else:
         reason = f"15M {side} breakout/reclaim condition not met"
 
@@ -630,6 +652,7 @@ def _fifteen_minute_entry_confirmation(
         "rvol": rv,
         "atr": a,
         "body_ratio": body,
+        "close_location": close_location,
         "candle_time": int(cur["time"]),
         "trigger_type": trigger_type,
         "reason": reason,
@@ -652,8 +675,10 @@ def _five_minute_trigger(candles: List[Candle], side: str, setup_level: Optional
     breakout_short=close<o and close<pl and short_level
     reclaim_long=close>o and long_level and (setup_level is None or l<=setup_level)
     reclaim_short=close<o and short_level and (setup_level is None or h>=setup_level)
-    mom_long=r>=51 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY
-    mom_short=r<=49 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY
+    close_location_long=(close-l)/rng
+    close_location_short=(h-close)/rng
+    mom_long=r>=55.0 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY and close_location_long>=0.70
+    mom_short=r<=45.0 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY and close_location_short>=0.70
     long_ok=(breakout_long or reclaim_long) and mom_long
     short_ok=(breakout_short or reclaim_short) and mom_short
     if side=="LONG":
@@ -667,11 +692,13 @@ def _five_minute_trigger(candles: List[Candle], side: str, setup_level: Optional
     elif side=="NONE": reason="not evaluated: no directional 15M setup"
     elif rv<MIN_TRIGGER_RVOL: reason="5M relative volume below threshold"
     elif body<MIN_TRIGGER_BODY: reason="5M candle body too weak"
-    elif side=="LONG" and r<51: reason="5M LONG momentum below threshold"
-    elif side=="SHORT" and r>49: reason="5M SHORT momentum below threshold"
+    elif side=="LONG" and close_location_long<0.70: reason="5M LONG close location too weak"
+    elif side=="SHORT" and close_location_short<0.70: reason="5M SHORT close location too weak"
+    elif side=="LONG" and r<55.0: reason="5M LONG momentum below strict threshold"
+    elif side=="SHORT" and r>45.0: reason="5M SHORT momentum below strict threshold"
     else: reason=f"5M {side} breakout/reclaim condition not met"
     return {"ready":bool(ready),"long":bool(long_ok),"short":bool(short_ok),"quality":quality,
-            "rsi":r,"rvol":rv,"atr":a,"candle_time":int(cur["time"]),"body_ratio":body,
+            "rsi":r,"rvol":rv,"atr":a,"candle_time":int(cur["time"]),"body_ratio":body,"close_location": close_location_long if side=="LONG" else close_location_short,
             "trigger_type":t,"reason":reason}
 
 
@@ -782,6 +809,16 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
         return base
 
     tp2 = float(tp2_level["price"])
+    tp2_rr = abs(tp2 - entry) / risk
+    if tp2_rr > MAX_TP2_R:
+        base.update({
+            "tp1": tp1,
+            "reason": f"higher-timeframe TP2 is too far at {tp2_rr:.2f}R",
+            "structural": True,
+            "tp1_level": tp1_level,
+            "tp2_level": tp2_level,
+        })
+        return base
     base.update({
         "ok": True,
         "tp1": tp1,
@@ -1119,6 +1156,16 @@ def analyze_candles(
     active_retest = ret_long if trigger_side == "LONG" else ret_short if trigger_side == "SHORT" else None
     trigger_level = float(active_bos["level"]) if active_bos else None
     retest_time = int(active_retest["time"]) if active_retest and active_retest.get("time") is not None else None
+    bos_quality = _num((active_bos or {}).get("strength"))
+    retest_quality = _num((active_retest or {}).get("quality"))
+    structure_quality_ok = bool(
+        active_bos
+        and active_retest
+        and active_retest.get("valid")
+        and bos_quality >= 0.70
+        and retest_quality >= 0.80
+        and bool(active_retest.get("rejection"))
+    )
 
     entry_15m = _fifteen_minute_entry_confirmation(
         c15,
@@ -1160,11 +1207,19 @@ def analyze_candles(
         and 0.0005 <= atr_pct <= 0.05
     )
     macd_line, macd_signal, macd_hist = _macd(close15)
+    macd_hist_delta = _macd_histogram_delta(close15)
     momentum_ok = bool(
-        (setup == "LONG" and 50 < r15 < 78 and macd_hist >= 0)
-        or (setup == "SHORT" and 22 < r15 < 50 and macd_hist <= 0)
+        (setup == "LONG" and 55.0 <= r15 <= 72.0 and macd_hist > 0 and macd_hist_delta >= 0.0)
+        or (setup == "SHORT" and 28.0 <= r15 <= 45.0 and macd_hist < 0 and macd_hist_delta <= 0.0)
     )
-    volume_ok = bool(rv15 >= MIN_TRIGGER_RVOL)
+    volume_ok = bool(rv15 >= MIN_TRIGGER_RVOL and str(vol15).upper() == "INCREASING")
+    ema21_15 = _safe_ema(close15, 21)
+    extension_atr = (abs(price - ema21_15) / atr15) if ema21_15 is not None and atr15 > 0 else 999.0
+    ema_extension_ok = bool(
+        setup in {"LONG", "SHORT"}
+        and extension_atr <= 1.25
+        and ((setup == "LONG" and price >= ema21_15) or (setup == "SHORT" and price <= ema21_15))
+    )
 
     levels = calculate_trade_levels({
         "setup": setup,
@@ -1198,6 +1253,7 @@ def analyze_candles(
         and levels.get("target_path_structural")
         and levels.get("trade_geometry_ok")
         and entry_distance <= MAX_ENTRY_DISTANCE_ATR
+        and ema_extension_ok
     )
 
     direction_ok = bool(
@@ -1205,10 +1261,11 @@ def analyze_candles(
         or (setup == "SHORT" and alignment["short"] and regime["bear"])
     )
     structure_ok = bool(
-        (setup == "LONG" and bos_long and ret_long["valid"])
-        or (setup == "SHORT" and bos_short and ret_short["valid"])
+        ((setup == "LONG" and bos_long and ret_long["valid"])
+        or (setup == "SHORT" and bos_short and ret_short["valid"]))
+        and structure_quality_ok
     )
-    setup_ok = bool(entry_15m.get("ready") and structure_ok and risk_ok)
+    setup_ok = bool(entry_15m.get("ready") and structure_ok and risk_ok and refinement_5m.get("ready"))
     trigger_quality = _clamp(
         0.70 * _num(entry_15m.get("quality"))
         + 0.30 * _num(refinement_5m.get("quality")),
@@ -1273,6 +1330,12 @@ def analyze_candles(
         failures.append("trade geometry")
     if setup in {"LONG", "SHORT"} and not entry_15m.get("ready"):
         failures.append("15M entry confirmation")
+    if setup in {"LONG", "SHORT"} and not refinement_5m.get("ready"):
+        failures.append("5M trigger confirmation")
+    if setup in {"LONG", "SHORT"} and not structure_quality_ok:
+        failures.append("BOS/retest quality")
+    if setup in {"LONG", "SHORT"} and not ema_extension_ok:
+        failures.append("15M EMA extension")
     failures = list(dict.fromkeys(failures))
 
     reasons = []
@@ -1359,6 +1422,7 @@ def analyze_candles(
         "macd": macd_line,
         "macd_signal": macd_signal,
         "macd_hist": macd_hist,
+        "macd_hist_delta": macd_hist_delta,
         "atr": atr15,
         "atr_4h": regime["atr"],
         "atr_5m": refinement_5m.get("atr", 0.0),
@@ -1386,8 +1450,15 @@ def analyze_candles(
         "trigger_reason_5m": refinement_5m.get("reason", "not required"),
         "trigger_quality_5m": refinement_5m.get("quality", 0.0),
         "trigger_quality_15m": entry_15m.get("quality", 0.0),
+        "entry_15m_close_location": entry_15m.get("close_location", 0.0),
+        "structure_quality_ok": structure_quality_ok,
+        "bos_quality_threshold": 0.70,
+        "retest_quality_threshold": 0.80,
+        "ema_extension_atr": extension_atr,
+        "ema_extension_ok": ema_extension_ok,
         "trigger_quality": trigger_quality,
         "five_minute_ready": bool(refinement_5m.get("ready")),
+        "five_minute_close_location": refinement_5m.get("close_location", 0.0),
         "five_minute_long": bool(refinement_5m.get("long")),
         "five_minute_short": bool(refinement_5m.get("short")),
         "closed_5m_candle_time": refinement_5m.get("candle_time", 0),

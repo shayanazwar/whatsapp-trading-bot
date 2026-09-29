@@ -145,8 +145,13 @@ def _isolated_backtest_symbol(
 
         started = time.monotonic()
 
-        def report_progress(stage: str, details: dict[str, Any]) -> None:
-            _send_child_status(conn, stage, details)
+        child_pid = multiprocessing.current_process().pid
+
+        def report_progress(stage: str, details: dict[str, Any] | None = None) -> None:
+            status = dict(details or {})
+            status.setdefault("symbol", history.symbol)
+            status["pid"] = child_pid
+            _send_child_status(conn, stage, status)
 
         symbol_trades = runner._backtest_symbol(
             history,
@@ -569,6 +574,14 @@ class BacktestRunner:
         child_booted = threading.Event()
         watchdog_reason = [""]
         watchdog_thread: threading.Thread | None = None
+        # Each invocation owns its progress snapshot. The shared run state is
+        # only an observability index; it must never be used for timeout data.
+        progress_lock = threading.Lock()
+        worker_progress: dict[str, Any] = {
+            "stage": "PROCESS_START",
+            "details": {"symbol": history.symbol, "pid": None},
+        }
+        progress_key: tuple[str, int | None] = (history.symbol, None)
 
         try:
             with tempfile.NamedTemporaryFile(
@@ -614,11 +627,15 @@ class BacktestRunner:
                     return
 
                 watchdog_timeout.set()
+                with progress_lock:
+                    latest_progress = dict(worker_progress)
                 LOGGER.error(
-                    "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | reason=%s | boot_timeout=%ss | analysis_timeout=%ss",
+                    "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | reason=%s | last_stage=%s | last_progress=%s | boot_timeout=%ss | analysis_timeout=%ss",
                     history.symbol,
                     process.pid,
                     watchdog_reason[0] or "analysis timeout",
+                    latest_progress["stage"],
+                    latest_progress["details"],
                     CHILD_BOOT_TIMEOUT_SECONDS,
                     SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
                 )
@@ -697,17 +714,40 @@ class BacktestRunner:
 
                     if message and message[0] == "status":
                         _, child_stage, details = message
+                        if not isinstance(details, dict):
+                            details = {"value": details}
+                        message_symbol = str(details.get("symbol", history.symbol))
+                        message_pid = details.get("pid", process.pid)
+                        # This pipe belongs to this child, but validate identity
+                        # before accepting state so malformed/stale IPC cannot
+                        # replace another worker's diagnostic.
+                        if message_symbol != history.symbol or message_pid != process.pid:
+                            LOGGER.warning(
+                                "BACKTEST CHILD STATUS IDENTITY MISMATCH | expected=%s/%s got=%s/%s",
+                                history.symbol, process.pid, message_symbol, message_pid,
+                            )
+                            continue
                         child_booted.set()
+                        with progress_lock:
+                            worker_progress["stage"] = str(child_stage)
+                            worker_progress["details"] = dict(details)
+                            progress_key = (history.symbol, process.pid)
                         if state is not None:
+                            workers = state.setdefault("child_workers", {})
+                            workers[progress_key] = {
+                                "stage": str(child_stage),
+                                "details": dict(details),
+                            }
+                            # Keep legacy heartbeat fields as most recently
+                            # received, but never consult them for watchdogs.
                             state["child_stage"] = str(child_stage)
-                            state["child_progress"] = details
-                            if isinstance(details, dict):
-                                state["child_pid"] = details.get("pid", process.pid)
-                                state["candidate"] = details.get("candidate", "-")
-                                state["candidate_total"] = details.get("candidates", "-")
-                                state["engine_calls"] = details.get("engine_calls", 0)
-                                state["engine_seconds"] = details.get("engine_seconds", 0)
-                                state["last_engine_seconds"] = details.get("last_engine_seconds", 0)
+                            state["child_progress"] = dict(details)
+                            state["child_pid"] = process.pid
+                            state["candidate"] = details.get("candidate", "-")
+                            state["candidate_total"] = details.get("candidates", "-")
+                            state["engine_calls"] = details.get("engine_calls", 0)
+                            state["engine_seconds"] = details.get("engine_seconds", 0)
+                            state["last_engine_seconds"] = details.get("last_engine_seconds", 0)
                         LOGGER.info(
                             "BACKTEST CHILD PROGRESS | symbol=%s pid=%s stage=%s details=%s",
                             history.symbol,
@@ -721,11 +761,12 @@ class BacktestRunner:
                     break
 
                 if watchdog_timeout.is_set():
-                    progress = state.get("child_progress", {}) if state else {}
+                    with progress_lock:
+                        latest_progress = dict(worker_progress)
                     raise TimeoutError(
                         f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "
-                        f"last_stage={state.get('child_stage', '-') if state else '-'}; "
-                        f"last_progress={progress!r}; "
+                        f"pid={process.pid}; last_stage={latest_progress['stage']}; "
+                        f"last_progress={latest_progress['details']!r}; "
                         f"boot_limit={CHILD_BOOT_TIMEOUT_SECONDS}s; "
                         f"analysis_limit={SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
                     )
@@ -745,11 +786,12 @@ class BacktestRunner:
                     payload = None
 
             if watchdog_timeout.is_set():
-                progress = state.get("child_progress", {}) if state else {}
+                with progress_lock:
+                    latest_progress = dict(worker_progress)
                 raise TimeoutError(
                     f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "
-                    f"last_stage={state.get('child_stage', '-') if state else '-'}; "
-                    f"last_progress={progress!r}; "
+                    f"pid={process.pid}; last_stage={latest_progress['stage']}; "
+                    f"last_progress={latest_progress['details']!r}; "
                     f"boot_limit={CHILD_BOOT_TIMEOUT_SECONDS}s; "
                     f"analysis_limit={SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
                 )
@@ -1560,6 +1602,7 @@ class BacktestRunner:
                     "candidates": len(candidates),
                     "engine_calls": 0,
                     "engine_seconds": 0.0,
+                    "pid": multiprocessing.current_process().pid,
                 },
             )
 
@@ -1652,6 +1695,25 @@ class BacktestRunner:
 
             engine_started = time.monotonic()
 
+            def report_engine_progress(stage: str, details: dict[str, Any] | None = None) -> None:
+                if progress_callback is None:
+                    return
+                status = dict(details or {})
+                status.update(
+                    symbol=history.symbol,
+                    candidate=candidate_index,
+                    candidates=len(candidates),
+                    engine_calls=engine_calls,
+                    elapsed_seconds=round(time.monotonic() - symbol_started, 2),
+                )
+                progress_callback(stage, status)
+
+            # Surface long-running engine stages while the call is still active.
+            report_engine_progress(
+                "ENGINE_CALL_START",
+                {"engine_seconds": round(engine_seconds, 2)},
+            )
+
             try:
                 analysis = analyze_candles(
                     history.symbol,
@@ -1661,6 +1723,7 @@ class BacktestRunner:
                     c5s,
                     c1ds,
                     now_ms=signal_close_time,
+                    cache={"_BACKTEST_PROGRESS_CALLBACK": report_engine_progress},
                 )
             except Exception:
                 diagnostics["ENGINE_ERRORS"] += 1

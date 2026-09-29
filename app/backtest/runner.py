@@ -6,7 +6,6 @@ import multiprocessing
 import os
 import pickle
 import tempfile
-import threading
 import time
 from bisect import bisect_right
 from collections import defaultdict
@@ -62,6 +61,10 @@ SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 # Emergency ceiling only. Normal symbols should finish far sooner.
 SYMBOL_ANALYSIS_TIMEOUT_SECONDS = 180
 
+# Startup/import/pickle phase should never hold a worker indefinitely.
+# Normal child startup is much faster than this on the deployed runtime.
+CHILD_BOOT_TIMEOUT_SECONDS = 45
+
 HEARTBEAT_INTERVAL_SECONDS = 30
 
 CHILD_PROGRESS_INTERVAL_CALLS = 25
@@ -81,6 +84,21 @@ class BacktestAlreadyRunning(RuntimeError):
 
 
 
+def _child_send(conn: Any, payload: tuple[Any, ...]) -> None:
+    """Best-effort status/result send from the isolated child."""
+    try:
+        conn.send(payload)
+    except (BrokenPipeError, EOFError, OSError):
+        # Parent may already have timed out and closed the pipe.
+        pass
+    except Exception:
+        # Never let diagnostics/IPC prevent child cleanup.
+        try:
+            LOGGER.exception("BACKTEST CHILD IPC SEND FAILED")
+        except Exception:
+            pass
+
+
 def _isolated_backtest_symbol(
     payload_path: str,
     start: int,
@@ -95,22 +113,54 @@ def _isolated_backtest_symbol(
 
     Keeping the large candle payload out of multiprocessing ``spawn`` avoids
     serializing hundreds of thousands of Python objects through Process.start.
+
+    The child emits low-level status markers over the Pipe so the parent can
+    distinguish interpreter/startup/pickle delays from actual engine work.
     """
+    pid = multiprocessing.current_process().pid
+
+    # This is intentionally the FIRST executable operation in the child.
+    # If this marker never reaches the parent, the child did not get through
+    # the spawned target entrypoint.
+    _child_send(conn, ("status", "BOOT", int(pid or 0)))
+
     try:
-        settings = SimpleNamespace(
-            backtest_fee_rate=fee_rate,
-            backtest_slippage_bps=slippage_bps,
-            backtest_max_holding_minutes=default_max_hold_minutes,
-        )
+        _child_send(conn, ("status", "PICKLE_LOAD_START", int(pid or 0)))
 
         with open(payload_path, "rb") as handle:
             history, btc_history = pickle.load(handle)
+
+        _child_send(
+            conn,
+            (
+                "status",
+                "PICKLE_LOAD_DONE",
+                int(pid or 0),
+                str(getattr(history, "symbol", "?")),
+            ),
+        )
 
         LOGGER.info(
             "BACKTEST CHILD START | symbol=%s candidates=%d pid=%s",
             history.symbol,
             len(getattr(history, "prefilter_candidates", ()) or ()),
-            multiprocessing.current_process().pid,
+            pid,
+        )
+
+        _child_send(
+            conn,
+            (
+                "status",
+                "RUNNER_INIT_START",
+                int(pid or 0),
+                history.symbol,
+            ),
+        )
+
+        settings = SimpleNamespace(
+            backtest_fee_rate=fee_rate,
+            backtest_slippage_bps=slippage_bps,
+            backtest_max_holding_minutes=default_max_hold_minutes,
         )
 
         runner = BacktestRunner(
@@ -120,7 +170,28 @@ def _isolated_backtest_symbol(
             max_concurrency=1,
         )
 
+        _child_send(
+            conn,
+            (
+                "status",
+                "RUNNER_INIT_DONE",
+                int(pid or 0),
+                history.symbol,
+            ),
+        )
+
         started = time.monotonic()
+
+        _child_send(
+            conn,
+            (
+                "status",
+                "ANALYSIS_START",
+                int(pid or 0),
+                history.symbol,
+            ),
+        )
+
         symbol_trades = runner._backtest_symbol(
             history,
             start,
@@ -129,41 +200,58 @@ def _isolated_backtest_symbol(
             {},
         )
 
+        elapsed = time.monotonic() - started
+
+        _child_send(
+            conn,
+            (
+                "status",
+                "ANALYSIS_DONE",
+                int(pid or 0),
+                history.symbol,
+                float(elapsed),
+                len(symbol_trades),
+            ),
+        )
+
         LOGGER.info(
             "BACKTEST CHILD COMPLETE | symbol=%s trades=%d seconds=%.2f",
             history.symbol,
             len(symbol_trades),
-            time.monotonic() - started,
+            elapsed,
         )
 
-        conn.send(
+        _child_send(
+            conn,
             (
                 "ok",
                 symbol_trades,
                 dict(history.diagnostics),
-            )
+            ),
         )
+
     except BaseException as exc:
         LOGGER.exception(
             "BACKTEST CHILD ERROR | type=%s message=%s",
             type(exc).__name__,
             exc,
         )
-        try:
-            conn.send(
-                (
-                    "error",
-                    type(exc).__name__,
-                    str(exc),
-                )
-            )
-        except Exception:
-            pass
+
+        _child_send(
+            conn,
+            (
+                "error",
+                type(exc).__name__,
+                str(exc),
+            ),
+        )
+
     finally:
         try:
             child_done.set()
         except Exception:
             pass
+
         try:
             conn.close()
         except Exception:
@@ -492,7 +580,17 @@ class BacktestRunner:
         end: int,
         btc_history: SymbolHistory,
     ) -> tuple[list[SimulatedTrade], dict[str, int]]:
-        """Run one symbol in an isolated subprocess with a hard watchdog."""
+        """Run one symbol in an isolated subprocess with hard child timeouts.
+
+        There are two independent failure classes:
+        1. CHILD_BOOT_TIMEOUT_SECONDS covers spawn/import/pickle/initialization
+           until the child runner is fully initialized.
+        2. SYMBOL_ANALYSIS_TIMEOUT_SECONDS covers the full symbol analysis.
+
+        The parent owns the watchdog here. This keeps timeout handling in the
+        asyncio task that already owns the child process and removes the old
+        thread-based watchdog race.
+        """
         fee_rate = float(
             getattr(
                 self.settings,
@@ -527,9 +625,65 @@ class BacktestRunner:
 
         payload_path: str | None = None
         process: multiprocessing.Process | None = None
-        watchdog_stop = threading.Event()
-        watchdog_timeout = threading.Event()
-        watchdog_thread: threading.Thread | None = None
+
+        def _terminate_process(reason: str) -> None:
+            """Best-effort terminate/kill with clear logging."""
+            if process is None:
+                return
+
+            if process.is_alive():
+                LOGGER.error(
+                    "BACKTEST CHILD TERMINATING | symbol=%s | pid=%s | reason=%s",
+                    history.symbol,
+                    process.pid,
+                    reason,
+                )
+
+                try:
+                    process.terminate()
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST CHILD TERMINATE FAILED | symbol=%s | pid=%s",
+                        history.symbol,
+                        process.pid,
+                    )
+                    return
+
+                try:
+                    process.join(3.0)
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST CHILD JOIN FAILED | symbol=%s | pid=%s",
+                        history.symbol,
+                        process.pid,
+                    )
+
+                if process.is_alive():
+                    try:
+                        process.kill()
+                    except Exception:
+                        LOGGER.exception(
+                            "BACKTEST CHILD KILL FAILED | symbol=%s | pid=%s",
+                            history.symbol,
+                            process.pid,
+                        )
+
+                    try:
+                        process.join(2.0)
+                    except Exception:
+                        LOGGER.exception(
+                            "BACKTEST CHILD FINAL JOIN FAILED | symbol=%s | pid=%s",
+                            history.symbol,
+                            process.pid,
+                        )
+
+            LOGGER.error(
+                "BACKTEST CHILD TERMINATED | symbol=%s | pid=%s | exitcode=%s | reason=%s",
+                history.symbol,
+                process.pid,
+                process.exitcode,
+                reason,
+            )
 
         try:
             with tempfile.NamedTemporaryFile(
@@ -562,60 +716,12 @@ class BacktestRunner:
             )
             process.daemon = True
 
-            def watchdog() -> None:
-                if watchdog_stop.wait(SYMBOL_ANALYSIS_TIMEOUT_SECONDS):
-                    return
-                if child_done.is_set() or process is None:
-                    return
-                if not process.is_alive():
-                    return
-
-                watchdog_timeout.set()
-                LOGGER.error(
-                    "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | timeout=%ss",
-                    history.symbol,
-                    process.pid,
-                    SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
-                )
-                try:
-                    process.terminate()
-                except Exception:
-                    LOGGER.exception(
-                        "BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s",
-                        history.symbol,
-                    )
-                    return
-
-                try:
-                    process.join(3.0)
-                except Exception:
-                    LOGGER.exception(
-                        "BACKTEST WATCHDOG JOIN FAILED | symbol=%s",
-                        history.symbol,
-                    )
-
-                if process.is_alive():
-                    try:
-                        process.kill()
-                        process.join(2.0)
-                    except Exception:
-                        LOGGER.exception(
-                            "BACKTEST WATCHDOG KILL FAILED | symbol=%s",
-                            history.symbol,
-                        )
-
-                LOGGER.error(
-                    "BACKTEST WATCHDOG KILLED | symbol=%s | pid=%s | exitcode=%s",
-                    history.symbol,
-                    process.pid,
-                    process.exitcode,
-                )
-
             payload_kb = (
                 os.path.getsize(payload_path) / 1024.0
                 if payload_path
                 else 0.0
             )
+
             LOGGER.info(
                 "BACKTEST ANALYSIS CANDIDATES | symbol=%s candidates=%d",
                 history.symbol,
@@ -627,6 +733,7 @@ class BacktestRunner:
                 payload_kb,
             )
 
+            # Keep process.start off the asyncio event loop.
             await asyncio.to_thread(process.start)
 
             try:
@@ -640,52 +747,122 @@ class BacktestRunner:
                 process.pid,
             )
 
-            watchdog_thread = threading.Thread(
-                target=watchdog,
-                name=f"backtest-watchdog-{history.symbol}",
-                daemon=True,
+            analysis_started = time.monotonic()
+            boot_deadline = (
+                analysis_started + CHILD_BOOT_TIMEOUT_SECONDS
             )
-            watchdog_thread.start()
+            analysis_deadline = (
+                analysis_started + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
+            )
 
-            payload = None
+            child_ready = False
+            child_phase = "PROCESS_STARTED"
+            payload: tuple[Any, ...] | None = None
+
             while True:
-                if parent_conn.poll(0):
+                now = time.monotonic()
+
+                # Drain every status/result message the child has produced.
+                while parent_conn.poll(0):
                     try:
-                        payload = parent_conn.recv()
+                        message = parent_conn.recv()
                     except (EOFError, OSError):
-                        payload = None
+                        message = None
+
+                    if message is None:
+                        break
+
+                    if not isinstance(message, tuple) or not message:
+                        LOGGER.warning(
+                            "BACKTEST CHILD INVALID MESSAGE | symbol=%s | message=%r",
+                            history.symbol,
+                            message,
+                        )
+                        continue
+
+                    kind = message[0]
+
+                    if kind == "status":
+                        status = (
+                            str(message[1])
+                            if len(message) > 1
+                            else "UNKNOWN"
+                        )
+                        child_phase = status
+
+                        if status == "RUNNER_INIT_DONE":
+                            child_ready = True
+
+                        LOGGER.info(
+                            "BACKTEST CHILD STATUS | symbol=%s | pid=%s | phase=%s",
+                            history.symbol,
+                            process.pid,
+                            status,
+                        )
+                        continue
+
+                    payload = message
                     break
 
-                if watchdog_timeout.is_set():
+                if payload is not None:
+                    break
+
+                if not child_ready and now >= boot_deadline:
+                    LOGGER.error(
+                        "BACKTEST CHILD BOOT TIMEOUT | symbol=%s | pid=%s | timeout=%ss | phase=%s",
+                        history.symbol,
+                        process.pid,
+                        CHILD_BOOT_TIMEOUT_SECONDS,
+                        child_phase,
+                    )
+                    _terminate_process("child_boot_timeout")
+
+                    raise TimeoutError(
+                        f"{history.symbol}: child failed to reach "
+                        f"BACKTEST CHILD BOOT within "
+                        f"{CHILD_BOOT_TIMEOUT_SECONDS}s "
+                        f"(phase={child_phase})"
+                    )
+
+                if now >= analysis_deadline:
+                    LOGGER.error(
+                        "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | timeout=%ss | phase=%s",
+                        history.symbol,
+                        process.pid,
+                        SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
+                        child_phase,
+                    )
+                    _terminate_process("symbol_analysis_timeout")
+
                     raise TimeoutError(
                         f"{history.symbol}: analysis exceeded "
-                        f"{SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
+                        f"{SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s "
+                        f"(phase={child_phase})"
                     )
 
                 if not process.is_alive():
-                    break
+                    # The child may have exited immediately after sending its
+                    # final message, so do one final non-blocking drain.
+                    if parent_conn.poll(0.05):
+                        try:
+                            payload = parent_conn.recv()
+                        except (EOFError, OSError):
+                            payload = None
+
+                    if payload is not None:
+                        break
+
+                    raise RuntimeError(
+                        f"{history.symbol}: analysis subprocess exited "
+                        f"without a result "
+                        f"(exitcode={process.exitcode}, phase={child_phase})"
+                    )
 
                 await asyncio.sleep(0.10)
 
-            if (
-                payload is None
-                and parent_conn.poll(0)
-            ):
-                try:
-                    payload = parent_conn.recv()
-                except (EOFError, OSError):
-                    payload = None
-
-            if watchdog_timeout.is_set():
-                raise TimeoutError(
-                    f"{history.symbol}: analysis exceeded "
-                    f"{SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
-                )
-
             if payload is None:
                 raise RuntimeError(
-                    f"{history.symbol}: analysis subprocess exited "
-                    f"without a result (exitcode={process.exitcode})"
+                    f"{history.symbol}: analysis subprocess returned no payload"
                 )
 
             if payload[0] == "error":
@@ -696,45 +873,23 @@ class BacktestRunner:
 
             if payload[0] != "ok":
                 raise RuntimeError(
-                    f"{history.symbol}: invalid analysis subprocess payload"
+                    f"{history.symbol}: invalid analysis subprocess payload: "
+                    f"{payload[0]!r}"
                 )
 
             return payload[1], payload[2]
 
         except asyncio.CancelledError:
-            if process is not None and process.is_alive():
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.to_thread(process.join, 3.0)
-                except Exception:
-                    pass
-                if process.is_alive():
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
-                    try:
-                        await asyncio.to_thread(process.join, 2.0)
-                    except Exception:
-                        pass
+            if process is not None:
+                _terminate_process("parent_task_cancelled")
             raise
 
         finally:
-            watchdog_stop.set()
-
-            if watchdog_thread is not None and watchdog_thread.is_alive():
-                try:
-                    watchdog_thread.join(timeout=1.0)
-                except Exception:
-                    pass
-
             try:
                 child_conn.close()
             except Exception:
                 pass
+
             try:
                 parent_conn.close()
             except Exception:
@@ -742,23 +897,8 @@ class BacktestRunner:
 
             if process is not None:
                 if process.is_alive():
-                    try:
-                        process.terminate()
-                    except Exception:
-                        pass
-                    try:
-                        await asyncio.to_thread(process.join, 2.0)
-                    except Exception:
-                        pass
-                    if process.is_alive():
-                        try:
-                            process.kill()
-                        except Exception:
-                            pass
-                        try:
-                            await asyncio.to_thread(process.join, 2.0)
-                        except Exception:
-                            pass
+                    _terminate_process("parent_cleanup")
+
                 try:
                     process.close()
                 except Exception:
@@ -775,6 +915,7 @@ class BacktestRunner:
                         history.symbol,
                         payload_path,
                     )
+
 
     async def _fetch_btc_history(
         self,

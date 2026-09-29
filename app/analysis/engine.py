@@ -613,6 +613,10 @@ def _build_15m_backtest_context(candles: List[Candle]) -> Dict[str, Any]:
         "swings": swings,
         "bos_long": bos_long,
         "bos_short": bos_short,
+        # Precomputed indexes let every point-in-time prefix slice BOS events with
+        # two binary searches instead of scanning the entire event list.
+        "bos_long_indices": [int(event["index"]) for event in bos_long],
+        "bos_short_indices": [int(event["index"]) for event in bos_short],
     }
 
 
@@ -623,15 +627,25 @@ def _slice_backtest_bos_events(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Return exactly the BOS window visible to a candidate prefix."""
     start = max(1, int(prefix_count) - int(lookback))
-    long_events = [
-        event for event in context.get("bos_long", [])
-        if start <= int(event.get("index", -1)) < prefix_count
-    ]
-    short_events = [
-        event for event in context.get("bos_short", [])
-        if start <= int(event.get("index", -1)) < prefix_count
-    ]
-    return long_events, short_events
+
+    def _slice(events_key: str, indices_key: str) -> List[Dict[str, Any]]:
+        events = context.get(events_key, []) or []
+        indices = context.get(indices_key)
+        if not indices:
+            # Compatibility path for externally supplied contexts created by an
+            # older engine version. The authoritative event semantics are unchanged.
+            return [
+                event for event in events
+                if start <= int(event.get("index", -1)) < prefix_count
+            ]
+        left = bisect_right(indices, start - 1)
+        right = bisect_right(indices, prefix_count - 1)
+        return list(events[left:right])
+
+    return (
+        _slice("bos_long", "bos_long_indices"),
+        _slice("bos_short", "bos_short_indices"),
+    )
 
 
 def _pullback_retest(candles: List[Candle], side: str, bos: Optional[Dict[str,Any]], max_bars: int=8) -> Dict[str,Any]:

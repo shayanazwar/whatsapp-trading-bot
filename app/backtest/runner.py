@@ -119,20 +119,19 @@ def _isolated_backtest_symbol(
     conn: Any,
     child_done: Any,
 ) -> None:
-    """Fetch and analyze one symbol entirely inside the isolated child.
+    """Fetch, candidate-build, analyze, and simulate one symbol in one child loop.
 
-    The parent asyncio loop never performs symbol-history preparation or
-    CPU-bound candidate generation. A stalled MEXC request or expensive
-    historical calculation is therefore contained by the child watchdog.
+    Critical lifecycle rule:
+        The MEXC AsyncClient is created, used, and closed inside the SAME
+        asyncio.run() event loop. It is never allowed to outlive that loop.
+
+    This child contains the entire expensive symbol lifecycle so the parent
+    Render/asyncio event loop remains responsive.
     """
     pid = multiprocessing.current_process().pid
-    client: MexcClient | None = None
-
-    # The first operation remains an IPC marker so the parent can distinguish
-    # spawn/import delay from all later phases.
     _child_send(conn, ("status", "BOOT", int(pid or 0)))
 
-    try:
+    async def _child_async_main() -> tuple[Any, ...]:
         _child_send(conn, ("status", "PICKLE_LOAD_START", int(pid or 0)))
         with open(payload_path, "rb") as handle:
             symbol, btc_history = pickle.load(handle)
@@ -160,36 +159,32 @@ def _isolated_backtest_symbol(
             mexc_api_base_url=mexc_api_base_url,
         )
 
-        # Public historical data needs only the API base URL. Credentials are
-        # intentionally not copied into the child payload.
-        client = MexcClient(settings)
+        _child_send(
+            conn,
+            ("status", "RUNNER_INIT_DONE", int(pid or 0), symbol),
+        )
 
-        runner = BacktestRunner(
+        # --------------------------------------------------------------
+        # FETCH + CANDIDATE GENERATION
+        # --------------------------------------------------------------
+        _child_send(
+            conn,
+            ("status", "FETCH_START", int(pid or 0), symbol),
+        )
+
+        client = MexcClient(settings)
+        fetch_runner = BacktestRunner(
             client=client,
             universe=None,
             settings=settings,
             max_concurrency=1,
         )
 
-        _child_send(
-            conn,
-            ("status", "RUNNER_INIT_DONE", int(pid or 0), symbol),
-        )
-
-        _child_send(
-            conn,
-            ("status", "FETCH_START", int(pid or 0), symbol),
-        )
-
-        # asyncio.run creates a child-local event loop. Symbol fetches, HTTP
-        # parsing, and candidate preparation cannot block the Render main loop.
         try:
-            history = asyncio.run(
-                runner._prepare_symbol_history(
-                    symbol,
-                    start,
-                    end,
-                )
+            history = await fetch_runner._prepare_symbol_history(
+                symbol,
+                start,
+                end,
             )
         except BaseException as exc:
             LOGGER.exception(
@@ -198,22 +193,25 @@ def _isolated_backtest_symbol(
                 type(exc).__name__,
                 exc,
             )
-            _child_send(
-                conn,
-                (
-                    "data_error",
-                    type(exc).__name__,
-                    str(exc),
-                ),
+            return (
+                "data_error",
+                type(exc).__name__,
+                str(exc),
             )
-            return
-
-        # Network I/O is complete. Close the child-local AsyncClient before
-        # entering synchronous analysis; the engine itself does not need it.
-        try:
-            asyncio.run(client.close())
         finally:
-            client = None
+            # The close happens INSIDE the same event loop in which the client
+            # was created and used. A close failure is diagnostic only and must
+            # never convert successfully fetched data into an analysis error.
+            try:
+                await client.close()
+            except BaseException as close_exc:
+                LOGGER.exception(
+                    "BACKTEST CHILD CLIENT CLOSE FAILED | symbol=%s | pid=%s | type=%s message=%s",
+                    symbol,
+                    pid,
+                    type(close_exc).__name__,
+                    close_exc,
+                )
 
         _child_send(
             conn,
@@ -226,19 +224,43 @@ def _isolated_backtest_symbol(
             ),
         )
 
+        # --------------------------------------------------------------
+        # SYNCHRONOUS CANDIDATE GENERATION + ENGINE + SIMULATION
+        # --------------------------------------------------------------
         _child_send(
             conn,
             ("status", "PREFILTER_ANALYSIS_START", int(pid or 0), symbol),
         )
 
-        started = time.monotonic()
-        symbol_trades = runner._backtest_symbol(
-            history,
-            start,
-            end,
-            btc_history,
-            {},
+        analysis_runner = BacktestRunner(
+            client=None,
+            universe=None,
+            settings=settings,
+            max_concurrency=1,
         )
+
+        started = time.monotonic()
+        try:
+            symbol_trades = analysis_runner._backtest_symbol(
+                history,
+                start,
+                end,
+                btc_history,
+                {},
+            )
+        except BaseException as exc:
+            LOGGER.exception(
+                "BACKTEST CHILD ANALYSIS ERROR | symbol=%s | type=%s message=%s",
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            return (
+                "error",
+                type(exc).__name__,
+                str(exc),
+            )
+
         elapsed = time.monotonic() - started
 
         _child_send(
@@ -260,18 +282,55 @@ def _isolated_backtest_symbol(
             elapsed,
         )
 
-        _child_send(
-            conn,
-            (
-                "ok",
-                symbol_trades,
-                dict(history.diagnostics),
-            ),
+        return (
+            "ok",
+            symbol_trades,
+            dict(history.diagnostics),
         )
 
+    try:
+        result = asyncio.run(_child_async_main())
+        kind = result[0]
+
+        if kind == "data_error":
+            _child_send(
+                conn,
+                (
+                    "data_error",
+                    result[1],
+                    result[2],
+                ),
+            )
+        elif kind == "error":
+            _child_send(
+                conn,
+                (
+                    "error",
+                    result[1],
+                    result[2],
+                ),
+            )
+        elif kind == "ok":
+            _child_send(
+                conn,
+                (
+                    "ok",
+                    result[1],
+                    result[2],
+                ),
+            )
+        else:
+            _child_send(
+                conn,
+                (
+                    "error",
+                    "InvalidChildResult",
+                    repr(result),
+                ),
+            )
     except BaseException as exc:
         LOGGER.exception(
-            "BACKTEST CHILD ERROR | type=%s message=%s",
+            "BACKTEST CHILD FATAL ERROR | type=%s message=%s",
             type(exc).__name__,
             exc,
         )
@@ -284,14 +343,6 @@ def _isolated_backtest_symbol(
             ),
         )
     finally:
-        if client is not None:
-            try:
-                asyncio.run(client.close())
-            except Exception:
-                LOGGER.exception(
-                    "BACKTEST CHILD CLIENT CLOSE FAILED | pid=%s",
-                    pid,
-                )
         try:
             child_done.set()
         except Exception:

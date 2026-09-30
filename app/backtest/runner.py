@@ -22,6 +22,8 @@ from ..analysis.engine import (
     _four_hour_regime,
     _one_hour_alignment,
     _pullback_retest,
+    MIN_TRIGGER_BODY,
+    MIN_TRIGGER_RVOL,
     analyze_candles,
     build_btc_context,
     btc_filter_ok,
@@ -1094,6 +1096,7 @@ class BacktestRunner:
         *,
         bos_long: list[dict[str, Any]] | None = None,
         bos_short: list[dict[str, Any]] | None = None,
+        atr_values: list[float] | None = None,
     ) -> tuple[
         tuple[int, Any],
         ...,
@@ -1161,6 +1164,7 @@ class BacktestRunner:
 
                 setups.append(
                     {
+                        "side": side,
                         "bos_index": int(bos["index"]),
                         "bos_time": int(bos["time"]),
                         "bos_level": float(bos["level"]),
@@ -1243,6 +1247,42 @@ class BacktestRunner:
 
                 if active_setup is None:
                     continue
+
+                # Cheap, causal 15M entry prefilter. In production the
+                # precomputed ATR series is always supplied. Direct/unit-test
+                # callers without that context retain the legacy candidate
+                # behavior so this helper remains backwards compatible.
+                if atr_values is not None:
+                    if index < 1 or index >= len(c15):
+                        continue
+                    cur = c15[index]
+                    prev = c15[index - 1]
+                    o = float(cur["open"])
+                    h = float(cur["high"])
+                    l = float(cur["low"])
+                    close = float(cur["close"])
+                    ph = float(prev["high"])
+                    pl = float(prev["low"])
+                    rng = max(h - l, 1e-12)
+                    body = abs(close - o) / rng
+                    close_location_long = (close - l) / rng
+                    close_location_short = (h - close) / rng
+                    atr_now = float(atr_values[index]) if index < len(atr_values) else 0.0
+                    level = float(active_setup["bos_level"])
+                    buffer = max(atr_now * 0.05, abs(level) * 0.00025)
+
+                    if active_setup["side"] == "LONG":
+                        breakout = close > level + buffer and close > o and close > ph
+                        reclaim = close > level + buffer and close > o and l <= level + buffer
+                        cheap_ready = (breakout or reclaim) and body >= MIN_TRIGGER_BODY and close_location_long >= 0.70
+                    else:
+                        breakdown = close < level - buffer and close < o and close < pl
+                        reclaim = close < level - buffer and close < o and h >= level - buffer
+                        cheap_ready = (breakdown or reclaim) and body >= MIN_TRIGGER_BODY and close_location_short >= 0.70
+
+                    if not cheap_ready:
+                        diagnostics["ENTRY_PREFILTER_REJECT"] = diagnostics.get("ENTRY_PREFILTER_REJECT", 0) + 1
+                        continue
 
                 candidates[
                     (
@@ -1461,6 +1501,7 @@ class BacktestRunner:
                 diagnostics,
                 bos_long=backtest_15m_context.get("bos_long"),
                 bos_short=backtest_15m_context.get("bos_short"),
+                atr_values=backtest_15m_context.get("atr"),
             )
         )
 

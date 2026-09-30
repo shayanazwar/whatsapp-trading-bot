@@ -173,12 +173,22 @@ def _isolated_backtest_symbol(
             time.monotonic() - started,
         )
 
+        LOGGER.info(
+            "BACKTEST CHILD RESULT SEND START | symbol=%s trades=%d",
+            history.symbol,
+            len(symbol_trades),
+        )
         conn.send(
             (
                 "ok",
                 symbol_trades,
                 dict(history.diagnostics),
             )
+        )
+        LOGGER.info(
+            "BACKTEST CHILD RESULT SENT | symbol=%s trades=%d",
+            history.symbol,
+            len(symbol_trades),
         )
     except BaseException as exc:
         LOGGER.exception(
@@ -718,6 +728,14 @@ class BacktestRunner:
                     except (EOFError, OSError):
                         message = None
 
+                    if message and message[0] in {"ok", "error"}:
+                        LOGGER.info(
+                            "BACKTEST PARENT RESULT RECEIVED | symbol=%s pid=%s type=%s",
+                            history.symbol,
+                            process.pid,
+                            message[0],
+                        )
+
                     if message and message[0] == "status":
                         _, child_stage, details = message
                         if not isinstance(details, dict):
@@ -740,10 +758,22 @@ class BacktestRunner:
                             progress_key = (history.symbol, process.pid)
                         if state is not None:
                             workers = state.setdefault("child_workers", {})
-                            workers[progress_key] = {
-                                "stage": str(child_stage),
-                                "details": dict(details),
-                            }
+                            worker_record = workers.setdefault(
+                                progress_key,
+                                {"history": []},
+                            )
+                            history_trace = worker_record.setdefault("history", [])
+                            history_trace.append(str(child_stage))
+                            if len(history_trace) > 32:
+                                del history_trace[:-32]
+                            worker_record.update(
+                                {
+                                    "stage": str(child_stage),
+                                    "details": dict(details),
+                                    "history": history_trace,
+                                }
+                            )
+                            workers[progress_key] = worker_record
                             # Keep legacy heartbeat fields as most recently
                             # received, but never consult them for watchdogs.
                             state["child_stage"] = str(child_stage)
@@ -840,6 +870,12 @@ class BacktestRunner:
                     f"{history.symbol}: invalid analysis subprocess payload"
                 )
 
+            LOGGER.info(
+                "BACKTEST ANALYSIS RETURN | symbol=%s pid=%s trades=%d",
+                history.symbol,
+                process.pid,
+                len(payload[1]),
+            )
             return payload[1], payload[2]
 
         except asyncio.CancelledError:
@@ -1834,6 +1870,14 @@ class BacktestRunner:
                     now_ms=signal_close_time,
                     cache={"_BACKTEST_PROGRESS_CALLBACK": report_engine_progress, "_BACKTEST_15M": backtest_15m_context},
                 )
+                elapsed_engine = time.monotonic() - engine_started
+                report_engine_progress(
+                    "ENGINE_CALL_DONE",
+                    {
+                        "engine_seconds": round(elapsed_engine, 4),
+                        "technical_candidate": bool(analysis.get("technical_candidate")),
+                    },
+                )
             except Exception:
                 diagnostics["ENGINE_ERRORS"] += 1
                 diagnostics["ENGINE_EXCEPTION"] += 1
@@ -2594,6 +2638,21 @@ class BacktestRunner:
                                     state[
                                         "processed"
                                     ] += 1
+                                    processed_after = state["processed"]
+                                    tested_after = state["tested"]
+                                    data_errors_after = state["data_errors"]
+                                    engine_errors_after = state["engine_errors"]
+
+                                LOGGER.info(
+                                    "BACKTEST SYMBOL WORKER FINISHED | worker=%d symbol=%s processed=%d/%d tested=%d data_errors=%d engine_errors=%d",
+                                    worker_id,
+                                    symbol,
+                                    processed_after,
+                                    len(symbols),
+                                    tested_after,
+                                    data_errors_after,
+                                    engine_errors_after,
+                                )
 
                             queue.task_done()
 

@@ -1278,6 +1278,16 @@ def analyze_candles(
 
     cache = cache if cache is not None else {}
 
+    progress_callback = cache.get("_BACKTEST_PROGRESS_CALLBACK")
+
+    def report_progress(stage: str, details: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage, details or {})
+        except Exception:
+            pass
+
     def _cache_key(tag: str, candles: List[Candle], extra: Any = None):
         last = candles[-1] if candles else None
         return (tag, len(candles), int(last["time"]) if last else 0, float(last["close"]) if last else 0.0, extra)
@@ -1288,6 +1298,11 @@ def analyze_candles(
         regime = _four_hour_regime(c4)
         cache[regime_key] = regime
 
+    report_progress(
+        "ENGINE_STAGE_4H_DONE",
+        {"candles": len(c4), "regime": regime.get("regime")},
+    )
+
     align_key = _cache_key("ALIGN1", c1, str(regime.get("regime") or "NO_TRADE"))
     alignment = cache.get(align_key)
     if alignment is None:
@@ -1297,19 +1312,20 @@ def analyze_candles(
     structure1 = alignment["structure"]
     e21_1, e50_1 = alignment["e21"], alignment["e50"]
 
+    report_progress(
+        "ENGINE_STAGE_1H_DONE",
+        {
+            "candles": len(c1),
+            "structure": structure1,
+            "long_votes": alignment.get("long_votes"),
+            "short_votes": alignment.get("short_votes"),
+        },
+    )
+
     # Reuse one ATR/swing pass for all 15M consumers in this analysis. A
     # backtest may additionally provide a full-history context; in that mode
     # BOS events are filtered to the causal prefix rather than rescanned.
     bt15 = cache.get("_BACKTEST_15M")
-    progress_callback = cache.get("_BACKTEST_PROGRESS_CALLBACK")
-
-    def report_progress(stage: str, details: Optional[Dict[str, Any]] = None) -> None:
-        if progress_callback is None:
-            return
-        try:
-            progress_callback(stage, details or {})
-        except Exception:
-            pass
 
     prefix_count_15 = len(c15)
     full_context_matches = bool(
@@ -1374,6 +1390,17 @@ def analyze_candles(
     long_candidate = bool(alignment["long"] and bos_long and ret_long["valid"])
     short_candidate = bool(alignment["short"] and bos_short and ret_short["valid"])
 
+    report_progress(
+        "ENGINE_STAGE_15M_DONE",
+        {
+            "candles": len(c15),
+            "long_candidate": long_candidate,
+            "short_candidate": short_candidate,
+            "bos_long": len(bos_events_long),
+            "bos_short": len(bos_events_short),
+        },
+    )
+
     # Direction is selected from 4H/1H first. When both directions are present,
     # choose the stronger current BOS; the 15M candle then confirms that side.
     if long_candidate and not short_candidate:
@@ -1414,12 +1441,25 @@ def analyze_candles(
         atr_value=atr15,
     )
 
+    report_progress(
+        "ENGINE_STAGE_ENTRY_DONE",
+        {"trigger_side": trigger_side, "ready": bool(entry_15m.get("ready"))},
+    )
+
     # 5M is execution refinement only. It can improve quality but can never
     # manufacture a setup that the 15M primary confirmation did not produce.
     refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level)
     if refinement_5m.get("ready") and retest_time is not None and int(refinement_5m["candle_time"]) < retest_time:
         refinement_5m = dict(refinement_5m)
         refinement_5m.update({"ready": False, "long": False, "short": False, "trigger_type": "INVALID_BEFORE_RETEST"})
+
+    report_progress(
+        "ENGINE_STAGE_5M_DONE",
+        {
+            "ready": bool(refinement_5m.get("ready")),
+            "trigger_type": refinement_5m.get("trigger_type", "NONE"),
+        },
+    )
 
     setup = trigger_side if entry_15m.get("ready") else "NO TRADE"
 
@@ -1475,6 +1515,16 @@ def analyze_candles(
         "target_frames": [("1D", c1d), ("4H", c4), ("1H", c1), ("15M", c15)],
         "_candles_15m": c15,
     })
+
+    report_progress(
+        "ENGINE_STAGE_LEVELS_DONE",
+        {
+            "trade_geometry_ok": bool(levels.get("trade_geometry_ok")),
+            "rr": levels.get("rr"),
+            "stop_loss": levels.get("stop_loss"),
+            "tp2": levels.get("tp2"),
+        },
+    )
 
     rr = levels.get("rr")
     risk_ok = bool(
@@ -1544,6 +1594,15 @@ def analyze_candles(
         and rr >= MIN_RR
         and score >= MIN_SCORE
         and families >= MIN_FAMILIES
+    )
+
+    report_progress(
+        "ENGINE_STAGE_SCORE_DONE",
+        {
+            "score": score,
+            "families": families,
+            "technical_candidate": technical_candidate,
+        },
     )
 
     failures = _diagnostic_failures(
@@ -1618,6 +1677,15 @@ def analyze_candles(
         "BULLISH" if (ema21_15 or 0) > (ema50_15 or 0)
         else "BEARISH" if (ema21_15 or 0) < (ema50_15 or 0)
         else "NEUTRAL"
+    )
+
+    report_progress(
+        "ENGINE_STAGE_RETURN",
+        {
+            "technical_candidate": technical_candidate,
+            "score": score,
+            "families": families,
+        },
     )
 
     return {

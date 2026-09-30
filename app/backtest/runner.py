@@ -1631,6 +1631,7 @@ class BacktestRunner:
                 diagnostics,
                 bos_long=backtest_15m_context.get("bos_long"),
                 bos_short=backtest_15m_context.get("bos_short"),
+                atr_values=backtest_15m_context.get("atr"),
             )
         )
 

@@ -1375,6 +1375,82 @@ class BacktestRunner:
             )
         )
 
+    @staticmethod
+    def _prefilter_candidate_times(
+        c4: list,
+        c1: list,
+        candidates: tuple[tuple[int, Any], ...],
+        diagnostics: dict[str, int],
+    ) -> tuple[tuple[int, Any], ...]:
+        """Apply only logically necessary HTF direction gates before full engine work.
+
+        A candidate can never become a technical candidate when the point-in-time
+        4H regime is NO_TRADE or the matching 4H/1H directional alignment is absent.
+        These checks are the same engine helpers used by analyze_candles(), so this
+        optimization does not loosen or change the trading rules. It only prevents
+        impossible timestamps from spawning full engine analysis and avoids the
+        unnecessary 5M/1D downloads for symbols with no viable timestamps.
+        """
+        if not candidates:
+            return ()
+
+        regime_cache: dict[tuple[int, int], dict[str, Any]] = {}
+        alignment_cache: dict[tuple[int, int, str], dict[str, Any]] = {}
+        filtered: list[tuple[int, Any]] = []
+
+        diagnostics["PREFILTER_CANDIDATES_INPUT"] += len(candidates)
+
+        for signal_close_time, setup_hint in candidates:
+            close_time = int(signal_close_time)
+            c4s = _closed_slice(c4, H4_MS, close_time)
+            c1s = _closed_slice(c1, H1_MS, close_time)
+
+            if len(c4s) < 205 or len(c1s) < 205:
+                diagnostics["PREFILTER_WARMUP_REJECT"] += 1
+                continue
+
+            regime_key = (
+                len(c4s),
+                int(c4s[-1]["time"]),
+            )
+            regime = regime_cache.get(regime_key)
+            if regime is None:
+                regime = _four_hour_regime(c4s)
+                regime_cache[regime_key] = regime
+
+            if not (regime.get("bull") or regime.get("bear")):
+                diagnostics["PREFILTER_4H_REJECT"] += 1
+                continue
+            diagnostics["PREFILTER_4H_PASS"] += 1
+
+            align_key = (
+                len(c1s),
+                int(c1s[-1]["time"]),
+                str(regime.get("regime") or "NO_TRADE"),
+            )
+            alignment = alignment_cache.get(align_key)
+            if alignment is None:
+                alignment = _one_hour_alignment(c1s, regime)
+                alignment_cache[align_key] = alignment
+
+            direction_ok = bool(
+                (regime.get("bull") and alignment.get("long"))
+                or (regime.get("bear") and alignment.get("short"))
+            )
+            if not direction_ok:
+                diagnostics["PREFILTER_1H_DIRECTION_REJECT"] += 1
+                continue
+
+            diagnostics["PREFILTER_1H_DIRECTION_PASS"] += 1
+            filtered.append((close_time, setup_hint))
+
+        diagnostics["PREFILTER_CANDIDATES_OUTPUT"] += len(filtered)
+        diagnostics["PREFILTER_CANDIDATES_REMOVED"] += max(
+            0,
+            len(candidates) - len(filtered),
+        )
+        return tuple(filtered)
+
     async def _prepare_symbol_history(
         self,
         symbol: str,
@@ -1539,6 +1615,25 @@ class BacktestRunner:
                 bos_short=backtest_15m_context.get("bos_short"),
                 atr_values=backtest_15m_context.get("atr"),
             )
+        )
+
+        # Fast, semantics-preserving HTF prefilter. A timestamp that fails the
+        # exact 4H/1H direction gate can never become a technical candidate.
+        candidate_times = self._prefilter_candidate_times(
+            c4,
+            c1,
+            candidate_times,
+            diagnostics,
+        )
+
+        LOGGER.info(
+            "BACKTEST CANDIDATE PREFILTER | symbol=%s input=%d output=%d removed=%d 4h_reject=%d direction_reject=%d",
+            symbol,
+            diagnostics.get("PREFILTER_CANDIDATES_INPUT", 0),
+            diagnostics.get("PREFILTER_CANDIDATES_OUTPUT", 0),
+            diagnostics.get("PREFILTER_CANDIDATES_REMOVED", 0),
+            diagnostics.get("PREFILTER_4H_REJECT", 0),
+            diagnostics.get("PREFILTER_1H_DIRECTION_REJECT", 0),
         )
 
         if not candidate_times:
@@ -1777,6 +1872,14 @@ class BacktestRunner:
                 len(backtest_15m_context.get("bos_short", [])),
             )
 
+        # Reuse the engine's pure calculation cache across candidate calls.
+        # This is safe because analyze_candles() keys cached values by causal
+        # candle prefix/timeframe; changing the callback each iteration keeps
+        # progress reporting current without discarding expensive calculations.
+        engine_cache: dict[str, Any] = {
+            "_BACKTEST_15M": backtest_15m_context,
+        }
+
         for candidate_index, (signal_close_time, _setup_hint) in enumerate(
             candidates,
             start=1,
@@ -1854,6 +1957,7 @@ class BacktestRunner:
                 progress_callback(stage, status)
 
             # Surface long-running engine stages while the call is still active.
+            engine_cache["_BACKTEST_PROGRESS_CALLBACK"] = report_engine_progress
             report_engine_progress(
                 "ENGINE_CALL_START",
                 {"engine_seconds": round(engine_seconds, 2)},
@@ -1868,7 +1972,7 @@ class BacktestRunner:
                     c5s,
                     c1ds,
                     now_ms=signal_close_time,
-                    cache={"_BACKTEST_PROGRESS_CALLBACK": report_engine_progress, "_BACKTEST_15M": backtest_15m_context},
+                    cache=engine_cache,
                 )
                 elapsed_engine = time.monotonic() - engine_started
                 report_engine_progress(
@@ -2696,6 +2800,26 @@ class BacktestRunner:
                     ),
                     trades=trades,
                     diagnostics=diagnostics,
+                )
+
+                LOGGER.info(
+                    "BACKTEST GATE FUNNEL | "
+                    "candidates_in=%d "
+                    "after_htf_direction=%d "
+                    "4h_reject=%d "
+                    "direction_reject=%d "
+                    "engine_calls=%d "
+                    "technical_accept=%d "
+                    "btc_reject=%d "
+                    "trades=%d",
+                    diagnostics.get("PREFILTER_CANDIDATES_INPUT", 0),
+                    diagnostics.get("PREFILTER_CANDIDATES_OUTPUT", 0),
+                    diagnostics.get("PREFILTER_4H_REJECT", 0),
+                    diagnostics.get("PREFILTER_1H_DIRECTION_REJECT", 0),
+                    diagnostics.get("ENGINE_CALLS", 0),
+                    diagnostics.get("TECHNICAL_ACCEPT", 0),
+                    diagnostics.get("BTC_REJECT", 0),
+                    len(trades),
                 )
 
                 LOGGER.info(

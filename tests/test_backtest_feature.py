@@ -16,6 +16,7 @@ M5 = 300_000
 M15 = 900_000
 H1 = 3_600_000
 H4 = 14_400_000
+D1 = 86_400_000
 
 
 def candle(ts: int, price: float, *, high: float | None = None, low: float | None = None):
@@ -317,14 +318,112 @@ def test_runner_prefilter_skips_5m_trigger_when_no_15m_candidate(monkeypatch):
     assert out == ()
 
 
-def test_backtest_duration_accepts_1d(monkeypatch):
+@pytest.mark.asyncio
+async def test_backtest_duration_accepts_1d():
     from app.backtest import runner as runner_module
-    assert 1 in {1, 7, 30, 90}
+
+    class FakeUniverse:
+        async def refresh(self):
+            return []
+
+    runner = runner_module.BacktestRunner.__new__(runner_module.BacktestRunner)
+    runner.client = None
+    runner.universe = FakeUniverse()
+    runner.settings = SimpleNamespace()
+    runner.max_concurrency = 1
+    runner._lock = asyncio.Lock()
+
+    with pytest.raises(RuntimeError, match="No eligible MEXC"):
+        await runner.run(1)
+
     assert runner_module.MAX_BACKTEST_SYMBOLS == 200
 
 
-def test_runner_passes_reusable_15m_context(monkeypatch):
-    from app.backtest import runner as runner_module
-    source = open(runner_module.__file__, encoding="utf-8").read()
-    assert "_BACKTEST_15M" in source
-    assert "_build_15m_backtest_context" in source
+def test_runner_reusable_15m_context_preserves_engine_output():
+    from app.analysis.engine import analyze_candles, convert_candles, _build_15m_backtest_context
+
+    base = 1_700_500_000_000
+
+    def rows(end_open, count, interval, seed):
+        import random, math
+        rnd = random.Random(seed)
+        start = end_open - (count - 1) * interval
+        price = 100.0
+        out = []
+        for i in range(count):
+            drift = 0.10 * math.sin(i / 9.0) + 0.02 * (1 if (i // 30) % 2 == 0 else -1)
+            op = price
+            close = max(1.0, price + drift + rnd.uniform(-0.8, 0.8))
+            high = max(op, close) + rnd.uniform(0.0, 0.7)
+            low = min(op, close) - rnd.uniform(0.0, 0.7)
+            out.append([start + i * interval, op, high, low, close, 100.0 + i])
+            price = close
+        return out
+
+    c4 = rows(base - H4, 250, H4, 1)
+    c1 = rows(base - 3_600_000, 250, 3_600_000, 2)
+    c15 = rows(base - M15, 300, M15, 3)
+    c5 = rows(base - M5, 500, M5, 4)
+    c1d = rows(base - D1, 70, D1, 5)
+
+    converted = convert_candles(c15)
+    context = _build_15m_backtest_context(converted)
+
+    keys = (
+        "setup", "technical_candidate", "score",
+        "confirmation_family_count", "bos_15m_time",
+        "setup_bos_time", "setup_retest_time", "atr",
+        "atr_percentile", "support", "resistance",
+        "entry", "stop_loss", "tp1", "tp2", "rr",
+        "technical_gate_failures",
+    )
+
+    for index in (220, 250, 280):
+        now_ms = int(converted[index]["time"]) + M15
+        normal = analyze_candles(
+            "TEST_USDT", c4, c1, c15, c5, c1d,
+            now_ms=now_ms, cache={}
+        )
+        cached = analyze_candles(
+            "TEST_USDT", c4, c1, c15, c5, c1d,
+            now_ms=now_ms,
+            cache={"_BACKTEST_15M": context},
+        )
+        assert {key: normal.get(key) for key in keys} == {key: cached.get(key) for key in keys}
+
+
+@pytest.mark.asyncio
+async def test_bot_backtest_1d_routes_to_runner(monkeypatch):
+    from app.bot import Bot
+
+    class FakeWhatsApp:
+        def __init__(self):
+            self.texts = []
+
+        async def send_text(self, phone, text):
+            self.texts.append((phone, text))
+
+    class FakeRunner:
+        is_running = False
+
+        def __init__(self):
+            self.days = None
+
+        async def run(self, days):
+            self.days = days
+            return SimpleNamespace(days=days)
+
+    wa = FakeWhatsApp()
+    runner = FakeRunner()
+    bot = Bot.__new__(Bot)
+    bot.backtest_runner = runner
+    bot.whatsapp = wa
+
+    import app.backtest.report as report_module
+    monkeypatch.setattr(report_module, "format_report", lambda summary: f"REPORT {summary.days}D")
+
+    await bot._backtest("user", "1D")
+
+    assert runner.days == 1
+    assert any("BACKTEST 1D STARTED" in text for _, text in wa.texts)
+    assert wa.texts[-1] == ("user", "REPORT 1D")

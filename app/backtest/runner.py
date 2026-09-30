@@ -215,6 +215,7 @@ class SymbolHistory:
     candles_1d: list[list[float | int]]
     prefilter_candidates: tuple[tuple[int, Any], ...] = ()
     diagnostics: dict[str, int] = field(default_factory=dict)
+    backtest_15m_context: dict[str, Any] = field(default_factory=dict)
 
 
 def _row_time(row: Any) -> int:
@@ -1085,12 +1086,14 @@ class BacktestRunner:
         )
 
     @staticmethod
-    @staticmethod
     def _find_15m_setup_windows(
         c15: list,
         period_start: int,
         period_end: int,
         diagnostics: dict[str, int],
+        *,
+        bos_long: list[dict[str, Any]] | None = None,
+        bos_short: list[dict[str, Any]] | None = None,
     ) -> tuple[
         tuple[int, Any],
         ...,
@@ -1119,15 +1122,20 @@ class BacktestRunner:
 
         setup_by_side: dict[str, list[dict[str, Any]]] = {}
 
-        # Keep the one full-history BOS scan for performance. BOS events are
-        # point-in-time causal: ATR at event i uses candles through i, and the
-        # swing used by BOS is constrained by idx + 2 <= i.
+        # Reuse the symbol's precomputed causal BOS events when available.
+        # Falling back to a local calculation keeps this helper compatible with
+        # direct/unit-test callers that do not supply a context.
         for side in ("LONG", "SHORT"):
-            bos_events = _bos_events(
-                c15,
-                side,
-                lookback=len(c15),
-            )
+            if side == "LONG" and bos_long is not None:
+                bos_events = bos_long
+            elif side == "SHORT" and bos_short is not None:
+                bos_events = bos_short
+            else:
+                bos_events = _bos_events(
+                    c15,
+                    side,
+                    lookback=len(c15),
+                )
 
             diagnostics[f"BOS_{side}"] = (
                 diagnostics.get(f"BOS_{side}", 0)
@@ -1441,12 +1449,18 @@ class BacktestRunner:
             int,
         ] = defaultdict(int)
 
+        # Build the causal 15M context once per symbol. It is persisted in the
+        # worker payload and reused for every candidate without look-ahead.
+        backtest_15m_context = _build_15m_backtest_context(c15)
+
         candidate_times = (
             self._find_15m_setup_windows(
                 c15,
                 start,
                 end,
                 diagnostics,
+                bos_long=backtest_15m_context.get("bos_long"),
+                bos_short=backtest_15m_context.get("bos_short"),
             )
         )
 
@@ -1469,6 +1483,7 @@ class BacktestRunner:
                 [],
                 candidate_times,
                 dict(diagnostics),
+                backtest_15m_context,
             )
 
         t5 = asyncio.create_task(
@@ -1541,6 +1556,7 @@ class BacktestRunner:
             c1d_raw,
             candidate_times,
             dict(diagnostics),
+            backtest_15m_context,
         )
 
     def _backtest_symbol(
@@ -1656,20 +1672,33 @@ class BacktestRunner:
         evaluated_times: set[int] = set()
         last_progress = time.monotonic()
 
-        # Build the complete 15M structure once. The engine slices this context
-        # to each candidate prefix, preserving point-in-time/casual semantics
-        # while avoiding a full ATR/swing/BOS rebuild for every candidate.
-        backtest_15m_context = _build_15m_backtest_context(
-            c15,
-            progress_callback=progress_callback,
-        )
-        LOGGER.info(
-            "BACKTEST 15M CONTEXT PRECOMPUTED | symbol=%s candles=%d bos_long=%d bos_short=%d",
-            history.symbol,
-            len(c15),
-            len(backtest_15m_context.get("bos_long", [])),
-            len(backtest_15m_context.get("bos_short", [])),
-        )
+        # Reuse the causal 15M context created during symbol preparation.
+        # Legacy/external SymbolHistory objects may not contain it, so retain a
+        # safe fallback build for those callers.
+        backtest_15m_context = getattr(history, "backtest_15m_context", {}) or {}
+        if (
+            not isinstance(backtest_15m_context, dict)
+            or int(backtest_15m_context.get("count", 0)) < len(c15)
+        ):
+            backtest_15m_context = _build_15m_backtest_context(
+                c15,
+                progress_callback=progress_callback,
+            )
+            LOGGER.info(
+                "BACKTEST 15M CONTEXT FALLBACK | symbol=%s candles=%d bos_long=%d bos_short=%d",
+                history.symbol,
+                len(c15),
+                len(backtest_15m_context.get("bos_long", [])),
+                len(backtest_15m_context.get("bos_short", [])),
+            )
+        else:
+            LOGGER.info(
+                "BACKTEST 15M CONTEXT REUSED | symbol=%s candles=%d bos_long=%d bos_short=%d",
+                history.symbol,
+                len(c15),
+                len(backtest_15m_context.get("bos_long", [])),
+                len(backtest_15m_context.get("bos_short", [])),
+            )
 
         for candidate_index, (signal_close_time, _setup_hint) in enumerate(
             candidates,

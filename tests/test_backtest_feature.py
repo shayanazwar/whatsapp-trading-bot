@@ -427,3 +427,35 @@ async def test_bot_backtest_1d_routes_to_runner(monkeypatch):
     assert runner.days == 1
     assert any("BACKTEST 1D STARTED" in text for _, text in wa.texts)
     assert wa.texts[-1] == ("user", "REPORT 1D")
+
+
+def test_runner_entry_prefilter_rejects_impossible_15m_candidates(monkeypatch):
+    import app.backtest.runner as runner_module
+
+    base = 1_700_000_000_000
+    c15 = [
+        {"time": base + i * M15, "open": 100.0, "high": 100.2, "low": 99.8, "close": 100.0, "volume": 100.0}
+        for i in range(120)
+    ]
+    bos_time = c15[100]["time"] - M15
+    monkeypatch.setattr(
+        runner_module,
+        "_pullback_retest",
+        lambda *args, **kwargs: {"valid": True, "time": c15[101]["time"], "index": 101, "level": 100.0, "quality": 0.9, "rejection": True},
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_bos_events",
+        lambda candles, side, lookback: ([{"time": bos_time, "index": 100, "level": 100.0, "strength": 0.9}] if side == "LONG" else []),
+    )
+
+    diagnostics = {}
+    out = runner_module.BacktestRunner._find_15m_setup_windows(
+        c15,
+        c15[102]["time"] + M15,
+        c15[110]["time"] + M15,
+        diagnostics,
+        atr_values=[1.0] * len(c15),
+    )
+    assert out == ()
+    assert diagnostics["ENTRY_PREFILTER_REJECT"] > 0

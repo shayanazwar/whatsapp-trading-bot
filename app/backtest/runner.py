@@ -16,6 +16,7 @@ from typing import Any
 
 from ..analysis.engine import (
     _bos_events,
+    _build_15m_backtest_context,
     _five_minute_trigger,
     _fifteen_minute_entry_confirmation,
     _four_hour_regime,
@@ -706,6 +707,7 @@ class BacktestRunner:
             watchdog_thread.start()
 
             payload = None
+            analysis_deadline = time.monotonic() + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
             while True:
                 if parent_conn.poll(0):
                     try:
@@ -761,6 +763,27 @@ class BacktestRunner:
                     payload = message
                     break
 
+                if time.monotonic() >= analysis_deadline and not watchdog_timeout.is_set():
+                    watchdog_timeout.set()
+                    watchdog_reason[0] = watchdog_reason[0] or "analysis timeout (parent deadline)"
+                    with progress_lock:
+                        latest_progress = dict(worker_progress)
+                    LOGGER.error(
+                        "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | reason=%s | last_stage=%s | last_progress=%s | boot_timeout=%ss | analysis_timeout=%ss",
+                        history.symbol, process.pid, watchdog_reason[0], latest_progress["stage"], latest_progress["details"], CHILD_BOOT_TIMEOUT_SECONDS, SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
+                    )
+                    if process.is_alive():
+                        try:
+                            process.terminate()
+                            await asyncio.to_thread(process.join, 3.0)
+                        except Exception:
+                            LOGGER.exception("BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s", history.symbol)
+                        if process.is_alive():
+                            try:
+                                process.kill()
+                                await asyncio.to_thread(process.join, 2.0)
+                            except Exception:
+                                LOGGER.exception("BACKTEST WATCHDOG KILL FAILED | symbol=%s", history.symbol)
                 if watchdog_timeout.is_set():
                     with progress_lock:
                         latest_progress = dict(worker_progress)
@@ -1633,6 +1656,21 @@ class BacktestRunner:
         evaluated_times: set[int] = set()
         last_progress = time.monotonic()
 
+        # Build the complete 15M structure once. The engine slices this context
+        # to each candidate prefix, preserving point-in-time/casual semantics
+        # while avoiding a full ATR/swing/BOS rebuild for every candidate.
+        backtest_15m_context = _build_15m_backtest_context(
+            c15,
+            progress_callback=progress_callback,
+        )
+        LOGGER.info(
+            "BACKTEST 15M CONTEXT PRECOMPUTED | symbol=%s candles=%d bos_long=%d bos_short=%d",
+            history.symbol,
+            len(c15),
+            len(backtest_15m_context.get("bos_long", [])),
+            len(backtest_15m_context.get("bos_short", [])),
+        )
+
         for candidate_index, (signal_close_time, _setup_hint) in enumerate(
             candidates,
             start=1,
@@ -1724,7 +1762,7 @@ class BacktestRunner:
                     c5s,
                     c1ds,
                     now_ms=signal_close_time,
-                    cache={"_BACKTEST_PROGRESS_CALLBACK": report_engine_progress},
+                    cache={"_BACKTEST_PROGRESS_CALLBACK": report_engine_progress, "_BACKTEST_15M": backtest_15m_context},
                 )
             except Exception:
                 diagnostics["ENGINE_ERRORS"] += 1
@@ -2040,13 +2078,14 @@ class BacktestRunner:
         days = int(days)
 
         if days not in {
+            1,
             7,
             30,
             90,
         }:
             raise ValueError(
                 "Supported backtests: "
-                "7D, 30D, 90D"
+                "1D, 7D, 30D, 90D"
             )
 
         if self._lock.locked():

@@ -1283,10 +1283,10 @@ class BacktestRunner:
         supplied, entry validation is delegated to the engine helper instead of
         duplicating its rules. The production path passes None.
         """
-        candidates: dict[
-            tuple[int, str],
-            dict[str, Any],
-        ] = {}
+        # Candidate identity is the closed 15M timestamp, not (timestamp, side).
+        # The engine independently determines direction from the point-in-time
+        # candle context, so side duplicates only create work that is skipped later.
+        candidates: dict[int, dict[str, Any]] = {}
 
         open_times = [
             _row_time(row)
@@ -1428,12 +1428,7 @@ class BacktestRunner:
                         )
                         continue
 
-                candidates[
-                    (
-                        close_time,
-                        side,
-                    )
-                ] = {
+                candidates[close_time] = {
                     "side": side,
                     "bos_level": float(
                         active_setup["bos_level"]
@@ -1467,19 +1462,10 @@ class BacktestRunner:
         )
 
         return tuple(
-            (
-                timestamp,
-                meta,
-            )
-            for (
-                timestamp,
-                _side,
-            ), meta in sorted(
+            (timestamp, meta)
+            for timestamp, meta in sorted(
                 candidates.items(),
-                key=lambda item: (
-                    item[0][0],
-                    item[0][1],
-                ),
+                key=lambda item: item[0],
             )
         )
 

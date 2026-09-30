@@ -22,8 +22,6 @@ from ..analysis.engine import (
     _four_hour_regime,
     _one_hour_alignment,
     _pullback_retest,
-    MIN_TRIGGER_BODY,
-    MIN_TRIGGER_RVOL,
     analyze_candles,
     build_btc_context,
     btc_filter_ok,
@@ -71,6 +69,26 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 
 CHILD_PROGRESS_INTERVAL_CALLS = 25
 CHILD_PROGRESS_INTERVAL_SECONDS = 20.0
+IPC_DRAIN_YIELD_EVERY = 100
+IPC_IDLE_SLEEP_SECONDS = 0.05
+IPC_TERMINAL_GRACE_SECONDS = 1.0
+
+
+class BacktestAnalysisTimeout(TimeoutError):
+    """Analysis subprocess exceeded its watchdog/parent deadline."""
+
+    def __init__(self, message: str, *, last_stage: str = "UNKNOWN", last_progress: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.last_stage = last_stage
+        self.last_progress = dict(last_progress or {})
+
+
+class BacktestAnalysisProcessError(RuntimeError):
+    """Isolated child returned a terminal error with its last known progress."""
+
+    def __init__(self, message: str, *, last_progress: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.last_progress = dict(last_progress or {})
 
 
 def _send_child_status(conn: Any, stage: str, details: dict[str, Any]) -> None:
@@ -225,6 +243,8 @@ class SymbolHistory:
     candles_15m: list[list[float | int]]
     candles_5m: list[list[float | int]]
     candles_1d: list[list[float | int]]
+    # Compatibility name retained for existing callers. This is now the
+    # authoritative causal candidate-discovery result, not a technical prefilter.
     prefilter_candidates: tuple[tuple[int, Any], ...] = ()
     diagnostics: dict[str, int] = field(default_factory=dict)
     backtest_15m_context: dict[str, Any] = field(default_factory=dict)
@@ -275,6 +295,95 @@ def _safe_float(
         return float(value)
     except Exception:
         return default
+
+
+def _normalize_engine_reject_reason(reason: Any) -> str:
+    raw = str(reason or "").strip()
+    key = raw.lower().replace(" ", "_").replace("/", "_").replace("-", "_")
+    mapping = {
+        "4h_regime": "4H_REGIME",
+        "1h_alignment": "1H_ALIGNMENT",
+        "15m_bos": "15M_BOS",
+        "15m_post_bos_retest": "15M_RETEST",
+        "15m_directional_setup": "15M_DIRECTIONAL_SETUP",
+        "15m_entry_confirmation": "15M_ENTRY",
+        "5m_trigger_confirmation": "5M_TRIGGER",
+        "momentum": "MOMENTUM",
+        "volume_rvol": "VOLUME_RVOL",
+        "target_path_location": "TARGET_PATH_LOCATION",
+        "risk_rr": "RISK_RR",
+        "volatility": "VOLATILITY",
+        "score": "SCORE",
+        "confirmation_families": "CONFIRMATION_FAMILIES",
+        "technical_hard_gate": "TECHNICAL_HARD_GATE",
+    }
+    if key in mapping:
+        return mapping[key]
+    safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in raw.upper())
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe[:80] or "UNKNOWN"
+
+
+def _log_gate_funnel(diagnostics: dict[str, int]) -> None:
+    def g(key: str) -> int:
+        try:
+            return int(diagnostics.get(key, 0))
+        except Exception:
+            return 0
+
+    LOGGER.info("=" * 72)
+    LOGGER.info("BACKTEST GATE FUNNEL")
+    LOGGER.info("=" * 72)
+    LOGGER.info(
+        "SYMBOLS | discovered=%d selected=%d data_ready=%d data_error=%d "
+        "candidate_bearing=%d analysis_completed=%d analysis_failed=%d",
+        g("SYMBOLS_DISCOVERED"), g("SYMBOLS_SELECTED"),
+        g("SYMBOLS_DATA_READY"), g("SYMBOLS_DATA_ERROR"),
+        g("SYMBOLS_WITH_CANDIDATES"), g("SYMBOLS_ANALYSIS_COMPLETED"),
+        g("SYMBOLS_ANALYSIS_FAILED"),
+    )
+    LOGGER.info(
+        "CANDIDATES | discovered=%d unique_timestamps=%d engine_evaluated=%d "
+        "warmup_reject=%d duplicate_timestamp=%d overlap_skipped=%d",
+        g("CANDIDATES_DISCOVERED"), g("CANDIDATES_UNIQUE_TIMESTAMPS"),
+        g("CANDIDATES_ENGINE_EVALUATED"), g("ENGINE_WARMUP_REJECT"),
+        g("DUPLICATE_TIMESTAMP_SKIPPED"), g("OVERLAPPING_SIGNAL_SKIPPED"),
+    )
+    LOGGER.info(
+        "ACCOUNTING | engine_gap=%d technical_gap=%d",
+        max(0, g("ENGINE_CALLS") - g("ENGINE_SUCCESS") - g("ENGINE_ERRORS") - g("ENGINE_OUTCOME_UNKNOWN_CALLS")),
+        g("TECHNICAL_ACCOUNTING_GAP"),
+    )
+    LOGGER.info(
+        "ENGINE | calls=%d success=%d errors=%d unknown_calls=%d timeouts=%d",
+        g("ENGINE_CALLS"), g("ENGINE_SUCCESS"), g("ENGINE_ERRORS"),
+        g("ENGINE_OUTCOME_UNKNOWN_CALLS"), g("ANALYSIS_TIMEOUT"),
+    )
+    LOGGER.info(
+        "TECHNICAL | accepted=%d rejected=%d structure_duplicates=%d invalid_side=%d "
+        "BTC_accept=%d BTC_reject=%d BTC_errors=%d",
+        g("TECHNICAL_ACCEPT"), g("TECHNICAL_REJECT"),
+        g("DUPLICATE_STRUCTURE_SKIPPED"), g("INVALID_ENGINE_SIDE"),
+        g("BTC_ACCEPT"), g("BTC_REJECT"), g("BTC_CONTEXT_ERRORS"),
+    )
+    LOGGER.info(
+        "SIMULATION | accepted=%d no_trade=%d errors=%d no_future=%d TP2=%d SL=%d expired=%d",
+        g("SIMULATION_ACCEPT"), g("SIMULATION_NO_TRADE"),
+        g("SIMULATION_ERRORS"), g("NO_FUTURE_CANDLES"),
+        g("OUTCOME_TP2"), g("OUTCOME_SL"), g("EXPIRY"),
+    )
+    reject_keys = sorted(
+        ((key, int(value)) for key, value in diagnostics.items()
+         if key.startswith("ENGINE_REJECT_") and int(value) > 0),
+        key=lambda item: (-item[1], item[0]),
+    )
+    if reject_keys:
+        LOGGER.info("TECHNICAL REJECT BUCKETS (one candidate may fail multiple gates):")
+        for key, value in reject_keys[:30]:
+            LOGGER.info("  %s=%d", key[len("ENGINE_REJECT_"):], value)
+    else:
+        LOGGER.info("TECHNICAL REJECT BUCKETS: none")
+    LOGGER.info("=" * 72)
 
 
 async def _fetch_range(
@@ -510,7 +619,7 @@ class BacktestRunner:
                     "processed=%d/%d "
                     "tested=%d "
                     "data_errors=%d "
-                    "engine_errors=%d "
+                    "engine_errors=%d analysis_errors=%d "
                     "simulation_errors=%d "
                     "signals=%d "
                     "worker=%s symbol=%s "
@@ -524,6 +633,7 @@ class BacktestRunner:
                     state.get("tested", 0),
                     state.get("data_errors", 0),
                     state.get("engine_errors", 0),
+                    state.get("analysis_errors", 0),
                     state.get(
                         "simulation_errors",
                         0,
@@ -631,14 +741,12 @@ class BacktestRunner:
 
             def watchdog() -> None:
                 if not child_booted.wait(CHILD_BOOT_TIMEOUT_SECONDS):
-                    if watchdog_stop.is_set() or child_done.is_set():
+                    if watchdog_stop.is_set():
                         return
                     watchdog_reason[0] = "child boot timeout"
                 elif watchdog_stop.wait(SYMBOL_ANALYSIS_TIMEOUT_SECONDS):
                     return
-                if child_done.is_set() or process is None:
-                    return
-                if not process.is_alive():
+                if process is None or not process.is_alive():
                     return
 
                 watchdog_timeout.set()
@@ -721,20 +829,21 @@ class BacktestRunner:
 
             payload = None
             analysis_deadline = time.monotonic() + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
+            terminal_grace_deadline: float | None = None
+
             while True:
-                if parent_conn.poll(0):
+                drained = 0
+
+                # Drain all pending messages. Status traffic is diagnostic and
+                # must never be allowed to back up the child pipe.
+                while parent_conn.poll(0):
                     try:
                         message = parent_conn.recv()
                     except (EOFError, OSError):
                         message = None
 
-                    if message and message[0] in {"ok", "error"}:
-                        LOGGER.info(
-                            "BACKTEST PARENT RESULT RECEIVED | symbol=%s pid=%s type=%s",
-                            history.symbol,
-                            process.pid,
-                            message[0],
-                        )
+                    if message is None:
+                        break
 
                     if message and message[0] == "status":
                         _, child_stage, details = message
@@ -742,26 +851,23 @@ class BacktestRunner:
                             details = {"value": details}
                         message_symbol = str(details.get("symbol", history.symbol))
                         message_pid = details.get("pid", process.pid)
-                        # This pipe belongs to this child, but validate identity
-                        # before accepting state so malformed/stale IPC cannot
-                        # replace another worker's diagnostic.
                         if message_symbol != history.symbol or message_pid != process.pid:
                             LOGGER.warning(
                                 "BACKTEST CHILD STATUS IDENTITY MISMATCH | expected=%s/%s got=%s/%s",
                                 history.symbol, process.pid, message_symbol, message_pid,
                             )
+                            drained += 1
                             continue
+
                         child_booted.set()
                         with progress_lock:
                             worker_progress["stage"] = str(child_stage)
                             worker_progress["details"] = dict(details)
                             progress_key = (history.symbol, process.pid)
+
                         if state is not None:
                             workers = state.setdefault("child_workers", {})
-                            worker_record = workers.setdefault(
-                                progress_key,
-                                {"history": []},
-                            )
+                            worker_record = workers.setdefault(progress_key, {"history": []})
                             history_trace = worker_record.setdefault("history", [])
                             history_trace.append(str(child_stage))
                             if len(history_trace) > 32:
@@ -774,36 +880,64 @@ class BacktestRunner:
                                 }
                             )
                             workers[progress_key] = worker_record
-                            # Keep legacy heartbeat fields as most recently
-                            # received, but never consult them for watchdogs.
                             state["child_stage"] = str(child_stage)
                             state["child_progress"] = dict(details)
                             state["child_pid"] = process.pid
                             state["candidate"] = details.get("candidate", "-")
                             state["candidate_total"] = details.get("candidates", "-")
                             state["engine_calls"] = details.get("engine_calls", 0)
+                            state["engine_success"] = details.get("engine_success", 0)
                             state["engine_seconds"] = details.get("engine_seconds", 0)
                             state["last_engine_seconds"] = details.get("last_engine_seconds", 0)
+
                         LOGGER.info(
                             "BACKTEST CHILD PROGRESS | symbol=%s pid=%s stage=%s details=%s",
-                            history.symbol,
-                            process.pid,
-                            child_stage,
-                            details,
+                            history.symbol, process.pid, child_stage, details,
                         )
+                        drained += 1
+                        if drained >= IPC_DRAIN_YIELD_EVERY:
+                            drained = 0
+                            await asyncio.sleep(0)
                         continue
 
-                    payload = message
+                    if message and message[0] in {"ok", "error"}:
+                        LOGGER.info(
+                            "BACKTEST PARENT RESULT RECEIVED | symbol=%s pid=%s type=%s",
+                            history.symbol, process.pid, message[0],
+                        )
+                        payload = message
+                        break
+
+                    LOGGER.warning(
+                        "BACKTEST UNKNOWN CHILD MESSAGE | symbol=%s pid=%s type=%s",
+                        history.symbol, process.pid, type(message).__name__,
+                    )
+                    drained += 1
+
+                if payload is not None:
                     break
 
-                if time.monotonic() >= analysis_deadline and not watchdog_timeout.is_set():
+                if watchdog_timeout.is_set():
+                    with progress_lock:
+                        latest_progress = dict(worker_progress)
+                    raise BacktestAnalysisTimeout(
+                        f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "
+                        f"pid={process.pid}; last_stage={latest_progress['stage']}; "
+                        f"last_progress={latest_progress['details']!r}",
+                        last_stage=str(latest_progress["stage"]),
+                        last_progress=latest_progress["details"],
+                    )
+
+                now = time.monotonic()
+                if now >= analysis_deadline:
                     watchdog_timeout.set()
                     watchdog_reason[0] = watchdog_reason[0] or "analysis timeout (parent deadline)"
                     with progress_lock:
                         latest_progress = dict(worker_progress)
                     LOGGER.error(
-                        "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | reason=%s | last_stage=%s | last_progress=%s | boot_timeout=%ss | analysis_timeout=%ss",
-                        history.symbol, process.pid, watchdog_reason[0], latest_progress["stage"], latest_progress["details"], CHILD_BOOT_TIMEOUT_SECONDS, SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
+                        "BACKTEST WATCHDOG TIMEOUT | symbol=%s pid=%s reason=%s last_stage=%s last_progress=%s",
+                        history.symbol, process.pid, watchdog_reason[0],
+                        latest_progress["stage"], latest_progress["details"],
                     )
                     if process.is_alive():
                         try:
@@ -817,41 +951,40 @@ class BacktestRunner:
                                 await asyncio.to_thread(process.join, 2.0)
                             except Exception:
                                 LOGGER.exception("BACKTEST WATCHDOG KILL FAILED | symbol=%s", history.symbol)
-                if watchdog_timeout.is_set():
-                    with progress_lock:
-                        latest_progress = dict(worker_progress)
-                    raise TimeoutError(
-                        f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "
-                        f"pid={process.pid}; last_stage={latest_progress['stage']}; "
-                        f"last_progress={latest_progress['details']!r}; "
-                        f"boot_limit={CHILD_BOOT_TIMEOUT_SECONDS}s; "
-                        f"analysis_limit={SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
+                    raise BacktestAnalysisTimeout(
+                        f"{history.symbol}: {watchdog_reason[0]}; pid={process.pid}; "
+                        f"last_stage={latest_progress['stage']}; "
+                        f"last_progress={latest_progress['details']!r}",
+                        last_stage=str(latest_progress["stage"]),
+                        last_progress=latest_progress["details"],
                     )
 
                 if not process.is_alive():
-                    break
+                    if terminal_grace_deadline is None:
+                        terminal_grace_deadline = now + IPC_TERMINAL_GRACE_SECONDS
+                    if now >= terminal_grace_deadline:
+                        break
+                    await asyncio.sleep(0.02)
+                    continue
 
-                await asyncio.sleep(0.10)
+                terminal_grace_deadline = None
+                if drained == 0:
+                    await asyncio.sleep(IPC_IDLE_SLEEP_SECONDS)
 
-            if (
-                payload is None
-                and parent_conn.poll(0)
-            ):
+            # Final non-blocking drain for a terminal payload buffered just as
+            # the child transitioned to not-alive.
+            while payload is None and parent_conn.poll(0):
                 try:
-                    payload = parent_conn.recv()
+                    message = parent_conn.recv()
                 except (EOFError, OSError):
-                    payload = None
-
-            if watchdog_timeout.is_set():
-                with progress_lock:
-                    latest_progress = dict(worker_progress)
-                raise TimeoutError(
-                    f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "
-                    f"pid={process.pid}; last_stage={latest_progress['stage']}; "
-                    f"last_progress={latest_progress['details']!r}; "
-                    f"boot_limit={CHILD_BOOT_TIMEOUT_SECONDS}s; "
-                    f"analysis_limit={SYMBOL_ANALYSIS_TIMEOUT_SECONDS}s"
-                )
+                    break
+                if message and message[0] == "status":
+                    _, child_stage, details = message
+                    with progress_lock:
+                        worker_progress["stage"] = str(child_stage)
+                        worker_progress["details"] = dict(details if isinstance(details, dict) else {"value": details})
+                    continue
+                payload = message
 
             if payload is None:
                 raise RuntimeError(
@@ -860,9 +993,12 @@ class BacktestRunner:
                 )
 
             if payload[0] == "error":
-                raise RuntimeError(
+                with progress_lock:
+                    terminal_progress = dict(worker_progress.get("details") or {})
+                raise BacktestAnalysisProcessError(
                     f"{history.symbol}: isolated analysis failed: "
-                    f"{payload[1]}: {payload[2]}"
+                    f"{payload[1]}: {payload[2]}",
+                    last_progress=terminal_progress,
                 )
 
             if payload[0] != "ok":
@@ -1137,17 +1273,15 @@ class BacktestRunner:
         tuple[int, Any],
         ...,
     ]:
-        """Build candidates equivalent to analyze_candles() at each point in time.
+        """Discover causal 15M BOS+retest timestamps for engine evaluation.
 
-        The authoritative engine uses:
-          1. _bos_events(..., lookback=70)
-          2. newest BOS no older than MAX_SETUP_AGE_15M + 2 candles
-          3. a valid post-BOS retest no older than MAX_SETUP_AGE_15M
+        The runner does not make 4H, 1H, 15M-entry, 5M, momentum, volume,
+        geometry, RR, score, or confirmation-family decisions. Those belong to
+        analyze_candles(). Candidate identity is a closed 15M timestamp.
 
-        The previous Runner incorrectly allowed any BOS inside the 70-candle
-        window as long as its retest was recent. That produced ~1,100 candidates
-        per symbol, while the engine rejected nearly all of them. This function
-        mirrors the engine's actual latest-BOS selection rules.
+        atr_values is retained only for explicit legacy/unit-test callers; when
+        supplied, entry validation is delegated to the engine helper instead of
+        duplicating its rules. The production path passes None.
         """
         candidates: dict[
             tuple[int, str],
@@ -1247,35 +1381,24 @@ class BacktestRunner:
                 for setup in reversed(setup_by_side[side]):
                     bos_index = int(setup["bos_index"])
                     retest_index = int(setup["retest_index"])
-                    bos_time = int(setup["bos_time"])
-                    retest_time = int(setup["retest_time"])
-
                     if bos_index > index:
                         continue
 
-                    # Use candle timestamps for the final age test. This is
-                    # equivalent to the engine's candle-index logic on regular
-                    # MEXC candles and is robust to synthetic/test fixtures whose
-                    # mocked indexes may not match their timestamps.
-                    bos_close_time = bos_time + M15_MS
-                    bos_age_ms = close_time - bos_close_time
-
-                    if bos_age_ms < 0:
+                    # Match the engine's authoritative candle-index age semantics
+                    # exactly. This avoids semantic drift when data has gaps.
+                    bos_age_bars = index - bos_index
+                    if bos_age_bars < 0:
                         continue
-
-                    if bos_age_ms > max_bos_age * M15_MS:
+                    if bos_age_bars > max_bos_age:
                         break
 
                     if retest_index > index:
                         continue
 
-                    retest_close_time = retest_time + M15_MS
-                    retest_age_ms = close_time - retest_close_time
-
-                    if retest_age_ms < 0:
+                    retest_age_bars = index - retest_index
+                    if retest_age_bars < 0:
                         continue
-
-                    if retest_age_ms > MAX_SETUP_AGE_15M * M15_MS:
+                    if retest_age_bars > MAX_SETUP_AGE_15M:
                         continue
 
                     active_setup = setup
@@ -1284,40 +1407,25 @@ class BacktestRunner:
                 if active_setup is None:
                     continue
 
-                # Cheap, causal 15M entry prefilter. In production the
-                # precomputed ATR series is always supplied. Direct/unit-test
-                # callers without that context retain the legacy candidate
-                # behavior so this helper remains backwards compatible.
+                # Production does not perform an entry prefilter here. This
+                # optional branch exists solely for direct/unit-test compatibility
+                # and delegates to the authoritative engine implementation.
                 if atr_values is not None:
-                    if index < 1 or index >= len(c15):
-                        continue
-                    cur = c15[index]
-                    prev = c15[index - 1]
-                    o = float(cur["open"])
-                    h = float(cur["high"])
-                    l = float(cur["low"])
-                    close = float(cur["close"])
-                    ph = float(prev["high"])
-                    pl = float(prev["low"])
-                    rng = max(h - l, 1e-12)
-                    body = abs(close - o) / rng
-                    close_location_long = (close - l) / rng
-                    close_location_short = (h - close) / rng
-                    atr_now = float(atr_values[index]) if index < len(atr_values) else 0.0
-                    level = float(active_setup["bos_level"])
-                    buffer = max(atr_now * 0.05, abs(level) * 0.00025)
-
-                    if active_setup["side"] == "LONG":
-                        breakout = close > level + buffer and close > o and close > ph
-                        reclaim = close > level + buffer and close > o and l <= level + buffer
-                        cheap_ready = (breakout or reclaim) and body >= MIN_TRIGGER_BODY and close_location_long >= 0.70
-                    else:
-                        breakdown = close < level - buffer and close < o and close < pl
-                        reclaim = close < level - buffer and close < o and h >= level - buffer
-                        cheap_ready = (breakdown or reclaim) and body >= MIN_TRIGGER_BODY and close_location_short >= 0.70
-
-                    if not cheap_ready:
-                        diagnostics["ENTRY_PREFILTER_REJECT"] = diagnostics.get("ENTRY_PREFILTER_REJECT", 0) + 1
+                    entry_check = _fifteen_minute_entry_confirmation(
+                        c15[: index + 1],
+                        active_setup["side"],
+                        float(active_setup["bos_level"]),
+                        int(active_setup["retest_time"]),
+                        atr_value=(
+                            float(atr_values[index])
+                            if index < len(atr_values)
+                            else None
+                        ),
+                    )
+                    if not entry_check.get("ready"):
+                        diagnostics["ENTRY_PREFILTER_REJECT"] = (
+                            diagnostics.get("ENTRY_PREFILTER_REJECT", 0) + 1
+                        )
                         continue
 
                 candidates[
@@ -1374,82 +1482,6 @@ class BacktestRunner:
                 ),
             )
         )
-
-    @staticmethod
-    def _prefilter_candidate_times(
-        c4: list,
-        c1: list,
-        candidates: tuple[tuple[int, Any], ...],
-        diagnostics: dict[str, int],
-    ) -> tuple[tuple[int, Any], ...]:
-        """Apply only logically necessary HTF direction gates before full engine work.
-
-        A candidate can never become a technical candidate when the point-in-time
-        4H regime is NO_TRADE or the matching 4H/1H directional alignment is absent.
-        These checks are the same engine helpers used by analyze_candles(), so this
-        optimization does not loosen or change the trading rules. It only prevents
-        impossible timestamps from spawning full engine analysis and avoids the
-        unnecessary 5M/1D downloads for symbols with no viable timestamps.
-        """
-        if not candidates:
-            return ()
-
-        regime_cache: dict[tuple[int, int], dict[str, Any]] = {}
-        alignment_cache: dict[tuple[int, int, str], dict[str, Any]] = {}
-        filtered: list[tuple[int, Any]] = []
-
-        diagnostics["PREFILTER_CANDIDATES_INPUT"] += len(candidates)
-
-        for signal_close_time, setup_hint in candidates:
-            close_time = int(signal_close_time)
-            c4s = _closed_slice(c4, H4_MS, close_time)
-            c1s = _closed_slice(c1, H1_MS, close_time)
-
-            if len(c4s) < 205 or len(c1s) < 205:
-                diagnostics["PREFILTER_WARMUP_REJECT"] += 1
-                continue
-
-            regime_key = (
-                len(c4s),
-                int(c4s[-1]["time"]),
-            )
-            regime = regime_cache.get(regime_key)
-            if regime is None:
-                regime = _four_hour_regime(c4s)
-                regime_cache[regime_key] = regime
-
-            if not (regime.get("bull") or regime.get("bear")):
-                diagnostics["PREFILTER_4H_REJECT"] += 1
-                continue
-            diagnostics["PREFILTER_4H_PASS"] += 1
-
-            align_key = (
-                len(c1s),
-                int(c1s[-1]["time"]),
-                str(regime.get("regime") or "NO_TRADE"),
-            )
-            alignment = alignment_cache.get(align_key)
-            if alignment is None:
-                alignment = _one_hour_alignment(c1s, regime)
-                alignment_cache[align_key] = alignment
-
-            direction_ok = bool(
-                (regime.get("bull") and alignment.get("long"))
-                or (regime.get("bear") and alignment.get("short"))
-            )
-            if not direction_ok:
-                diagnostics["PREFILTER_1H_DIRECTION_REJECT"] += 1
-                continue
-
-            diagnostics["PREFILTER_1H_DIRECTION_PASS"] += 1
-            filtered.append((close_time, setup_hint))
-
-        diagnostics["PREFILTER_CANDIDATES_OUTPUT"] += len(filtered)
-        diagnostics["PREFILTER_CANDIDATES_REMOVED"] += max(
-            0,
-            len(candidates) - len(filtered),
-        )
-        return tuple(filtered)
 
     async def _prepare_symbol_history(
         self,
@@ -1613,27 +1645,12 @@ class BacktestRunner:
                 diagnostics,
                 bos_long=backtest_15m_context.get("bos_long"),
                 bos_short=backtest_15m_context.get("bos_short"),
-                atr_values=backtest_15m_context.get("atr"),
             )
         )
 
-        # Fast, semantics-preserving HTF prefilter. A timestamp that fails the
-        # exact 4H/1H direction gate can never become a technical candidate.
-        candidate_times = self._prefilter_candidate_times(
-            c4,
-            c1,
-            candidate_times,
-            diagnostics,
-        )
-
-        LOGGER.info(
-            "BACKTEST CANDIDATE PREFILTER | symbol=%s input=%d output=%d removed=%d 4h_reject=%d direction_reject=%d",
-            symbol,
-            diagnostics.get("PREFILTER_CANDIDATES_INPUT", 0),
-            diagnostics.get("PREFILTER_CANDIDATES_OUTPUT", 0),
-            diagnostics.get("PREFILTER_CANDIDATES_REMOVED", 0),
-            diagnostics.get("PREFILTER_4H_REJECT", 0),
-            diagnostics.get("PREFILTER_1H_DIRECTION_REJECT", 0),
+        diagnostics["CANDIDATES_DISCOVERED"] = len(candidate_times)
+        diagnostics["CANDIDATES_UNIQUE_TIMESTAMPS"] = len(
+            {int(item[0]) for item in candidate_times}
         )
 
         if not candidate_times:
@@ -1759,31 +1776,22 @@ class BacktestRunner:
         btc1 = convert_candles(btc_history.candles_1h)
         btc15 = convert_candles(btc_history.candles_15m)
 
-        candidates = tuple(
-            getattr(
-                history,
-                "prefilter_candidates",
-                (),
-            )
-            or ()
-        )
-
-        if not candidates:
+        raw_candidates = getattr(history, "prefilter_candidates", None)
+        # None = legacy/uninitialized. Empty tuple = real discovery result.
+        # Never regenerate an explicitly empty candidate list inside the child.
+        if raw_candidates is None:
             local_diag = defaultdict(int)
-            candidates = self._find_15m_setup_windows(
+            raw_candidates = self._find_15m_setup_windows(
                 c15,
                 start,
                 end,
                 local_diag,
             )
             history.diagnostics = {
-                **getattr(
-                    history,
-                    "diagnostics",
-                    {},
-                ),
+                **getattr(history, "diagnostics", {}),
                 **dict(local_diag),
             }
+        candidates = tuple(raw_candidates or ())
 
         diagnostics: defaultdict[str, int] = defaultdict(
             int,
@@ -1837,6 +1845,7 @@ class BacktestRunner:
         seen_structures: set[tuple[Any, Any, Any]] = set()
 
         engine_calls = 0
+        engine_success = 0
         engine_seconds = 0.0
         btc_seconds = 0.0
         simulation_seconds = 0.0
@@ -1871,14 +1880,6 @@ class BacktestRunner:
                 len(backtest_15m_context.get("bos_long", [])),
                 len(backtest_15m_context.get("bos_short", [])),
             )
-
-        # Reuse the engine's pure calculation cache across candidate calls.
-        # This is safe because analyze_candles() keys cached values by causal
-        # candle prefix/timeframe; changing the callback each iteration keeps
-        # progress reporting current without discarding expensive calculations.
-        engine_cache: dict[str, Any] = {
-            "_BACKTEST_15M": backtest_15m_context,
-        }
 
         for candidate_index, (signal_close_time, _setup_hint) in enumerate(
             candidates,
@@ -1942,6 +1943,9 @@ class BacktestRunner:
                 continue
 
             engine_started = time.monotonic()
+            engine_calls += 1
+            diagnostics["ENGINE_CALLS"] = engine_calls
+            diagnostics["CANDIDATES_ENGINE_EVALUATED"] = engine_calls
 
             def report_engine_progress(stage: str, details: dict[str, Any] | None = None) -> None:
                 if progress_callback is None:
@@ -1952,12 +1956,12 @@ class BacktestRunner:
                     candidate=candidate_index,
                     candidates=len(candidates),
                     engine_calls=engine_calls,
+                    engine_success=engine_success,
                     elapsed_seconds=round(time.monotonic() - symbol_started, 2),
                 )
                 progress_callback(stage, status)
 
             # Surface long-running engine stages while the call is still active.
-            engine_cache["_BACKTEST_PROGRESS_CALLBACK"] = report_engine_progress
             report_engine_progress(
                 "ENGINE_CALL_START",
                 {"engine_seconds": round(engine_seconds, 2)},
@@ -1972,9 +1976,14 @@ class BacktestRunner:
                     c5s,
                     c1ds,
                     now_ms=signal_close_time,
-                    cache=engine_cache,
+                    cache={
+                        "_BACKTEST_PROGRESS_CALLBACK": report_engine_progress,
+                        "_BACKTEST_15M": backtest_15m_context,
+                    },
                 )
                 elapsed_engine = time.monotonic() - engine_started
+                engine_success += 1
+                diagnostics["ENGINE_SUCCESS"] = engine_success
                 report_engine_progress(
                     "ENGINE_CALL_DONE",
                     {
@@ -1982,9 +1991,20 @@ class BacktestRunner:
                         "technical_candidate": bool(analysis.get("technical_candidate")),
                     },
                 )
-            except Exception:
+            except Exception as exc:
+                elapsed_engine = time.monotonic() - engine_started
+                engine_seconds += elapsed_engine
+                diagnostics["ENGINE_TIME_MS"] += int(elapsed_engine * 1000)
                 diagnostics["ENGINE_ERRORS"] += 1
                 diagnostics["ENGINE_EXCEPTION"] += 1
+                report_engine_progress(
+                    "ENGINE_CALL_ERROR",
+                    {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "engine_errors": diagnostics["ENGINE_ERRORS"],
+                    },
+                )
                 LOGGER.exception(
                     "BACKTEST ENGINE FAILED | symbol=%s | candidate=%d/%d | signal=%d",
                     history.symbol,
@@ -1996,9 +2016,9 @@ class BacktestRunner:
 
             elapsed_engine = time.monotonic() - engine_started
             engine_seconds += elapsed_engine
-            engine_calls += 1
-
             diagnostics["ENGINE_CALLS"] = engine_calls
+            diagnostics["ENGINE_SUCCESS"] = engine_success
+            diagnostics["CANDIDATES_ENGINE_EVALUATED"] = engine_calls
             diagnostics["ENGINE_TIME_MS"] += int(elapsed_engine * 1000)
 
             now = time.monotonic()
@@ -2009,12 +2029,13 @@ class BacktestRunner:
                 last_progress = now
                 LOGGER.info(
                     "BACKTEST ENGINE PROGRESS | symbol=%s candidate=%d/%d "
-                    "full_engine_calls=%d technical_accept=%d "
+                    "engine_calls=%d engine_success=%d technical_accept=%d "
                     "elapsed=%.1fs engine_seconds=%.1fs last_engine=%.3fs",
                     history.symbol,
                     candidate_index,
                     len(candidates),
                     engine_calls,
+                    engine_success,
                     diagnostics["TECHNICAL_ACCEPT"],
                     time.monotonic() - symbol_started,
                     engine_seconds,
@@ -2028,6 +2049,7 @@ class BacktestRunner:
                             "candidate": candidate_index,
                             "candidates": len(candidates),
                             "engine_calls": engine_calls,
+                            "engine_success": engine_success,
                             "technical_accept": diagnostics["TECHNICAL_ACCEPT"],
                             "elapsed_seconds": round(time.monotonic() - symbol_started, 2),
                             "engine_seconds": round(engine_seconds, 2),
@@ -2045,7 +2067,8 @@ class BacktestRunner:
 
                 for reason in failures:
                     reason_text = str(reason)
-                    diagnostics[f"ENGINE_REJECT_{reason_text}"] += 1
+                    bucket = _normalize_engine_reject_reason(reason_text)
+                    diagnostics[f"ENGINE_REJECT_{bucket}"] += 1
 
                 continue
 
@@ -2249,6 +2272,16 @@ class BacktestRunner:
             previous_exit_time = trade.exit_time_ms
 
         diagnostics["ENGINE_CALLS"] = engine_calls
+        diagnostics["ENGINE_SUCCESS"] = engine_success
+        diagnostics["CANDIDATES_ENGINE_EVALUATED"] = engine_calls
+        diagnostics["ENGINE_ERRORS"] = int(diagnostics.get("ENGINE_ERRORS", 0))
+        diagnostics["ENGINE_OUTCOME_UNKNOWN_CALLS"] = int(diagnostics.get("ENGINE_OUTCOME_UNKNOWN_CALLS", 0))
+        diagnostics["TECHNICAL_ACCOUNTING_GAP"] = max(
+            0,
+            engine_success
+            - int(diagnostics.get("TECHNICAL_ACCEPT", 0))
+            - int(diagnostics.get("TECHNICAL_REJECT", 0)),
+        )
         diagnostics["ENGINE_TIME_MS"] = int(engine_seconds * 1000)
         diagnostics["BTC_TIME_MS"] = int(btc_seconds * 1000)
         diagnostics["SIMULATION_TIME_MS"] = int(simulation_seconds * 1000)
@@ -2268,15 +2301,18 @@ class BacktestRunner:
 
         LOGGER.info(
             "BACKTEST SYMBOL ANALYSIS COMPLETE | "
-            "symbol=%s candidates=%d engine_calls=%d "
-            "technical_accept=%d btc_reject=%d trades=%d "
+            "symbol=%s candidates=%d engine_calls=%d engine_success=%d engine_errors=%d "
+            "technical_accept=%d technical_reject=%d btc_reject=%d trades=%d "
             "engine_seconds=%.2f btc_seconds=%.2f "
             "simulation_seconds=%.2f total_seconds=%.2f "
             "top_rejects=%s",
             history.symbol,
             len(candidates),
             engine_calls,
+            engine_success,
+            diagnostics["ENGINE_ERRORS"],
             diagnostics["TECHNICAL_ACCEPT"],
+            diagnostics["TECHNICAL_REJECT"],
             diagnostics["BTC_REJECT"],
             len(trades),
             engine_seconds,
@@ -2330,6 +2366,7 @@ class BacktestRunner:
                 "tested": 0,
                 "data_errors": 0,
                 "engine_errors": 0,
+                "analysis_errors": 0,
                 "simulation_errors": 0,
                 "signals": 0,
                 "worker": "-",
@@ -2388,12 +2425,13 @@ class BacktestRunner:
 
                 try:
 
-                    symbols = list(
+                    all_symbols = list(
                         await asyncio.wait_for(
                             self.universe.refresh(),
                             timeout=60,
                         )
-                    )[:MAX_BACKTEST_SYMBOLS]
+                    )
+                    symbols = all_symbols[:MAX_BACKTEST_SYMBOLS]
 
                 except Exception:
 
@@ -2414,6 +2452,9 @@ class BacktestRunner:
                 state[
                     "total"
                 ] = len(symbols)
+
+                diagnostics["SYMBOLS_DISCOVERED"] = len(all_symbols)
+                diagnostics["SYMBOLS_SELECTED"] = len(symbols)
 
                 LOGGER.info(
                     "BACKTEST START | "
@@ -2523,19 +2564,12 @@ class BacktestRunner:
                                         )
                                     )
 
-                                for (
-                                    key,
-                                    value,
-                                ) in (
-                                    history
-                                    .diagnostics
-                                    .items()
-                                ):
-                                    diagnostics[
-                                        key
-                                    ] += int(
-                                        value
-                                    )
+                                async with state_lock:
+                                    for key, value in history.diagnostics.items():
+                                        diagnostics[key] += int(value)
+                                    diagnostics["SYMBOLS_DATA_READY"] += 1
+                                    if history.prefilter_candidates:
+                                        diagnostics["SYMBOLS_WITH_CANDIDATES"] += 1
 
                             except asyncio.CancelledError:
                                 raise
@@ -2546,6 +2580,7 @@ class BacktestRunner:
                                     state[
                                         "data_errors"
                                     ] += 1
+                                    diagnostics["SYMBOLS_DATA_ERROR"] += 1
 
                                 diagnostics[
                                     (
@@ -2574,9 +2609,10 @@ class BacktestRunner:
                                     "data_seconds"
                                 ] += data_seconds
 
-                            state[
-                                "phase"
-                            ] = "ANALYSIS"
+                            async with state_lock:
+                                state[
+                                    "phase"
+                                ] = "ANALYSIS"
 
                             analysis_started = (
                                 time.monotonic()
@@ -2601,27 +2637,22 @@ class BacktestRunner:
                                     )
                                 )
 
-                                for (
-                                    key,
-                                    value,
-                                ) in (
-                                    symbol_diag.items()
-                                ):
-
-                                    delta = (
-                                        int(value)
-                                        - int(
-                                            pre_analysis_diag.get(
-                                                key,
-                                                0,
-                                            )
-                                        )
+                                async with state_lock:
+                                    for key, value in symbol_diag.items():
+                                        delta = int(value) - int(pre_analysis_diag.get(key, 0))
+                                        if delta > 0:
+                                            diagnostics[key] += delta
+                                    diagnostics["SYMBOLS_ANALYSIS_COMPLETED"] += 1
+                                    state["engine_errors"] += max(
+                                        0,
+                                        int(symbol_diag.get("ENGINE_ERRORS", 0))
+                                        - int(pre_analysis_diag.get("ENGINE_ERRORS", 0)),
                                     )
-
-                                    if delta > 0:
-                                        diagnostics[
-                                            key
-                                        ] += delta
+                                    state["simulation_errors"] += max(
+                                        0,
+                                        int(symbol_diag.get("SIMULATION_ERRORS", 0))
+                                        - int(pre_analysis_diag.get("SIMULATION_ERRORS", 0)),
+                                    )
 
                             except asyncio.CancelledError:
                                 raise
@@ -2629,10 +2660,8 @@ class BacktestRunner:
                             except Exception as exc:
 
                                 async with state_lock:
-
-                                    state[
-                                        "engine_errors"
-                                    ] += 1
+                                    state["analysis_errors"] += 1
+                                    diagnostics["SYMBOLS_ANALYSIS_FAILED"] += 1
 
                                 diagnostics[
                                     (
@@ -2640,6 +2669,27 @@ class BacktestRunner:
                                         f"{type(exc).__name__}"
                                     )
                                 ] += 1
+
+                                last_progress = getattr(exc, "last_progress", {})
+                                known_calls = known_success = known_errors = 0
+                                if isinstance(last_progress, dict):
+                                    try:
+                                        known_calls = int(last_progress.get("engine_calls", 0))
+                                        known_success = int(last_progress.get("engine_success", 0))
+                                        known_errors = int(last_progress.get("engine_errors", 0))
+                                    except (TypeError, ValueError):
+                                        known_calls = known_success = known_errors = 0
+                                unknown_calls = max(0, known_calls - known_success - known_errors)
+                                if known_calls:
+                                    diagnostics["ENGINE_CALLS"] += known_calls
+                                    diagnostics["CANDIDATES_ENGINE_EVALUATED"] += known_calls
+                                if known_success:
+                                    diagnostics["ENGINE_SUCCESS"] += known_success
+                                if known_errors:
+                                    diagnostics["ENGINE_ERRORS"] += known_errors
+                                    state["engine_errors"] += known_errors
+                                if unknown_calls:
+                                    diagnostics["ENGINE_OUTCOME_UNKNOWN_CALLS"] += unknown_calls
 
                                 if isinstance(
                                     exc,
@@ -2802,31 +2852,14 @@ class BacktestRunner:
                     diagnostics=diagnostics,
                 )
 
-                LOGGER.info(
-                    "BACKTEST GATE FUNNEL | "
-                    "candidates_in=%d "
-                    "after_htf_direction=%d "
-                    "4h_reject=%d "
-                    "direction_reject=%d "
-                    "engine_calls=%d "
-                    "technical_accept=%d "
-                    "btc_reject=%d "
-                    "trades=%d",
-                    diagnostics.get("PREFILTER_CANDIDATES_INPUT", 0),
-                    diagnostics.get("PREFILTER_CANDIDATES_OUTPUT", 0),
-                    diagnostics.get("PREFILTER_4H_REJECT", 0),
-                    diagnostics.get("PREFILTER_1H_DIRECTION_REJECT", 0),
-                    diagnostics.get("ENGINE_CALLS", 0),
-                    diagnostics.get("TECHNICAL_ACCEPT", 0),
-                    diagnostics.get("BTC_REJECT", 0),
-                    len(trades),
-                )
+                _log_gate_funnel(dict(diagnostics))
 
                 LOGGER.info(
                     "BACKTEST COMPLETE | "
                     "days=%d tested=%d "
                     "data_errors=%d "
                     "engine_errors=%d "
+                    "analysis_errors=%d "
                     "simulation_errors=%d "
                     "signals=%d duration=%.2fs",
                     days,
@@ -2838,6 +2871,9 @@ class BacktestRunner:
                     ],
                     state[
                         "engine_errors"
+                    ],
+                    state[
+                        "analysis_errors"
                     ],
                     state[
                         "simulation_errors"

@@ -5,42 +5,52 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from .charts import ChartRenderer
-from .formatting import fmt_price
-from .analysis.engine import analyze_symbol
-from .config import Settings
-from .database import Alert, Database
-from .market import MarketData, MarketRef, TIMEFRAME_ALIASES
-from .whatsapp import WhatsAppClient
+try:
+    from .charts import ChartRenderer
+    from .formatting import fmt_price
+    from .analysis.engine import analyze_symbol
+    from .backtest.runner import BacktestAlreadyRunning, BacktestRunner
+    from .config import Settings
+    from .database import Alert, Database
+    from .market import MarketData, MarketRef, TIMEFRAME_ALIASES
+    from .whatsapp import WhatsAppClient
+except ImportError:
+    from charts import ChartRenderer
+    from formatting import fmt_price
+    from app.analysis.engine import analyze_symbol
+    from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner
+    from config import Settings
+    from database import Alert, Database
+    from market import MarketData, MarketRef, TIMEFRAME_ALIASES
+    from whatsapp import WhatsAppClient
 
 LOGGER = logging.getLogger(__name__)
 
-HELP = """📈 WhatsApp Trading Bot
+HELP = """ðŸ“ˆ WhatsApp Trading Bot
 
-Commands:
-
+ðŸ’° PRICE
 PRICE BTCUSDT
 
+ðŸ“Š ANALYZE
 ANALYZE BTCUSDT
-ANALYZE ETHUSDT
-ANALYZE SOLUSDT
 
+ðŸ“ˆ CHART
 CHART BTCUSDT 1H
-CHART BINANCE:BTCUSDT 4H
-CHART BYBIT:BTC/USDT 15M
 
+ðŸ”” ALERT
 ALERT BTCUSDT ABOVE 120000
-ALERT BTCUSDT BELOW 110000
-ALERTS
-DELETE 12
-DELETE ALL
+ALERTS â€¢ DELETE 12 â€¢ DELETE ALL
 
+ðŸ”Ž SEARCH
 SEARCH PEPE
-SEARCH AIOT
 
-Charts: 5M, 15M, 1H, 4H, 1D
+ðŸ§ª BACKTEST
+BACKTEST 1D
+BACKTEST 7D
+BACKTEST 30D
+BACKTEST 90D
 
-Alerts are one-shot and trigger on a price crossing the target.
+â± 5M â€¢ 15M â€¢ 1H â€¢ 4H â€¢ 1D
 """
 
 COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
@@ -66,6 +76,10 @@ class Bot:
         self.market = market
         self.whatsapp = whatsapp
         self.charts = charts
+        self.backtest_runner: BacktestRunner | None = None
+
+    def set_backtest_runner(self, runner: BacktestRunner) -> None:
+        self.backtest_runner = runner
 
     async def handle(self, phone: str, text: str) -> None:
         cleaned = text.strip()
@@ -73,16 +87,13 @@ class Bot:
         if not cleaned:
             return
 
-        if phone not in self.settings.allowed_user_set:
-    await self.whatsapp.send_text(
-        phone,
-        "❌ Access Denied\n\nThis bot is available to paid members only.\n\n💳 Contact admin to get access.",
-    )
-    return
+        if (
+            self.settings.allowed_user_set
+            and phone not in self.settings.allowed_user_set
         ):
             await self.whatsapp.send_text(
                 phone,
-                "⛔ This bot is private.",
+                "â›” This bot is private.",
             )
             return
 
@@ -146,6 +157,12 @@ class Bot:
                     args,
                 )
 
+            elif command == "BACKTEST":
+                await self._backtest(
+                    phone,
+                    args,
+                )
+
             else:
                 # Friendly shortcut:
                 # "BTCUSDT 1H" means chart
@@ -163,7 +180,7 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"❌ {exc}",
+                f"âŒ {exc}",
             )
 
     async def _price(
@@ -183,15 +200,10 @@ class Bot:
             raw
         )
 
-        if ref.exchange != "binance":
-            raise ValueError(
-                "PRICE currently uses Binance spot real-time prices. "
-                "Use a Binance symbol."
-            )
+        if ref.exchange != "mexc":
+            raise ValueError("Only MEXC Futures markets are supported.")
 
-        price = await self.market.binance_price(
-            ref.symbol
-        )
+        price = await self.market.price(ref.symbol)
 
         if price is None:
             raise ValueError(
@@ -201,8 +213,8 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"💰 {ref.symbol}\n"
-                f"Exchange: BINANCE SPOT\n"
+                f"ðŸ’° {ref.symbol}\n"
+                f"Exchange: MEXC FUTURES\n"
                 f"Price: ${fmt_price(price)}"
             ),
         )
@@ -214,71 +226,66 @@ class Bot:
     ) -> None:
 
         if not args:
-            raise ValueError(
-                "Usage: ANALYZE BTCUSDT"
-            )
+            raise ValueError("Usage: ANALYZE BTCUSDT")
 
         raw_symbol = args.split()[0]
 
-        data = await analyze_symbol(
-            self.market,
-            raw_symbol,
-        )
+        try:
+            data = await analyze_symbol(self.market, raw_symbol)
+        except TypeError as exc:
+            # Some legacy analysis paths can receive an incomplete numeric value.
+            # Do not expose a Python traceback/type error to the WhatsApp user.
+            if "NoneType" in str(exc) or "abs()" in str(exc):
+                LOGGER.exception("Incomplete analysis data for %s", raw_symbol)
+                await self.whatsapp.send_text(
+                    phone,
+                    f"âš ï¸ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
+                )
+                return
+            raise
 
-        def fmt_optional(
-            value: Optional[float],
-        ) -> str:
-
+        def fmt_optional(value: object) -> str:
             if value is None:
                 return "N/A"
+            try:
+                return fmt_price(float(value))
+            except (TypeError, ValueError):
+                return "N/A"
 
-            return fmt_price(value)
+        def fmt_number(value: object, digits: int = 1) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"{float(value):.{digits}f}"
+            except (TypeError, ValueError):
+                return "N/A"
 
         body = (
-            f"🧠 {data['symbol']} ANALYSIS\n\n"
-
-            f"4H Trend: {data['trend_4h']}\n"
-            f"1H Structure: {data['structure_1h']}\n"
-            f"15M Structure: {data['bos_15m']}\n"
-
-            f"EMA 21/50: {data['ema_direction']}\n"
-            f"RSI: {data['rsi']:.1f}\n"
-            f"Volume: {data['volume']}\n"
-
-            f"Support: "
-            f"{fmt_optional(data['support'])}\n"
-
-            f"Resistance: "
-            f"{fmt_optional(data['resistance'])}\n"
-
-            f"Confluence: {data['score']}/6\n\n"
-
-            f"Potential Setup: {data['setup']}\n"
+            f"ðŸ§  {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
+            f"4H Trend: {data.get('trend_4h', 'N/A')}\n"
+            f"1H Structure: {data.get('structure_1h', 'N/A')}\n"
+            f"15M Structure: {data.get('bos_15m', 'N/A')}\n"
+            f"EMA 21/50: {data.get('ema_direction', 'N/A')}\n"
+            f"RSI: {fmt_number(data.get('rsi'))}\n"
+            f"Volume: {data.get('volume', 'N/A')}\n"
+            f"Support: {fmt_optional(data.get('support'))}\n"
+            f"Resistance: {fmt_optional(data.get('resistance'))}\n"
+            f"Score: {data.get('score', 'N/A')}/100\n"
+            f"Families: {data.get('confirmation_family_count', 0)}/6\n\n"
+            f"Potential Setup: {data.get('setup', 'NO TRADE')}\n"
         )
 
-        if data["entry"] is not None:
-
+        entry = data.get("entry")
+        if entry is not None:
             body += (
-                f"Entry: "
-                f"{fmt_price(data['entry'])}\n"
-
-                f"SL: "
-                f"{fmt_price(data['stop_loss'])}\n"
-
-                f"TP1: "
-                f"{fmt_price(data['tp1'])}\n"
-
-                f"TP2: "
-                f"{fmt_price(data['tp2'])}\n"
-
-                f"RR: "
-                f"1:{data['rr']:.2f}"
+                f"Entry: {fmt_optional(entry)}\n"
+                f"SL: {fmt_optional(data.get('stop_loss'))}\n"
+                f"TP1: {fmt_optional(data.get('tp1'))}\n"
+                f"TP2: {fmt_optional(data.get('tp2'))}\n"
+                f"RR: 1:{fmt_number(data.get('rr'), 2)}"
             )
 
-        await self.whatsapp.send_text(
-            phone,
-            body,
-        )
+        await self.whatsapp.send_text(phone, body)
 
     async def _chart(
         self,
@@ -289,58 +296,47 @@ class Bot:
         parts = args.split()
 
         if len(parts) < 2:
-            raise ValueError(
-                "Usage: CHART BTCUSDT 1H"
-            )
+            raise ValueError("Usage: CHART BTCUSDT 1H")
 
         raw_symbol = parts[0]
         raw_tf = parts[1]
 
-        tf = TIMEFRAME_ALIASES.get(
-            raw_tf.upper()
-        )
-
+        tf = TIMEFRAME_ALIASES.get(raw_tf.upper())
         if not tf:
-            raise ValueError(
-                "Supported chart timeframes: "
-                "5M, 15M, 1H, 4H, 1D"
-            )
+            raise ValueError("Supported chart timeframes: 5M, 15M, 1H, 4H, 1D")
 
-        ref = await self.market.resolve(
-            raw_symbol
-        )
-
+        ref = await self.market.resolve(raw_symbol)
         rows = await self.market.ohlcv(
             ref,
             tf,
             self.settings.chart_default_bars,
         )
 
-        path = await self.charts.render(
-            ref,
-            tf,
-            rows,
-        )
-
+        path = None
         try:
-            media_id = await self.whatsapp.upload_image(
-                path
-            )
+            path = await self.charts.render(ref, tf, rows)
+            if path is None:
+                raise RuntimeError("Chart renderer did not return an image file.")
 
+            path = Path(path)
+            if not path.is_file():
+                raise RuntimeError("Chart image was not created.")
+
+            media_id = await self.whatsapp.upload_image(path)
             await self.whatsapp.send_image(
                 phone,
                 media_id,
                 caption=(
-                    f"📊 {ref.exchange.upper()} "
-                    f"{ref.symbol} • {tf.upper()}\n"
-                    f"EMA 21 / EMA 50"
+                    f"ðŸ“Š {ref.exchange.upper()} {ref.symbol} â€¢ {tf.upper()}\n"
+                    f"EMA 21 / 50 / 100 / 200"
                 ),
             )
-
         finally:
-            Path(path).unlink(
-                missing_ok=True
-            )
+            if path is not None:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except (TypeError, ValueError, OSError):
+                    LOGGER.warning("Could not remove temporary chart file: %r", path)
 
     async def _create_alert(
         self,
@@ -383,19 +379,14 @@ class Bot:
             raw_symbol
         )
 
-        if ref.exchange != "binance":
-            raise ValueError(
-                "Real-time alerts in this version "
-                "are enabled for Binance spot symbols."
-            )
+        if ref.exchange != "mexc":
+            raise ValueError("Only MEXC Futures markets are supported.")
 
-        current = await self.market.binance_price(
-            ref.symbol
-        )
+        current = await self.market.price(ref.symbol)
 
         if current is None:
             raise ValueError(
-                "Could not read the current Binance price. "
+                "Could not read the current MEXC price. "
                 "Try again."
             )
 
@@ -421,7 +412,7 @@ class Bot:
 
         alert = self.db.create_alert(
             phone,
-            "binance",
+            "mexc",
             ref.symbol,
             condition,
             target,
@@ -430,7 +421,7 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"✅ Alert #{alert.id} created\n\n"
+                f"âœ… Alert #{alert.id} created\n\n"
                 f"{ref.symbol}\n"
                 f"Condition: "
                 f"{condition.upper()} "
@@ -454,12 +445,12 @@ class Bot:
         if not alerts:
             await self.whatsapp.send_text(
                 phone,
-                "🔔 No active alerts.",
+                "ðŸ”” No active alerts.",
             )
             return
 
         lines = [
-            "🔔 ACTIVE ALERTS",
+            "ðŸ”” ACTIVE ALERTS",
             "",
         ]
 
@@ -502,7 +493,7 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"🗑️ Deleted {count} active alert(s).",
+                f"ðŸ—‘ï¸ Deleted {count} active alert(s).",
             )
 
             return
@@ -522,14 +513,14 @@ class Bot:
 
             await self.whatsapp.send_text(
                 phone,
-                f"🗑️ Alert #{alert_id} deleted.",
+                f"ðŸ—‘ï¸ Alert #{alert_id} deleted.",
             )
 
         else:
 
             await self.whatsapp.send_text(
                 phone,
-                f"❌ Active alert #{alert_id} was not found.",
+                f"âŒ Active alert #{alert_id} was not found.",
             )
 
     async def _search(
@@ -551,12 +542,12 @@ class Bot:
         if not results:
             await self.whatsapp.send_text(
                 phone,
-                "No matching spot markets found.",
+                "No matching MEXC Futures markets found.",
             )
             return
 
         lines = [
-            f"🔎 Matches for {args.upper()}:",
+            f"ðŸ”Ž Matches for {args.upper()}:",
             "",
         ]
 
@@ -567,14 +558,82 @@ class Bot:
 
         lines.append("")
         lines.append(
-            "For a chart, use: "
-            "CHART EXCHANGE:SYMBOL 1H"
+            "Charts use MEXC Futures. Example: CHART MEXC:BTCUSDT 1H"
         )
 
         await self.whatsapp.send_text(
             phone,
             "\n".join(lines),
         )
+
+    async def _backtest(
+        self,
+        phone: str,
+        args: str,
+    ) -> None:
+
+        if self.backtest_runner is None:
+            raise RuntimeError(
+                "Backtest service is not configured."
+            )
+
+        period = args.strip().upper()
+        periods = {
+            "1D": 1,
+            "7D": 7,
+            "30D": 30,
+            "90D": 90,
+        }
+
+        if period not in periods:
+            raise ValueError(
+                "Usage: BACKTEST 1D, BACKTEST 7D, BACKTEST 30D, or BACKTEST 90D"
+            )
+
+        if self.backtest_runner.is_running:
+            await self.whatsapp.send_text(
+                phone,
+                "â³ A backtest is already running. Please wait for it to finish.",
+            )
+            return
+
+        days = periods[period]
+
+        await self.whatsapp.send_text(
+            phone,
+            (
+                f"â³ BACKTEST {period} STARTED\n\n"
+                "Up to 200 eligible MEXC Futures coins will be tested.\n"
+                "No real trades will be executed.\n\n"
+                "I'll send the report here when finished."
+            ),
+        )
+
+        try:
+            summary = await self.backtest_runner.run(days)
+            try:
+                from .backtest.report import format_report
+            except ImportError:
+                from app.backtest.report import format_report
+
+            await self.whatsapp.send_text(
+                phone,
+                format_report(summary),
+            )
+        except BacktestAlreadyRunning:
+            await self.whatsapp.send_text(
+                phone,
+                "â³ A backtest is already running. Please wait for it to finish.",
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "BACKTEST %s failed",
+                period,
+            )
+            await self.whatsapp.send_text(
+                phone,
+                f"âŒ BACKTEST {period} failed: {exc}",
+            )
 
     async def _shortcut(
         self,
@@ -616,9 +675,9 @@ class Bot:
     ) -> None:
 
         body = (
-            f"🚨 PRICE ALERT\n\n"
+            f"ðŸš¨ PRICE ALERT\n\n"
             f"{alert.symbol}\n"
-            f"BINANCE SPOT\n"
+            f"MEXC FUTURES\n"
             f"Current: ${fmt_price(price)}\n"
             f"Target: ${fmt_price(alert.target)}\n"
             f"Condition: {alert.condition.upper()}\n\n"

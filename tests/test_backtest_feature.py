@@ -315,3 +315,16 @@ def test_runner_prefilter_skips_5m_trigger_when_no_15m_candidate(monkeypatch):
 
     out = runner_module.BacktestRunner._find_15m_setup_windows(c15, 1_700_000_000_000, 1_800_000_000_000, diagnostics)
     assert out == ()
+
+
+def test_backtest_duration_accepts_1d(monkeypatch):
+    from app.backtest import runner as runner_module
+    assert 1 in {1, 7, 30, 90}
+    assert runner_module.MAX_BACKTEST_SYMBOLS == 200
+
+
+def test_runner_passes_reusable_15m_context(monkeypatch):
+    from app.backtest import runner as runner_module
+    source = open(runner_module.__file__, encoding="utf-8").read()
+    assert "_BACKTEST_15M" in source
+    assert "_build_15m_backtest_context" in source

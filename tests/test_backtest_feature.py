@@ -429,6 +429,91 @@ async def test_bot_backtest_1d_routes_to_runner(monkeypatch):
     assert wa.texts[-1] == ("user", "REPORT 1D")
 
 
+@pytest.mark.asyncio
+async def test_backtest_subprocess_completion_chain_moves_to_next_symbol():
+    from app.backtest.runner import SymbolHistory
+
+    end_time = 1_700_500_000_000
+
+    def rows(count, interval):
+        start = end_time - (count - 1) * interval
+        return [
+            [
+                start + i * interval,
+                100.0 + i * 0.01,
+                100.5 + i * 0.01,
+                99.5 + i * 0.01,
+                100.1 + i * 0.01,
+                100.0 + i,
+            ]
+            for i in range(count)
+        ]
+
+    c4 = rows(250, H4)
+    c1 = rows(250, H1)
+    c15 = rows(300, M15)
+    c5 = rows(500, M5)
+    c1d = rows(70, D1)
+
+    signal_close = c15[280][0] + M15
+
+    def history(symbol):
+        return SymbolHistory(
+            symbol,
+            c4,
+            c1,
+            c15,
+            c5,
+            c1d,
+            ((signal_close, "LONG"),),
+            {},
+        )
+
+    runner = BacktestRunner.__new__(BacktestRunner)
+    runner.settings = SimpleNamespace(
+        backtest_fee_rate=0.0,
+        backtest_slippage_bps=0.0,
+        backtest_max_holding_minutes=360,
+    )
+    runner.max_concurrency = 1
+
+    btc = history("BTC_USDT")
+
+    state1 = {}
+    trades1, diag1 = await runner._run_symbol_analysis_with_timeout(
+        history("CHAIN_A_USDT"), signal_close, signal_close + M15, btc, state1
+    )
+
+    state2 = {}
+    trades2, diag2 = await runner._run_symbol_analysis_with_timeout(
+        history("CHAIN_B_USDT"), signal_close, signal_close + M15, btc, state2
+    )
+
+    assert isinstance(trades1, list)
+    assert isinstance(trades2, list)
+    assert diag1["ENGINE_CALLS"] == 1
+    assert diag2["ENGINE_CALLS"] == 1
+    trace1 = next(iter(state1["child_workers"].values()))["history"]
+    trace2 = next(iter(state2["child_workers"].values()))["history"]
+    expected_stages = [
+        "ENGINE_STAGE_4H_DONE",
+        "ENGINE_STAGE_1H_DONE",
+        "ENGINE_STAGE_15M_DONE",
+        "ENGINE_STAGE_ENTRY_DONE",
+        "ENGINE_STAGE_5M_DONE",
+        "ENGINE_STAGE_LEVELS_DONE",
+        "ENGINE_STAGE_SCORE_DONE",
+        "ENGINE_STAGE_RETURN",
+        "ENGINE_CALL_DONE",
+    ]
+    for trace in (trace1, trace2):
+        for stage in expected_stages:
+            assert stage in trace
+        positions = [trace.index(stage) for stage in expected_stages]
+        assert positions == sorted(positions)
+
+
+
 def test_runner_entry_prefilter_rejects_impossible_15m_candidates(monkeypatch):
     import app.backtest.runner as runner_module
 

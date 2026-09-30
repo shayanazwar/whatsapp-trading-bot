@@ -26,31 +26,31 @@ except ImportError:
 
 LOGGER = logging.getLogger(__name__)
 
-HELP = """ðŸ“ˆ WhatsApp Trading Bot
+HELP = """📈 WhatsApp Trading Bot
 
-ðŸ’° PRICE
+💰 PRICE
 PRICE BTCUSDT
 
-ðŸ“Š ANALYZE
+📊 ANALYZE
 ANALYZE BTCUSDT
 
-ðŸ“ˆ CHART
+📈 CHART
 CHART BTCUSDT 1H
 
-ðŸ”” ALERT
+🔔 ALERT
 ALERT BTCUSDT ABOVE 120000
-ALERTS â€¢ DELETE 12 â€¢ DELETE ALL
+ALERTS • DELETE 12 • DELETE ALL
 
-ðŸ”Ž SEARCH
+🔎 SEARCH
 SEARCH PEPE
 
-ðŸ§ª BACKTEST
+🧪 BACKTEST
 BACKTEST 1D
 BACKTEST 7D
 BACKTEST 30D
 BACKTEST 90D
 
-â± 5M â€¢ 15M â€¢ 1H â€¢ 4H â€¢ 1D
+⏱ 5M • 15M • 1H • 4H • 1D
 """
 
 COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
@@ -93,7 +93,7 @@ class Bot:
         ):
             await self.whatsapp.send_text(
                 phone,
-                "â›” This bot is private.",
+                "⛔ This bot is private.",
             )
             return
 
@@ -213,7 +213,7 @@ class Bot:
         await self.whatsapp.send_text(
             phone,
             (
-                f"ðŸ’° {ref.symbol}\n"
+                f"💰 {ref.symbol}\n"
                 f"Exchange: MEXC FUTURES\n"
                 f"Price: ${fmt_price(price)}"
             ),
@@ -327,7 +327,7 @@ class Bot:
                 phone,
                 media_id,
                 caption=(
-                    f"ðŸ“Š {ref.exchange.upper()} {ref.symbol} â€¢ {tf.upper()}\n"
+                    f"📊 {ref.exchange.upper()} {ref.symbol} • {tf.upper()}\n"
                     f"EMA 21 / 50 / 100 / 200"
                 ),
             )
@@ -445,12 +445,12 @@ class Bot:
         if not alerts:
             await self.whatsapp.send_text(
                 phone,
-                "ðŸ”” No active alerts.",
+                "🔔 No active alerts.",
             )
             return
 
         lines = [
-            "ðŸ”” ACTIVE ALERTS",
+            "🔔 ACTIVE ALERTS",
             "",
         ]
 
@@ -547,7 +547,7 @@ class Bot:
             return
 
         lines = [
-            f"ðŸ”Ž Matches for {args.upper()}:",
+            f"🔎 Matches for {args.upper()}:",
             "",
         ]
 

@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     mexc_rate_limit_backoff_cap_seconds: float = Field(default=20.0, alias="MEXC_RATE_LIMIT_BACKOFF_CAP_SECONDS")
     mexc_rate_limit_jitter_seconds: float = Field(default=0.25, alias="MEXC_RATE_LIMIT_JITTER_SECONDS")
     candle_limit: int = Field(default=250, alias="CANDLE_LIMIT")
-    min_confluence: int = Field(default=90, alias="MIN_CONFLUENCE")
+    min_confluence: int = Field(default=82, alias="MIN_CONFLUENCE")
     min_rr: float = Field(default=2.0, alias="MIN_RR")
     max_entry_drift_pct: float = Field(default=0.002, alias="MAX_ENTRY_DRIFT_PCT")
     max_mexc_spread_pct: float = Field(default=0.001, alias="MAX_MEXC_SPREAD_PCT")

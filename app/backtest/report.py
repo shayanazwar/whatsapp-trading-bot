@@ -264,6 +264,35 @@ def format_report(summary: BacktestSummary) -> str:
                 f"Exp={_fmt(stat['expectancy_r'])}R"
             )
     if summary.diagnostics:
+        d = summary.diagnostics
+        gate_keys = (
+            "CANDIDATES_DISCOVERED",
+            "CANDIDATES_ENGINE_EVALUATED",
+            "ENGINE_SUCCESS",
+            "ENGINE_ERRORS",
+            "TECHNICAL_ACCEPT",
+            "TECHNICAL_REJECT",
+            "BTC_REJECT",
+            "SIMULATION_ACCEPT",
+            "SIMULATION_NO_TRADE",
+        )
+        gate_lines = [(key, int(d.get(key, 0) or 0)) for key in gate_keys if key in d]
+        reject_keys = sorted(
+            (
+                (key.replace("ENGINE_REJECT_", ""), int(value))
+                for key, value in d.items()
+                if key.startswith("ENGINE_REJECT_") and int(value or 0) > 0
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if gate_lines or reject_keys:
+            lines.append("")
+            lines.append("GATE FUNNEL")
+            lines.extend(f"{key}: {value}" for key, value in gate_lines)
+            if reject_keys:
+                lines.append("TOP ENGINE REJECTIONS")
+                lines.extend(f"{key}: {value}" for key, value in reject_keys[:12])
+
         top = sorted(summary.diagnostics.items(), key=lambda item: (-item[1], item[0]))[:8]
         if top:
             lines.append("")

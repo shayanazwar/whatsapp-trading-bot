@@ -1675,18 +1675,21 @@ class BacktestRunner:
         # worker payload and reused for every candidate without look-ahead.  
         backtest_15m_context = _build_15m_backtest_context(c15)  
   
-        candidate_times = (  
-            self._find_15m_setup_windows(  
-                c15,  
-                start,  
-                end,  
-                diagnostics,  
-                bos_long=backtest_15m_context.get("bos_long"),  
-                bos_short=backtest_15m_context.get("bos_short"),  
-                atr_values=backtest_15m_context.get("atr"),  
-            )  
-        )  
-  
+        # The 15M prefilter only discovers causal BOS/retest setup windows.
+        # Do not pass ATR into the optional 15M entry-confirmation branch here:
+        # the authoritative strategy uses 5M as the execution trigger, so a
+        # 15M entry candle must never discard a valid setup before 5M is checked.
+        candidate_times = (
+            self._find_15m_setup_windows(
+                c15,
+                start,
+                end,
+                diagnostics,
+                bos_long=backtest_15m_context.get("bos_long"),
+                bos_short=backtest_15m_context.get("bos_short"),
+            )
+        )
+
         diagnostics["CANDIDATES_DISCOVERED"] = len(candidate_times)  
         diagnostics["CANDIDATES_UNIQUE_TIMESTAMPS"] = len(  
             {int(item[0]) for item in candidate_times}  

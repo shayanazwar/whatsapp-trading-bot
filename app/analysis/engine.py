@@ -5,7 +5,7 @@ from __future__ import annotations
 V1.7 - deterministic pipeline.
 
 1D context -> 4H regime -> 1H directional evidence ->
-15M BOS/retest -> 5M trigger -> momentum/volume/volatility ->
+15M BOS/retest -> 15M entry confirmation -> momentum/volume/volatility ->
 structural SL -> structural TP path -> RR -> technical candidate.
 
 This module never places orders.
@@ -32,14 +32,14 @@ TIMEFRAME_ALIASES = {
 
 MIN_SCORE = 82
 MIN_RR = 2.0
-MIN_FAMILIES = 5
+MIN_FAMILIES = 4
 # Intraday geometry is structural. Percentage stop/target floors are deliberately
 # absent. ATR is used only as a volatility/buffer sanity check around structure.
 MIN_SL_ATR = 0.50
-MAX_SL_ATR = 2.50
+MAX_SL_ATR = 2.75
 MIN_ATR_PERCENTILE = 20.0
 MAX_ATR_PERCENTILE = 95.0
-MAX_SETUP_AGE_15M = 8
+MAX_SETUP_AGE_15M = 16
 MAX_ENTRY_DISTANCE_ATR = 3.00
 BOS_BUFFER_ATR = 0.10
 BOS_BUFFER_PCT = 0.0005
@@ -51,8 +51,8 @@ MIN_TRIGGER_BODY = 0.55
 RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
 # TP1 is the first meaningful structural obstacle; TP2 must clear 2R.
-MIN_TP1_ATR = 0.40
-MIN_TP2_ATR = 1.00
+MIN_TP1_ATR = 0.60
+MIN_TP2_ATR = 1.50
 INTRADAY_MAX_HOLD_MINUTES = 360
 ENGINE_VERSION = "gold-v4.0-intraday-state-machine"
 
@@ -975,26 +975,31 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
     tp1 = float(tp1_level["price"])
     base["obstacle"] = tp1
 
-    # TP2 must be the first meaningful higher-timeframe level beyond TP1 that
-    # provides the required final RR. There is deliberately no MAX_TP2_R cap.
+    # TP2 prefers a meaningful higher-timeframe structural level. When no
+    # 1H/4H/1D level can satisfy the swing-distance + RR requirements, fall back
+    # to the next valid 15M structural level rather than rejecting a tradable
+    # path solely because a higher-timeframe level is absent.
     major = {"1H", "4H", "1D"}
     tp2_level = None
-    for level in ordered:
-        price = float(level["price"])
-        farther = price > tp1 + clearance if side == "LONG" else price < tp1 - clearance
-        if not farther:
-            continue
-        if str(level.get("timeframe")) not in major:
-            continue
-        distance = abs(price - entry)
-        if distance >= MIN_TP2_ATR * atr_value and distance / risk >= MIN_RR:
-            tp2_level = level
+    minimum_distance = max(MIN_TP2_ATR * atr_value, MIN_RR * risk)
+    for require_major in (True, False):
+        for level in ordered:
+            price = float(level["price"])
+            farther = price > tp1 + clearance if side == "LONG" else price < tp1 - clearance
+            if not farther:
+                continue
+            if require_major and str(level.get("timeframe")) not in major:
+                continue
+            if abs(price - entry) >= minimum_distance:
+                tp2_level = level
+                break
+        if tp2_level is not None:
             break
 
     if tp2_level is None:
         base.update({
             "tp1": tp1,
-            "reason": "no higher-timeframe structural TP2 reaches minimum RR",
+            "reason": "no structural TP2 reaches minimum swing distance and RR",
             "structural": True,
             "tp1_level": tp1_level,
         })
@@ -1133,18 +1138,43 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_score(*,direction_ok,structure_ok,setup_ok,momentum_ok,volume_ok,location_ok,
-                 futures_ok,volatility_ok,trigger_quality=0,rvol=0,bos_quality=0,retest_quality=0):
-    groups={"direction_regime":20 if direction_ok else 0,"market_structure":20 if structure_ok else 0,
-            "setup_entry_trigger":20 if setup_ok else 0,"momentum":10 if momentum_ok else 0,
-            "volume_participation":10 if volume_ok else 0,"location_target_path":10 if location_ok else 0,
-            "futures_market_context":5 if futures_ok else 0,"volatility_execution":5 if volatility_ok else 0}
-    if groups["setup_entry_trigger"]:
-        quality=.50*trigger_quality+.25*bos_quality+.25*retest_quality
-        if quality<.60: groups["setup_entry_trigger"]-=5
-    if groups["volume_participation"] and rvol<1.25:
-        groups["volume_participation"]-=2
-    families=sum(bool(x) for x in (direction_ok,structure_ok,setup_ok,momentum_ok,volume_ok,location_ok))
-    return max(0,min(100,sum(groups.values()))),groups,families
+                 futures_ok,volatility_ok,trigger_quality=0,rvol=0,bos_quality=0,
+                 retest_quality=0,momentum_quality=None,volume_quality=None):
+    """Grade supporting evidence instead of making every family a hard gate."""
+    if momentum_quality is None:
+        momentum_quality = 1.0 if momentum_ok else 0.0
+    if volume_quality is None:
+        volume_quality = 1.0 if volume_ok else _clamp(rvol / 1.50, 0.0, 1.0)
+
+    setup_quality = _clamp(
+        0.50 * _num(trigger_quality)
+        + 0.25 * _num(bos_quality)
+        + 0.25 * _num(retest_quality),
+        0.0,
+        1.0,
+    )
+    groups = {
+        "direction_regime": 20 if direction_ok else 0,
+        "market_structure": 20 if structure_ok else 0,
+        "setup_entry_trigger": 20 if setup_ok else 0,
+        "momentum": int(round(10 * _clamp(_num(momentum_quality), 0.0, 1.0))) if setup_ok else 0,
+        "volume_participation": int(round(10 * _clamp(_num(volume_quality), 0.0, 1.0))) if setup_ok else 0,
+        "location_target_path": 10 if location_ok else 0,
+        "futures_market_context": 5 if futures_ok else 0,
+        "volatility_execution": 5 if volatility_ok else 0,
+    }
+    if groups["setup_entry_trigger"] and setup_quality < 0.55:
+        groups["setup_entry_trigger"] = max(15, groups["setup_entry_trigger"] - 5)
+
+    families = sum(bool(x) for x in (
+        direction_ok,
+        structure_ok,
+        setup_ok,
+        location_ok,
+        _num(momentum_quality) >= 0.55,
+        _num(volume_quality) >= 0.55,
+    ))
+    return max(0, min(100, sum(groups.values()))), groups, families
 
 
 def _data_quality(candles: List[Candle], timeframe_ms: int, minimum: int):
@@ -1234,8 +1264,8 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
         elif alignment["long"] or alignment["short"]:
             failures.append("15M directional setup")
     if setup in {"LONG","SHORT"}:
-        if not momentum_ok: failures.append("momentum")
-        if not volume_ok: failures.append("volume/RVOL")
+        if not momentum_ok: failures.append("momentum support")
+        if not volume_ok: failures.append("volume support")
         if not location_ok: failures.append("target path/location")
         if not risk_ok: failures.append("risk/RR")
         if not volatility_ok: failures.append("volatility")
@@ -1267,7 +1297,7 @@ def analyze_candles(
     c15 = closed_candle_rows(candles_15m, "15m", now)
     c5 = closed_candle_rows(candles_5m or [], "5m", now)
     c1d = closed_candle_rows(candles_1d or [], "1d", now)
-    for candles, tf, n in ((c4, "4h", 205), (c1, "1h", 205), (c15, "15m", 80), (c5, "5m", 30)):
+    for candles, tf, n in ((c4, "4h", 205), (c1, "1h", 205), (c15, "15m", 80)):
         ok, reason = _data_quality(candles, TIMEFRAME_MS[tf], n)
         if not ok:
             raise ValueError(f"{symbol}: {reason}")
@@ -1427,9 +1457,8 @@ def analyze_candles(
         active_bos
         and active_retest
         and active_retest.get("valid")
-        and bos_quality >= 0.70
-        and retest_quality >= 0.80
-        and bool(active_retest.get("rejection"))
+        and bos_quality >= 0.65
+        and retest_quality >= 0.70
     )
 
     entry_15m = _fifteen_minute_entry_confirmation(
@@ -1447,8 +1476,13 @@ def analyze_candles(
         {"trigger_side": trigger_side, "ready": bool(entry_15m.get("ready"))},
     )
 
-    # 5M is the immediate execution trigger for the validated 15M setup.
-    refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level)
+    # 5M is optional refinement for a 15M setup and is never eligibility-gating.
+    refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level) if len(c5) >= 30 else {
+        "ready": False, "long": False, "short": False, "quality": 0.0, "rsi": 50.0,
+        "rvol": 0.0, "atr": 0.0, "candle_time": 0, "body_ratio": 0.0,
+        "trigger_type": "OPTIONAL_NOT_AVAILABLE", "reason": "5M refinement not available",
+        "bos_level": None, "volume_expanding": False,
+    }
     if refinement_5m.get("ready") and retest_time is not None and int(refinement_5m["candle_time"]) < retest_time:
         refinement_5m = dict(refinement_5m)
         refinement_5m.update({"ready": False, "long": False, "short": False, "trigger_type": "INVALID_BEFORE_RETEST"})
@@ -1461,8 +1495,7 @@ def analyze_candles(
         },
     )
 
-    # 5M is the execution trigger. 15M BOS/retest defines the setup; a separate
-    # 15M momentum candle is not a mandatory second entry gate.
+    # 15M BOS/retest defines the setup; 5M is optional refinement only.
     setup = trigger_side if structure_quality_ok else "NO TRADE"
 
     sr_key = _cache_key("SRACTIONABLE", c15)
@@ -1489,19 +1522,30 @@ def analyze_candles(
         and 0.0005 <= atr_pct <= 0.05
     )
     macd_line, macd_signal, macd_hist, macd_hist_delta = _macd_components(close15)
-    # The 5M trigger is the user's required momentum confirmation. Keep 15M
-    # momentum/volume as supporting evidence without making either a hidden
-    # duplicate hard gate.
-    momentum_ok = bool(
-        refinement_5m.get("ready")
-        or (setup == "LONG" and 55.0 <= r15 <= 72.0 and macd_hist > 0 and macd_hist_delta >= 0.0)
-        or (setup == "SHORT" and 28.0 <= r15 <= 45.0 and macd_hist < 0 and macd_hist_delta <= 0.0)
+    # Momentum and volume are supporting evidence, not independent hard gates.
+    if setup == "LONG":
+        momentum_quality = _clamp((r15 - 48.0) / 20.0, 0.0, 1.0)
+        if macd_hist > 0:
+            momentum_quality = _clamp(momentum_quality + 0.20, 0.0, 1.0)
+        if macd_hist_delta >= 0.0:
+            momentum_quality = _clamp(momentum_quality + 0.10, 0.0, 1.0)
+    elif setup == "SHORT":
+        momentum_quality = _clamp((52.0 - r15) / 20.0, 0.0, 1.0)
+        if macd_hist < 0:
+            momentum_quality = _clamp(momentum_quality + 0.20, 0.0, 1.0)
+        if macd_hist_delta <= 0.0:
+            momentum_quality = _clamp(momentum_quality + 0.10, 0.0, 1.0)
+    else:
+        momentum_quality = 0.0
+    momentum_ok = bool(momentum_quality >= 0.45)
+
+    rvol_quality = _clamp((rv15 - 0.80) / 0.90, 0.0, 1.0)
+    volume_quality = _clamp(
+        0.80 * rvol_quality + 0.20 * (1.0 if vol15 == "INCREASING" else 0.0),
+        0.0,
+        1.0,
     )
-    volume_ok = bool(
-        refinement_5m.get("ready")
-        and refinement_5m.get("volume_expanding")
-        and _num(refinement_5m.get("rvol")) >= MIN_TRIGGER_RVOL
-    )
+    volume_ok = bool(volume_quality >= 0.55)
     ema21_15 = _safe_ema(close15, 21)
     extension_atr = (abs(price - ema21_15) / atr15) if ema21_15 is not None and atr15 > 0 else 999.0
     ema_extension_ok = bool(
@@ -1560,14 +1604,11 @@ def analyze_candles(
         or (setup == "SHORT" and bos_short and ret_short["valid"]))
         and structure_quality_ok
     )
-    # Core 15M setup + mandatory 5M continuation confirmation.
-    setup_ok = bool(structure_ok and risk_ok and refinement_5m.get("ready"))
-    trigger_quality = _clamp(
-        0.30 * _num(entry_15m.get("quality"))
-        + 0.70 * _num(refinement_5m.get("quality")),
-        0.0,
-        1.0,
-    )
+    # Core 15M setup. 5M can improve diagnostics but cannot invalidate the setup.
+    setup_ok = bool(structure_ok)
+    # The 15M setup owns signal eligibility. 5M is diagnostic/refinement only
+    # and must not influence the score or any hard eligibility decision.
+    trigger_quality = _clamp(_num(entry_15m.get("quality")), 0.0, 1.0)
 
     score, groups, families = _build_score(
         direction_ok=direction_ok,
@@ -1582,6 +1623,8 @@ def analyze_candles(
         rvol=rv15,
         bos_quality=_num((active_bos or {}).get("strength")),
         retest_quality=_num((active_retest or {}).get("quality")),
+        momentum_quality=momentum_quality,
+        volume_quality=volume_quality,
     )
 
     technical_candidate = bool(
@@ -1589,6 +1632,7 @@ def analyze_candles(
         and direction_ok
         and structure_ok
         and setup_ok
+        and location_ok
         and risk_ok
         and volatility_ok
         and rr is not None
@@ -1630,8 +1674,6 @@ def analyze_candles(
     # an unacceptably small stop.
     if setup in {"LONG", "SHORT"} and not levels.get("trade_geometry_ok"):
         failures.append("trade geometry")
-    if setup in {"LONG", "SHORT"} and not refinement_5m.get("ready"):
-        failures.append("5M trigger confirmation")
     if setup in {"LONG", "SHORT"} and not structure_quality_ok:
         failures.append("BOS/retest quality")
     failures = list(dict.fromkeys(failures))
@@ -1652,11 +1694,11 @@ def analyze_candles(
     if entry_15m.get("ready"):
         reasons.append(f"15M {entry_15m.get('trigger_type', 'SETUP')} confirmation supportive")
     if refinement_5m.get("ready"):
-        reasons.append("5M BOS + strong candle + expanding volume confirmed")
+        reasons.append("Optional 5M refinement confirmed")
     if momentum_ok:
         reasons.append("Momentum aligned")
     if volume_ok:
-        reasons.append("5M volume participation aligned")
+        reasons.append("15M volume participation supportive")
     if location_ok:
         reasons.append("Structural target path acceptable")
     if risk_ok and rr is not None:
@@ -1749,11 +1791,11 @@ def analyze_candles(
         "btc_filter_reason": "PENDING",
         "data_fresh": True,
         "signal_engine_version": ENGINE_VERSION,
-        "primary_entry_timeframe": "5M",
+        "primary_entry_timeframe": "15M",
         "setup_timeframe": "15M",
         "intraday_max_hold_minutes": INTRADAY_MAX_HOLD_MINUTES,
         "trigger_side": trigger_side,
-        "trigger_5m": "BOS_CONTINUATION" if refinement_5m.get("ready") else "REQUIRED",
+        "trigger_5m": "BOS_CONTINUATION" if refinement_5m.get("ready") else "OPTIONAL",
         "trigger_type_5m": refinement_5m.get("trigger_type", "NONE"),
         "five_minute_bos_level": refinement_5m.get("bos_level"),
         "five_minute_volume_expanding": bool(refinement_5m.get("volume_expanding")),
@@ -1762,11 +1804,13 @@ def analyze_candles(
         "trigger_quality_15m": entry_15m.get("quality", 0.0),
         "entry_15m_close_location": entry_15m.get("close_location", 0.0),
         "structure_quality_ok": structure_quality_ok,
-        "bos_quality_threshold": 0.70,
-        "retest_quality_threshold": 0.80,
+        "bos_quality_threshold": 0.65,
+        "retest_quality_threshold": 0.70,
         "ema_extension_atr": extension_atr,
         "ema_extension_ok": ema_extension_ok,
         "trigger_quality": trigger_quality,
+        "momentum_quality": momentum_quality,
+        "volume_quality": volume_quality,
         "five_minute_ready": bool(refinement_5m.get("ready")),
         "five_minute_close_location": refinement_5m.get("close_location", 0.0),
         "five_minute_long": bool(refinement_5m.get("long")),

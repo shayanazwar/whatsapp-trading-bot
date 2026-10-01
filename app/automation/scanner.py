@@ -7,8 +7,9 @@ from typing import Any
 
 from ..analysis.engine import (
     _bos_events,
-    _fifteen_minute_entry_confirmation,
     _five_minute_trigger,
+    _direction_aligned,
+    _fifteen_minute_entry_confirmation,
     _four_hour_regime,
     _one_hour_alignment,
     _select_latest_bos_with_retest,
@@ -19,8 +20,6 @@ from ..analysis.engine import (
     MIN_RR,
     MIN_SL_ATR,
     MAX_SL_ATR,
-    MIN_STOP_DISTANCE_PCT,
-    MAX_STOP_DISTANCE_PCT,
 )
 from ..config import Settings
 from .executor import MexcExecutor
@@ -132,10 +131,8 @@ class MexcScanner:
             try:
                 limit = max(250, int(getattr(self.settings, "candle_limit", 250)))
 
-                # Stage 1: fetch only the minimum technical timeframes. Most
-                # symbols fail the higher-timeframe / 15M setup gates, so there
-                # is no reason to spend additional MEXC requests on 5M/1D data
-                # unless the exact prerequisite gates are satisfied.
+                # Stage 1: fetch the 4H/1H/15M setup context. 5M/1D is fetched only
+                # after a causal 15M BOS/retest setup is found.
                 raw4, raw1, raw15 = await asyncio.gather(
                     self.client.get_klines(symbol, MEXC_INTERVALS["4H"], limit),
                     self.client.get_klines(symbol, MEXC_INTERVALS["1H"], limit),
@@ -159,17 +156,18 @@ class MexcScanner:
                 bos_short, ret_short = _select_latest_bos_with_retest(c15, "SHORT", bos_events_short)
                 long_candidate = bool(alignment.get("long") and bos_long and ret_long.get("valid"))
                 short_candidate = bool(alignment.get("short") and bos_short and ret_short.get("valid"))
+                technical_direction_ok = (
+                    (long_candidate and _direction_aligned("LONG", regime, alignment))
+                    or (short_candidate and _direction_aligned("SHORT", regime, alignment))
+                )
 
-                if not (
-                    (regime.get("bull") and long_candidate)
-                    or (regime.get("bear") and short_candidate)
-                ):
+                if not technical_direction_ok:
                     return self._reject(
                         symbol,
                         "Mandatory 4H/1H/15M technical gates not satisfied",
                         stage="TECHNICAL",
                         analysis={
-                            "trend_4h": "BULLISH" if regime.get("bull") else "BEARISH" if regime.get("bear") else "NO_TRADE",
+                            "trend_4h": regime.get("regime", "NO_TRADE"),
                             "one_hour_long_votes": alignment.get("long_votes", 0),
                             "one_hour_short_votes": alignment.get("short_votes", 0),
                             "long_bos_event_count": len(bos_events_long),
@@ -208,26 +206,8 @@ class MexcScanner:
                             "retest_rejection": bool((active_retest or {}).get("rejection")),
                         },
                     )
-                entry_check = _fifteen_minute_entry_confirmation(
-                    c15, trigger_side, trigger_level, retest_time
-                )
-                if not entry_check.get("ready"):
-                    return self._reject(
-                        symbol,
-                        "15M entry confirmation not satisfied",
-                        stage="TECHNICAL",
-                        analysis={
-                            "setup": "NO TRADE",
-                            "trigger_side": trigger_side,
-                            "entry_15m_ready": False,
-                            "entry_15m_type": entry_check.get("trigger_type", "NONE"),
-                            "entry_15m_reason": entry_check.get("reason", "not ready"),
-                            "long_bos_event_count": len(bos_events_long),
-                            "short_bos_event_count": len(bos_events_short),
-                            "long_retest": bool(ret_long.get("valid")),
-                            "short_retest": bool(ret_short.get("valid")),
-                        },
-                    )
+                # 15M BOS/retest defines the setup. There is no separate 15M candle
+                # confirmation gate; the immediate 5M continuation trigger is authoritative.
 
                 # Stage 2: only qualifying technical candidates need the costly
                 # 5M refinement and 1D target context.
@@ -546,14 +526,10 @@ class MexcScanner:
         tp1_atr = tp1_distance / atr_value if atr_value > 0 else float("inf")
         tp2_atr = tp2_distance / atr_value if atr_value > 0 else float("inf")
 
-        if stop_pct < MIN_STOP_DISTANCE_PCT:
-            return False, f"Live stop distance {stop_pct * 100:.2f}% below intraday minimum"
-        if stop_pct > MAX_STOP_DISTANCE_PCT:
-            return False, f"Live stop distance {stop_pct * 100:.2f}% above intraday maximum"
+        # No arbitrary price-percent floors. Only structural ordering, ATR sanity,
+        # executable-entry drift, and final RR are checked here.
         if stop_atr < MIN_SL_ATR or stop_atr > MAX_SL_ATR:
-            return False, f"Live stop distance {stop_atr:.2f} ATR outside intraday bounds"
-        if tp1_atr < 0.75 or tp2_atr < 1.50:
-            return False, "Live target distance is too close for intraday geometry"
+            return False, f"Live structural stop {stop_atr:.2f} ATR outside safety bounds"
         if rr < MIN_RR:
             return False, f"Live RR {rr:.2f} below minimum {MIN_RR:.2f}"
 

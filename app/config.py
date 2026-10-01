@@ -20,39 +20,31 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="PORT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     database_path: str = Field(default="signals.db", alias="DATABASE_PATH")
-
-    # MEXC Futures is the sole market/trading venue.
     alert_check_seconds: float = Field(default=0.75, alias="ALERT_CHECK_SECONDS")
     market_cache_retry_seconds: int = Field(default=5, alias="MARKET_CACHE_RETRY_SECONDS")
     discovery_refresh_seconds: int = Field(default=900, alias="DISCOVERY_REFRESH_SECONDS")
     chart_default_bars: int = Field(default=180, alias="CHART_DEFAULT_BARS")
     force_utc: bool = Field(default=True, alias="FORCE_UTC")
 
-    # MEXC Futures automation.
-    # Current official Futures API base: https://api.mexc.com
-    mexc_api_base_url: str = Field(
-        default="https://api.mexc.com",
-        alias="MEXC_API_BASE_URL",
-    )
+    # MEXC Futures automation
+    mexc_api_base_url: str = Field(default="https://api.mexc.com", alias="MEXC_API_BASE_URL")
     mexc_access_key: str = Field(default="", alias="MEXC_ACCESS_KEY")
     mexc_secret_key: str = Field(default="", alias="MEXC_SECRET_KEY")
     mexc_recv_window: int = Field(default=10, alias="MEXC_RECV_WINDOW")
     mexc_order_type: int = Field(default=1, alias="MEXC_ORDER_TYPE")
-    mexc_open_type: int = Field(default=1, alias="MEXC_OPEN_TYPE")  # isolated
+    mexc_open_type: int = Field(default=1, alias="MEXC_OPEN_TYPE")
     mexc_default_leverage: int = Field(default=3, alias="MEXC_DEFAULT_LEVERAGE")
     max_risk_per_trade: float = Field(default=1.0, alias="MAX_RISK_PER_TRADE")
     max_open_trades: int = Field(default=3, alias="MAX_OPEN_TRADES")
     max_daily_loss: float = Field(default=0.05, alias="MAX_DAILY_LOSS")
 
-    # Scanner switches.
+    # Scanner switches
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(default=300, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")
     scan_concurrency: int = Field(default=4, alias="SCAN_CONCURRENCY")
-    # Conservative shared limiter for all public MEXC REST calls. These are
-    # client-side safety controls; MEXC may impose additional limits.
     mexc_public_min_interval_seconds: float = Field(default=0.20, alias="MEXC_PUBLIC_MIN_INTERVAL_SECONDS")
     mexc_public_window_seconds: float = Field(default=2.0, alias="MEXC_PUBLIC_WINDOW_SECONDS")
     mexc_public_window_limit: int = Field(default=8, alias="MEXC_PUBLIC_WINDOW_LIMIT")
@@ -69,21 +61,23 @@ class Settings(BaseSettings):
     max_data_age_seconds: float = Field(default=5.0, alias="MAX_DATA_AGE_SECONDS")
     orderbook_levels: int = Field(default=10, alias="ORDERBOOK_LEVELS")
     trade_flow_limit: int = Field(default=100, alias="TRADE_FLOW_LIMIT")
-    require_increasing_volume: bool = Field(
-        default=True,
-        alias="REQUIRE_INCREASING_VOLUME",
-    )
+    require_increasing_volume: bool = Field(default=True, alias="REQUIRE_INCREASING_VOLUME")
     signal_expiry_minutes: int = Field(default=30, alias="SIGNAL_EXPIRY_MINUTES")
-    max_signal_age_seconds: float = Field(default=330.0, alias="MAX_SIGNAL_AGE_SECONDS")
+    # 15M is now the signal identity/freshness clock. The validator also protects
+    # against an old 5M legacy environment value by enforcing a sensible floor.
+    max_signal_age_seconds: float = Field(default=1200.0, alias="MAX_SIGNAL_AGE_SECONDS")
     auto_signal_recipients: str = Field(default="", alias="AUTO_SIGNAL_RECIPIENTS")
     test_symbols: str = Field(default="", alias="TEST_SYMBOLS")
 
-    # Additional live-trading kill switch. Must remain false until live execution
-    # has been explicitly tested with the user's account and approved.
-    allow_live_execution: bool = Field(
-        default=False,
-        alias="ALLOW_LIVE_EXECUTION",
-    )
+    # Backtest resource controls
+    backtest_max_symbols: int = Field(default=200, alias="BACKTEST_MAX_SYMBOLS")
+    backtest_symbol_concurrency: int = Field(default=2, alias="BACKTEST_SYMBOL_CONCURRENCY")
+    backtest_analysis_timeout_seconds: float = Field(default=120.0, alias="BACKTEST_ANALYSIS_TIMEOUT_SECONDS")
+    backtest_child_boot_timeout_seconds: float = Field(default=30.0, alias="BACKTEST_CHILD_BOOT_TIMEOUT_SECONDS")
+    backtest_progress_interval_seconds: float = Field(default=5.0, alias="BACKTEST_PROGRESS_INTERVAL_SECONDS")
+
+    # Additional live-trading kill switch
+    allow_live_execution: bool = Field(default=False, alias="ALLOW_LIVE_EXECUTION")
 
     model_config = SettingsConfigDict(
         env_file=".env",

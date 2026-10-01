@@ -1,15 +1,13 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from typing import Any
 
 
 MIN_RR = 2.0
 MIN_SL_ATR = 0.50
 MAX_SL_ATR = 2.50
-
-# Conservative allowance for trading costs/slippage during sizing.
 DEFAULT_COST_BUFFER_PCT = 0.0015  # 0.15%
 
 
@@ -23,60 +21,43 @@ class TradePlan:
     rr: float
 
 
+def _finite_positive(value: float) -> bool:
+    return math.isfinite(float(value)) and float(value) > 0.0
+
+
 def validate_levels(
     plan: TradePlan,
     min_rr: float = MIN_RR,
 ) -> tuple[bool, str]:
-    values = [
+    values = (
         plan.entry,
         plan.stop_loss,
         plan.tp1,
         plan.tp2,
         plan.rr,
-    ]
+    )
+    if not all(_finite_positive(value) for value in values):
+        return False, "Trade levels and RR must be finite and positive"
 
-    if not all(value > 0 for value in values):
-        return False, "Trade levels must all be positive"
-
-    side = plan.side.upper()
-
+    side = str(plan.side).upper()
     if side == "LONG":
-        if not (
-            plan.stop_loss
-            < plan.entry
-            < plan.tp1
-            < plan.tp2
-        ):
-            return (
-                False,
-                "LONG levels are not ordered "
-                "SL < Entry < TP1 < TP2",
-            )
-
+        if not (plan.stop_loss < plan.entry < plan.tp1 < plan.tp2):
+            return False, "LONG levels are not ordered SL < Entry < TP1 < TP2"
     elif side == "SHORT":
-        if not (
-            plan.tp2
-            < plan.tp1
-            < plan.entry
-            < plan.stop_loss
-        ):
-            return (
-                False,
-                "SHORT levels are not ordered "
-                "TP2 < TP1 < Entry < SL",
-            )
-
+        if not (plan.tp2 < plan.tp1 < plan.entry < plan.stop_loss):
+            return False, "SHORT levels are not ordered TP2 < TP1 < Entry < SL"
     else:
         return False, "Unknown trade side"
 
-    required_rr = max(MIN_RR, float(min_rr))
+    try:
+        required_rr = max(MIN_RR, float(min_rr))
+    except (TypeError, ValueError):
+        return False, "Minimum RR must be numeric"
+    if not math.isfinite(required_rr) or required_rr <= 0:
+        return False, "Minimum RR must be finite and positive"
 
-    if plan.rr < required_rr:
-        return (
-            False,
-            f"RR {plan.rr:.2f} is below minimum "
-            f"{required_rr:.2f}",
-        )
+    if plan.rr + 1e-12 < required_rr:
+        return False, f"RR {plan.rr:.2f} is below minimum {required_rr:.2f}"
 
     return True, "OK"
 
@@ -89,25 +70,29 @@ def validate_atr_stop_distance(
     min_atr: float = MIN_SL_ATR,
     max_atr: float = MAX_SL_ATR,
 ) -> tuple[bool, str]:
-    if entry <= 0 or stop_loss <= 0 or atr <= 0:
+    if not all(_finite_positive(value) for value in (entry, stop_loss, atr)):
         return False, "Invalid entry, stop-loss, or ATR"
 
-    distance = abs(entry - stop_loss)
-    atr_multiple = distance / atr
+    try:
+        min_atr = float(min_atr)
+        max_atr = float(max_atr)
+    except (TypeError, ValueError):
+        return False, "ATR bounds must be numeric"
+
+    if not (
+        math.isfinite(min_atr)
+        and math.isfinite(max_atr)
+        and 0.0 <= min_atr <= max_atr
+    ):
+        return False, "ATR bounds are invalid"
+
+    distance = abs(float(entry) - float(stop_loss))
+    atr_multiple = distance / float(atr)
 
     if atr_multiple < min_atr:
-        return (
-            False,
-            f"SL distance {atr_multiple:.2f} ATR "
-            f"is below minimum {min_atr:.2f}",
-        )
-
+        return False, f"SL distance {atr_multiple:.2f} ATR is below minimum {min_atr:.2f}"
     if atr_multiple > max_atr:
-        return (
-            False,
-            f"SL distance {atr_multiple:.2f} ATR "
-            f"exceeds maximum {max_atr:.2f}",
-        )
+        return False, f"SL distance {atr_multiple:.2f} ATR exceeds maximum {max_atr:.2f}"
 
     return True, "OK"
 
@@ -118,23 +103,22 @@ def quantize_to_step(
     *,
     mode: str = "down",
 ) -> float:
-    if value <= 0 or step <= 0:
+    if not _finite_positive(value) or not _finite_positive(step):
         return 0.0
+
+    normalized_mode = str(mode).lower()
+    if normalized_mode == "down":
+        rounding = ROUND_DOWN
+    elif normalized_mode == "up":
+        rounding = ROUND_UP
+    else:
+        raise ValueError("Quantization mode must be 'down' or 'up'")
 
     value_d = Decimal(str(value))
     step_d = Decimal(str(step))
-
-    rounding = (
-        ROUND_DOWN
-        if mode == "down"
-        else ROUND_UP
-    )
-
-    units = (
-        value_d / step_d
-    ).to_integral_value(rounding=rounding)
-
-    return float(units * step_d)
+    units = (value_d / step_d).to_integral_value(rounding=rounding)
+    result = float(units * step_d)
+    return result if math.isfinite(result) else 0.0
 
 
 def calculate_contract_quantity(
@@ -148,81 +132,47 @@ def calculate_contract_quantity(
     *,
     cost_buffer_pct: float = DEFAULT_COST_BUFFER_PCT,
 ) -> float:
-    if risk_amount_usdt <= 0:
-        raise ValueError("Risk amount must be positive")
-
-    if entry <= 0 or stop_loss <= 0:
-        raise ValueError("Entry and stop-loss must be positive")
-
-    if contract_size <= 0:
-        raise ValueError("Contract size must be positive")
-
-    if vol_unit <= 0:
-        raise ValueError("Volume unit must be positive")
-
-    if min_vol < 0:
-        raise ValueError("Minimum volume cannot be negative")
-
-    if max_vol < 0:
-        raise ValueError("Maximum volume cannot be negative")
-
-    if cost_buffer_pct < 0:
-        raise ValueError("Cost buffer cannot be negative")
-
-    stop_distance = abs(entry - stop_loss)
-
-    if stop_distance <= 0:
-        raise ValueError(
-            "Entry and stop-loss must be different"
-        )
-
-    # Increase planned risk slightly to leave room for
-    # fees/slippage rather than sizing right at the limit.
-    effective_risk = risk_amount_usdt / (
-        1.0 + cost_buffer_pct
-    )
-
-    per_contract_risk = (
-        stop_distance * contract_size
-    )
-
-    if per_contract_risk <= 0:
-        raise ValueError(
-            "Per-contract risk must be positive"
-        )
-
-    raw_quantity = (
-        effective_risk / per_contract_risk
-    )
-
-    quantity = quantize_to_step(
-        raw_quantity,
+    values = (
+        risk_amount_usdt,
+        entry,
+        stop_loss,
+        contract_size,
         vol_unit,
-        mode="down",
     )
+    if not all(_finite_positive(value) for value in values):
+        raise ValueError("Risk, price, contract size, and volume unit must be finite and positive")
 
+    if not math.isfinite(float(min_vol)) or min_vol < 0:
+        raise ValueError("Minimum volume must be finite and non-negative")
+    if not math.isfinite(float(max_vol)) or max_vol < 0:
+        raise ValueError("Maximum volume must be finite and non-negative")
+    if max_vol > 0 and max_vol < min_vol:
+        raise ValueError("Maximum volume cannot be below minimum volume")
+    if not math.isfinite(float(cost_buffer_pct)) or cost_buffer_pct < 0:
+        raise ValueError("Cost buffer must be finite and non-negative")
+
+    stop_distance = abs(float(entry) - float(stop_loss))
+    if stop_distance <= 0 or not math.isfinite(stop_distance):
+        raise ValueError("Entry and stop-loss must be finite and different")
+
+    effective_risk = float(risk_amount_usdt) / (1.0 + float(cost_buffer_pct))
+    per_contract_risk = stop_distance * float(contract_size)
+    raw_quantity = effective_risk / per_contract_risk
+
+    if not math.isfinite(raw_quantity) or raw_quantity <= 0:
+        raise ValueError("Calculated raw quantity is invalid")
+
+    quantity = quantize_to_step(raw_quantity, float(vol_unit), mode="down")
     if quantity <= 0:
-        raise ValueError(
-            "Calculated quantity is zero"
-        )
+        raise ValueError("Calculated quantity is zero")
+    if quantity < float(min_vol):
+        raise ValueError("Calculated quantity is below the contract minimum")
 
-    if quantity < min_vol:
-        raise ValueError(
-            "Calculated quantity is below "
-            "the contract minimum"
-        )
+    if max_vol > 0 and quantity > float(max_vol):
+        quantity = quantize_to_step(float(max_vol), float(vol_unit), mode="down")
 
-    if max_vol > 0 and quantity > max_vol:
-        quantity = quantize_to_step(
-            max_vol,
-            vol_unit,
-            mode="down",
-        )
-
-    if quantity <= 0:
-        raise ValueError(
-            "Calculated quantity is zero"
-        )
+    if quantity <= 0 or (min_vol > 0 and quantity < min_vol):
+        raise ValueError("Contract volume constraints make the requested risk size impossible")
 
     return quantity
 
@@ -233,35 +183,20 @@ def calculate_risk_amount(
     *,
     max_risk_usdt: float | None = None,
 ) -> float:
-    if balance_usdt <= 0:
-        raise ValueError(
-            "Balance must be positive"
-        )
+    if not _finite_positive(balance_usdt):
+        raise ValueError("Balance must be finite and positive")
+    if not _finite_positive(risk_pct):
+        raise ValueError("Risk percentage must be finite and positive")
 
-    if risk_pct <= 0:
-        raise ValueError(
-            "Risk percentage must be positive"
-        )
-
-    risk_amount = (
-        balance_usdt * risk_pct / 100.0
-    )
+    risk_amount = float(balance_usdt) * float(risk_pct) / 100.0
 
     if max_risk_usdt is not None:
-        if max_risk_usdt <= 0:
-            raise ValueError(
-                "Maximum risk must be positive"
-            )
+        if not _finite_positive(max_risk_usdt):
+            raise ValueError("Maximum risk must be finite and positive")
+        risk_amount = min(risk_amount, float(max_risk_usdt))
 
-        risk_amount = min(
-            risk_amount,
-            max_risk_usdt,
-        )
-
-    if risk_amount <= 0:
-        raise ValueError(
-            "Calculated risk amount is zero"
-        )
+    if not _finite_positive(risk_amount):
+        raise ValueError("Calculated risk amount is invalid")
 
     return risk_amount
 
@@ -273,34 +208,28 @@ def calculate_rr(
     stop_loss: float,
     target: float,
 ) -> float:
-    if entry <= 0 or stop_loss <= 0 or target <= 0:
-        raise ValueError(
-            "Entry, stop-loss and target "
-            "must be positive"
-        )
+    if not all(_finite_positive(value) for value in (entry, stop_loss, target)):
+        raise ValueError("Entry, stop-loss and target must be finite and positive")
 
-    risk = abs(entry - stop_loss)
+    risk = abs(float(entry) - float(stop_loss))
+    if risk <= 0 or not math.isfinite(risk):
+        raise ValueError("Entry and stop-loss must differ")
 
-    if risk <= 0:
-        raise ValueError(
-            "Entry and stop-loss must differ"
-        )
-
-    side = side.upper()
-
-    if side == "LONG":
-        reward = target - entry
-    elif side == "SHORT":
-        reward = entry - target
+    normalized_side = str(side).upper()
+    if normalized_side == "LONG":
+        reward = float(target) - float(entry)
+    elif normalized_side == "SHORT":
+        reward = float(entry) - float(target)
     else:
         raise ValueError("Unknown trade side")
 
-    if reward <= 0:
-        raise ValueError(
-            "Target must be profitable for the trade side"
-        )
+    if reward <= 0 or not math.isfinite(reward):
+        raise ValueError("Target must be profitable for the trade side")
 
-    return reward / risk
+    rr = reward / risk
+    if not math.isfinite(rr) or rr <= 0:
+        raise ValueError("Calculated RR is invalid")
+    return float(rr)
 
 
 def build_trade_plan(
@@ -320,20 +249,18 @@ def build_trade_plan(
     )
 
     plan = TradePlan(
-        side=side.upper(),
+        side=str(side).upper(),
         entry=float(entry),
         stop_loss=float(stop_loss),
         tp1=float(tp1),
         tp2=float(tp2),
-        rr=float(rr),
+        rr=rr,
     )
 
     valid, reason = validate_levels(
         plan,
-        min_rr=max(MIN_RR, min_rr),
+        min_rr=max(MIN_RR, float(min_rr)),
     )
-
     if not valid:
         raise ValueError(reason)
-
     return plan

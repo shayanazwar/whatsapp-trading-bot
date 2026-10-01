@@ -56,8 +56,7 @@ def test_simulator_tp1_then_sl():
         "setup": "LONG",
         "entry": 100.0,
         "stop_loss": 95.0,
-        "tp1": 106.0,
-        "tp2": 110.0,
+        "tp": 110.0,
     }
     future = [
         candle(M5, 100.0, high=107.0, low=99.0),
@@ -65,14 +64,14 @@ def test_simulator_tp1_then_sl():
     ]
     trade = simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
-    assert trade.tp1_hit is True
+    assert trade.tp1_hit is False
     assert trade.tp2_hit is False
-    assert trade.sl_hit is False
-    assert trade.breakeven_hit is True
-    assert trade.outcome == "BE"
-    assert trade.final_close_size == pytest.approx(0.5)
+    assert trade.sl_hit is True
+    assert trade.breakeven_hit is False
+    assert trade.outcome == "SL"
+    assert trade.final_close_size == pytest.approx(1.0)
     assert trade.remaining_position_size == pytest.approx(0.0)
-    assert trade.r_multiple == pytest.approx(0.6)
+    assert trade.r_multiple == pytest.approx(-1.0)
 
 
 def test_simulator_same_candle_sl_is_conservative():
@@ -81,8 +80,7 @@ def test_simulator_same_candle_sl_is_conservative():
         "setup": "LONG",
         "entry": 100.0,
         "stop_loss": 95.0,
-        "tp1": 106.0,
-        "tp2": 110.0,
+        "tp": 110.0,
     }
     trade = simulate_trade(
         signal,
@@ -102,8 +100,7 @@ def test_simulator_same_candle_tp1_and_sl_is_conservative():
         "setup": "LONG",
         "entry": 100.0,
         "stop_loss": 95.0,
-        "tp1": 106.0,
-        "tp2": 110.0,
+        "tp": 110.0,
     }
     trade = simulate_trade(
         signal,
@@ -125,8 +122,7 @@ def test_simulator_short_tp2():
         "setup": "SHORT",
         "entry": 100.0,
         "stop_loss": 105.0,
-        "tp1": 94.0,
-        "tp2": 90.0,
+        "tp": 90.0,
     }
     trade = simulate_trade(
         signal,
@@ -136,19 +132,19 @@ def test_simulator_short_tp2():
         slippage_bps=0.0,
     )
     assert trade is not None
-    assert trade.outcome == "TP2"
+    assert trade.outcome == "TP"
     assert trade.tp1_hit is True
     assert trade.tp2_hit is True
-    assert trade.tp1_close_size == pytest.approx(0.5)
-    assert trade.final_close_size == pytest.approx(0.5)
+    assert trade.tp1_close_size == pytest.approx(0.0)
+    assert trade.final_close_size == pytest.approx(1.0)
     assert trade.remaining_position_size == pytest.approx(0.0)
-    assert trade.r_multiple == pytest.approx(1.6)
+    assert trade.r_multiple == pytest.approx(2.0)
 
 
 def test_report_metrics():
     signals = [
-        {"symbol": "A_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp1": 106, "tp2": 110},
-        {"symbol": "B_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp1": 94, "tp2": 90},
+        {"symbol": "A_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp": 110},
+        {"symbol": "B_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp": 90},
     ]
     trades = []
     for signal in signals:
@@ -163,9 +159,9 @@ def test_report_metrics():
     text = format_report(summary)
     assert "COINS TESTED: 298" in text
     assert "SIGNALS: 2" in text
-    assert "TP2 HIT: 2" in text
+    assert "TP HIT: 2" in text
     assert "WIN RATE: 100.0%" in text
-    assert "TOTAL R: +3.20R" in text
+    assert "TOTAL R: +4.00R" in text
     assert "trigger_quality_5m" not in text
 
 
@@ -265,7 +261,7 @@ def test_runner_candidate_discovery_does_not_call_5m_trigger(monkeypatch):
     )
     assert len(out) == 1
     assert c15[21][0] < out[0][0] <= c15[20 + runner_module.MAX_SETUP_AGE_15M + 2][0] + M15
-    assert diagnostics["STRUCTURE_WINDOW_COLLAPSED"] > 0
+    assert diagnostics["STRUCTURE_WINDOW_REVISITS"] > 0
 
 
 def test_runner_bypasses_only_5m_rejection():
@@ -327,9 +323,9 @@ def test_signal_validator_no_longer_requires_5m(monkeypatch):
         "setup": "LONG",
         "candle_time": 1_700_000_000_000,
         "entry": 100,
-        "stop_loss": 95,
-        "tp1": 106,
-        "tp2": 110,
+        "stop_loss": 97,
+        "tp": 115,
+        "atr": 1.0,
     }
     signal, reasons = validate_signal(
         data,
@@ -358,9 +354,9 @@ def test_signal_validator_ignores_5m_only_engine_failure(monkeypatch):
         "setup": "SHORT",
         "candle_time": 1_700_000_000_000,
         "entry": 100,
-        "stop_loss": 105,
-        "tp1": 94,
-        "tp2": 90,
+        "stop_loss": 103,
+        "tp": 80,
+        "atr": 1.0,
     }
     signal, reasons = validate_signal(
         data,
@@ -387,8 +383,7 @@ def test_signal_validator_keeps_non_5m_rejections(monkeypatch):
         "candle_time": 1_700_000_000_000,
         "entry": 100,
         "stop_loss": 95,
-        "tp1": 106,
-        "tp2": 110,
+        "tp": 120,
     }
     signal, reasons = validate_signal(
         data,
@@ -404,7 +399,7 @@ def test_risk_math_and_level_ordering():
     assert calculate_rr(side="LONG", entry=100, stop_loss=95, target=110) == pytest.approx(2.0)
     assert calculate_rr(side="SHORT", entry=100, stop_loss=105, target=90) == pytest.approx(2.0)
 
-    plan = TradePlan("LONG", 100, 95, 106, 110, 2.0)
+    plan = TradePlan("LONG", 100, 95, 110, 2.5)
     assert validate_levels(plan, min_rr=2.0) == (True, "OK")
     assert calculate_risk_amount(1000, 1.0) == pytest.approx(10.0)
     assert quantize_to_step(1.239, 0.1) == pytest.approx(1.2)

@@ -32,15 +32,15 @@ def test_long_short_stop_geometry_is_symmetric_and_uses_deepest_invalidation():
     })
     assert long["stop_source"].startswith("DEEPEST(")
     assert short["stop_source"].startswith("DEEPEST(")
-    assert long["stop_loss"] == pytest.approx(98.38)
-    assert short["stop_loss"] == pytest.approx(101.62)
+    assert long["stop_loss"] == pytest.approx(98.35)
+    assert short["stop_loss"] == pytest.approx(101.65)
     assert abs(100 - long["stop_loss"]) == pytest.approx(abs(short["stop_loss"] - 100))
 
 
 def test_structural_stop_uses_intraday_swing_floor(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
         {"price": 102.0, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
-        {"price": 104.0, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
+        {"price": 106.5, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
     ])
     levels = calculate_trade_levels({
         "setup": "LONG", "price": 100.0, "atr": 1.0,
@@ -51,14 +51,13 @@ def test_structural_stop_uses_intraday_swing_floor(monkeypatch):
     assert levels["stop_distance_pct"] >= engine.MIN_SL_ATR / 100.0
     assert levels["sl_atr"] >= engine.MIN_SL_ATR
     assert levels["trade_geometry_ok"] is True
-    assert levels["tp1"] == pytest.approx(102.0)
-    assert levels["tp2"] == pytest.approx(104.0)
+    assert levels["tp"] == pytest.approx(106.5)
 
 
 def test_target_path_does_not_skip_a_near_obstacle_and_requires_major_tp2(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
         {"price": 103.5, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
-        {"price": 104.0, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
+        {"price": 106.5, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
     ])
     levels = calculate_trade_levels({
         "setup": "LONG", "price": 100.0, "atr": 1.0,
@@ -67,10 +66,9 @@ def test_target_path_does_not_skip_a_near_obstacle_and_requires_major_tp2(monkey
         "target_frames": [("15M", []), ("1H", [])],
     })
     assert levels["trade_geometry_ok"] is True
-    assert levels["tp1"] == pytest.approx(103.5)
-    assert levels["tp2"] == pytest.approx(104.0)
-    assert levels["tp2_distance_atr"] >= 1.5
-    assert levels["rr"] >= 2.0
+    assert levels["tp"] == pytest.approx(106.5)
+    assert levels["tp_distance_atr"] >= 2.5
+    assert levels["rr"] >= 2.5
 
 
 def test_structural_target_path_allows_far_tp2_when_supported(monkeypatch):
@@ -85,7 +83,7 @@ def test_structural_target_path_allows_far_tp2_when_supported(monkeypatch):
         "target_frames": [("15M", []), ("1H", [])],
     })
     assert levels["trade_geometry_ok"] is True
-    assert levels["tp2"] == pytest.approx(106.5)
+    assert levels["tp"] == pytest.approx(106.5)
     assert levels["rr"] > 2.0
 
 
@@ -123,21 +121,19 @@ def test_live_geometry_keeps_structural_stop_and_targets(monkeypatch):
     analysis = {
         "entry": 100.0,
         "stop_loss": 98.5,
-        "tp1": 103.5,
-        "tp2": 106.5,
+        "tp": 106.5,
         "atr": 1.0,
     }
     ok, reason = MexcScanner._validate_live_geometry(analysis, 100.1, "LONG", max_drift_pct=0.01)
     assert ok, reason
     assert analysis["stop_loss"] == 98.5
-    assert analysis["tp1"] == 103.5
-    assert analysis["tp2"] == 106.5
+    assert analysis["tp"] == 106.5
 
 
 def test_simulator_intraday_expiry_and_costs():
     signal = {
         "symbol": "TEST_USDT", "setup": "LONG", "entry": 100.0,
-        "stop_loss": 98.0, "tp1": 103.0, "tp2": 106.0,
+        "stop_loss": 98.0, "tp": 106.0,
         "regime": "BULLISH",
     }
     future = [_candle(300_000 + i * 300_000, 100.0, 101.0, 99.0, 100.5) for i in range(4)]
@@ -156,74 +152,58 @@ def test_simulator_intraday_expiry_and_costs():
         max_holding_minutes=360,
     )
     assert winning is not None
-    assert winning.outcome == "TP2"
+    assert winning.outcome == "TP"
     assert winning.fees_r > 0
     assert winning.slippage_r > 0
     assert winning.r_multiple < winning.planned_rr
 
 
 def test_report_has_direction_regime_drawdown_and_expectancy_metrics():
-    long_signal = {"symbol": "A_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp1": 106, "tp2": 110, "regime": "BULLISH"}
-    short_signal = {"symbol": "B_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp1": 94, "tp2": 90, "regime": "BEARISH"}
+    long_signal = {"symbol": "A_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp": 110, "regime": "BULLISH"}
+    short_signal = {"symbol": "B_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp": 90, "regime": "BEARISH"}
     t1 = simulate_trade(long_signal, [_candle(600_000, 100, 111, 100, 110)], signal_close_time_ms=300_000, fee_rate=0.0, slippage_bps=0.0)
     t2 = simulate_trade(short_signal, [_candle(900_000, 100, 105, 89, 90)], signal_close_time_ms=600_000, fee_rate=0.0, slippage_bps=0.0)
     summary = summarize(days=7, coins_selected=2, coins_tested=2, data_errors=0, trades=[t for t in (t1, t2) if t is not None])
-    assert summary.expectancy_r == pytest.approx(0.3)
+    assert summary.expectancy_r == pytest.approx(0.5)
     assert summary.max_drawdown_r >= 0
     assert set(summary.direction_stats) == {"LONG", "SHORT"}
     assert set(summary.regime_stats) == {"BULLISH", "BEARISH"}
 
 
-def test_weighted_supporting_factors_can_pass_without_boolean_momentum_volume():
+def test_weighted_supporting_factors_can_pass_with_five_of_eight_families():
+    family_result = {"families": {
+        "momentum": {"status": "PASS"},
+        "relative_volume": {"status": "PASS"},
+        "volatility_regime": {"status": "PASS"},
+        "liquidity_quality": {"status": "ABSTAIN"},
+        "funding_crowding": {"status": "ABSTAIN"},
+        "flow_pressure": {"status": "PASS"},
+        "htf_target_path": {"status": "PASS"},
+        "vwap_location": {"status": "FAIL"},
+    }, "passed": 5}
     score, groups, families = engine._build_score(
-        direction_ok=True,
-        structure_ok=True,
-        setup_ok=True,
-        momentum_ok=False,
-        volume_ok=False,
-        location_ok=True,
-        futures_ok=False,
-        volatility_ok=True,
-        trigger_quality=0.8,
-        rvol=0.95,
-        bos_quality=0.8,
-        retest_quality=0.8,
-        momentum_quality=0.4,
-        volume_quality=0.3,
+        direction_ok=True, structure_ok=True, setup_ok=True,
+        momentum_ok=True, volume_ok=True, location_ok=True,
+        futures_ok=False, volatility_ok=True, trigger_quality=0.8,
+        rvol=1.2, bos_quality=0.8, retest_quality=0.8,
+        momentum_quality=0.8, volume_quality=0.8, family_result=family_result,
     )
-    assert score >= 82
-    assert families == 4
-    assert 0 < groups["momentum"] < 10
-    assert 0 < groups["volume_participation"] < 10
+    assert score >= 78
+    assert families == 5
 
-
-def test_tp2_can_use_next_structural_15m_level_when_htf_target_missing(monkeypatch):
-    monkeypatch.setattr(
-        engine,
-        "_collect_structural_levels",
-        lambda *args, **kwargs: [
-            {"price": 103.0, "timeframe": "15M", "index": 1, "kind": "RESISTANCE"},
-            {"price": 106.0, "timeframe": "15M", "index": 2, "kind": "RESISTANCE"},
-        ],
-    )
-    result = engine._target_path(
-        [("15M", [])],
-        "LONG",
-        100.0,
-        97.0,
-        2.0,
-    )
-    assert result["ok"] is True
-    assert result["tp1"] == pytest.approx(103.0)
-    assert result["tp2"] == pytest.approx(106.0)
-    assert result["structural"] is True
-
+def test_target_path_requires_higher_timeframe_target(monkeypatch):
+    monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
+        {"price": 103.0, "timeframe": "15M", "index": 1, "kind": "RESISTANCE"},
+        {"price": 106.0, "timeframe": "15M", "index": 2, "kind": "RESISTANCE"},
+    ])
+    result = engine._target_path([("15M", [])], "LONG", 100.0, 97.0, 2.0)
+    assert result["ok"] is False
+    assert "1H/4H/1D" in result["reason"]
 
 def test_intraday_structure_window_and_target_distance_are_widened():
-    assert engine.MAX_SETUP_AGE_15M == 24
-    assert engine.MIN_TP1_ATR == pytest.approx(0.60)
-    assert engine.MIN_TP2_ATR == pytest.approx(2.00)
-    assert engine.MIN_SL_ATR == pytest.approx(0.75)
+    assert engine.MAX_SETUP_AGE_15M == 32
+    assert engine.MIN_TP_ATR == pytest.approx(2.50)
+    assert engine.MIN_SL_ATR == pytest.approx(1.00)
     assert engine.MAX_SL_ATR == pytest.approx(3.50)
 
 
@@ -231,19 +211,26 @@ def test_5m_refinement_is_disabled_from_engine_decision_path():
     assert engine.ENABLE_5M_REFINEMENT is False
 
 
-def test_supporting_family_count_is_n_of_m_not_all_or_nothing():
-    score, groups, families = engine._build_score(
+def test_supporting_family_count_is_five_of_eight_with_diversity():
+    family_result = {"families": {
+        "momentum": {"status": "PASS"},
+        "relative_volume": {"status": "PASS"},
+        "volatility_regime": {"status": "PASS"},
+        "liquidity_quality": {"status": "FAIL"},
+        "funding_crowding": {"status": "ABSTAIN"},
+        "flow_pressure": {"status": "PASS"},
+        "htf_target_path": {"status": "PASS"},
+        "vwap_location": {"status": "FAIL"},
+    }, "passed": 5}
+    score, _groups, families = engine._build_score(
         direction_ok=True, structure_ok=True, setup_ok=True,
-        momentum_ok=False, volume_ok=True, location_ok=True,
-        futures_ok=False, volatility_ok=False, trigger_quality=0.8,
+        momentum_ok=True, volume_ok=True, location_ok=True,
+        futures_ok=False, volatility_ok=True, trigger_quality=0.8,
         rvol=1.2, bos_quality=0.8, retest_quality=0.8,
-        momentum_quality=0.35, volume_quality=0.65,
+        momentum_quality=0.8, volume_quality=0.8, family_result=family_result,
     )
-    assert score >= 75
+    assert score >= 78
     assert families == 5
-    assert groups["momentum"] > 0
-    assert groups["volume_participation"] > 0
-
 
 def test_structural_stop_floor_is_symmetric():
     long = calculate_trade_levels({

@@ -19,7 +19,17 @@ def _row(ts: int, price: float = 100.0): return [ts, price, price + 1, price - 1
 
 def _valid_analysis(side="LONG"):
     long = side == "LONG"; now = int(time.time() * 1000); fifteen = now - (now % 900000); five = now - (now % 300000)
-    return {"symbol":"BTC_USDT","price":100.0,"trend_4h":"BULLISH" if long else "BEARISH","structure_1h":"HH/HL" if long else "LH/LL","bos_15m":True,"ema_direction":"BULLISH" if long else "BEARISH","rsi":60.0 if long else 40.0,"rsi_5m":60.0 if long else 40.0,"atr":1.0,"atr_percentile":50,"volume":"INCREASING","rvol":1.5,"rvol_15m":1.5,"rvol_5m":1.5,"entry":100.0,"stop_loss":99.0 if long else 101.0,"tp1":101.5 if long else 98.5,"tp2":102.5 if long else 97.5,"rr":2.5,"setup":side,"setup_bos_time":fifteen-300000,"setup_retest_time":fifteen,"closed_5m_candle_time":five,"candle_time":fifteen,"direction_ok":True,"structure_ok":True,"setup_ok":True,"momentum_ok":True,"volume_ok":True,"location_ok":True,"futures_ok":True,"btc_filter_ok":True,"volatility_ok":True,"data_fresh":True,"target_path_structural":True,"five_minute_ready":True,"five_minute_long":long,"five_minute_short":not long,"confirmation_family_count":6,"supporting_family_count":4,"trigger_quality_5m":0.8,"score":100,"sl_atr":1.0,"signal_blocked":False,"technical_candidate":True,"structure_quality_ok":True,"ema_extension_ok":True,"five_minute_ready":True,"mexc_spread_pct":0.0001,"max_mexc_spread_pct":0.001,"entry_drift_pct":0.0,"max_entry_drift_pct":0.002,"max_signal_age_seconds":330}
+    families = {
+        "momentum":{"status":"PASS","value":0.8},
+        "relative_volume":{"status":"PASS","value":1.5},
+        "volatility_regime":{"status":"PASS","value":50},
+        "liquidity_quality":{"status":"ABSTAIN"},
+        "funding_crowding":{"status":"ABSTAIN"},
+        "flow_pressure":{"status":"PASS","value":0.2 if long else -0.2},
+        "htf_target_path":{"status":"PASS","value":3.0},
+        "vwap_location":{"status":"PASS","value":0.5},
+    }
+    return {"symbol":"BTC_USDT","price":100.0,"trend_4h":"BULLISH" if long else "BEARISH","structure_1h":"HH/HL" if long else "LH/LL","bos_15m":True,"ema_direction":"BULLISH" if long else "BEARISH","rsi":60.0 if long else 40.0,"rsi_5m":60.0 if long else 40.0,"atr":1.0,"atr_percentile":50,"volume":"INCREASING","rvol":1.5,"rvol_15m":1.5,"rvol_5m":1.5,"entry":100.0,"stop_loss":99.0 if long else 101.0,"tp":104.0 if long else 96.0,"rr":3.48,"setup":side,"setup_bos_time":fifteen-300000,"setup_retest_time":fifteen,"candle_time":fifteen,"direction_ok":True,"structure_ok":True,"setup_ok":True,"momentum_ok":True,"volume_ok":True,"location_ok":True,"futures_ok":True,"btc_filter_ok":True,"volatility_ok":True,"data_fresh":True,"target_path_structural":True,"shock_veto_ok":True,"confirmation_families":families,"confirmation_families_passed":6,"confirmation_families_available":6,"confirmation_family_diversity_ok":True,"confirmation_family_count":6,"supporting_family_count":6,"score":100,"sl_atr":1.0,"tp_distance_atr":4.0,"signal_blocked":False,"technical_candidate":True,"structure_quality_ok":True,"ema_extension_ok":True,"five_minute_ready":False,"five_minute_long":False,"five_minute_short":False,"mexc_spread_pct":0.0001,"max_mexc_spread_pct":0.001,"entry_drift_pct":0.0,"max_entry_drift_pct":0.002,"max_signal_age_seconds":1200,"estimated_round_trip_cost_pct":0.0015}
 
 
 def test_signature_is_deterministic():
@@ -35,7 +45,7 @@ def test_legacy_confluence_compatibility():
 
 
 def test_trade_levels_and_position_sizing():
-    long_plan=TradePlan("LONG",100,99,101.5,102.5,2.5); assert validate_levels(long_plan,2)[0]; qty=calculate_contract_quantity(10,100,99,0.1,1,1,1000); assert qty==99.0
+    long_plan=TradePlan("LONG",100,99,104,2.5); assert validate_levels(long_plan,2)[0]; qty=calculate_contract_quantity(10,100,99,0.1,1,1,1000); assert qty==99.0
     assert round(calculate_risk_amount(1000,1.0),2)==10.0
 
 
@@ -80,7 +90,9 @@ def test_signal_validation_does_not_require_5m_or_increasing_volume():
     data.pop("trigger_quality_5m", None)
     data["primary_entry_timeframe"] = "15M"
     data["volume"] = "DECREASING"
-    data["confirmation_family_count"] = 4
+    data["confirmation_family_count"] = 5
+    data["confirmation_families_passed"] = 5
+    data["confirmation_families_available"] = 6
     data["momentum_quality"] = 0.60
     data["volume_quality"] = 0.30
     signal, reasons = validate_signal(data, min_confluence=82, min_rr=2.0, require_increasing_volume=True)

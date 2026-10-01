@@ -7,7 +7,7 @@ from typing import Any
 
 MIN_RR = 2.0
 MIN_SL_ATR = 0.50
-MAX_SL_ATR = 1.80
+MAX_SL_ATR = 2.50
 
 # Conservative allowance for trading costs/slippage during sizing.
 DEFAULT_COST_BUFFER_PCT = 0.0015  # 0.15%

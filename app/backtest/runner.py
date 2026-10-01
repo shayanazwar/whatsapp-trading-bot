@@ -1354,88 +1354,60 @@ class BacktestRunner:
             )
             setup_by_side[side] = setups
 
-        # This exactly matches _select_latest_bos_with_retest():
-        # latest BOS age <= MAX_SETUP_AGE_15M + 2, then retest age <= MAX_SETUP_AGE_15M.
+        # This exactly matches the engine's authoritative BOS-age window.
         max_bos_age = MAX_SETUP_AGE_15M + 2
 
+        # Keep the latest eligible timestamp for each BOS/retest structure.
+        # This avoids firing at the first post-retest candle when the 15M entry
+        # context is still immature, while retaining one candidate per structure
+        # for bounded backtest cost.
+        latest_by_structure: dict[tuple[str, int, int], tuple[int, dict[str, Any]]] = {}
         for index, open_time in enumerate(open_times):
             close_time = int(open_time) + M15_MS
-
-            if (
-                close_time < period_start
-                or close_time > period_end
-            ):
+            if close_time < period_start or close_time > period_end:
                 continue
-
             for side in ("LONG", "SHORT"):
                 active_setup: dict[str, Any] | None = None
-
                 for setup in reversed(setup_by_side[side]):
                     bos_index = int(setup["bos_index"])
                     retest_index = int(setup["retest_index"])
                     if bos_index > index:
                         continue
-
-                    # Match the engine's authoritative candle-index age semantics
-                    # exactly. This avoids semantic drift when data has gaps.
                     bos_age_bars = index - bos_index
                     if bos_age_bars < 0:
                         continue
                     if bos_age_bars > max_bos_age:
                         break
-
                     if retest_index > index:
                         continue
-
                     retest_age_bars = index - retest_index
-                    if retest_age_bars < 0:
+                    if retest_age_bars < 0 or retest_age_bars > MAX_SETUP_AGE_15M:
                         continue
-                    if retest_age_bars > MAX_SETUP_AGE_15M:
-                        continue
-
                     active_setup = setup
                     break
-
                 if active_setup is None:
                     continue
-
-                # No 5M confirmation or separate entry prefilter is used. The
-                # authoritative engine receives one closed 15M setup timestamp per
-                # unique BOS/retest structure.
                 structure_key = (
                     side,
                     int(active_setup["bos_time"]),
                     int(active_setup["retest_time"]),
                 )
-                if structure_key in emitted_structures:
+                previous = latest_by_structure.get(structure_key)
+                if previous is not None:
                     diagnostics["STRUCTURE_WINDOW_COLLAPSED"] = diagnostics.get("STRUCTURE_WINDOW_COLLAPSED", 0) + 1
-                    continue
-                emitted_structures.add(structure_key)
+                latest_by_structure[structure_key] = (close_time, active_setup)
 
-                candidates[close_time] = {
-                    "side": side,
-                    "bos_level": float(
-                        active_setup["bos_level"]
-                    ),
-                    "bos_time": int(
-                        active_setup["bos_time"]
-                    ),
-                    "bos_strength": float(
-                        active_setup["bos_strength"]
-                    ),
-                    "retest_time": int(
-                        active_setup["retest_time"]
-                    ),
-                    "retest_index": int(
-                        active_setup["retest_index"]
-                    ),
-                    "retest_quality": float(
-                        active_setup["retest_quality"]
-                    ),
-                    "retest_rejection": bool(
-                        active_setup["retest_rejection"]
-                    ),
-                }
+        for close_time, active_setup in latest_by_structure.values():
+            candidates[close_time] = {
+                "side": str(active_setup["side"]),
+                "bos_level": float(active_setup["bos_level"]),
+                "bos_time": int(active_setup["bos_time"]),
+                "bos_strength": float(active_setup["bos_strength"]),
+                "retest_time": int(active_setup["retest_time"]),
+                "retest_index": int(active_setup["retest_index"]),
+                "retest_quality": float(active_setup["retest_quality"]),
+                "retest_rejection": bool(active_setup["retest_rejection"]),
+            }
 
         diagnostics["SETUP_WINDOWS_15M"] = (
             diagnostics.get(
@@ -2066,6 +2038,9 @@ class BacktestRunner:
 
                 for reason in failures:
                     reason_text = str(reason)
+                    if _is_5m_only_failure(reason_text):
+                        diagnostics["LEGACY_5M_FAILURE_IGNORED"] += 1
+                        continue
                     bucket = _normalize_engine_reject_reason(reason_text)
                     diagnostics[f"ENGINE_REJECT_{bucket}"] += 1
 

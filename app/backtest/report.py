@@ -18,6 +18,7 @@ class BacktestSummary:
     short_signals: int
     tp1_hits: int
     tp2_hits: int
+    breakeven_hits: int
     sl_hits: int
     unresolved: int
     resolved: int
@@ -46,7 +47,13 @@ class BacktestSummary:
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
-    return [t for t in trades if t.outcome in {"TP2", "SL"} and t.r_multiple is not None]
+    # EXPIRED trades are finalized at the last available completed price by the
+    # stateful simulator, so they are resolved when realized R is available.
+    return [
+        t for t in trades
+        if t.outcome in {"TP2", "SL", "BE", "EXPIRED"}
+        and t.r_multiple is not None
+    ]
 
 
 def _win_rate(trades: Sequence[SimulatedTrade]) -> float | None:
@@ -100,12 +107,12 @@ def _regime_group_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[s
 def _quality_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[str, Any]]:
     resolved = _resolved(trades)
     definitions = (
-        ("score", (("90-94", 90.0, 94.999999), ("95-100", 95.0, 100.000001))),
+        ("score", (("82-89", 82.0, 90.0), ("90-100", 90.0, 100.000001))),
         ("bos_15m_strength", (("0.70-0.79", 0.70, 0.80), ("0.80-1.00", 0.80, 1.000001))),
         ("retest_quality", (("0.80-0.89", 0.80, 0.90), ("0.90-1.00", 0.90, 1.000001))),
         ("trigger_quality_5m", (("0.65-0.79", 0.65, 0.80), ("0.80-1.00", 0.80, 1.000001))),
-        ("rvol_15m", (("1.15-1.49", 1.15, 1.50), ("1.50+", 1.50, float("inf")))),
-        ("adx_4h", (("22-24.9", 22.0, 25.0), ("25+", 25.0, float("inf")))),
+        ("rvol_15m", (("1.10-1.49", 1.10, 1.50), ("1.50+", 1.50, float("inf")))),
+        ("adx_4h", (("20-24.9", 20.0, 25.0), ("25+", 25.0, float("inf")))),
     )
     out: dict[str, Mapping[str, Any]] = {}
     for feature, bands in definitions:
@@ -169,8 +176,9 @@ def summarize(*, days: int, coins_selected: int, coins_tested: int, data_errors:
         short_signals=sum(t.side.upper() == "SHORT" for t in ordered),
         tp1_hits=sum(t.tp1_hit for t in ordered),
         tp2_hits=sum(t.tp2_hit for t in ordered),
+        breakeven_hits=sum(t.breakeven_hit for t in ordered),
         sl_hits=sum(t.sl_hit for t in ordered),
-        unresolved=sum(t.outcome == "OPEN" for t in ordered),
+        unresolved=sum(t.r_multiple is None for t in ordered),
         resolved=len(resolved),
         expiry_count=sum(t.expired for t in ordered),
         win_rate=_win_rate(ordered),
@@ -216,6 +224,7 @@ def format_report(summary: BacktestSummary) -> str:
         "",
         f"🎯 TP1 HIT: {summary.tp1_hits}",
         f"🏆 TP2 HIT: {summary.tp2_hits}",
+        f"🟡 TP1→BE: {summary.breakeven_hits}",
         f"🛑 SL HIT: {summary.sl_hits}",
         f"⏳ EXPIRED: {summary.expiry_count}",
         "",
@@ -263,7 +272,7 @@ def format_report(summary: BacktestSummary) -> str:
     lines.extend([
         "━━━━━━━━━━━━━━━━━━━━",
         "⚠️ PAPER BACKTEST",
-        "15M is the primary intraday entry timeframe; 5M is execution refinement only.",
+        "15M defines the intraday setup; 5M is the immediate execution trigger.",
         "Win rate = TP2 before SL among resolved trades.",
         "TP1 is a milestone, not a full win.",
         "Costs/slippage are included in resolved R.",

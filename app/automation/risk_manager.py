@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
-MIN_RR = 2.0
-MIN_SL_ATR = 0.75
+MIN_RR = 2.50
+MIN_SL_ATR = 1.00
 MAX_SL_ATR = 3.50
-DEFAULT_COST_BUFFER_PCT = 0.0015  # 0.15%
+MIN_TP_ATR = 2.50
+DEFAULT_COST_BUFFER_PCT = 0.0015  # 0.15% round-trip conservative buffer
 
 
 @dataclass(frozen=True)
@@ -16,36 +17,36 @@ class TradePlan:
     side: str
     entry: float
     stop_loss: float
-    tp1: float
-    tp2: float
+    tp: float
     rr: float
+
+    # Legacy read-only aliases keep old database/test integrations from breaking;
+    # the strategy itself has exactly one take-profit level.
+    @property
+    def tp1(self) -> float:
+        return self.tp
+
+    @property
+    def tp2(self) -> float:
+        return self.tp
 
 
 def _finite_positive(value: float) -> bool:
     return math.isfinite(float(value)) and float(value) > 0.0
 
 
-def validate_levels(
-    plan: TradePlan,
-    min_rr: float = MIN_RR,
-) -> tuple[bool, str]:
-    values = (
-        plan.entry,
-        plan.stop_loss,
-        plan.tp1,
-        plan.tp2,
-        plan.rr,
-    )
+def validate_levels(plan: TradePlan, min_rr: float = MIN_RR) -> tuple[bool, str]:
+    values = (plan.entry, plan.stop_loss, plan.tp, plan.rr)
     if not all(_finite_positive(value) for value in values):
         return False, "Trade levels and RR must be finite and positive"
 
     side = str(plan.side).upper()
     if side == "LONG":
-        if not (plan.stop_loss < plan.entry < plan.tp1 < plan.tp2):
-            return False, "LONG levels are not ordered SL < Entry < TP1 < TP2"
+        if not (plan.stop_loss < plan.entry < plan.tp):
+            return False, "LONG levels are not ordered SL < Entry < TP"
     elif side == "SHORT":
-        if not (plan.tp2 < plan.tp1 < plan.entry < plan.stop_loss):
-            return False, "SHORT levels are not ordered TP2 < TP1 < Entry < SL"
+        if not (plan.tp < plan.entry < plan.stop_loss):
+            return False, "SHORT levels are not ordered TP < Entry < SL"
     else:
         return False, "Unknown trade side"
 
@@ -55,10 +56,8 @@ def validate_levels(
         return False, "Minimum RR must be numeric"
     if not math.isfinite(required_rr) or required_rr <= 0:
         return False, "Minimum RR must be finite and positive"
-
     if plan.rr + 1e-12 < required_rr:
         return False, f"RR {plan.rr:.2f} is below minimum {required_rr:.2f}"
-
     return True, "OK"
 
 
@@ -232,35 +231,67 @@ def calculate_rr(
     return float(rr)
 
 
+
+def calculate_rr_after_costs(
+    *,
+    side: str,
+    entry: float,
+    stop_loss: float,
+    target: float,
+    round_trip_cost_pct: float = DEFAULT_COST_BUFFER_PCT,
+) -> float:
+    """Conservative RR after a round-trip cost allowance.
+
+    Costs are expressed as a fraction of entry price and are deducted from the
+    reward while added to the risk denominator. This prevents a geometrically
+    attractive trade from passing only because costs are ignored.
+    """
+    gross_rr = calculate_rr(
+        side=side,
+        entry=entry,
+        stop_loss=stop_loss,
+        target=target,
+    )
+    cost_pct = max(0.0, float(round_trip_cost_pct))
+    cost_price = float(entry) * cost_pct
+    risk = abs(float(entry) - float(stop_loss))
+    if risk <= 0:
+        raise ValueError("Entry and stop-loss must differ")
+    reward = (
+        float(target) - float(entry)
+        if str(side).upper() == "LONG"
+        else float(entry) - float(target)
+    )
+    net_reward = reward - cost_price
+    net_risk = risk + cost_price
+    if net_reward <= 0:
+        return 0.0
+    rr = net_reward / net_risk
+    return float(rr) if math.isfinite(rr) else 0.0
+
+
 def build_trade_plan(
     *,
     side: str,
     entry: float,
     stop_loss: float,
-    tp1: float,
-    tp2: float,
+    tp: float,
     min_rr: float = MIN_RR,
 ) -> TradePlan:
     rr = calculate_rr(
         side=side,
         entry=entry,
         stop_loss=stop_loss,
-        target=tp2,
+        target=tp,
     )
-
     plan = TradePlan(
         side=str(side).upper(),
         entry=float(entry),
         stop_loss=float(stop_loss),
-        tp1=float(tp1),
-        tp2=float(tp2),
+        tp=float(tp),
         rr=rr,
     )
-
-    valid, reason = validate_levels(
-        plan,
-        min_rr=max(MIN_RR, float(min_rr)),
-    )
+    valid, reason = validate_levels(plan, min_rr=max(MIN_RR, float(min_rr)))
     if not valid:
         raise ValueError(reason)
     return plan

@@ -3,33 +3,19 @@ from __future__ import annotations
 from typing import Any
 
 
-MIN_SCORE = 75
-MIN_RR = 2.0
-MIN_SUPPORTING_FAMILIES = 2
-
-MIN_SL_ATR = 0.75
+MIN_SCORE = 78
+MIN_RR = 2.50
+MIN_CONFIRMATION_FAMILIES = 5
+MIN_AVAILABLE_CONFIRMATION_FAMILIES = 6
+MIN_SL_ATR = 1.00
 MAX_SL_ATR = 3.50
-
-MIN_CONFIRMATION_FAMILIES = 4
-
-MAX_ATR_PERCENTILE = 95.0
-MIN_ATR_PERCENTILE = 20.0
+MIN_TP_ATR = 2.50
 
 
-def _f(
-    value: Any,
-    default: float = 0.0,
-) -> float:
+def _f(value: Any, default: float = 0.0) -> float:
     try:
-        return (
-            float(value)
-            if value is not None
-            else default
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
         return default
 
 
@@ -40,331 +26,106 @@ def validate_analysis(
     min_rr: float,
     require_increasing_volume: bool = False,
 ) -> tuple[bool, list[str]]:
+    """Final consistency/safety validator.
+
+    Structural prerequisites remain hard: 4H/1H/15M BOS+retest, clean target
+    geometry, BTC/data quality, and a valid single-TP trade plan. Supporting
+    evidence uses the 5-of-8 family model. Missing optional families abstain.
     """
-    Final setup filter.
-
-    This layer validates the engine's already-produced analysis.
-    It must NOT create a new LONG/SHORT setup.
-
-    The engine remains responsible for:
-        4H regime
-        1H alignment
-        15M structure/setup
-        5M optional refinement only
-        momentum
-        volume
-        location
-        volatility
-        trade levels
-
-    This filter only performs final consistency checks.
-    """
-
     reasons: list[str] = []
+    side = str(data.get("setup") or "").upper()
 
-    # =========================================================
-    # BASIC SETUP
-    # =========================================================
+    if side not in {"LONG", "SHORT"}:
+        reasons.append("No deterministic LONG/SHORT setup")
 
-    side = str(
-        data.get("setup")
-        or ""
-    ).upper()
-
-    if side not in {
-        "LONG",
-        "SHORT",
-    }:
-        reasons.append(
-            "No deterministic LONG/SHORT setup"
-        )
-
-    # =========================================================
-    # SCORE
-    # =========================================================
-
-    score = int(
-        _f(
-            data.get("score"),
-            0,
-        )
-    )
-
-    required_score = max(
-        MIN_SCORE,
-        int(
-            min_confluence or 0
-        ),
-    )
-
+    score = int(_f(data.get("score"), 0))
+    required_score = max(MIN_SCORE, int(min_confluence or 0))
     if score < required_score:
-        reasons.append(
-            f"Score {score}/100 < required {required_score}"
-        )
+        reasons.append(f"Score {score}/100 < required {required_score}")
 
-    # =========================================================
-    # RISK / REWARD
-    # =========================================================
-
-    rr = _f(
-        data.get("rr"),
-        0.0,
-    )
-
-    required_rr = max(
-        MIN_RR,
-        float(
-            min_rr or 0
-        ),
-    )
-
+    rr = _f(data.get("rr"), 0.0)
+    required_rr = max(MIN_RR, float(min_rr or 0.0))
     if rr < required_rr:
-        reasons.append(
-            f"RR {rr:.2f} < required {required_rr:.2f}"
-        )
+        reasons.append(f"RR {rr:.2f} < required {required_rr:.2f}")
 
-    # =========================================================
-    # CORE ENGINE GATES
-    # =========================================================
-
-    hard_gates = (
-        (
-            "direction_ok",
-            "4H/1H directional alignment failed",
-        ),
-        (
-            "structure_ok",
-            "Market structure confirmation failed",
-        ),
-        (
-            "setup_ok",
-            "15M setup failed",
-        ),
-        (
-            "location_ok",
-            "Location / structural target path failed",
-        ),
-        (
-            "btc_filter_ok",
-            "BTC/global filter failed",
-        ),
-        (
-            "data_fresh",
-            "Market data is stale",
-        ),
-        (
-            "target_path_structural",
-            "Targets are not backed by structural/liquidity levels",
-        ),
-        (
-            "structure_quality_ok",
-            "BOS/retest quality failed",
-        ),
-    )
-
-    for key, message in hard_gates:
-        if not bool(
-            data.get(
-                key,
-                False,
-            )
-        ):
+    # Structural prerequisites; these are intentionally not part of the 5/8 vote.
+    for key, message in (
+        ("direction_ok", "4H/1H directional alignment failed"),
+        ("structure_ok", "Market structure confirmation failed"),
+        ("setup_ok", "15M BOS + retest setup failed"),
+        ("btc_filter_ok", "BTC/global filter failed"),
+        ("data_fresh", "Market data is stale"),
+        ("target_path_structural", "TP is not backed by a structural HTF target"),
+        ("structure_quality_ok", "BOS/retest quality failed"),
+        ("shock_veto_ok", "Shock/liquidity veto failed"),
+        ("technical_candidate", "Engine did not mark this as a technical candidate"),
+    ):
+        if not bool(data.get(key, False)):
             reasons.append(message)
 
-    # =========================================================
-    # ENGINE TECHNICAL CANDIDATE
-    # =========================================================
+    if bool(data.get("signal_blocked", False)):
+        reasons.append("Engine marked signal blocked")
 
-    if not bool(
-        data.get(
-            "technical_candidate",
-            False,
-        )
-    ):
+    family_data = data.get("confirmation_families")
+    family_passed = data.get("confirmation_families_passed")
+    family_available = data.get("confirmation_families_available")
+    diversity_ok = data.get("confirmation_family_diversity_ok")
+
+    if isinstance(family_data, dict):
+        statuses = [
+            str(value.get("status") or "ABSTAIN").upper()
+            for value in family_data.values()
+            if isinstance(value, dict)
+        ]
+        derived_passed = sum(status == "PASS" for status in statuses)
+        derived_available = sum(status in {"PASS", "FAIL"} for status in statuses)
+        if family_passed is None:
+            family_passed = derived_passed
+        if family_available is None:
+            family_available = derived_available
+
+    passed = int(_f(family_passed, 0))
+    available = int(_f(family_available, 0))
+    if passed < MIN_CONFIRMATION_FAMILIES or available < MIN_AVAILABLE_CONFIRMATION_FAMILIES:
         reasons.append(
-            "Engine did not mark this as a technical candidate"
+            f"Confirmation families {passed}/{available} < required "
+            f"{MIN_CONFIRMATION_FAMILIES}/{MIN_AVAILABLE_CONFIRMATION_FAMILIES}"
         )
-
-    # =========================================================
-    # ENGINE BLOCK
-    # =========================================================
-
-    if bool(
-        data.get(
-            "signal_blocked",
-            False,
-        )
-    ):
-        reasons.append(
-            "Engine marked signal blocked"
-        )
-
-    # =========================================================
-    # CONFIRMATION FAMILIES
-    # =========================================================
-
-    families = int(
-        _f(
-            data.get(
-                "confirmation_family_count",
-            ),
-            0,
-        )
-    )
-
-    supporting_value = data.get("supporting_family_count")
-    if supporting_value is not None:
-        supporting_families = int(_f(supporting_value, 0))
-        if supporting_families < MIN_SUPPORTING_FAMILIES:
-            reasons.append(
-                f"Supporting confirmation families {supporting_families}/4 < required "
-                f"{MIN_SUPPORTING_FAMILIES}/4"
-            )
-
-    # =========================================================
-    # PRIMARY ENTRY TIMEFRAME CONSISTENCY
-    # =========================================================
+    if diversity_ok is False or (family_data is not None and diversity_ok is None):
+        reasons.append("Confirmation family diversity requirement failed")
 
     primary_tf = str(data.get("primary_entry_timeframe") or "15M").upper()
     if side in {"LONG", "SHORT"} and primary_tf != "15M":
-        reasons.append("Primary entry timeframe must be 15M for intraday mode")
+        reasons.append("Primary entry timeframe must be 15M")
 
-    # =========================================================
-    # VOLUME REQUIREMENT
-    # =========================================================
-
-    # Volume/RVOL is supporting evidence. The engine grades it into the score
-    # instead of rejecting otherwise valid 15M structures here.
-    _ = require_increasing_volume
-
-    # =========================================================
-    # SL / INTRADAY GEOMETRY
-    # =========================================================
-
-    sl_atr = _f(
-        data.get(
-            "sl_atr",
-        ),
-        999.0,
-    )
-
+    sl_atr = _f(data.get("sl_atr"), 999.0)
     if sl_atr < MIN_SL_ATR:
-        reasons.append(
-            f"SL distance {sl_atr:.2f} ATR "
-            f"< minimum {MIN_SL_ATR:.2f}"
-        )
-
+        reasons.append(f"SL distance {sl_atr:.2f} ATR < minimum {MIN_SL_ATR:.2f}")
     if sl_atr > MAX_SL_ATR:
-        reasons.append(
-            f"SL distance {sl_atr:.2f} ATR "
-            f"> maximum {MAX_SL_ATR:.2f}"
-        )
+        reasons.append(f"SL distance {sl_atr:.2f} ATR > maximum {MAX_SL_ATR:.2f}")
 
-    geometry_flag = data.get("trade_geometry_ok")
-    if side in {"LONG", "SHORT"} and geometry_flag is False:
-        reasons.append("Intraday trade geometry gate failed")
+    if side in {"LONG", "SHORT"} and data.get("trade_geometry_ok") is False:
+        reasons.append("Single-TP trade geometry gate failed")
 
-    # =========================================================
-    # ATR VOLATILITY PERCENTILE
-    # =========================================================
+    tp_distance_atr = _f(data.get("tp_distance_atr"), 0.0)
+    if side in {"LONG", "SHORT"} and tp_distance_atr < MIN_TP_ATR:
+        reasons.append(f"TP distance {tp_distance_atr:.2f} ATR < minimum {MIN_TP_ATR:.2f}")
 
-    atr_rank = _f(
-        data.get(
-            "atr_percentile",
-        ),
-        50.0,
-    )
-
-    # ATR percentile is supporting evidence in intraday mode. Extreme volatility
-    # is surfaced in the engine diagnostics but is no longer a duplicated hard gate.
-
-    # =========================================================
-    # MEXC EXECUTION QUALITY
-    #
-    # Spread remains a hard execution-quality check.
-    #
-    # Entry drift is intentionally NOT a rejection gate.
-    # The scanner reprices the trade levels to the executable
-    # market price before final validation.
-    # =========================================================
-
-    spread = _f(
-        data.get(
-            "mexc_spread_pct",
-        ),
-        0.0,
-    )
-
-    max_spread = _f(
-        data.get(
-            "max_mexc_spread_pct",
-        ),
-        0.001,
-    )
-
+    spread = _f(data.get("mexc_spread_pct"), 0.0)
+    max_spread = _f(data.get("max_mexc_spread_pct"), 0.001)
     if spread > max_spread:
-        reasons.append(
-            "MEXC spread gate failed"
-        )
+        reasons.append("MEXC spread gate failed")
 
-    # Entry drift is recorded for diagnostics only.
-    # It must NOT reject an otherwise valid setup.
-    _ = _f(
-        data.get(
-            "entry_drift_pct",
-        ),
-        0.0,
-    )
+    entry = _f(data.get("entry"), 0.0)
+    stop_loss = _f(data.get("stop_loss"), 0.0)
+    tp = _f(data.get("tp"), 0.0)
+    if entry <= 0 or stop_loss <= 0 or tp <= 0:
+        reasons.append("Single trade levels are incomplete or invalid")
+    elif side == "LONG" and not (stop_loss < entry < tp):
+        reasons.append("LONG levels must satisfy SL < Entry < TP")
+    elif side == "SHORT" and not (tp < entry < stop_loss):
+        reasons.append("SHORT levels must satisfy TP < Entry < SL")
 
-    _ = _f(
-        data.get(
-            "max_entry_drift_pct",
-        ),
-        0.002,
-    )
-
-    # =========================================================
-    # TRADE LEVELS
-    # =========================================================
-
-    entry = data.get("entry")
-    stop_loss = data.get("stop_loss")
-    tp1 = data.get("tp1")
-    tp2 = data.get("tp2")
-
-    if (
-        entry is None
-        or stop_loss is None
-        or tp1 is None
-        or tp2 is None
-    ):
-        reasons.append(
-            "Trade levels are incomplete"
-        )
-    else:
-        if (
-            _f(entry, 0.0) <= 0
-            or _f(stop_loss, 0.0) <= 0
-            or _f(tp1, 0.0) <= 0
-            or _f(tp2, 0.0) <= 0
-        ):
-            reasons.append(
-                "Trade levels contain invalid values"
-            )
-
-    # =========================================================
-    # FUTURES CONTEXT
-    #
-    # futures_ok is deliberately NOT an independent hard gate.
-    # =========================================================
-
-    # No direct rejection for futures_ok=False.
-
-    # =========================================================
-    # FINAL RESULT
-    # =========================================================
-
-    return (
-        len(reasons) == 0,
-        reasons,
-    )
+    # Increasing volume is deliberately supporting evidence only.
+    _ = require_increasing_volume
+    return len(reasons) == 0, list(dict.fromkeys(reasons))

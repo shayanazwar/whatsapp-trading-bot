@@ -19,6 +19,10 @@ from ..analysis.engine import (
     MIN_RR,
     MIN_SL_ATR,
     MAX_SL_ATR,
+    MIN_TP_ATR,
+    MIN_CONFIRMATION_FAMILIES,
+    MIN_AVAILABLE_CONFIRMATION_FAMILIES,
+    evaluate_confirmation_families,
 )
 from ..config import Settings
 from .executor import MexcExecutor
@@ -297,12 +301,27 @@ class MexcScanner:
                 futures_ok = self._futures_context_ok(analysis, setup)
                 analysis["futures_ok"] = futures_ok
                 analysis["futures_context"] = "AVAILABLE" if futures_ok else "INSUFFICIENT_DIRECTIONAL_CONFIRMATION"
+                analysis["max_mexc_spread_pct"] = float(getattr(self.settings, "max_mexc_spread_pct", 0.001))
+                analysis["estimated_round_trip_cost_pct"] = float(
+                    getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)
+                )
 
-                # Futures context is a 5-point supporting family. Missing or
-                # non-directional order-flow data must not erase a technically
-                # valid setup before the final validator.
+                # Re-evaluate the eight supporting families with real MEXC
+                # execution/flow data. Missing optional families abstain.
                 self._update_confirmation_families(analysis)
                 analysis["score"], analysis["score_groups"] = self._recalculate_score(analysis)
+                analysis["technical_candidate"] = bool(
+                    setup in {"LONG", "SHORT"}
+                    and analysis.get("direction_ok")
+                    and analysis.get("structure_ok")
+                    and analysis.get("setup_ok")
+                    and analysis.get("location_ok")
+                    and analysis.get("risk_ok")
+                    and int(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 78))
+                    and analysis.get("confirmation_families_passed_ok")
+                    and int(analysis.get("confirmation_families_passed", 0)) >= MIN_CONFIRMATION_FAMILIES
+                    and int(analysis.get("confirmation_families_available", 0)) >= MIN_AVAILABLE_CONFIRMATION_FAMILIES
+                )
 
                 planned_entry = self._safe_float(analysis.get("entry"))
                 if planned_entry <= 0:
@@ -330,7 +349,7 @@ class MexcScanner:
                 analysis["execution_entry"] = float(executable)
                 analysis["executable_entry"] = float(executable)
                 risk = abs(float(executable) - float(analysis["stop_loss"]))
-                reward = abs(float(analysis["tp2"]) - float(executable))
+                reward = abs(float(analysis["tp"]) - float(executable))
                 analysis["rr"] = reward / risk if risk > 0 else 0.0
                 analysis["max_signal_age_seconds"] = float(getattr(self.settings, "max_signal_age_seconds", 330.0))
 
@@ -367,39 +386,48 @@ class MexcScanner:
 
     @staticmethod
     def _update_confirmation_families(analysis: dict[str, Any]) -> None:
-        momentum_quality = float(analysis.get("momentum_quality", 0.0) or 0.0)
-        volume_quality = float(analysis.get("volume_quality", 0.0) or 0.0)
-        core = (
-            bool(analysis.get("direction_ok")),
-            bool(analysis.get("structure_ok")),
-            bool(analysis.get("setup_ok")),
-            bool(analysis.get("location_ok")),
-        )
-        analysis["confirmation_family_count"] = sum(core) + int(momentum_quality >= 0.55) + int(volume_quality >= 0.55)
+        family_result = evaluate_confirmation_families(analysis)
+        analysis["confirmation_families"] = family_result.get("families", {})
+        analysis["confirmation_families_passed"] = int(family_result.get("passed", 0))
+        analysis["confirmation_families_available"] = int(family_result.get("available", 0))
+        analysis["confirmation_family_diversity_ok"] = bool(family_result.get("diversity_ok"))
+        analysis["confirmation_families_passed_ok"] = bool(family_result.get("passed_ok"))
+        analysis["confirmation_family_count"] = int(family_result.get("passed", 0))
+        analysis["supporting_family_count"] = int(family_result.get("passed", 0))
+        analysis["min_confirmation_families"] = MIN_CONFIRMATION_FAMILIES
+        analysis["min_available_confirmation_families"] = MIN_AVAILABLE_CONFIRMATION_FAMILIES
 
     @staticmethod
     def _recalculate_score(analysis: dict[str, Any]) -> tuple[int, dict[str, int]]:
-        def clamp01(value: Any) -> float:
-            try:
-                return max(0.0, min(1.0, float(value)))
-            except (TypeError, ValueError):
-                return 0.0
-
-        momentum_quality = clamp01(analysis.get("momentum_quality"))
-        volume_quality = clamp01(analysis.get("volume_quality"))
-        groups = {
-            "direction_regime": 20 if analysis.get("direction_ok") else 0,
-            "market_structure": 20 if analysis.get("structure_ok") else 0,
-            "setup_entry_trigger": 20 if analysis.get("setup_ok") else 0,
-            "momentum": int(round(10 * momentum_quality)) if analysis.get("setup_ok") else 0,
-            "volume_participation": int(round(10 * volume_quality)) if analysis.get("setup_ok") else 0,
-            "location_target_path": 10 if analysis.get("location_ok") else 0,
-            "futures_market_context": 5 if analysis.get("futures_ok") else 0,
-            "volatility_execution": 5 if analysis.get("volatility_ok") else 0,
+        """Score uses structural prerequisites plus the eight-family evidence."""
+        family_data = analysis.get("confirmation_families") or {}
+        family_weights = {
+            "momentum": 5,
+            "relative_volume": 4,
+            "volatility_regime": 4,
+            "liquidity_quality": 4,
+            "funding_crowding": 4,
+            "flow_pressure": 5,
+            "htf_target_path": 5,
+            "vwap_location": 4,
         }
-        setup_q = 0.50 * clamp01(analysis.get("trigger_quality")) + 0.25 * clamp01(analysis.get("bos_15m_strength")) + 0.25 * clamp01((analysis.get("retest") or {}).get("quality"))
-        if groups["setup_entry_trigger"] and setup_q < 0.55:
-            groups["setup_entry_trigger"] = max(15, groups["setup_entry_trigger"] - 5)
+        family_points = sum(
+            family_weights[name]
+            for name, weight in family_weights.items()
+            if isinstance(family_data.get(name), dict)
+            and family_data[name].get("status") == "PASS"
+        )
+        trigger_q = max(0.0, min(1.0, float(analysis.get("trigger_quality") or 0.0)))
+        bos_q = max(0.0, min(1.0, float(analysis.get("bos_15m_strength") or 0.0)))
+        retest = analysis.get("retest") or {}
+        retest_q = max(0.0, min(1.0, float(retest.get("quality") or 0.0)))
+        setup_quality = 0.50 * trigger_q + 0.25 * bos_q + 0.25 * retest_q
+        groups = {
+            "structure_prerequisites": 35 if all(bool(analysis.get(k)) for k in ("direction_ok", "structure_ok", "setup_ok")) else 0,
+            "setup_quality": int(round(10 * setup_quality)) if analysis.get("setup_ok") else 0,
+            "family_evidence": family_points,
+            "risk_geometry": 20 if analysis.get("trade_geometry_ok") else 0,
+        }
         return max(0, min(100, sum(groups.values()))), groups
 
     @staticmethod
@@ -467,67 +495,75 @@ class MexcScanner:
         *,
         max_drift_pct: float = 0.002,
     ) -> tuple[bool, str]:
-        """Verify the engine's structural levels at the executable quote.
-
-        Entry may move to the executable ask/bid. Structural SL/TP are never
-        translated with that move.
-        """
+        """Revalidate one structural SL/TP at the executable quote."""
         try:
             planned_entry = float(analysis["entry"])
             stop = float(analysis["stop_loss"])
-            tp1 = float(analysis["tp1"])
-            tp2 = float(analysis["tp2"])
+            tp = float(analysis["tp"])
             atr_value = float(analysis.get("atr") or 0.0)
         except (KeyError, TypeError, ValueError):
-            return False, "Missing or invalid structural trade levels"
+            return False, "Missing or invalid structural SL/TP"
 
-        if executable_price <= 0 or planned_entry <= 0:
-            return False, "Invalid executable or planned entry"
-        if side == "LONG" and not (stop < planned_entry < tp1 < tp2):
+        if executable_price <= 0 or planned_entry <= 0 or atr_value <= 0:
+            return False, "Invalid executable entry or ATR"
+
+        if side == "LONG" and not (stop < planned_entry < tp):
             return False, "Invalid planned LONG geometry"
-        if side == "SHORT" and not (tp2 < tp1 < planned_entry < stop):
+        if side == "SHORT" and not (tp < planned_entry < stop):
             return False, "Invalid planned SHORT geometry"
 
         drift = abs(executable_price - planned_entry) / planned_entry
         if drift > max(0.0, float(max_drift_pct)):
             return False, "Executable entry drift exceeds limit"
 
-        if side == "LONG":
-            if not (stop < executable_price < tp1 < tp2):
-                return False, "Executable LONG geometry is no longer valid"
-        elif side == "SHORT":
-            if not (tp2 < tp1 < executable_price < stop):
-                return False, "Executable SHORT geometry is no longer valid"
-        else:
-            return False, "Invalid side"
+        if side == "LONG" and not (stop < executable_price < tp):
+            return False, "Executable LONG geometry is no longer valid"
+        if side == "SHORT" and not (tp < executable_price < stop):
+            return False, "Executable SHORT geometry is no longer valid"
 
         risk = abs(executable_price - stop)
-        reward = abs(tp2 - executable_price)
+        reward = abs(tp - executable_price)
         if risk <= 0 or reward <= 0:
             return False, "Executable price invalidates structural geometry"
 
-        stop_pct = risk / executable_price
-        stop_atr = risk / atr_value if atr_value > 0 else float("inf")
+        stop_atr = risk / atr_value
+        tp_atr = reward / atr_value
         rr = reward / risk
-        tp1_distance = abs(tp1 - executable_price)
-        tp2_distance = abs(tp2 - executable_price)
-        tp1_atr = tp1_distance / atr_value if atr_value > 0 else float("inf")
-        tp2_atr = tp2_distance / atr_value if atr_value > 0 else float("inf")
-
-        # No arbitrary price-percent floors. Only structural ordering, ATR sanity,
-        # executable-entry drift, and final RR are checked here.
         if stop_atr < MIN_SL_ATR or stop_atr > MAX_SL_ATR:
-            return False, f"Live structural stop {stop_atr:.2f} ATR outside safety bounds"
-        if rr < MIN_RR:
-            return False, f"Live RR {rr:.2f} below minimum {MIN_RR:.2f}"
+            return False, f"Live SL {stop_atr:.2f} ATR outside {MIN_SL_ATR:.2f}-{MAX_SL_ATR:.2f}"
+        if tp_atr < MIN_TP_ATR:
+            return False, f"Live TP {tp_atr:.2f} ATR below minimum {MIN_TP_ATR:.2f}"
 
+        # Reuse the same conservative cost allowance as the final validator.
+        try:
+            from .signal_validator import MIN_RR as VALIDATOR_MIN_RR
+            from ..automation.risk_manager import calculate_rr_after_costs
+            cost_pct = float(analysis.get("estimated_round_trip_cost_pct", 0.0015) or 0.0015)
+            funding = analysis.get("mexc_funding_rate")
+            if funding is not None:
+                cost_pct += min(0.0010, abs(float(funding)) * 2.0)
+            net_rr = calculate_rr_after_costs(
+                side=side,
+                entry=executable_price,
+                stop_loss=stop,
+                target=tp,
+                round_trip_cost_pct=cost_pct,
+            )
+        except (TypeError, ValueError):
+            return False, "Unable to calculate live post-cost RR"
+
+        if net_rr < max(MIN_RR, VALIDATOR_MIN_RR):
+            return False, f"Live post-cost RR {net_rr:.2f} below minimum {max(MIN_RR, VALIDATOR_MIN_RR):.2f}"
+
+        analysis["entry_drift_pct"] = drift
         analysis["trade_geometry_ok"] = True
-        analysis["stop_distance_pct"] = stop_pct
+        analysis["stop_distance_pct"] = risk / executable_price
         analysis["sl_atr"] = stop_atr
-        analysis["tp1_distance_atr"] = tp1_atr
-        analysis["tp2_distance_atr"] = tp2_atr
-        analysis["tp1_distance_pct"] = tp1_distance / executable_price
-        analysis["tp2_distance_pct"] = tp2_distance / executable_price
+        analysis["tp_distance_atr"] = tp_atr
+        analysis["tp_distance_pct"] = reward / executable_price
+        analysis["rr_gross"] = rr
+        analysis["rr_net"] = net_rr
+        analysis["rr"] = net_rr
         analysis["live_geometry_reason"] = "OK"
         return True, "OK"
 

@@ -78,73 +78,10 @@ class Bot:
         self.whatsapp = whatsapp
         self.charts = charts
         self.backtest_runner: BacktestRunner | None = None
-        self._backtest_keepalive_task: asyncio.Task | None = None
+        self._last_inbound_phone: str | None = None
 
     def set_backtest_runner(self, runner: BacktestRunner) -> None:
         self.backtest_runner = runner
-
-    async def _backtest_keepalive_loop(self, phone: str) -> None:
-        try:
-            while True:
-                await asyncio.sleep(180)
-
-                if (
-                    self.backtest_runner is None
-                    or not self.backtest_runner.is_running
-                ):
-                    break
-
-                LOGGER.info(
-                    "BACKTEST 3-MIN KEEPALIVE DISPATCH | phone=%s",
-                    phone,
-                )
-
-                # Route through the normal WhatsApp bot command handler.
-                await self.handle(
-                    phone,
-                    "KEEPALIVE",
-                )
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-            LOGGER.exception(
-                "BACKTEST 3-MIN KEEPALIVE LOOP FAILED"
-            )
-
-    async def _start_backtest_keepalive(self, phone: str) -> None:
-        task = self._backtest_keepalive_task
-
-        if task is not None and not task.done():
-            return
-
-        self._backtest_keepalive_task = asyncio.create_task(
-            self._backtest_keepalive_loop(phone),
-            name="backtest-3min-keepalive",
-        )
-
-        LOGGER.info(
-            "BACKTEST 3-MIN KEEPALIVE STARTED | interval=180s"
-        )
-
-    async def _stop_backtest_keepalive(self) -> None:
-        task = self._backtest_keepalive_task
-        self._backtest_keepalive_task = None
-
-        if task is None:
-            return
-
-        task.cancel()
-
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        LOGGER.info(
-            "BACKTEST 3-MIN KEEPALIVE STOPPED"
-        )
 
     async def _keepalive(self) -> None:
         LOGGER.info(
@@ -166,6 +103,8 @@ class Bot:
                 "⛔ This bot is private.",
             )
             return
+
+        self._last_inbound_phone = phone
 
         match = COMMAND_RE.match(cleaned)
 
@@ -683,8 +622,6 @@ class Bot:
         )
 
         try:
-            await self._start_backtest_keepalive(phone)
-
             summary = await self.backtest_runner.run(days)
             try:
                 from .backtest.report import format_report
@@ -709,9 +646,6 @@ class Bot:
                 phone,
                 f"âŒ BACKTEST {period} failed: {exc}",
             )
-        finally:
-            await self._stop_backtest_keepalive()
-
     async def _shortcut(
         self,
         phone: str,

@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import json
 import logging
+import time
 from contextlib import suppress
 from typing import Optional
 
@@ -169,6 +170,64 @@ _background_tasks: set[asyncio.Task] = set()
 def keep_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+async def whatsapp_keepalive_loop() -> None:
+    """Inject one synthetic inbound ANALYZE command every 4 minutes.
+
+    The payload is sent through the same process_webhook() path used by
+    the real WhatsApp webhook receiver. The task itself is permanent for
+    the lifetime of the application and is not tied to backtest state.
+    """
+    while True:
+        try:
+            await asyncio.sleep(240)
+
+            phone = bot._last_inbound_phone
+            if not phone and settings.allowed_user_set:
+                phone = next(iter(settings.allowed_user_set))
+
+            if not phone:
+                logger.info(
+                    "BACKTEST KEEPALIVE | waiting for a real WhatsApp sender"
+                )
+                continue
+
+            message_id = f"internal-keepalive-{time.time_ns()}"
+            payload = {
+                "entry": [{
+                    "changes": [{
+                        "field": "messages",
+                        "value": {
+                            "messages": [{
+                                "id": message_id,
+                                "from": phone,
+                                "type": "text",
+                                "text": {"body": "ANALYZE BTCUSDT"},
+                            }]
+                        },
+                    }]
+                }]
+            }
+
+            logger.info(
+                "BACKTEST KEEPALIVE | synthetic WhatsApp message | id=%s from=%s command=ANALYZE BTCUSDT",
+                message_id,
+                phone,
+            )
+
+            task = asyncio.create_task(
+                process_webhook(payload),
+                name="whatsapp-keepalive-webhook",
+            )
+            keep_task(task)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "BACKTEST KEEPALIVE | loop iteration failed; continuing"
+            )
 
 
 # ============================================================
@@ -460,6 +519,17 @@ async def startup_event():
     # Start MEXC scanner
     if settings.scanner_enabled:
         await scanner_scheduler.start()
+
+    keep_task(
+        asyncio.create_task(
+            whatsapp_keepalive_loop(),
+            name="whatsapp-backtest-keepalive",
+        )
+    )
+
+    logger.info(
+        "WhatsApp 4-minute keepalive started."
+    )
 
     logger.info(
         "Bot startup complete."

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from statistics import mean, median
-from typing import Mapping, Sequence, Any
+from typing import Any, Mapping, Sequence
 
 from .simulator import SimulatedTrade
 
@@ -47,12 +48,13 @@ class BacktestSummary:
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
-    # EXPIRED trades are finalized at the last available completed price by the
-    # stateful simulator, so they are resolved when realized R is available.
+    # EXPIRED trades are resolved only when the simulator produced realized R.
     return [
-        t for t in trades
-        if t.outcome in {"TP2", "SL", "BE", "EXPIRED"}
-        and t.r_multiple is not None
+        trade
+        for trade in trades
+        if trade.outcome in {"TP2", "SL", "BE", "EXPIRED"}
+        and trade.r_multiple is not None
+        and math.isfinite(float(trade.r_multiple))
     ]
 
 
@@ -60,19 +62,21 @@ def _win_rate(trades: Sequence[SimulatedTrade]) -> float | None:
     values = _resolved(trades)
     if not values:
         return None
-    return 100.0 * sum(t.outcome == "TP2" for t in values) / len(values)
+    return 100.0 * sum(trade.outcome == "TP2" for trade in values) / len(values)
 
 
 def _expectancy(trades: Sequence[SimulatedTrade]) -> float | None:
-    values = [float(t.r_multiple) for t in _resolved(trades)]
+    values = [float(trade.r_multiple) for trade in _resolved(trades)]
     return mean(values) if values else None
 
 
 def _group_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[str, Any]]:
     groups: dict[str, list[SimulatedTrade]] = {}
     for trade in trades:
-        key = trade.side.upper() if trade.side.upper() in {"LONG", "SHORT"} else "UNKNOWN"
+        side = str(trade.side).upper()
+        key = side if side in {"LONG", "SHORT"} else "UNKNOWN"
         groups.setdefault(key, []).append(trade)
+
     out: dict[str, Mapping[str, Any]] = {}
     for key, values in groups.items():
         resolved = _resolved(values)
@@ -91,6 +95,7 @@ def _regime_group_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[s
     for trade in trades:
         key = str(trade.regime or "UNKNOWN").upper()
         groups.setdefault(key, []).append(trade)
+
     out: dict[str, Mapping[str, Any]] = {}
     for key, values in groups.items():
         resolved = _resolved(values)
@@ -105,40 +110,50 @@ def _regime_group_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[s
 
 
 def _quality_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[str, Any]]:
+    """Report structural/context bands only; no 5M-trigger quality bucket remains."""
     resolved = _resolved(trades)
     definitions = (
         ("score", (("82-89", 82.0, 90.0), ("90-100", 90.0, 100.000001))),
         ("bos_15m_strength", (("0.70-0.79", 0.70, 0.80), ("0.80-1.00", 0.80, 1.000001))),
         ("retest_quality", (("0.80-0.89", 0.80, 0.90), ("0.90-1.00", 0.90, 1.000001))),
-        ("trigger_quality_5m", (("0.65-0.79", 0.65, 0.80), ("0.80-1.00", 0.80, 1.000001))),
         ("rvol_15m", (("1.10-1.49", 1.10, 1.50), ("1.50+", 1.50, float("inf")))),
         ("adx_4h", (("20-24.9", 20.0, 25.0), ("25+", 25.0, float("inf")))),
     )
+
     out: dict[str, Mapping[str, Any]] = {}
     for feature, bands in definitions:
         for label, low, high in bands:
             values = [
-                t for t in resolved
-                if low <= float(t.quality.get(feature, -float("inf"))) < high
+                trade
+                for trade in resolved
+                if low <= float(trade.quality.get(feature, -float("inf"))) < high
             ]
-            wins = sum(t.outcome == "TP2" for t in values)
+            wins = sum(trade.outcome == "TP2" for trade in values)
             total = len(values)
             out[f"{feature}:{label}"] = {
                 "signals": total,
                 "wins": wins,
-                "losses": sum(t.outcome == "SL" for t in values),
+                "losses": sum(trade.outcome == "SL" for trade in values),
                 "win_rate": (100.0 * wins / total) if total else None,
                 "expectancy_r": _expectancy(values),
             }
     return out
 
 
-def summarize(*, days: int, coins_selected: int, coins_tested: int, data_errors: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None) -> BacktestSummary:
-    ordered = sorted(trades, key=lambda t: t.signal_time_ms)
+def summarize(
+    *,
+    days: int,
+    coins_selected: int,
+    coins_tested: int,
+    data_errors: int,
+    trades: Sequence[SimulatedTrade],
+    diagnostics: Mapping[str, int] | None = None,
+) -> BacktestSummary:
+    ordered = sorted(trades, key=lambda trade: trade.signal_time_ms)
     resolved = _resolved(ordered)
-    values = [float(t.r_multiple) for t in resolved]
-    winners = [float(t.r_multiple) for t in resolved if t.outcome == "TP2"]
-    losers = [float(t.r_multiple) for t in resolved if t.outcome == "SL"]
+    values = [float(trade.r_multiple) for trade in resolved]
+    winners = [float(trade.r_multiple) for trade in resolved if trade.outcome == "TP2"]
+    losers = [float(trade.r_multiple) for trade in resolved if trade.outcome == "SL"]
 
     running = peak = 0.0
     max_drawdown = 0.0
@@ -156,10 +171,18 @@ def summarize(*, days: int, coins_selected: int, coins_tested: int, data_errors:
     positive = sum(value for value in values if value > 0)
     negative = abs(sum(value for value in values if value < 0))
     profit_factor = positive / negative if negative > 0 else (float("inf") if positive > 0 else None)
-    holds = [float(t.hold_minutes) for t in ordered if t.hold_minutes is not None]
-    stop_pcts = [abs(t.entry - t.stop_loss) / t.entry * 100.0 for t in ordered if t.entry > 0]
-    tp2_pcts = [abs(t.tp2 - t.entry) / t.entry * 100.0 for t in ordered if t.entry > 0]
-    planned_rr = [float(t.planned_rr) for t in ordered if t.planned_rr > 0]
+    holds = [float(trade.hold_minutes) for trade in ordered if trade.hold_minutes is not None]
+    stop_pcts = [
+        abs(float(trade.entry) - float(trade.stop_loss)) / float(trade.entry) * 100.0
+        for trade in ordered
+        if float(trade.entry) > 0
+    ]
+    tp2_pcts = [
+        abs(float(trade.tp2) - float(trade.entry)) / float(trade.entry) * 100.0
+        for trade in ordered
+        if float(trade.entry) > 0
+    ]
+    planned_rr = [float(trade.planned_rr) for trade in ordered if float(trade.planned_rr) > 0]
 
     direction_stats = _group_stats(ordered)
     regime_stats = _regime_group_stats(ordered)
@@ -172,15 +195,15 @@ def summarize(*, days: int, coins_selected: int, coins_tested: int, data_errors:
         coins_selected=coins_selected,
         data_errors=data_errors,
         signals=len(ordered),
-        long_signals=sum(t.side.upper() == "LONG" for t in ordered),
-        short_signals=sum(t.side.upper() == "SHORT" for t in ordered),
-        tp1_hits=sum(t.tp1_hit for t in ordered),
-        tp2_hits=sum(t.tp2_hit for t in ordered),
-        breakeven_hits=sum(t.breakeven_hit for t in ordered),
-        sl_hits=sum(t.sl_hit for t in ordered),
-        unresolved=sum(t.r_multiple is None for t in ordered),
+        long_signals=sum(str(trade.side).upper() == "LONG" for trade in ordered),
+        short_signals=sum(str(trade.side).upper() == "SHORT" for trade in ordered),
+        tp1_hits=sum(bool(trade.tp1_hit) for trade in ordered),
+        tp2_hits=sum(bool(trade.tp2_hit) for trade in ordered),
+        breakeven_hits=sum(bool(trade.breakeven_hit) for trade in ordered),
+        sl_hits=sum(bool(trade.sl_hit) for trade in ordered),
+        unresolved=sum(trade.r_multiple is None for trade in ordered),
         resolved=len(resolved),
-        expiry_count=sum(t.expired for t in ordered),
+        expiry_count=sum(bool(trade.expired) for trade in ordered),
         win_rate=_win_rate(ordered),
         avg_rr=mean(planned_rr) if planned_rr else None,
         total_r=sum(values) if values else 0.0,
@@ -211,6 +234,9 @@ def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
 
 def format_report(summary: BacktestSummary) -> str:
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
+    total_r = "N/A" if summary.total_r is None else f"{summary.total_r:+.2f}R"
+    expectancy = "N/A" if summary.expectancy_r is None else f"{summary.expectancy_r:+.2f}R/trade"
+
     lines = [
         "📊 MEXC INTRADAY ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -230,8 +256,8 @@ def format_report(summary: BacktestSummary) -> str:
         "",
         f"📈 WIN RATE: {_fmt(summary.win_rate, 1, '%')}",
         f"⚖️ AVG PLANNED RR: {_fmt(summary.avg_rr)}",
-        f"💰 TOTAL R: {"N/A" if summary.total_r is None else f"{summary.total_r:+.2f}R"}",
-        f"📊 EXPECTANCY: {"N/A" if summary.expectancy_r is None else f"{summary.expectancy_r:+.2f}R/trade"}",
+        f"💰 TOTAL R: {total_r}",
+        f"📊 EXPECTANCY: {expectancy}",
         f"📐 PROFIT FACTOR: {pf}",
         f"📉 MAX DRAWDOWN: {_fmt(summary.max_drawdown_r)}R",
         f"📉 MAX LOSING STREAK: {summary.max_losing_streak}",
@@ -245,24 +271,29 @@ def format_report(summary: BacktestSummary) -> str:
         f"⏳ OPEN/UNRESOLVED: {summary.unresolved}",
         f"⚠️ DATA ERRORS: {summary.data_errors}",
     ]
+
     if summary.regime_stats:
-        lines.append("")
-        lines.append("REGIME STATS")
+        lines.extend(("", "REGIME STATS"))
         for key in sorted(summary.regime_stats):
             stat = summary.regime_stats[key]
-            lines.append(f"{key}: n={stat['signals']} WR={_fmt(stat['win_rate'], 1, '%')} Exp={_fmt(stat['expectancy_r'])}R")
+            lines.append(
+                f"{key}: n={stat['signals']} WR={_fmt(stat['win_rate'], 1, '%')} "
+                f"Exp={_fmt(stat['expectancy_r'])}R"
+            )
+
     useful_quality = [
-        (key, stat) for key, stat in summary.quality_stats.items()
+        (key, stat)
+        for key, stat in summary.quality_stats.items()
         if int(stat.get("signals", 0) or 0) > 0
     ]
     if useful_quality:
-        lines.append("")
-        lines.append("FORENSIC QUALITY BUCKETS")
+        lines.extend(("", "FORENSIC QUALITY BUCKETS"))
         for key, stat in useful_quality[:8]:
             lines.append(
                 f"{key}: n={stat['signals']} WR={_fmt(stat['win_rate'], 1, '%')} "
                 f"Exp={_fmt(stat['expectancy_r'])}R"
             )
+
     if summary.diagnostics:
         d = summary.diagnostics
         gate_keys = (
@@ -275,8 +306,14 @@ def format_report(summary: BacktestSummary) -> str:
             "BTC_REJECT",
             "SIMULATION_ACCEPT",
             "SIMULATION_NO_TRADE",
+            "STRUCTURE_WINDOW_COLLAPSED",
+            "FIVE_MINUTE_CONFIRMATION_BYPASSED",
         )
-        gate_lines = [(key, int(d.get(key, 0) or 0)) for key in gate_keys if key in d]
+        gate_lines = [
+            (key, int(d.get(key, 0) or 0))
+            for key in gate_keys
+            if key in d
+        ]
         reject_keys = sorted(
             (
                 (key.replace("ENGINE_REJECT_", ""), int(value))
@@ -286,27 +323,31 @@ def format_report(summary: BacktestSummary) -> str:
             key=lambda item: (-item[1], item[0]),
         )
         if gate_lines or reject_keys:
-            lines.append("")
-            lines.append("GATE FUNNEL")
+            lines.extend(("", "GATE FUNNEL"))
             lines.extend(f"{key}: {value}" for key, value in gate_lines)
             if reject_keys:
                 lines.append("TOP ENGINE REJECTIONS")
                 lines.extend(f"{key}: {value}" for key, value in reject_keys[:12])
 
-        top = sorted(summary.diagnostics.items(), key=lambda item: (-item[1], item[0]))[:8]
+        top = sorted(
+            summary.diagnostics.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )[:8]
         if top:
-            lines.append("")
-            lines.append("FORENSIC COUNTERS")
+            lines.extend(("", "FORENSIC COUNTERS"))
             lines.extend(f"{key}: {value}" for key, value in top)
-    lines.extend([
-        "━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ PAPER BACKTEST",
-        "15M defines the intraday setup; 5M is the immediate execution trigger.",
-        "Win rate = TP2 before SL among resolved trades.",
-        "TP1 is a milestone, not a full win.",
-        "Costs/slippage are included in resolved R.",
-        "Current eligible MEXC universe; not a historical-universe test.",
-        "Historical BTC filter is included; live orderbook/freshness filters are not.",
-        "No real trades executed.",
-    ])
+
+    lines.extend(
+        [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "⚠️ PAPER BACKTEST",
+            "15M BOS + retest defines the setup; 5M is not a signal-confirmation gate.",
+            "Win rate = TP2 before SL among resolved trades.",
+            "TP1 is a milestone, not a full win.",
+            "Costs/slippage are included in resolved R.",
+            "Current eligible MEXC universe; not a historical-universe test.",
+            "Historical BTC filter is included; live orderbook/freshness filters are not.",
+            "No real trades executed.",
+        ]
+    )
     return "\n".join(lines)

@@ -225,6 +225,30 @@ def test_runner_has_nonblocking_ipc_reader():
     assert "def reader()" in method_source
 
 
+def test_backtest_production_candidate_discovery_does_not_apply_15m_entry_prefilter():
+    import app.backtest.runner as runner_module
+    source = open(runner_module.__file__, encoding="utf-8").read()
+    prepare_block = source.split("async def _prepare_symbol_history", 1)[1].split("def _backtest_symbol", 1)[0]
+    assert 'atr_values=backtest_15m_context.get("atr")' not in prepare_block
+    assert "15M prefilter only discovers causal BOS/retest setup windows" in prepare_block
+
+
+def test_strategy_thresholds_are_consistent_across_runtime_layers():
+    from app.analysis import engine
+    from app.automation import setup_filter, signal_validator
+
+    assert setup_filter.MIN_SCORE == engine.MIN_SCORE == signal_validator.MIN_SCORE == 82
+    assert setup_filter.MIN_CONFIRMATION_FAMILIES == signal_validator.MIN_CONFIRMATION_FAMILIES == 5
+
+
+def test_structural_stop_bound_is_consistent_with_execution_risk_manager():
+    from app.analysis import engine
+    from app.automation import risk_manager
+
+    assert risk_manager.MIN_SL_ATR == engine.MIN_SL_ATR
+    assert risk_manager.MAX_SL_ATR == engine.MAX_SL_ATR
+
+
 def test_runner_passes_reusable_15m_context():
     import app.backtest.runner as runner_module
     source = open(runner_module.__file__, encoding="utf-8").read()

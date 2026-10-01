@@ -646,442 +646,500 @@ class BacktestRunner:
                     - started,  
                 )  
   
-    async def _run_symbol_analysis_with_timeout(  
-        self,  
-        history: SymbolHistory,  
-        start: int,  
-        end: int,  
-        btc_history: SymbolHistory,  
-        state: dict[str, Any] | None = None,  
-    ) -> tuple[list[SimulatedTrade], dict[str, int]]:  
-        """Run one symbol in an isolated subprocess with a hard watchdog."""  
-        fee_rate = float(  
-            getattr(  
-                self.settings,  
-                "backtest_fee_rate",  
-                DEFAULT_FEE_RATE,  
-            )  
-            if self.settings is not None  
-            else DEFAULT_FEE_RATE  
-        )  
-        slippage_bps = float(  
-            getattr(  
-                self.settings,  
-                "backtest_slippage_bps",  
-                DEFAULT_SLIPPAGE_BPS,  
-            )  
-            if self.settings is not None  
-            else DEFAULT_SLIPPAGE_BPS  
-        )  
-        default_max_hold_minutes = float(  
-            getattr(  
-                self.settings,  
-                "backtest_max_holding_minutes",  
-                DEFAULT_MAX_HOLDING_MINUTES,  
-            )  
-            if self.settings is not None  
-            else DEFAULT_MAX_HOLDING_MINUTES  
-        )  
-  
-        ctx = multiprocessing.get_context("spawn")  
-        parent_conn, child_conn = ctx.Pipe(duplex=False)  
-  
-        payload_path: str | None = None  
-        process: multiprocessing.Process | None = None  
-        watchdog_stop = threading.Event()  
-        watchdog_timeout = threading.Event()  
-        child_booted = threading.Event()  
-        watchdog_reason = [""]  
-        watchdog_thread: threading.Thread | None = None  
-        # Each invocation owns its progress snapshot. The shared run state is  
-        # only an observability index; it must never be used for timeout data.  
-        progress_lock = threading.Lock()  
-        worker_progress: dict[str, Any] = {  
-            "stage": "PROCESS_START",  
-            "details": {"symbol": history.symbol, "pid": None},  
-        }  
-        progress_key: tuple[str, int | None] = (history.symbol, None)  
-  
-        try:  
-            with tempfile.NamedTemporaryFile(  
-                mode="wb",  
-                prefix=f"pta-backtest-{history.symbol}-",  
-                suffix=".pkl",  
-                delete=False,  
-            ) as handle:  
-                payload_path = handle.name  
-                pickle.dump(  
-                    (history, btc_history),  
-                    handle,  
-                    protocol=pickle.HIGHEST_PROTOCOL,  
-                )  
-                handle.flush()  
-  
-            process = ctx.Process(  
-                target=_isolated_backtest_symbol,  
-                args=(  
-                    payload_path,  
-                    start,  
-                    end,  
-                    fee_rate,  
-                    slippage_bps,  
-                    default_max_hold_minutes,  
-                    child_conn,  
-                ),  
-                name=f"backtest-analysis-{history.symbol}",  
-            )  
-            process.daemon = True  
-  
-            def watchdog() -> None:  
-                if not child_booted.wait(CHILD_BOOT_TIMEOUT_SECONDS):  
-                    if watchdog_stop.is_set():  
-                        return  
-                    watchdog_reason[0] = "child boot timeout"  
-                elif watchdog_stop.wait(SYMBOL_ANALYSIS_TIMEOUT_SECONDS):  
-                    return  
-                if process is None or not process.is_alive():  
-                    return  
-  
-                watchdog_timeout.set()  
-                with progress_lock:  
-                    latest_progress = dict(worker_progress)  
-                LOGGER.error(  
-                    "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | reason=%s | last_stage=%s | last_progress=%s | boot_timeout=%ss | analysis_timeout=%ss",  
-                    history.symbol,  
-                    process.pid,  
-                    watchdog_reason[0] or "analysis timeout",  
-                    latest_progress["stage"],  
-                    latest_progress["details"],  
-                    CHILD_BOOT_TIMEOUT_SECONDS,  
-                    SYMBOL_ANALYSIS_TIMEOUT_SECONDS,  
-                )  
-                try:  
-                    process.terminate()  
-                except Exception:  
-                    LOGGER.exception(  
-                        "BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s",  
-                        history.symbol,  
-                    )  
-                    return  
-  
-                try:  
-                    process.join(3.0)  
-                except Exception:  
-                    LOGGER.exception(  
-                        "BACKTEST WATCHDOG JOIN FAILED | symbol=%s",  
-                        history.symbol,  
-                    )  
-  
-                if process.is_alive():  
-                    try:  
-                        process.kill()  
-                        process.join(2.0)  
-                    except Exception:  
-                        LOGGER.exception(  
-                            "BACKTEST WATCHDOG KILL FAILED | symbol=%s",  
-                            history.symbol,  
-                        )  
-  
-                LOGGER.error(  
-                    "BACKTEST WATCHDOG KILLED | symbol=%s | pid=%s | exitcode=%s",  
-                    history.symbol,  
-                    process.pid,  
-                    process.exitcode,  
-                )  
-  
-            payload_kb = (  
-                os.path.getsize(payload_path) / 1024.0  
-                if payload_path  
-                else 0.0  
-            )  
-            LOGGER.info(  
-                "BACKTEST ANALYSIS PROCESS START | symbol=%s | payload_kb=%.1f",  
-                history.symbol,  
-                payload_kb,  
-            )  
-  
-            await asyncio.to_thread(process.start)  
-  
-            try:  
-                child_conn.close()  
-            except Exception:  
-                pass  
-  
-            LOGGER.info(  
-                "BACKTEST ANALYSIS PROCESS STARTED | symbol=%s | pid=%s | method=spawn | payload=FILE",  
-                history.symbol,  
-                process.pid,  
-            )  
-  
-            watchdog_thread = threading.Thread(  
-                target=watchdog,  
-                name=f"backtest-watchdog-{history.symbol}",  
-                daemon=True,  
-            )  
-            watchdog_thread.start()  
-  
-            payload = None  
-            analysis_deadline = time.monotonic() + SYMBOL_ANALYSIS_TIMEOUT_SECONDS  
-            terminal_grace_deadline: float | None = None  
-  
-            while True:  
-                drained = 0  
-  
-                # Drain all pending messages. Status traffic is diagnostic and  
-                # must never be allowed to back up the child pipe.  
-                while parent_conn.poll(0):  
-                    try:  
-                        message = parent_conn.recv()  
-                    except (EOFError, OSError):  
-                        message = None  
-  
-                    if message is None:  
-                        break  
-  
-                    if message and message[0] == "status":  
-                        _, child_stage, details = message  
-                        if not isinstance(details, dict):  
-                            details = {"value": details}  
-                        message_symbol = str(details.get("symbol", history.symbol))  
-                        message_pid = details.get("pid", process.pid)  
-                        if message_symbol != history.symbol or message_pid != process.pid:  
-                            LOGGER.warning(  
-                                "BACKTEST CHILD STATUS IDENTITY MISMATCH | expected=%s/%s got=%s/%s",  
-                                history.symbol, process.pid, message_symbol, message_pid,  
-                            )  
-                            drained += 1  
-                            continue  
-  
-                        child_booted.set()  
-                        with progress_lock:  
-                            worker_progress["stage"] = str(child_stage)  
-                            worker_progress["details"] = dict(details)  
-                            progress_key = (history.symbol, process.pid)  
-  
-                        if state is not None:  
-                            workers = state.setdefault("child_workers", {})  
-                            worker_record = workers.setdefault(progress_key, {"history": []})  
-                            history_trace = worker_record.setdefault("history", [])  
-                            history_trace.append(str(child_stage))  
-                            if len(history_trace) > 32:  
-                                del history_trace[:-32]  
-                            worker_record.update(  
-                                {  
-                                    "stage": str(child_stage),  
-                                    "details": dict(details),  
-                                    "history": history_trace,  
-                                }  
-                            )  
-                            workers[progress_key] = worker_record  
-                            state["child_stage"] = str(child_stage)  
-                            state["child_progress"] = dict(details)  
-                            state["child_pid"] = process.pid  
-                            state["candidate"] = details.get("candidate", "-")  
-                            state["candidate_total"] = details.get("candidates", "-")  
-                            state["engine_calls"] = details.get("engine_calls", 0)  
-                            state["engine_success"] = details.get("engine_success", 0)  
-                            state["engine_seconds"] = details.get("engine_seconds", 0)  
-                            state["last_engine_seconds"] = details.get("last_engine_seconds", 0)  
-  
-                        LOGGER.info(  
-                            "BACKTEST CHILD PROGRESS | symbol=%s pid=%s stage=%s details=%s",  
-                            history.symbol, process.pid, child_stage, details,  
-                        )  
-                        drained += 1  
-                        if drained >= IPC_DRAIN_YIELD_EVERY:  
-                            drained = 0  
-                            await asyncio.sleep(0)  
-                        continue  
-  
-                    if message and message[0] in {"ok", "error"}:  
-                        LOGGER.info(  
-                            "BACKTEST PARENT RESULT RECEIVED | symbol=%s pid=%s type=%s",  
-                            history.symbol, process.pid, message[0],  
-                        )  
-                        payload = message  
-                        break  
-  
-                    LOGGER.warning(  
-                        "BACKTEST UNKNOWN CHILD MESSAGE | symbol=%s pid=%s type=%s",  
-                        history.symbol, process.pid, type(message).__name__,  
-                    )  
-                    drained += 1  
-  
-                if payload is not None:  
-                    break  
-  
-                if watchdog_timeout.is_set():  
-                    with progress_lock:  
-                        latest_progress = dict(worker_progress)  
-                    raise BacktestAnalysisTimeout(  
-                        f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "  
-                        f"pid={process.pid}; last_stage={latest_progress['stage']}; "  
-                        f"last_progress={latest_progress['details']!r}",  
-                        last_stage=str(latest_progress["stage"]),  
-                        last_progress=latest_progress["details"],  
-                    )  
-  
-                now = time.monotonic()  
-                if now >= analysis_deadline:  
-                    watchdog_timeout.set()  
-                    watchdog_reason[0] = watchdog_reason[0] or "analysis timeout (parent deadline)"  
-                    with progress_lock:  
-                        latest_progress = dict(worker_progress)  
-                    LOGGER.error(  
-                        "BACKTEST WATCHDOG TIMEOUT | symbol=%s pid=%s reason=%s last_stage=%s last_progress=%s",  
-                        history.symbol, process.pid, watchdog_reason[0],  
-                        latest_progress["stage"], latest_progress["details"],  
-                    )  
-                    if process.is_alive():  
-                        try:  
-                            process.terminate()  
-                            await asyncio.to_thread(process.join, 3.0)  
-                        except Exception:  
-                            LOGGER.exception("BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s", history.symbol)  
-                        if process.is_alive():  
-                            try:  
-                                process.kill()  
-                                await asyncio.to_thread(process.join, 2.0)  
-                            except Exception:  
-                                LOGGER.exception("BACKTEST WATCHDOG KILL FAILED | symbol=%s", history.symbol)  
-                    raise BacktestAnalysisTimeout(  
-                        f"{history.symbol}: {watchdog_reason[0]}; pid={process.pid}; "  
-                        f"last_stage={latest_progress['stage']}; "  
-                        f"last_progress={latest_progress['details']!r}",  
-                        last_stage=str(latest_progress["stage"]),  
-                        last_progress=latest_progress["details"],  
-                    )  
-  
-                if not process.is_alive():  
-                    if terminal_grace_deadline is None:  
-                        terminal_grace_deadline = now + IPC_TERMINAL_GRACE_SECONDS  
-                    if now >= terminal_grace_deadline:  
-                        break  
-                    await asyncio.sleep(0.02)  
-                    continue  
-  
-                terminal_grace_deadline = None  
-                if drained == 0:  
-                    await asyncio.sleep(IPC_IDLE_SLEEP_SECONDS)  
-  
-            # Final non-blocking drain for a terminal payload buffered just as  
-            # the child transitioned to not-alive.  
-            while payload is None and parent_conn.poll(0):  
-                try:  
-                    message = parent_conn.recv()  
-                except (EOFError, OSError):  
-                    break  
-                if message and message[0] == "status":  
-                    _, child_stage, details = message  
-                    with progress_lock:  
-                        worker_progress["stage"] = str(child_stage)  
-                        worker_progress["details"] = dict(details if isinstance(details, dict) else {"value": details})  
-                    continue  
-                payload = message  
-  
-            if payload is None:  
-                raise RuntimeError(  
-                    f"{history.symbol}: analysis subprocess exited "  
-                    f"without a result (exitcode={process.exitcode})"  
-                )  
-  
-            if payload[0] == "error":  
-                with progress_lock:  
-                    terminal_progress = dict(worker_progress.get("details") or {})  
-                raise BacktestAnalysisProcessError(  
-                    f"{history.symbol}: isolated analysis failed: "  
-                    f"{payload[1]}: {payload[2]}",  
-                    last_progress=terminal_progress,  
-                )  
-  
-            if payload[0] != "ok":  
-                raise RuntimeError(  
-                    f"{history.symbol}: invalid analysis subprocess payload"  
-                )  
-  
-            LOGGER.info(  
-                "BACKTEST ANALYSIS RETURN | symbol=%s pid=%s trades=%d",  
-                history.symbol,  
-                process.pid,  
-                len(payload[1]),  
-            )  
-            return payload[1], payload[2]  
-  
-        except asyncio.CancelledError:  
-            if process is not None and process.is_alive():  
-                try:  
-                    process.terminate()  
-                except Exception:  
-                    pass  
-                try:  
-                    await asyncio.to_thread(process.join, 3.0)  
-                except Exception:  
-                    pass  
-                if process.is_alive():  
-                    try:  
-                        process.kill()  
-                    except Exception:  
-                        pass  
-                    try:  
-                        await asyncio.to_thread(process.join, 2.0)  
-                    except Exception:  
-                        pass  
-            raise  
-  
-        finally:  
-            watchdog_stop.set()  
-  
-            if watchdog_thread is not None and watchdog_thread.is_alive():  
-                try:  
-                    watchdog_thread.join(timeout=1.0)  
-                except Exception:  
-                    pass  
-  
-            try:  
-                child_conn.close()  
-            except Exception:  
-                pass  
-            try:  
-                parent_conn.close()  
-            except Exception:  
-                pass  
-  
-            if process is not None:  
-                if process.is_alive():  
-                    try:  
-                        process.terminate()  
-                    except Exception:  
-                        pass  
-                    try:  
-                        await asyncio.to_thread(process.join, 2.0)  
-                    except Exception:  
-                        pass  
-                    if process.is_alive():  
-                        try:  
-                            process.kill()  
-                        except Exception:  
-                            pass  
-                        try:  
-                            await asyncio.to_thread(process.join, 2.0)  
-                        except Exception:  
-                            pass  
-                try:  
-                    process.close()  
-                except Exception:  
-                    pass  
-  
-            if payload_path:  
-                try:  
-                    os.unlink(payload_path)  
-                except FileNotFoundError:  
-                    pass  
-                except Exception:  
-                    LOGGER.warning(  
-                        "BACKTEST TEMP PAYLOAD CLEANUP FAILED | symbol=%s | path=%s",  
-                        history.symbol,  
-                        payload_path,  
-                    )  
-  
+    async def _run_symbol_analysis_with_timeout(
+        self,
+        history: SymbolHistory,
+        start: int,
+        end: int,
+        btc_history: SymbolHistory,
+        state: dict[str, Any] | None = None,
+    ) -> tuple[list[SimulatedTrade], dict[str, int]]:
+        """Run one symbol in an isolated subprocess with a non-blocking parent IPC loop."""
+        fee_rate = float(
+            getattr(
+                self.settings,
+                "backtest_fee_rate",
+                DEFAULT_FEE_RATE,
+            )
+            if self.settings is not None
+            else DEFAULT_FEE_RATE
+        )
+        slippage_bps = float(
+            getattr(
+                self.settings,
+                "backtest_slippage_bps",
+                DEFAULT_SLIPPAGE_BPS,
+            )
+            if self.settings is not None
+            else DEFAULT_SLIPPAGE_BPS
+        )
+        default_max_hold_minutes = float(
+            getattr(
+                self.settings,
+                "backtest_max_holding_minutes",
+                DEFAULT_MAX_HOLDING_MINUTES,
+            )
+            if self.settings is not None
+            else DEFAULT_MAX_HOLDING_MINUTES
+        )
+
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+        payload_path: str | None = None
+        process: multiprocessing.Process | None = None
+        watchdog_stop = threading.Event()
+        watchdog_timeout = threading.Event()
+        child_booted = threading.Event()
+        watchdog_reason = [""]
+        watchdog_thread: threading.Thread | None = None
+        reader_stop = threading.Event()
+        reader_thread: threading.Thread | None = None
+        messages: thread_queue.Queue = thread_queue.Queue()
+
+        progress_lock = threading.Lock()
+        worker_progress: dict[str, Any] = {
+            "stage": "PROCESS_START",
+            "details": {"symbol": history.symbol, "pid": None},
+        }
+        progress_key: tuple[str, int | None] = (history.symbol, None)
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f"pta-backtest-{history.symbol}-",
+                suffix=".pkl",
+                delete=False,
+            ) as handle:
+                payload_path = handle.name
+                pickle.dump(
+                    (history, btc_history),
+                    handle,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+                handle.flush()
+
+            process = ctx.Process(
+                target=_isolated_backtest_symbol,
+                args=(
+                    payload_path,
+                    start,
+                    end,
+                    fee_rate,
+                    slippage_bps,
+                    default_max_hold_minutes,
+                    child_conn,
+                ),
+                name=f"backtest-analysis-{history.symbol}",
+            )
+            process.daemon = True
+
+            def watchdog() -> None:
+                if not child_booted.wait(CHILD_BOOT_TIMEOUT_SECONDS):
+                    if watchdog_stop.is_set():
+                        return
+                    watchdog_reason[0] = "child boot timeout"
+                elif watchdog_stop.wait(SYMBOL_ANALYSIS_TIMEOUT_SECONDS):
+                    return
+
+                if watchdog_stop.is_set() or process is None or not process.is_alive():
+                    return
+
+                watchdog_timeout.set()
+                with progress_lock:
+                    latest_progress = dict(worker_progress)
+
+                LOGGER.error(
+                    "BACKTEST WATCHDOG TIMEOUT | symbol=%s | pid=%s | reason=%s | "
+                    "last_stage=%s | last_progress=%s | boot_timeout=%ss | analysis_timeout=%ss",
+                    history.symbol,
+                    process.pid,
+                    watchdog_reason[0] or "analysis timeout",
+                    latest_progress["stage"],
+                    latest_progress["details"],
+                    CHILD_BOOT_TIMEOUT_SECONDS,
+                    SYMBOL_ANALYSIS_TIMEOUT_SECONDS,
+                )
+
+                try:
+                    process.terminate()
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s",
+                        history.symbol,
+                    )
+                    return
+
+                try:
+                    process.join(3.0)
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST WATCHDOG JOIN FAILED | symbol=%s",
+                        history.symbol,
+                    )
+
+                if process.is_alive():
+                    try:
+                        process.kill()
+                        process.join(2.0)
+                    except Exception:
+                        LOGGER.exception(
+                            "BACKTEST WATCHDOG KILL FAILED | symbol=%s",
+                            history.symbol,
+                        )
+
+                LOGGER.error(
+                    "BACKTEST WATCHDOG KILLED | symbol=%s | pid=%s | exitcode=%s",
+                    history.symbol,
+                    process.pid,
+                    process.exitcode,
+                )
+
+            def reader() -> None:
+                """Drain the child pipe in a dedicated thread so recv() can never block the event loop."""
+                while not reader_stop.is_set():
+                    try:
+                        message = parent_conn.recv()
+                    except (EOFError, OSError):
+                        break
+                    except Exception:
+                        LOGGER.exception(
+                            "BACKTEST IPC READER FAILED | symbol=%s",
+                            history.symbol,
+                        )
+                        break
+
+                    if message is None:
+                        continue
+
+                    if isinstance(message, tuple) and len(message) >= 2 and message[0] == "status":
+                        child_booted.set()
+
+                    try:
+                        messages.put(message, timeout=0.1)
+                    except Exception:
+                        break
+
+            payload_kb = (
+                os.path.getsize(payload_path) / 1024.0
+                if payload_path
+                else 0.0
+            )
+            LOGGER.info(
+                "BACKTEST ANALYSIS PROCESS START | symbol=%s | payload_kb=%.1f",
+                history.symbol,
+                payload_kb,
+            )
+
+            await asyncio.to_thread(process.start)
+
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+
+            LOGGER.info(
+                "BACKTEST ANALYSIS PROCESS STARTED | symbol=%s | pid=%s | method=spawn | payload=FILE",
+                history.symbol,
+                process.pid,
+            )
+
+            reader_thread = threading.Thread(
+                target=reader,
+                name=f"backtest-ipc-reader-{history.symbol}",
+                daemon=True,
+            )
+            reader_thread.start()
+
+            watchdog_thread = threading.Thread(
+                target=watchdog,
+                name=f"backtest-watchdog-{history.symbol}",
+                daemon=True,
+            )
+            watchdog_thread.start()
+
+            payload = None
+            analysis_deadline = time.monotonic() + SYMBOL_ANALYSIS_TIMEOUT_SECONDS
+            terminal_grace_deadline: float | None = None
+
+            while True:
+                drained = 0
+
+                while True:
+                    try:
+                        message = messages.get_nowait()
+                    except thread_queue.Empty:
+                        break
+
+                    if isinstance(message, tuple) and len(message) >= 1 and message[0] == "status":
+                        _, child_stage, details = message
+                        if not isinstance(details, dict):
+                            details = {"value": details}
+
+                        message_symbol = str(details.get("symbol", history.symbol))
+                        message_pid = details.get("pid", process.pid)
+                        if message_symbol != history.symbol or message_pid != process.pid:
+                            LOGGER.warning(
+                                "BACKTEST CHILD STATUS IDENTITY MISMATCH | expected=%s/%s got=%s/%s",
+                                history.symbol,
+                                process.pid,
+                                message_symbol,
+                                message_pid,
+                            )
+                            drained += 1
+                            continue
+
+                        child_booted.set()
+                        with progress_lock:
+                            worker_progress["stage"] = str(child_stage)
+                            worker_progress["details"] = dict(details)
+                            progress_key = (history.symbol, process.pid)
+
+                        if state is not None:
+                            workers = state.setdefault("child_workers", {})
+                            worker_record = workers.setdefault(
+                                progress_key,
+                                {"history": []},
+                            )
+                            history_trace = worker_record.setdefault("history", [])
+                            history_trace.append(str(child_stage))
+                            if len(history_trace) > 32:
+                                del history_trace[:-32]
+                            worker_record.update(
+                                {
+                                    "stage": str(child_stage),
+                                    "details": dict(details),
+                                    "history": history_trace,
+                                }
+                            )
+                            workers[progress_key] = worker_record
+                            state["child_stage"] = str(child_stage)
+                            state["child_progress"] = dict(details)
+                            state["child_pid"] = process.pid
+                            state["candidate"] = details.get("candidate", "-")
+                            state["candidate_total"] = details.get("candidates", "-")
+                            state["engine_calls"] = details.get("engine_calls", 0)
+                            state["engine_success"] = details.get("engine_success", 0)
+                            state["engine_seconds"] = details.get("engine_seconds", 0)
+                            state["last_engine_seconds"] = details.get("last_engine_seconds", 0)
+
+                        LOGGER.info(
+                            "BACKTEST CHILD PROGRESS | symbol=%s pid=%s stage=%s details=%s",
+                            history.symbol,
+                            process.pid,
+                            child_stage,
+                            details,
+                        )
+                        drained += 1
+                        continue
+
+                    if isinstance(message, tuple) and len(message) >= 1 and message[0] in {"ok", "error"}:
+                        LOGGER.info(
+                            "BACKTEST PARENT RESULT RECEIVED | symbol=%s pid=%s type=%s",
+                            history.symbol,
+                            process.pid,
+                            message[0],
+                        )
+                        payload = message
+                        break
+
+                    LOGGER.warning(
+                        "BACKTEST UNKNOWN CHILD MESSAGE | symbol=%s pid=%s type=%s",
+                        history.symbol,
+                        process.pid,
+                        type(message).__name__,
+                    )
+                    drained += 1
+
+                if payload is not None:
+                    break
+
+                if watchdog_timeout.is_set():
+                    with progress_lock:
+                        latest_progress = dict(worker_progress)
+                    raise BacktestAnalysisTimeout(
+                        f"{history.symbol}: {watchdog_reason[0] or 'analysis timeout'}; "
+                        f"pid={process.pid}; last_stage={latest_progress['stage']}; "
+                        f"last_progress={latest_progress['details']!r}",
+                        last_stage=str(latest_progress["stage"]),
+                        last_progress=latest_progress["details"],
+                    )
+
+                now = time.monotonic()
+                if now >= analysis_deadline:
+                    watchdog_timeout.set()
+                    watchdog_reason[0] = watchdog_reason[0] or "analysis timeout (parent deadline)"
+                    with progress_lock:
+                        latest_progress = dict(worker_progress)
+
+                    LOGGER.error(
+                        "BACKTEST WATCHDOG TIMEOUT | symbol=%s pid=%s reason=%s last_stage=%s last_progress=%s",
+                        history.symbol,
+                        process.pid,
+                        watchdog_reason[0],
+                        latest_progress["stage"],
+                        latest_progress["details"],
+                    )
+
+                    if process.is_alive():
+                        try:
+                            process.terminate()
+                            await asyncio.to_thread(process.join, 3.0)
+                        except Exception:
+                            LOGGER.exception(
+                                "BACKTEST WATCHDOG TERMINATE FAILED | symbol=%s",
+                                history.symbol,
+                            )
+                        if process.is_alive():
+                            try:
+                                process.kill()
+                                await asyncio.to_thread(process.join, 2.0)
+                            except Exception:
+                                LOGGER.exception(
+                                    "BACKTEST WATCHDOG KILL FAILED | symbol=%s",
+                                    history.symbol,
+                                )
+
+                    raise BacktestAnalysisTimeout(
+                        f"{history.symbol}: {watchdog_reason[0]}; pid={process.pid}; "
+                        f"last_stage={latest_progress['stage']}; "
+                        f"last_progress={latest_progress['details']!r}",
+                        last_stage=str(latest_progress["stage"]),
+                        last_progress=latest_progress["details"],
+                    )
+
+                if not process.is_alive():
+                    if terminal_grace_deadline is None:
+                        terminal_grace_deadline = now + IPC_TERMINAL_GRACE_SECONDS
+                    if now >= terminal_grace_deadline:
+                        break
+                    await asyncio.sleep(0.02)
+                    continue
+
+                terminal_grace_deadline = None
+                if drained == 0:
+                    await asyncio.sleep(IPC_IDLE_SLEEP_SECONDS)
+
+            while payload is None:
+                try:
+                    payload = messages.get_nowait()
+                except thread_queue.Empty:
+                    break
+                if isinstance(payload, tuple) and len(payload) >= 1 and payload[0] == "status":
+                    payload = None
+                    continue
+
+            if payload is None:
+                raise RuntimeError(
+                    f"{history.symbol}: analysis subprocess exited without a result "
+                    f"(exitcode={process.exitcode})"
+                )
+
+            if payload[0] == "error":
+                with progress_lock:
+                    terminal_progress = dict(worker_progress.get("details") or {})
+                raise BacktestAnalysisProcessError(
+                    f"{history.symbol}: isolated analysis failed: "
+                    f"{payload[1]}: {payload[2]}",
+                    last_progress=terminal_progress,
+                )
+
+            if payload[0] != "ok":
+                raise RuntimeError(
+                    f"{history.symbol}: invalid analysis subprocess payload"
+                )
+
+            LOGGER.info(
+                "BACKTEST ANALYSIS RETURN | symbol=%s pid=%s trades=%d",
+                history.symbol,
+                process.pid,
+                len(payload[1]),
+            )
+            return payload[1], payload[2]
+
+        except asyncio.CancelledError:
+            if process is not None and process.is_alive():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.to_thread(process.join, 3.0)
+                except Exception:
+                    pass
+                if process.is_alive():
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.to_thread(process.join, 2.0)
+                    except Exception:
+                        pass
+            raise
+
+        finally:
+            watchdog_stop.set()
+
+            if process is not None and process.is_alive():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.to_thread(process.join, 2.0)
+                except Exception:
+                    pass
+                if process.is_alive():
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.to_thread(process.join, 2.0)
+                    except Exception:
+                        pass
+
+            reader_stop.set()
+            if reader_thread is not None and reader_thread.is_alive():
+                try:
+                    await asyncio.to_thread(reader_thread.join, 1.0)
+                except Exception:
+                    pass
+
+            if watchdog_thread is not None and watchdog_thread.is_alive():
+                try:
+                    await asyncio.to_thread(watchdog_thread.join, 1.0)
+                except Exception:
+                    pass
+
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+
+            if process is not None:
+                try:
+                    process.close()
+                except Exception:
+                    pass
+
+            if payload_path:
+                try:
+                    os.unlink(payload_path)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    LOGGER.warning(
+                        "BACKTEST TEMP PAYLOAD CLEANUP FAILED | symbol=%s | path=%s",
+                        history.symbol,
+                        payload_path,
+                    )
+
     async def _fetch_btc_history(  
         self,  
         start: int,  

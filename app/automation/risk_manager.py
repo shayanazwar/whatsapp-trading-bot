@@ -6,8 +6,8 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
 MIN_RR = 2.0
-MIN_SL_ATR = 0.50
-MAX_SL_ATR = 2.75
+MIN_SL_ATR = 0.75
+MAX_SL_ATR = 3.50
 DEFAULT_COST_BUFFER_PCT = 0.0015  # 0.15%
 
 

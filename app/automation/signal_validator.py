@@ -10,9 +10,9 @@ from .risk_manager import TradePlan, calculate_rr, validate_levels
 from .setup_filter import validate_analysis
 
 
-MIN_SCORE = 82
+MIN_SCORE = 75
 MIN_RR = 2.0
-MIN_CONFIRMATION_FAMILIES = 5
+MIN_CONFIRMATION_FAMILIES = 4
 
 FIFTEEN_MINUTE_MS = 900_000
 DEFAULT_MAX_SIGNAL_AGE_MS = 20 * 60 * 1000

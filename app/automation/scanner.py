@@ -334,7 +334,7 @@ class MexcScanner:
                 analysis["rr"] = reward / risk if risk > 0 else 0.0
                 analysis["max_signal_age_seconds"] = float(getattr(self.settings, "max_signal_age_seconds", 330.0))
 
-                validated, reasons = validate_signal(analysis, min_confluence=int(getattr(self.settings, "min_confluence", 82)), min_rr=float(getattr(self.settings, "min_rr", 2.0)), require_increasing_volume=bool(getattr(self.settings, "require_increasing_volume", False)))
+                validated, reasons = validate_signal(analysis, min_confluence=int(getattr(self.settings, "min_confluence", 75)), min_rr=float(getattr(self.settings, "min_rr", 2.0)), require_increasing_volume=bool(getattr(self.settings, "require_increasing_volume", False)))
                 if validated is None:
                     return self._reject(symbol, reasons, stage="FINAL_VALIDATOR", analysis=analysis)
 

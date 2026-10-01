@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 
-MIN_SCORE = 82
+MIN_SCORE = 75
 MIN_RR = 2.0
+MIN_SUPPORTING_FAMILIES = 2
 
-MIN_SL_ATR = 0.50
-MAX_SL_ATR = 2.75
+MIN_SL_ATR = 0.75
+MAX_SL_ATR = 3.50
 
 MIN_CONFIRMATION_FAMILIES = 4
 
@@ -144,10 +145,6 @@ def validate_analysis(
             "Location / structural target path failed",
         ),
         (
-            "volatility_ok",
-            "Volatility hard gate failed",
-        ),
-        (
             "btc_filter_ok",
             "BTC/global filter failed",
         ),
@@ -215,12 +212,14 @@ def validate_analysis(
         )
     )
 
-    if families < MIN_CONFIRMATION_FAMILIES:
-        reasons.append(
-            f"Confirmation families "
-            f"{families}/6 < required "
-            f"{MIN_CONFIRMATION_FAMILIES}/6"
-        )
+    supporting_value = data.get("supporting_family_count")
+    if supporting_value is not None:
+        supporting_families = int(_f(supporting_value, 0))
+        if supporting_families < MIN_SUPPORTING_FAMILIES:
+            reasons.append(
+                f"Supporting confirmation families {supporting_families}/4 < required "
+                f"{MIN_SUPPORTING_FAMILIES}/4"
+            )
 
     # =========================================================
     # PRIMARY ENTRY TIMEFRAME CONSISTENCY
@@ -276,14 +275,8 @@ def validate_analysis(
         50.0,
     )
 
-    if (
-        atr_rank < MIN_ATR_PERCENTILE
-        or atr_rank > MAX_ATR_PERCENTILE
-    ):
-        reasons.append(
-            "ATR volatility percentile "
-            "outside allowed range"
-        )
+    # ATR percentile is supporting evidence in intraday mode. Extreme volatility
+    # is surfaced in the engine diagnostics but is no longer a duplicated hard gate.
 
     # =========================================================
     # MEXC EXECUTION QUALITY

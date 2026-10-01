@@ -30,16 +30,17 @@ TIMEFRAME_ALIASES = {
     "1D":"1d","1DAY":"1d","1W":"1w","1WEEK":"1w",
 }
 
-MIN_SCORE = 82
+MIN_SCORE = 75
 MIN_RR = 2.0
-MIN_FAMILIES = 4
+MIN_FAMILIES = 4  # legacy/core-family display threshold; not the supporting gate
+MIN_SUPPORTING_FAMILIES = 2
 # Intraday geometry is structural. Percentage stop/target floors are deliberately
 # absent. ATR is used only as a volatility/buffer sanity check around structure.
-MIN_SL_ATR = 0.50
-MAX_SL_ATR = 2.75
+MIN_SL_ATR = 0.75
+MAX_SL_ATR = 3.50
 MIN_ATR_PERCENTILE = 20.0
 MAX_ATR_PERCENTILE = 95.0
-MAX_SETUP_AGE_15M = 16
+MAX_SETUP_AGE_15M = 24
 MAX_ENTRY_DISTANCE_ATR = 3.00
 BOS_BUFFER_ATR = 0.10
 BOS_BUFFER_PCT = 0.0005
@@ -52,9 +53,10 @@ RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
 # TP1 is the first meaningful structural obstacle; TP2 must clear 2R.
 MIN_TP1_ATR = 0.60
-MIN_TP2_ATR = 1.50
+MIN_TP2_ATR = 2.00
 INTRADAY_MAX_HOLD_MINUTES = 360
-ENGINE_VERSION = "gold-v4.0-intraday-state-machine"
+ENGINE_VERSION = "gold-v4.1-intraday-state-machine"
+ENABLE_5M_REFINEMENT = False
 
 
 class Candle(dict):
@@ -1051,7 +1053,9 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
         anchor = min(value for _, value in anchors)
         names = "+".join(name for name, _ in anchors)
         stop_source = f"DEEPEST({names})"
-        stop = anchor - 0.12 * atr15
+        structural_stop = anchor - 0.12 * atr15
+        swing_floor_stop = entry - MIN_SL_ATR * atr15
+        stop = min(structural_stop, swing_floor_stop)
     else:
         anchors: list[tuple[str, float]] = []
         if retest.get("high") is not None and _num(retest.get("high")) > entry:
@@ -1065,7 +1069,9 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
         anchor = max(value for _, value in anchors)
         names = "+".join(name for name, _ in anchors)
         stop_source = f"DEEPEST({names})"
-        stop = anchor + 0.12 * atr15
+        structural_stop = anchor + 0.12 * atr15
+        swing_floor_stop = entry + MIN_SL_ATR * atr15
+        stop = max(structural_stop, swing_floor_stop)
 
     if (side == "LONG" and stop >= entry) or (side == "SHORT" and stop <= entry):
         return empty | {"entry": entry, "stop_source": stop_source, "geometry_reason": "stop is on wrong side of entry"}
@@ -1251,7 +1257,7 @@ def _direction_aligned(setup: str, regime: Dict[str, Any], alignment: Dict[str, 
 
 def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos_long, bos_short,
                          ret_long, ret_short, trigger_side, trigger, setup, momentum_ok, volume_ok,
-                         location_ok, risk_ok, volatility_ok, score, families):
+                         location_ok, risk_ok, volatility_ok, score, families, supporting_family_count):
     failures=[]
     if regime.get("regime") == "NO_TRADE": failures.append("4H regime data")
     if not (alignment["long"] or alignment["short"]): failures.append("1H alignment")
@@ -1263,14 +1269,12 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
             failures.append("15M post-BOS retest")
         elif alignment["long"] or alignment["short"]:
             failures.append("15M directional setup")
-    if setup in {"LONG","SHORT"}:
-        if not momentum_ok: failures.append("momentum support")
-        if not volume_ok: failures.append("volume support")
+    if setup in {"LONG", "SHORT"}:
         if not location_ok: failures.append("target path/location")
         if not risk_ok: failures.append("risk/RR")
-        if not volatility_ok: failures.append("volatility")
-        if score<MIN_SCORE: failures.append("score")
-        if families<MIN_FAMILIES: failures.append("confirmation families")
+        if score < MIN_SCORE: failures.append("score")
+        if supporting_family_count < MIN_SUPPORTING_FAMILIES:
+            failures.append("supporting confirmation families")
     if not failures:
         # Deterministic fallback: explain the first stage that stopped the pipeline.
         if regime.get("regime") == "NO_TRADE": failures.append("4H regime data")
@@ -1476,13 +1480,18 @@ def analyze_candles(
         {"trigger_side": trigger_side, "ready": bool(entry_15m.get("ready"))},
     )
 
-    # 5M is optional refinement for a 15M setup and is never eligibility-gating.
-    refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level) if len(c5) >= 30 else {
-        "ready": False, "long": False, "short": False, "quality": 0.0, "rsi": 50.0,
-        "rvol": 0.0, "atr": 0.0, "candle_time": 0, "body_ratio": 0.0,
-        "trigger_type": "OPTIONAL_NOT_AVAILABLE", "reason": "5M refinement not available",
-        "bos_level": None, "volume_expanding": False,
-    }
+    # 5M is intentionally disabled in the signal decision path. 15M BOS/retest
+    # is the authoritative setup/entry timeframe; 5M cannot affect eligibility,
+    # score, family count, rejection reasons, or signal identity.
+    if ENABLE_5M_REFINEMENT and len(c5) >= 30 and not bool(cache.get("_BACKTEST_DISABLE_5M_CONFIRMATION")):
+        refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level)
+    else:
+        refinement_5m = {
+            "ready": False, "long": False, "short": False, "quality": 0.0, "rsi": 50.0,
+            "rvol": 0.0, "atr": 0.0, "candle_time": 0, "body_ratio": 0.0,
+            "trigger_type": "DISABLED", "reason": "5M refinement disabled; 15M is authoritative",
+            "bos_level": None, "volume_expanding": False,
+        }
     if refinement_5m.get("ready") and retest_time is not None and int(refinement_5m["candle_time"]) < retest_time:
         refinement_5m = dict(refinement_5m)
         refinement_5m.update({"ready": False, "long": False, "short": False, "trigger_type": "INVALID_BEFORE_RETEST"})
@@ -1546,6 +1555,12 @@ def analyze_candles(
         1.0,
     )
     volume_ok = bool(volume_quality >= 0.55)
+    supporting_family_count = sum((
+        momentum_quality >= 0.45,
+        volume_quality >= 0.50,
+        bool(_num(entry_15m.get("quality")) >= 0.50),
+        volatility_ok,
+    ))
     ema21_15 = _safe_ema(close15, 21)
     extension_atr = (abs(price - ema21_15) / atr15) if ema21_15 is not None and atr15 > 0 else 999.0
     ema_extension_ok = bool(
@@ -1634,11 +1649,10 @@ def analyze_candles(
         and setup_ok
         and location_ok
         and risk_ok
-        and volatility_ok
         and rr is not None
         and rr >= MIN_RR
         and score >= MIN_SCORE
-        and families >= MIN_FAMILIES
+        and supporting_family_count >= MIN_SUPPORTING_FAMILIES
     )
 
     report_progress(
@@ -1646,6 +1660,7 @@ def analyze_candles(
         {
             "score": score,
             "families": families,
+            "supporting_families": supporting_family_count,
             "technical_candidate": technical_candidate,
         },
     )
@@ -1669,6 +1684,7 @@ def analyze_candles(
         volatility_ok,
         score,
         families,
+        supporting_family_count,
     )
     # Geometry diagnostics are explicit because a high RR can otherwise hide
     # an unacceptably small stop.
@@ -1812,6 +1828,7 @@ def analyze_candles(
         "momentum_quality": momentum_quality,
         "volume_quality": volume_quality,
         "five_minute_ready": bool(refinement_5m.get("ready")),
+        "five_minute_refinement_enabled": ENABLE_5M_REFINEMENT,
         "five_minute_close_location": refinement_5m.get("close_location", 0.0),
         "five_minute_long": bool(refinement_5m.get("long")),
         "five_minute_short": bool(refinement_5m.get("short")),
@@ -1823,6 +1840,8 @@ def analyze_candles(
         "score": score,
         "score_groups": groups,
         "confirmation_family_count": families,
+        "supporting_family_count": supporting_family_count,
+        "min_supporting_family_count": MIN_SUPPORTING_FAMILIES,
         "bullish_points": int(regime["bull"]) + int(alignment["long"]) + int(e21_1 is not None and e50_1 is not None and e21_1 >= e50_1),
         "bearish_points": int(regime["bear"]) + int(alignment["short"]) + int(e21_1 is not None and e50_1 is not None and e21_1 <= e50_1),
         "direction_ok": direction_ok,

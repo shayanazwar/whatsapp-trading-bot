@@ -23,6 +23,7 @@ from ..analysis.engine import (
     build_btc_context,
     btc_filter_ok,
     convert_candles,
+    MAX_SETUP_AGE_15M,
 )
 from ..automation.mexc_client import MexcClient
 from ..automation.universe import MexcUniverse
@@ -143,7 +144,6 @@ MIN_15M_WARMUP_MS = 7 * 24 * 60 * 60 * 1000
 MIN_5M_WARMUP_MS = 2 * 24 * 60 * 60 * 1000
 MIN_1D_WARMUP_MS = 60 * 24 * 60 * 60 * 1000
 
-MAX_SETUP_AGE_15M = 8
 
 
 class BacktestAlreadyRunning(RuntimeError):

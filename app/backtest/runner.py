@@ -399,10 +399,10 @@ def _log_gate_funnel(diagnostics: dict[str, int]) -> None:
         g("BTC_ACCEPT"), g("BTC_REJECT"), g("BTC_CONTEXT_ERRORS"),
     )
     LOGGER.info(
-        "SIMULATION | accepted=%d no_trade=%d errors=%d no_future=%d TP2=%d SL=%d expired=%d",
+        "SIMULATION | accepted=%d no_trade=%d errors=%d no_future=%d TP=%d SL=%d expired=%d",
         g("SIMULATION_ACCEPT"), g("SIMULATION_NO_TRADE"),
         g("SIMULATION_ERRORS"), g("NO_FUTURE_CANDLES"),
-        g("OUTCOME_TP2"), g("OUTCOME_SL"), g("EXPIRY"),
+        g("OUTCOME_TP"), g("OUTCOME_SL"), g("EXPIRY"),
     )
     reject_keys = sorted(
         ((key, int(value)) for key, value in diagnostics.items()
@@ -1390,11 +1390,11 @@ class BacktestRunner:
                 structure_key = (
                     side,
                     int(active_setup["bos_time"]),
-                    int(active_setup["retest_time"]),
+                    round(float(active_setup["bos_level"]), 12),
                 )
                 previous = latest_by_structure.get(structure_key)
                 if previous is not None:
-                    diagnostics["STRUCTURE_WINDOW_COLLAPSED"] = diagnostics.get("STRUCTURE_WINDOW_COLLAPSED", 0) + 1
+                    diagnostics["STRUCTURE_WINDOW_REVISITS"] = diagnostics.get("STRUCTURE_WINDOW_REVISITS", 0) + 1
                 latest_by_structure[structure_key] = (close_time, active_setup)
 
         for close_time, active_setup in latest_by_structure.values():
@@ -2058,10 +2058,19 @@ class BacktestRunner:
 
             diagnostics[f"FULL_ENGINE_ACCEPT_{side}"] += 1
 
+            try:
+                bos_level = float(
+                    analysis.get(
+                        "bos_15m_level",
+                        analysis.get("long_bos_level") if side == "LONG" else analysis.get("short_bos_level"),
+                    )
+                )
+            except (TypeError, ValueError):
+                bos_level = 0.0
             structure_key = (
                 side,
                 analysis.get("setup_bos_time"),
-                analysis.get("setup_retest_time"),
+                round(bos_level, 12),
             )
 
             if structure_key in seen_structures:
@@ -2234,8 +2243,8 @@ class BacktestRunner:
             diagnostics["SIMULATION_ACCEPT"] += 1
             diagnostics[f"OUTCOME_{trade.outcome}"] += 1
 
-            if trade.outcome == "TP2":
-                diagnostics["TP2_BEFORE_SL"] += 1
+            if trade.outcome == "TP":
+                diagnostics["TP_BEFORE_SL"] += 1
 
             if trade.outcome == "SL":
                 diagnostics["SL_OUTCOME"] += 1

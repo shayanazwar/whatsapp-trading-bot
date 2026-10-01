@@ -17,9 +17,7 @@ class BacktestSummary:
     signals: int
     long_signals: int
     short_signals: int
-    tp1_hits: int
-    tp2_hits: int
-    breakeven_hits: int
+    tp_hits: int
     sl_hits: int
     unresolved: int
     resolved: int
@@ -40,7 +38,7 @@ class BacktestSummary:
     long_expectancy_r: float | None
     short_expectancy_r: float | None
     avg_stop_pct: float | None
-    avg_tp2_pct: float | None
+    avg_tp_pct: float | None
     direction_stats: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     regime_stats: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     diagnostics: Mapping[str, int] = field(default_factory=dict)
@@ -48,11 +46,10 @@ class BacktestSummary:
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
-    # EXPIRED trades are resolved only when the simulator produced realized R.
     return [
         trade
         for trade in trades
-        if trade.outcome in {"TP2", "SL", "BE", "EXPIRED"}
+        if trade.outcome in {"TP", "SL", "EXPIRED"}
         and trade.r_multiple is not None
         and math.isfinite(float(trade.r_multiple))
     ]
@@ -62,7 +59,7 @@ def _win_rate(trades: Sequence[SimulatedTrade]) -> float | None:
     values = _resolved(trades)
     if not values:
         return None
-    return 100.0 * sum(trade.outcome == "TP2" for trade in values) / len(values)
+    return 100.0 * sum(trade.outcome == "TP" for trade in values) / len(values)
 
 
 def _expectancy(trades: Sequence[SimulatedTrade]) -> float | None:
@@ -110,13 +107,12 @@ def _regime_group_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[s
 
 
 def _quality_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[str, Any]]:
-    """Report structural/context bands only; no 5M-trigger quality bucket remains."""
     resolved = _resolved(trades)
     definitions = (
-        ("score", (("82-89", 82.0, 90.0), ("90-100", 90.0, 100.000001))),
+        ("score", (("78-89", 78.0, 90.0), ("90-100", 90.0, 100.000001))),
         ("bos_15m_strength", (("0.70-0.79", 0.70, 0.80), ("0.80-1.00", 0.80, 1.000001))),
         ("retest_quality", (("0.80-0.89", 0.80, 0.90), ("0.90-1.00", 0.90, 1.000001))),
-        ("rvol_15m", (("1.10-1.49", 1.10, 1.50), ("1.50+", 1.50, float("inf")))),
+        ("rvol_15m", (("1.00-1.49", 1.00, 1.50), ("1.50+", 1.50, float("inf")))),
         ("adx_4h", (("20-24.9", 20.0, 25.0), ("25+", 25.0, float("inf")))),
     )
 
@@ -128,7 +124,7 @@ def _quality_stats(trades: Sequence[SimulatedTrade]) -> dict[str, Mapping[str, A
                 for trade in resolved
                 if low <= float(trade.quality.get(feature, -float("inf"))) < high
             ]
-            wins = sum(trade.outcome == "TP2" for trade in values)
+            wins = sum(trade.outcome == "TP" for trade in values)
             total = len(values)
             out[f"{feature}:{label}"] = {
                 "signals": total,
@@ -152,7 +148,7 @@ def summarize(
     ordered = sorted(trades, key=lambda trade: trade.signal_time_ms)
     resolved = _resolved(ordered)
     values = [float(trade.r_multiple) for trade in resolved]
-    winners = [float(trade.r_multiple) for trade in resolved if trade.outcome == "TP2"]
+    winners = [float(trade.r_multiple) for trade in resolved if trade.outcome == "TP"]
     losers = [float(trade.r_multiple) for trade in resolved if trade.outcome == "SL"]
 
     running = peak = 0.0
@@ -177,8 +173,8 @@ def summarize(
         for trade in ordered
         if float(trade.entry) > 0
     ]
-    tp2_pcts = [
-        abs(float(trade.tp2) - float(trade.entry)) / float(trade.entry) * 100.0
+    tp_pcts = [
+        abs(float(trade.tp) - float(trade.entry)) / float(trade.entry) * 100.0
         for trade in ordered
         if float(trade.entry) > 0
     ]
@@ -197,9 +193,7 @@ def summarize(
         signals=len(ordered),
         long_signals=sum(str(trade.side).upper() == "LONG" for trade in ordered),
         short_signals=sum(str(trade.side).upper() == "SHORT" for trade in ordered),
-        tp1_hits=sum(bool(trade.tp1_hit) for trade in ordered),
-        tp2_hits=sum(bool(trade.tp2_hit) for trade in ordered),
-        breakeven_hits=sum(bool(trade.breakeven_hit) for trade in ordered),
+        tp_hits=sum(bool(trade.tp1_hit) for trade in ordered),
         sl_hits=sum(bool(trade.sl_hit) for trade in ordered),
         unresolved=sum(trade.r_multiple is None for trade in ordered),
         resolved=len(resolved),
@@ -220,7 +214,7 @@ def summarize(
         long_expectancy_r=long.get("expectancy_r"),
         short_expectancy_r=short.get("expectancy_r"),
         avg_stop_pct=mean(stop_pcts) if stop_pcts else None,
-        avg_tp2_pct=mean(tp2_pcts) if tp2_pcts else None,
+        avg_tp_pct=mean(tp_pcts) if tp_pcts else None,
         direction_stats=direction_stats,
         regime_stats=regime_stats,
         diagnostics=dict(diagnostics or {}),
@@ -248,9 +242,7 @@ def format_report(summary: BacktestSummary) -> str:
         f"🟢 LONG: {summary.long_signals}",
         f"🔴 SHORT: {summary.short_signals}",
         "",
-        f"🎯 TP1 HIT: {summary.tp1_hits}",
-        f"🏆 TP2 HIT: {summary.tp2_hits}",
-        f"🟡 TP1→BE: {summary.breakeven_hits}",
+        f"🎯 TP HIT: {summary.tp_hits}",
         f"🛑 SL HIT: {summary.sl_hits}",
         f"⏳ EXPIRED: {summary.expiry_count}",
         "",
@@ -264,7 +256,7 @@ def format_report(summary: BacktestSummary) -> str:
         f"⏱ AVG HOLD: {_fmt(summary.avg_hold_minutes, 1)} min",
         f"⏱ MEDIAN HOLD: {_fmt(summary.median_hold_minutes, 1)} min",
         f"🛑 AVG STOP: {_fmt(summary.avg_stop_pct)}%",
-        f"🎯 AVG TP2 DIST: {_fmt(summary.avg_tp2_pct)}%",
+        f"🎯 AVG TP DIST: {_fmt(summary.avg_tp_pct)}%",
         "",
         f"🟢 LONG WIN/EXP: {_fmt(summary.long_win_rate, 1, '%')} / {_fmt(summary.long_expectancy_r)}R",
         f"🔴 SHORT WIN/EXP: {_fmt(summary.short_win_rate, 1, '%')} / {_fmt(summary.short_expectancy_r)}R",
@@ -306,14 +298,11 @@ def format_report(summary: BacktestSummary) -> str:
             "BTC_REJECT",
             "SIMULATION_ACCEPT",
             "SIMULATION_NO_TRADE",
-            "STRUCTURE_WINDOW_COLLAPSED",
+            "STRUCTURE_WINDOW_REVISITS",
+            "DUPLICATE_STRUCTURE_SKIPPED",
             "FIVE_MINUTE_CONFIRMATION_BYPASSED",
         )
-        gate_lines = [
-            (key, int(d.get(key, 0) or 0))
-            for key in gate_keys
-            if key in d
-        ]
+        gate_lines = [(key, int(d.get(key, 0) or 0)) for key in gate_keys if key in d]
         reject_keys = sorted(
             (
                 (key.replace("ENGINE_REJECT_", ""), int(value))
@@ -329,10 +318,7 @@ def format_report(summary: BacktestSummary) -> str:
                 lines.append("TOP ENGINE REJECTIONS")
                 lines.extend(f"{key}: {value}" for key, value in reject_keys[:12])
 
-        top = sorted(
-            summary.diagnostics.items(),
-            key=lambda item: (-int(item[1]), item[0]),
-        )[:8]
+        top = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))[:8]
         if top:
             lines.extend(("", "FORENSIC COUNTERS"))
             lines.extend(f"{key}: {value}" for key, value in top)
@@ -342,9 +328,9 @@ def format_report(summary: BacktestSummary) -> str:
             "━━━━━━━━━━━━━━━━━━━━",
             "⚠️ PAPER BACKTEST",
             "15M BOS + retest defines the setup; 5M is not a signal-confirmation gate.",
-            "Win rate = TP2 before SL among resolved trades.",
-            "TP1 is a milestone, not a full win.",
-            "Costs/slippage are included in resolved R.",
+            "Win rate = single TP before SL among resolved trades.",
+            "ONE TP and ONE SL; no partial close or breakeven stage.",
+            "Costs/slippage are included in realized R.",
             "Current eligible MEXC universe; not a historical-universe test.",
             "Historical BTC filter is included; live orderbook/freshness filters are not.",
             "No real trades executed.",

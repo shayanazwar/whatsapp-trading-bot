@@ -7,9 +7,9 @@ MIN_SCORE = 82
 MIN_RR = 2.0
 
 MIN_SL_ATR = 0.50
-MAX_SL_ATR = 2.50
+MAX_SL_ATR = 2.75
 
-MIN_CONFIRMATION_FAMILIES = 5
+MIN_CONFIRMATION_FAMILIES = 4
 
 MAX_ATR_PERCENTILE = 95.0
 MIN_ATR_PERCENTILE = 20.0
@@ -49,7 +49,7 @@ def validate_analysis(
         4H regime
         1H alignment
         15M structure/setup
-        5M mandatory momentum/BOS/volume trigger
+        5M optional refinement only
         momentum
         volume
         location
@@ -137,7 +137,7 @@ def validate_analysis(
         ),
         (
             "setup_ok",
-            "15M setup / 5M trigger failed",
+            "15M setup failed",
         ),
         (
             "location_ok",
@@ -162,10 +162,6 @@ def validate_analysis(
         (
             "structure_quality_ok",
             "BOS/retest quality failed",
-        ),
-        (
-            "five_minute_ready",
-            "5M BOS + momentum + volume trigger is required",
         ),
     )
 
@@ -230,41 +226,17 @@ def validate_analysis(
     # PRIMARY ENTRY TIMEFRAME CONSISTENCY
     # =========================================================
 
-    primary_tf = str(data.get("primary_entry_timeframe") or "5M").upper()
-    trigger_ready = bool(data.get("five_minute_ready", False))
-    trigger_long = bool(data.get("five_minute_long", False))
-    trigger_short = bool(data.get("five_minute_short", False))
-
-    if primary_tf != "5M":
-        reasons.append("Primary entry timeframe must be 5M for intraday mode")
-    if side in {"LONG", "SHORT"}:
-        if not trigger_ready:
-            reasons.append("5M trigger is not ready")
-        if side == "LONG" and not trigger_long:
-            reasons.append("5M LONG trigger is not confirmed")
-        if side == "SHORT" and not trigger_short:
-            reasons.append("5M SHORT trigger is not confirmed")
-    if trigger_long and trigger_short:
-        reasons.append("Conflicting 5M triggers")
-    trigger_q = _f(data.get("trigger_quality_5m"), 0.0)
-    if trigger_q < 0.55:
-        reasons.append(f"5M trigger quality {trigger_q:.2f} < 0.55")
+    primary_tf = str(data.get("primary_entry_timeframe") or "15M").upper()
+    if side in {"LONG", "SHORT"} and primary_tf != "15M":
+        reasons.append("Primary entry timeframe must be 15M for intraday mode")
 
     # =========================================================
     # VOLUME REQUIREMENT
     # =========================================================
 
-    if (
-        require_increasing_volume
-        and str(
-            data.get("volume")
-            or ""
-        ).upper()
-        != "INCREASING"
-    ):
-        reasons.append(
-            "15M volume is not INCREASING"
-        )
+    # Volume/RVOL is supporting evidence. The engine grades it into the score
+    # instead of rejecting otherwise valid 15M structures here.
+    _ = require_increasing_volume
 
     # =========================================================
     # SL / INTRADAY GEOMETRY

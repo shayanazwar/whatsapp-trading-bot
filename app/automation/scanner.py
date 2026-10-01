@@ -7,7 +7,6 @@ from typing import Any
 
 from ..analysis.engine import (
     _bos_events,
-    _five_minute_trigger,
     _direction_aligned,
     _fifteen_minute_entry_confirmation,
     _four_hour_regime,
@@ -191,54 +190,33 @@ class MexcScanner:
                 active_retest = ret_long if trigger_side == "LONG" else ret_short
                 trigger_level = float(active_bos["level"])
                 retest_time = int(active_retest["time"])
-                bos_strength = float((active_bos or {}).get("strength") or 0.0)
-                retest_quality = float((active_retest or {}).get("quality") or 0.0)
-                if bos_strength < 0.70 or retest_quality < 0.80 or not bool((active_retest or {}).get("rejection")):
-                    return self._reject(
-                        symbol,
-                        "BOS/retest quality below high-precision threshold",
-                        stage="TECHNICAL",
-                        analysis={
-                            "setup": "NO TRADE",
-                            "trigger_side": trigger_side,
-                            "bos_15m_strength": bos_strength,
-                            "retest_quality": retest_quality,
-                            "retest_rejection": bool((active_retest or {}).get("rejection")),
-                        },
-                    )
-                # 15M BOS/retest defines the setup. There is no separate 15M candle
-                # confirmation gate; the immediate 5M continuation trigger is authoritative.
+                # 15M BOS/retest defines the setup. Quality is evaluated once by
+                # the authoritative engine; the scanner must not duplicate it with
+                # a stricter high-precision prefilter.
 
-                # Stage 2: only qualifying technical candidates need the costly
-                # 5M refinement and 1D target context.
+                # Stage 2: qualifying structural candidates need the 1D target
+                # context. 5M remains optional refinement and cannot reject setup.
                 raw5, raw1d = await asyncio.gather(
                     self.client.get_klines(symbol, MEXC_INTERVALS["5M"], limit),
                     self.client.get_klines(symbol, MEXC_INTERVALS["1D"], 60),
                 )
                 c5 = closed_candle_rows(raw5, "5m")
                 c1d = closed_candle_rows(raw1d, "1d")
-                if len(c5) < 30:
-                    return self._reject(symbol, "Insufficient closed 5M candles", stage="DATA", analysis={})
-
-                trigger_5m = _five_minute_trigger(c5, trigger_side, trigger_level)
-                if not trigger_5m.get("ready"):
-                    return self._reject(
-                        symbol,
-                        "5M high-precision trigger not confirmed",
-                        stage="TECHNICAL",
-                        analysis={
-                            "setup": "NO TRADE",
-                            "trigger_side": trigger_side,
-                            "five_minute_ready": False,
-                            "trigger_5m_reason": trigger_5m.get("reason", "not ready"),
-                            "trigger_quality_5m": trigger_5m.get("quality", 0.0),
-                            "rvol_5m": trigger_5m.get("rvol", 0.0),
-                            "rsi_5m": trigger_5m.get("rsi", 50.0),
-                        },
-                    )
-
-                analysis = analyze_candles(symbol, c4, c1, c15, c5, c1d)
-                analysis.update({"mexc_4h_rows": c4, "mexc_1h_rows": c1, "mexc_15m_rows": c15, "mexc_5m_rows": c5, "mexc_1d_rows": c1d, "closed_4h_candles": len(c4), "closed_1h_candles": len(c1), "closed_15m_candles": len(c15), "closed_5m_candles": len(c5), "closed_5m_candle_time": int(c5[-1]["time"])})
+                # 5M is optional refinement. Missing/insufficient 5M data must not
+                # reject a valid 15M intraday setup.
+                analysis = analyze_candles(symbol, c4, c1, c15, c5 if len(c5) >= 30 else [], c1d)
+                analysis.update({
+                    "mexc_4h_rows": c4,
+                    "mexc_1h_rows": c1,
+                    "mexc_15m_rows": c15,
+                    "mexc_5m_rows": c5,
+                    "mexc_1d_rows": c1d,
+                    "closed_4h_candles": len(c4),
+                    "closed_1h_candles": len(c1),
+                    "closed_15m_candles": len(c15),
+                    "closed_5m_candles": len(c5),
+                    "closed_5m_candle_time": int(c5[-1]["time"]) if c5 else 0,
+                })
 
                 setup = str(analysis.get("setup") or "NO TRADE").upper()
                 LOGGER.info(
@@ -389,29 +367,39 @@ class MexcScanner:
 
     @staticmethod
     def _update_confirmation_families(analysis: dict[str, Any]) -> None:
-        families = ("direction_ok", "structure_ok", "setup_ok", "momentum_ok", "volume_ok", "location_ok")
-        analysis["confirmation_family_count"] = sum(bool(analysis.get(name, False)) for name in families)
+        momentum_quality = float(analysis.get("momentum_quality", 0.0) or 0.0)
+        volume_quality = float(analysis.get("volume_quality", 0.0) or 0.0)
+        core = (
+            bool(analysis.get("direction_ok")),
+            bool(analysis.get("structure_ok")),
+            bool(analysis.get("setup_ok")),
+            bool(analysis.get("location_ok")),
+        )
+        analysis["confirmation_family_count"] = sum(core) + int(momentum_quality >= 0.55) + int(volume_quality >= 0.55)
 
     @staticmethod
     def _recalculate_score(analysis: dict[str, Any]) -> tuple[int, dict[str, int]]:
+        def clamp01(value: Any) -> float:
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                return 0.0
+
+        momentum_quality = clamp01(analysis.get("momentum_quality"))
+        volume_quality = clamp01(analysis.get("volume_quality"))
         groups = {
             "direction_regime": 20 if analysis.get("direction_ok") else 0,
             "market_structure": 20 if analysis.get("structure_ok") else 0,
             "setup_entry_trigger": 20 if analysis.get("setup_ok") else 0,
-            "momentum": 10 if analysis.get("momentum_ok") else 0,
-            "volume_participation": 10 if analysis.get("volume_ok") else 0,
+            "momentum": int(round(10 * momentum_quality)) if analysis.get("setup_ok") else 0,
+            "volume_participation": int(round(10 * volume_quality)) if analysis.get("setup_ok") else 0,
             "location_target_path": 10 if analysis.get("location_ok") else 0,
             "futures_market_context": 5 if analysis.get("futures_ok") else 0,
             "volatility_execution": 5 if analysis.get("volatility_ok") else 0,
         }
-        setup_q = float(analysis.get("trigger_quality_5m", 0.0) or 0.0)
-        bos_q = float(analysis.get("bos_15m_strength", 0.0) or 0.0)
-        ret_q = float((analysis.get("retest") or {}).get("quality", 0.0) or 0.0)
-        quality = 0.50 * setup_q + 0.25 * bos_q + 0.25 * ret_q
-        if groups["setup_entry_trigger"] and quality < 0.60:
-            groups["setup_entry_trigger"] -= 5
-        if groups["volume_participation"] and float(analysis.get("rvol_15m", 0.0) or 0.0) < 1.25:
-            groups["volume_participation"] -= 2
+        setup_q = 0.50 * clamp01(analysis.get("trigger_quality")) + 0.25 * clamp01(analysis.get("bos_15m_strength")) + 0.25 * clamp01((analysis.get("retest") or {}).get("quality"))
+        if groups["setup_entry_trigger"] and setup_q < 0.55:
+            groups["setup_entry_trigger"] = max(15, groups["setup_entry_trigger"] - 5)
         return max(0, min(100, sum(groups.values()))), groups
 
     @staticmethod

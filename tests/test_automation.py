@@ -72,6 +72,21 @@ def test_mexc_trade_flow_uses_official_T_v_fields():
     assert flow["volume_delta"] == 6.0
 
 
+def test_signal_validation_does_not_require_5m_or_increasing_volume():
+    data = _valid_analysis("LONG")
+    data.pop("five_minute_ready", None)
+    data.pop("five_minute_long", None)
+    data.pop("five_minute_short", None)
+    data.pop("trigger_quality_5m", None)
+    data["primary_entry_timeframe"] = "15M"
+    data["volume"] = "DECREASING"
+    data["confirmation_family_count"] = 4
+    data["momentum_quality"] = 0.60
+    data["volume_quality"] = 0.30
+    signal, reasons = validate_signal(data, min_confluence=82, min_rr=2.0, require_increasing_volume=True)
+    assert signal is not None, reasons
+
+
 def test_signal_format_uses_score_100():
     signal, reasons = validate_signal(_valid_analysis("LONG"), min_confluence=82, min_rr=2, require_increasing_volume=False)
     assert signal is not None, reasons
@@ -196,7 +211,6 @@ def test_live_scanner_stages_5m_and_1d_after_technical_prefilter(monkeypatch):
         monkeypatch.setattr(scanner_module, "_bos_events", lambda c, side: [{"level": 100, "time": c[-2]["time"], "strength": 1}] if side == "LONG" else [])
         monkeypatch.setattr(scanner_module, "_select_latest_bos_with_retest", lambda c, side, events: ({"level": 100, "strength": 1}, {"valid": force_pass, "time": c[-2]["time"], "quality": 1.0, "rejection": True}) if side == "LONG" else (None, {"valid": False}))
         monkeypatch.setattr(scanner_module, "_fifteen_minute_entry_confirmation", lambda *args: {"ready": force_pass, "quality": 1})
-        monkeypatch.setattr(scanner_module, "_five_minute_trigger", lambda *args: {"ready": force_pass, "quality": 1, "rvol": 1.5, "rsi": 60})
         monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: {"setup": "NO TRADE"})
 
     async def run(force_pass):

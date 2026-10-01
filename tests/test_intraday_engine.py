@@ -172,3 +172,55 @@ def test_report_has_direction_regime_drawdown_and_expectancy_metrics():
     assert summary.max_drawdown_r >= 0
     assert set(summary.direction_stats) == {"LONG", "SHORT"}
     assert set(summary.regime_stats) == {"BULLISH", "BEARISH"}
+
+
+def test_weighted_supporting_factors_can_pass_without_boolean_momentum_volume():
+    score, groups, families = engine._build_score(
+        direction_ok=True,
+        structure_ok=True,
+        setup_ok=True,
+        momentum_ok=False,
+        volume_ok=False,
+        location_ok=True,
+        futures_ok=False,
+        volatility_ok=True,
+        trigger_quality=0.8,
+        rvol=0.95,
+        bos_quality=0.8,
+        retest_quality=0.8,
+        momentum_quality=0.4,
+        volume_quality=0.3,
+    )
+    assert score >= 82
+    assert families == 4
+    assert 0 < groups["momentum"] < 10
+    assert 0 < groups["volume_participation"] < 10
+
+
+def test_tp2_can_use_next_structural_15m_level_when_htf_target_missing(monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "_collect_structural_levels",
+        lambda *args, **kwargs: [
+            {"price": 103.0, "timeframe": "15M", "index": 1, "kind": "RESISTANCE"},
+            {"price": 106.0, "timeframe": "15M", "index": 2, "kind": "RESISTANCE"},
+        ],
+    )
+    result = engine._target_path(
+        [("15M", [])],
+        "LONG",
+        100.0,
+        97.0,
+        2.0,
+    )
+    assert result["ok"] is True
+    assert result["tp1"] == pytest.approx(103.0)
+    assert result["tp2"] == pytest.approx(106.0)
+    assert result["structural"] is True
+
+
+def test_intraday_structure_window_and_target_distance_are_widened():
+    assert engine.MAX_SETUP_AGE_15M == 16
+    assert engine.MIN_TP1_ATR == pytest.approx(0.60)
+    assert engine.MIN_TP2_ATR == pytest.approx(1.50)
+    assert engine.MAX_SL_ATR == pytest.approx(2.75)

@@ -37,7 +37,7 @@ def test_long_short_stop_geometry_is_symmetric_and_uses_deepest_invalidation():
     assert abs(100 - long["stop_loss"]) == pytest.approx(abs(short["stop_loss"] - 100))
 
 
-def test_structural_stop_has_no_fixed_percent_floor(monkeypatch):
+def test_structural_stop_uses_intraday_swing_floor(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
         {"price": 102.0, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
         {"price": 104.0, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
@@ -48,7 +48,7 @@ def test_structural_stop_has_no_fixed_percent_floor(monkeypatch):
         "protected_low": 99.50,
         "target_frames": [("15M", []), ("1H", [])],
     })
-    assert levels["stop_distance_pct"] < 0.0075
+    assert levels["stop_distance_pct"] >= engine.MIN_SL_ATR / 100.0
     assert levels["sl_atr"] >= engine.MIN_SL_ATR
     assert levels["trade_geometry_ok"] is True
     assert levels["tp1"] == pytest.approx(102.0)
@@ -220,7 +220,43 @@ def test_tp2_can_use_next_structural_15m_level_when_htf_target_missing(monkeypat
 
 
 def test_intraday_structure_window_and_target_distance_are_widened():
-    assert engine.MAX_SETUP_AGE_15M == 16
+    assert engine.MAX_SETUP_AGE_15M == 24
     assert engine.MIN_TP1_ATR == pytest.approx(0.60)
-    assert engine.MIN_TP2_ATR == pytest.approx(1.50)
-    assert engine.MAX_SL_ATR == pytest.approx(2.75)
+    assert engine.MIN_TP2_ATR == pytest.approx(2.00)
+    assert engine.MIN_SL_ATR == pytest.approx(0.75)
+    assert engine.MAX_SL_ATR == pytest.approx(3.50)
+
+
+def test_5m_refinement_is_disabled_from_engine_decision_path():
+    assert engine.ENABLE_5M_REFINEMENT is False
+
+
+def test_supporting_family_count_is_n_of_m_not_all_or_nothing():
+    score, groups, families = engine._build_score(
+        direction_ok=True, structure_ok=True, setup_ok=True,
+        momentum_ok=False, volume_ok=True, location_ok=True,
+        futures_ok=False, volatility_ok=False, trigger_quality=0.8,
+        rvol=1.2, bos_quality=0.8, retest_quality=0.8,
+        momentum_quality=0.35, volume_quality=0.65,
+    )
+    assert score >= 75
+    assert families == 5
+    assert groups["momentum"] > 0
+    assert groups["volume_participation"] > 0
+
+
+def test_structural_stop_floor_is_symmetric():
+    long = calculate_trade_levels({
+        "setup": "LONG", "price": 100.0, "atr": 1.0,
+        "retest": {"low": 99.9, "high": 100.5},
+        "protected_low": 99.9,
+        "target_frames": [],
+    })
+    short = calculate_trade_levels({
+        "setup": "SHORT", "price": 100.0, "atr": 1.0,
+        "retest": {"low": 99.5, "high": 100.1},
+        "protected_high": 100.1,
+        "target_frames": [],
+    })
+    assert long["sl_atr"] == pytest.approx(engine.MIN_SL_ATR)
+    assert short["sl_atr"] == pytest.approx(engine.MIN_SL_ATR)

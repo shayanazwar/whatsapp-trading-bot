@@ -264,6 +264,7 @@ def test_runner_candidate_discovery_does_not_call_5m_trigger(monkeypatch):
         diagnostics,
     )
     assert len(out) == 1
+    assert c15[21][0] < out[0][0] <= c15[20 + runner_module.MAX_SETUP_AGE_15M + 2][0] + M15
     assert diagnostics["STRUCTURE_WINDOW_COLLAPSED"] > 0
 
 

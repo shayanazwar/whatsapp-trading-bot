@@ -261,13 +261,13 @@ def test_5m_trigger_rejects_missing_volume_expansion(monkeypatch):
 def test_live_geometry_has_no_fixed_percent_stop_floor():
     analysis = {
         "entry": 100.0,
-        "stop_loss": 99.38,
+        "stop_loss": 99.25,
         "tp1": 102.0,
         "tp2": 104.0,
         "atr": 1.0,
     }
     ok, reason = MexcScanner._validate_live_geometry(analysis, 100.0, "LONG", max_drift_pct=0.01)
     assert ok, reason
-    assert analysis["stop_distance_pct"] == pytest.approx(0.0062)
+    assert analysis["stop_distance_pct"] == pytest.approx(0.0075)
     assert analysis["tp1"] == 102.0
     assert analysis["tp2"] == 104.0

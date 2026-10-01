@@ -30,17 +30,24 @@ TIMEFRAME_ALIASES = {
     "1D":"1d","1DAY":"1d","1W":"1w","1WEEK":"1w",
 }
 
-MIN_SCORE = 75
-MIN_RR = 2.0
-MIN_FAMILIES = 4  # legacy/core-family display threshold; not the supporting gate
-MIN_SUPPORTING_FAMILIES = 2
-# Intraday geometry is structural. Percentage stop/target floors are deliberately
-# absent. ATR is used only as a volatility/buffer sanity check around structure.
-MIN_SL_ATR = 0.75
+MIN_SCORE = 78
+MIN_RR = 2.50
+# Five supporting confirmation families out of eight, while 4H/1H/15M
+# remain structural prerequisites. Live-only families may abstain when data
+# is unavailable; they never auto-pass or auto-fail.
+MIN_CONFIRMATION_FAMILIES = 5
+MIN_AVAILABLE_CONFIRMATION_FAMILIES = 6
+MIN_FAMILIES = 5
+MIN_SUPPORTING_FAMILIES = 5
+# Intraday-swing geometry is volatility/structure based rather than percentage
+# based. The stop must clear a meaningful invalidation point with an ATR floor;
+# the single TP must be a real higher-timeframe structural target.
+MIN_SL_ATR = 1.00
 MAX_SL_ATR = 3.50
+MIN_TP_ATR = 2.50
 MIN_ATR_PERCENTILE = 20.0
 MAX_ATR_PERCENTILE = 95.0
-MAX_SETUP_AGE_15M = 24
+MAX_SETUP_AGE_15M = 32  # up to 8 hours for a causal BOS/retest window
 MAX_ENTRY_DISTANCE_ATR = 3.00
 BOS_BUFFER_ATR = 0.10
 BOS_BUFFER_PCT = 0.0005
@@ -51,12 +58,20 @@ MIN_TRIGGER_RVOL = 1.10
 MIN_TRIGGER_BODY = 0.55
 RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
-# TP1 is the first meaningful structural obstacle; TP2 must clear 2R.
-MIN_TP1_ATR = 0.60
-MIN_TP2_ATR = 2.00
 INTRADAY_MAX_HOLD_MINUTES = 360
-ENGINE_VERSION = "gold-v4.1-intraday-state-machine"
+ENGINE_VERSION = "gold-v5.0-single-tp-5of8"
 ENABLE_5M_REFINEMENT = False
+
+CONFIRMATION_FAMILY_NAMES = (
+    "momentum",
+    "relative_volume",
+    "volatility_regime",
+    "liquidity_quality",
+    "funding_crowding",
+    "flow_pressure",
+    "htf_target_path",
+    "vwap_location",
+)
 
 
 class Candle(dict):
@@ -939,12 +954,22 @@ def _collect_structural_levels(frames, atr_value: float, entry: float, max_swing
     return clusters
 
 
+
 def _target_path(frames, side: str, entry: float, stop: float, atr_value: float):
-    """Select TP1/TP2 from real structural levels; no fixed price-percent floors."""
+    """Select ONE realistic higher-timeframe structural target.
+
+    The final target must be a confirmed 1H/4H/1D swing level and must provide
+    both the required ATR distance and minimum post-cost RR geometry.
+    """
     risk = abs(entry - stop)
     base = {
-        "ok": False, "tp1": None, "tp2": None, "obstacle": None,
-        "risk": risk, "structural": False, "target_levels": [],
+        "ok": False,
+        "tp": None,
+        "obstacle": None,
+        "risk": risk,
+        "structural": False,
+        "target_levels": [],
+        "target_timeframe": None,
     }
     if risk <= 0 or atr_value <= 0:
         base["reason"] = "zero risk or ATR"
@@ -952,72 +977,278 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
 
     levels = _collect_structural_levels(frames, atr_value, entry)
     clearance = max(0.30 * atr_value, entry * 0.0005)
+    major = {"1H", "4H", "1D"}
     ordered = [
         x for x in levels
-        if (x["price"] > entry + clearance if side == "LONG" else x["price"] < entry - clearance)
+        if (
+            x["price"] > entry + clearance
+            if side == "LONG"
+            else x["price"] < entry - clearance
+        )
     ]
     ordered.sort(key=lambda x: x["price"], reverse=(side == "SHORT"))
-    base["target_levels"] = ordered[:12]
+    base["target_levels"] = ordered[:16]
+
     if not ordered:
-        base["reason"] = "no confirmed structural target"
+        base["reason"] = "no structural target"
         return base
 
-    # TP1 is the nearest meaningful obstacle. It is not fabricated and need not
-    # satisfy an arbitrary percentage target. The only floor is a small ATR-based
-    # separation so the target is not effectively the entry itself.
-    tp1_level = None
-    for level in ordered:
-        distance = abs(float(level["price"]) - entry)
-        if distance >= max(MIN_TP1_ATR * atr_value, clearance):
-            tp1_level = level
-            break
-    if tp1_level is None:
-        base["reason"] = "nearest structural obstacle is too close"
+    minimum_distance = max(MIN_TP_ATR * atr_value, MIN_RR * risk)
+    candidates = [
+        x for x in ordered
+        if x.get("timeframe") in major
+        and abs(float(x["price"]) - entry) >= minimum_distance
+    ]
+    if not candidates:
+        base["reason"] = (
+            f"no 1H/4H/1D target reaches {MIN_TP_ATR:.2f} ATR and "
+            f"{MIN_RR:.2f}R"
+        )
         return base
-    tp1 = float(tp1_level["price"])
-    base["obstacle"] = tp1
 
-    # TP2 prefers a meaningful higher-timeframe structural level. When no
-    # 1H/4H/1D level can satisfy the swing-distance + RR requirements, fall back
-    # to the next valid 15M structural level rather than rejecting a tradable
-    # path solely because a higher-timeframe level is absent.
-    major = {"1H", "4H", "1D"}
-    tp2_level = None
-    minimum_distance = max(MIN_TP2_ATR * atr_value, MIN_RR * risk)
-    for require_major in (True, False):
-        for level in ordered:
-            price = float(level["price"])
-            farther = price > tp1 + clearance if side == "LONG" else price < tp1 - clearance
-            if not farther:
-                continue
-            if require_major and str(level.get("timeframe")) not in major:
-                continue
-            if abs(price - entry) >= minimum_distance:
-                tp2_level = level
-                break
-        if tp2_level is not None:
-            break
+    target = candidates[0]
+    target_price = float(target["price"])
 
-    if tp2_level is None:
-        base.update({
-            "tp1": tp1,
-            "reason": "no structural TP2 reaches minimum swing distance and RR",
+    # The selected target is the first major structural level that clears the
+    # geometry floor. A closer major level would have been selected instead.
+    closer_major = [
+        x for x in ordered
+        if x.get("timeframe") in major
+        and (
+            x["price"] < target_price - clearance
+            if side == "LONG"
+            else x["price"] > target_price + clearance
+        )
+    ]
+    if closer_major:
+        base["reason"] = "major structural target ordering is ambiguous"
+        return base
+
+    base.update(
+        {
+            "ok": True,
+            "tp": target_price,
+            "obstacle": None,
+            "reason": "single higher-timeframe structural target",
             "structural": True,
-            "tp1_level": tp1_level,
-        })
-        return base
-
-    tp2 = float(tp2_level["price"])
-    base.update({
-        "ok": True,
-        "tp1": tp1,
-        "tp2": tp2,
-        "reason": "structural TP1 + higher-timeframe structural TP2",
-        "structural": True,
-        "tp1_level": tp1_level,
-        "tp2_level": tp2_level,
-    })
+            "tp_level": target,
+            "target_timeframe": str(target.get("timeframe") or ""),
+        }
+    )
     return base
+
+
+def _rolling_vwap(candles: List[Candle], window: int = 48) -> float | None:
+    rows = candles[-window:] if candles and len(candles) > window else (candles or [])
+    total_volume = 0.0
+    weighted = 0.0
+    for candle in rows:
+        try:
+            high = float(candle["high"])
+            low = float(candle["low"])
+            close = float(candle["close"])
+            volume = float(candle.get("volume", 0.0))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if volume <= 0 or not all(math.isfinite(v) for v in (high, low, close, volume)):
+            continue
+        typical = (high + low + close) / 3.0
+        weighted += typical * volume
+        total_volume += volume
+    return (weighted / total_volume) if total_volume > 0 else None
+
+
+def _backtest_flow_proxy(candles: List[Candle], window: int = 12) -> float | None:
+    rows = candles[-window:] if candles and len(candles) > window else (candles or [])
+    buy = sell = 0.0
+    for candle in rows:
+        try:
+            open_price = float(candle["open"])
+            close_price = float(candle["close"])
+            volume = float(candle.get("volume", 0.0))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if volume <= 0 or not all(math.isfinite(v) for v in (open_price, close_price, volume)):
+            continue
+        if close_price > open_price:
+            buy += volume
+        elif close_price < open_price:
+            sell += volume
+    total = buy + sell
+    return ((buy - sell) / total) if total > 0 else None
+
+
+
+
+def _shock_veto(candles: List[Candle], side: str, atr_value: float) -> tuple[bool, str]:
+    """Hard veto for abnormal 15M shock candles/liquidation-like moves."""
+    if not candles or atr_value <= 0:
+        return False, "shock veto cannot be evaluated"
+    cur = candles[-1]
+    try:
+        o = float(cur["open"])
+        h = float(cur["high"])
+        l = float(cur["low"])
+        c = float(cur["close"])
+    except (KeyError, TypeError, ValueError):
+        return False, "invalid 15M candle for shock veto"
+    if not all(math.isfinite(v) for v in (o, h, l, c)) or o <= 0:
+        return False, "invalid 15M candle for shock veto"
+    range_atr = max(0.0, h - l) / atr_value
+    body_atr = abs(c - o) / atr_value
+    adverse_body = (o - c) / atr_value if side == "LONG" else (c - o) / atr_value
+    if range_atr > 4.0:
+        return False, f"15M shock range {range_atr:.2f} ATR > 4.00"
+    if adverse_body > 2.0:
+        return False, f"15M adverse shock body {adverse_body:.2f} ATR > 2.00"
+    return True, "OK"
+
+def evaluate_confirmation_families(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate eight decorrelated supporting families.
+
+    Status values are PASS/FAIL/ABSTAIN. Missing live-only data abstains; it
+    never becomes an implicit pass or fail. A signal requires at least five
+    passes with at least six families available, plus diversity across
+    momentum, flow/positioning, and liquidity/volatility.
+    """
+    side = str(data.get("setup") or "").upper()
+    result: Dict[str, Dict[str, Any]] = {}
+
+    momentum = _num(data.get("momentum_quality"))
+    result["momentum"] = {
+        "status": "PASS" if side in {"LONG", "SHORT"} and momentum >= 0.55 else "FAIL",
+        "value": momentum,
+        "source": "RSI+MACD+15M momentum",
+    }
+
+    rvol = _num(data.get("rvol_15m", data.get("rvol")))
+    result["relative_volume"] = {
+        "status": "PASS" if rvol >= 1.0 else "FAIL",
+        "value": rvol,
+        "source": "15M RVOL",
+    }
+
+    vol_ok = bool(data.get("volatility_ok"))
+    atr_rank = _num(data.get("atr_percentile"), 50.0)
+    result["volatility_regime"] = {
+        "status": "PASS" if vol_ok else "FAIL",
+        "value": atr_rank,
+        "source": "ATR percentile/regime",
+    }
+
+    spread = data.get("mexc_spread_pct")
+    bid_depth = data.get("bid_depth")
+    ask_depth = data.get("ask_depth")
+    if spread is None and bid_depth is None and ask_depth is None:
+        result["liquidity_quality"] = {
+            "status": "ABSTAIN", "value": None, "source": "MEXC order book unavailable"
+        }
+    else:
+        spread_v = _num(spread, 999.0)
+        depth_total = _num(bid_depth) + _num(ask_depth)
+        imbalance = abs(_num(data.get("orderbook_imbalance")))
+        max_spread = _num(data.get("max_mexc_spread_pct"), 0.001)
+        result["liquidity_quality"] = {
+            "status": "PASS" if spread_v <= max_spread and depth_total > 0 and imbalance <= 0.85 else "FAIL",
+            "value": {"spread_pct": spread_v, "depth": depth_total, "imbalance": imbalance},
+            "source": "MEXC spread+depth",
+        }
+
+    funding = data.get("mexc_funding_rate")
+    if funding is None:
+        result["funding_crowding"] = {
+            "status": "ABSTAIN", "value": None, "source": "funding unavailable"
+        }
+    else:
+        funding_v = _num(funding)
+        # Funding is used as a crowding veto/family, not a direction predictor.
+        # 0.05% per interval is deliberately treated as crowded.
+        result["funding_crowding"] = {
+            "status": "PASS" if abs(funding_v) <= 0.0005 else "FAIL",
+            "value": funding_v,
+            "source": "MEXC funding rate",
+        }
+
+    flow = data.get("volume_delta_ratio")
+    flow_source = "MEXC deals"
+    if flow is None:
+        candles = data.get("_candles_15m") or data.get("mexc_15m_rows") or []
+        flow = _backtest_flow_proxy(candles)
+        if flow is None and data.get("flow_proxy_ratio") is not None:
+            flow = _num(data.get("flow_proxy_ratio"))
+        flow_source = "15M candle volume proxy"
+    if flow is None:
+        result["flow_pressure"] = {
+            "status": "ABSTAIN", "value": None, "source": "flow unavailable"
+        }
+    else:
+        flow_v = _num(flow)
+        aligned = flow_v >= 0.05 if side == "LONG" else flow_v <= -0.05 if side == "SHORT" else False
+        result["flow_pressure"] = {
+            "status": "PASS" if aligned else "FAIL",
+            "value": flow_v,
+            "source": flow_source,
+        }
+
+    tp = data.get("tp")
+    atr = _num(data.get("atr"))
+    tp_distance_atr = abs(_num(tp) - _num(data.get("entry"))) / atr if _num(tp) > 0 and _num(data.get("entry")) > 0 and atr > 0 else 0.0
+    target_pass = bool(
+        data.get("target_path_ok")
+        and data.get("target_path_structural")
+        and _num(tp) > 0
+        and tp_distance_atr >= MIN_TP_ATR
+    )
+    result["htf_target_path"] = {
+        "status": "PASS" if target_pass else "FAIL",
+        "value": tp_distance_atr,
+        "source": "1H/4H/1D structural target",
+    }
+
+    candles = data.get("_candles_15m") or data.get("mexc_15m_rows") or []
+    vwap = _rolling_vwap(candles)
+    if vwap is None and data.get("rolling_vwap_12h") is not None:
+        vwap = _num(data.get("rolling_vwap_12h"))
+    entry = _num(data.get("entry"))
+    if vwap is None or entry <= 0 or atr <= 0 or side not in {"LONG", "SHORT"}:
+        result["vwap_location"] = {
+            "status": "ABSTAIN", "value": None, "source": "rolling VWAP unavailable"
+        }
+    else:
+        vwap_distance_atr = abs(entry - vwap) / atr
+        favorable = entry >= vwap if side == "LONG" else entry <= vwap
+        # Avoid buying/selling a setup that is already excessively extended.
+        result["vwap_location"] = {
+            "status": "PASS" if favorable and vwap_distance_atr <= 1.5 else "FAIL",
+            "value": vwap_distance_atr,
+            "source": "12h rolling VWAP",
+        }
+
+    statuses = [item["status"] for item in result.values()]
+    passed = sum(status == "PASS" for status in statuses)
+    failed = sum(status == "FAIL" for status in statuses)
+    available = passed + failed
+
+    momentum_group = result["momentum"]["status"] == "PASS"
+    flow_group = result["flow_pressure"]["status"] == "PASS" or result["funding_crowding"]["status"] == "PASS"
+    liquidity_vol_group = (
+        result["liquidity_quality"]["status"] == "PASS"
+        or result["volatility_regime"]["status"] == "PASS"
+    )
+    diversity_ok = momentum_group and flow_group and liquidity_vol_group
+    passed_ok = passed >= MIN_CONFIRMATION_FAMILIES and available >= MIN_AVAILABLE_CONFIRMATION_FAMILIES and diversity_ok
+
+    return {
+        "families": result,
+        "passed": passed,
+        "failed": failed,
+        "available": available,
+        "required_passes": MIN_CONFIRMATION_FAMILIES,
+        "minimum_available": MIN_AVAILABLE_CONFIRMATION_FAMILIES,
+        "diversity_ok": diversity_ok,
+        "passed_ok": passed_ok,
+    }
+
 
 def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
     side = str(data.get("setup") or "").upper()
@@ -1026,8 +1257,7 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
     empty = {
         "entry": entry if entry > 0 else None,
         "stop_loss": None,
-        "tp1": None,
-        "tp2": None,
+        "tp": None,
         "rr": None,
         "target_path_ok": False,
         "target_path_structural": False,
@@ -1050,14 +1280,16 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
             anchors.append(("STRUCTURAL_SUPPORT", _num(data.get("support"))))
         if not anchors:
             return empty | {"entry": entry, "geometry_reason": "no structural invalidation anchor"}
+        # Use the deepest relevant invalidation point, then add a small ATR
+        # safety buffer. A separate 1 ATR floor prevents scalp-tight stops.
         anchor = min(value for _, value in anchors)
         names = "+".join(name for name, _ in anchors)
-        stop_source = f"DEEPEST({names})"
-        structural_stop = anchor - 0.12 * atr15
+        structural_stop = anchor - 0.15 * atr15
         swing_floor_stop = entry - MIN_SL_ATR * atr15
         stop = min(structural_stop, swing_floor_stop)
+        stop_source = f"DEEPEST({names})+ATR_BUFFER"
     else:
-        anchors: list[tuple[str, float]] = []
+        anchors = []
         if retest.get("high") is not None and _num(retest.get("high")) > entry:
             anchors.append(("15M_RETEST_HIGH", _num(retest.get("high"))))
         if protected_high > entry:
@@ -1068,10 +1300,10 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
             return empty | {"entry": entry, "geometry_reason": "no structural invalidation anchor"}
         anchor = max(value for _, value in anchors)
         names = "+".join(name for name, _ in anchors)
-        stop_source = f"DEEPEST({names})"
-        structural_stop = anchor + 0.12 * atr15
+        structural_stop = anchor + 0.15 * atr15
         swing_floor_stop = entry + MIN_SL_ATR * atr15
         stop = max(structural_stop, swing_floor_stop)
+        stop_source = f"DEEPEST({names})+ATR_BUFFER"
 
     if (side == "LONG" and stop >= entry) or (side == "SHORT" and stop <= entry):
         return empty | {"entry": entry, "stop_source": stop_source, "geometry_reason": "stop is on wrong side of entry"}
@@ -1079,13 +1311,7 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
     stop_distance = abs(entry - stop)
     stop_pct = stop_distance / entry
     stop_atr = stop_distance / atr15
-    geometry_reason = "OK"
-    if stop_atr < MIN_SL_ATR:
-        geometry_reason = f"stop distance {stop_atr:.2f} ATR below structural safety floor"
-    elif stop_atr > MAX_SL_ATR:
-        geometry_reason = f"stop distance {stop_atr:.2f} ATR above intraday volatility bound"
-
-    if geometry_reason != "OK":
+    if stop_atr < MIN_SL_ATR or stop_atr > MAX_SL_ATR:
         return {
             **empty,
             "entry": entry,
@@ -1093,60 +1319,64 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
             "sl_atr": stop_atr,
             "stop_distance_pct": stop_pct,
             "stop_source": stop_source,
-            "geometry_reason": geometry_reason,
+            "geometry_reason": (
+                f"stop distance {stop_atr:.2f} ATR outside "
+                f"{MIN_SL_ATR:.2f}-{MAX_SL_ATR:.2f} ATR"
+            ),
             "trade_geometry_ok": False,
         }
 
     frames = data.get("target_frames") or [("15M", data.get("_candles_15m", []))]
     path = _target_path(frames, side, entry, stop, atr15)
-    tp1, tp2 = path.get("tp1"), path.get("tp2")
+    tp = path.get("tp")
     risk = stop_distance
-    rr = abs(tp2 - entry) / risk if tp2 is not None and risk > 0 else None
-    tp1_distance = abs(tp1 - entry) if tp1 is not None else 0.0
-    tp2_distance = abs(tp2 - entry) if tp2 is not None else 0.0
-    tp1_atr = tp1_distance / atr15 if atr15 > 0 else 0.0
-    tp2_atr = tp2_distance / atr15 if atr15 > 0 else 0.0
+    gross_rr = abs(tp - entry) / risk if tp is not None and risk > 0 else None
+    tp_distance = abs(tp - entry) if tp is not None else 0.0
+    tp_atr = tp_distance / atr15 if atr15 > 0 else 0.0
+    cost_pct = 0.0015
+    cost_price = entry * cost_pct
+    net_reward = max(0.0, tp_distance - cost_price)
+    net_risk = risk + cost_price
+    rr = (net_reward / net_risk) if net_risk > 0 else None
 
     geometry_ok = bool(
         path.get("ok")
         and path.get("structural")
-        and tp1 is not None
-        and tp2 is not None
+        and tp is not None
         and rr is not None
-        and tp1_atr >= MIN_TP1_ATR
-        and tp2_atr >= MIN_TP2_ATR
+        and tp_atr >= MIN_TP_ATR
         and rr >= MIN_RR
     )
-    if not geometry_ok and geometry_reason == "OK":
-        geometry_reason = str(path.get("reason") or "target path failed intraday geometry")
+    geometry_reason = "OK" if geometry_ok else str(path.get("reason") or "single-TP geometry failed")
 
     return {
         "entry": entry,
         "stop_loss": float(stop),
-        "tp1": float(tp1) if tp1 is not None else None,
-        "tp2": float(tp2) if tp2 is not None else None,
+        "tp": float(tp) if tp is not None else None,
         "rr": rr,
+        "rr_gross": gross_rr,
+        "estimated_round_trip_cost_pct": cost_pct,
         "target_path_ok": bool(path.get("ok")),
         "target_path_structural": bool(path.get("structural")),
         "target_obstacle": path.get("obstacle"),
         "target_path_reason": path.get("reason"),
         "target_levels": path.get("target_levels", []),
+        "target_timeframe": path.get("target_timeframe"),
         "stop_source": stop_source,
         "stop_distance_pct": stop_pct,
         "sl_atr": stop_atr,
-        "tp1_distance_pct": tp1_distance / entry if entry > 0 else 0.0,
-        "tp2_distance_pct": tp2_distance / entry if entry > 0 else 0.0,
-        "tp1_distance_atr": tp1_atr,
-        "tp2_distance_atr": tp2_atr,
+        "tp_distance_pct": tp_distance / entry if entry > 0 else 0.0,
+        "tp_distance_atr": tp_atr,
         "trade_geometry_ok": geometry_ok,
         "geometry_reason": geometry_reason,
     }
 
 
-def _build_score(*,direction_ok,structure_ok,setup_ok,momentum_ok,volume_ok,location_ok,
-                 futures_ok,volatility_ok,trigger_quality=0,rvol=0,bos_quality=0,
-                 retest_quality=0,momentum_quality=None,volume_quality=None):
-    """Grade supporting evidence instead of making every family a hard gate."""
+def _build_score(*, direction_ok, structure_ok, setup_ok, momentum_ok, volume_ok,
+                 location_ok, futures_ok, volatility_ok, trigger_quality=0,
+                 rvol=0, bos_quality=0, retest_quality=0, momentum_quality=None,
+                 volume_quality=None, family_result=None):
+    """Build a quality score from structural prerequisites plus supporting families."""
     if momentum_quality is None:
         momentum_quality = 1.0 if momentum_ok else 0.0
     if volume_quality is None:
@@ -1159,28 +1389,36 @@ def _build_score(*,direction_ok,structure_ok,setup_ok,momentum_ok,volume_ok,loca
         0.0,
         1.0,
     )
-    groups = {
-        "direction_regime": 20 if direction_ok else 0,
-        "market_structure": 20 if structure_ok else 0,
-        "setup_entry_trigger": 20 if setup_ok else 0,
-        "momentum": int(round(10 * _clamp(_num(momentum_quality), 0.0, 1.0))) if setup_ok else 0,
-        "volume_participation": int(round(10 * _clamp(_num(volume_quality), 0.0, 1.0))) if setup_ok else 0,
-        "location_target_path": 10 if location_ok else 0,
-        "futures_market_context": 5 if futures_ok else 0,
-        "volatility_execution": 5 if volatility_ok else 0,
-    }
-    if groups["setup_entry_trigger"] and setup_quality < 0.55:
-        groups["setup_entry_trigger"] = max(15, groups["setup_entry_trigger"] - 5)
 
-    families = sum(bool(x) for x in (
-        direction_ok,
-        structure_ok,
-        setup_ok,
-        location_ok,
-        _num(momentum_quality) >= 0.55,
-        _num(volume_quality) >= 0.55,
-    ))
-    return max(0, min(100, sum(groups.values()))), groups, families
+    families = family_result.get("families", {}) if isinstance(family_result, dict) else {}
+    family_weights = {
+        "momentum": 5,
+        "relative_volume": 4,
+        "volatility_regime": 4,
+        "liquidity_quality": 4,
+        "funding_crowding": 4,
+        "flow_pressure": 5,
+        "htf_target_path": 5,
+        "vwap_location": 4,
+    }
+    family_points = 0
+    for name, weight in family_weights.items():
+        if families.get(name, {}).get("status") == "PASS":
+            family_points += weight
+
+    groups = {
+        "structure_prerequisites": 35 if (direction_ok and structure_ok and setup_ok) else 0,
+        "setup_quality": int(round(10 * setup_quality)) if setup_ok else 0,
+        "family_evidence": family_points,
+        "risk_geometry": 20 if location_ok else 0,
+    }
+    score = sum(groups.values())
+
+    # A non-ready 15M candle is not a separate hard gate; its quality simply
+    # influences setup_quality. This keeps the 15M BOS/retest prerequisite causal.
+    return max(0, min(100, int(score))), groups, int(
+        family_result.get("passed", 0) if isinstance(family_result, dict) else 0
+    )
 
 
 def _data_quality(candles: List[Candle], timeframe_ms: int, minimum: int):
@@ -1530,6 +1768,7 @@ def analyze_candles(
         and MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE
         and 0.0005 <= atr_pct <= 0.05
     )
+    shock_veto_ok, shock_veto_reason = _shock_veto(c15, setup, atr15) if setup in {"LONG", "SHORT"} else (False, "no active setup")
     macd_line, macd_signal, macd_hist, macd_hist_delta = _macd_components(close15)
     # Momentum and volume are supporting evidence, not independent hard gates.
     if setup == "LONG":
@@ -1555,12 +1794,9 @@ def analyze_candles(
         1.0,
     )
     volume_ok = bool(volume_quality >= 0.55)
-    supporting_family_count = sum((
-        momentum_quality >= 0.45,
-        volume_quality >= 0.50,
-        bool(_num(entry_15m.get("quality")) >= 0.50),
-        volatility_ok,
-    ))
+    # The supporting-family score is calculated later by the eight-family
+    # evaluator; keep this field for compatibility with existing reports.
+    supporting_family_count = 0
     ema21_15 = _safe_ema(close15, 21)
     extension_atr = (abs(price - ema21_15) / atr15) if ema21_15 is not None and atr15 > 0 else 999.0
     ema_extension_ok = bool(
@@ -1588,7 +1824,7 @@ def analyze_candles(
             "trade_geometry_ok": bool(levels.get("trade_geometry_ok")),
             "rr": levels.get("rr"),
             "stop_loss": levels.get("stop_loss"),
-            "tp2": levels.get("tp2"),
+            "tp": levels.get("tp"),
         },
     )
 
@@ -1597,7 +1833,7 @@ def analyze_candles(
         setup in {"LONG", "SHORT"}
         and levels.get("trade_geometry_ok")
         and levels.get("stop_loss") is not None
-        and levels.get("tp2") is not None
+        and levels.get("tp") is not None
         and rr is not None
         and rr >= MIN_RR
     )
@@ -1609,7 +1845,8 @@ def analyze_candles(
     location_ok = bool(
         levels.get("target_path_ok")
         and levels.get("target_path_structural")
-        and levels.get("trade_geometry_ok")
+        and levels.get("tp") is not None
+        and levels.get("tp_distance_atr", 0.0) >= MIN_TP_ATR
         and entry_distance <= MAX_ENTRY_DISTANCE_ATR
     )
 
@@ -1619,11 +1856,29 @@ def analyze_candles(
         or (setup == "SHORT" and bos_short and ret_short["valid"]))
         and structure_quality_ok
     )
-    # Core 15M setup. 5M can improve diagnostics but cannot invalidate the setup.
+    # 4H/1H/15M remain structural prerequisites. 15M candle confirmation is
+    # supporting evidence and cannot independently invalidate a BOS/retest setup.
     setup_ok = bool(structure_ok)
-    # The 15M setup owns signal eligibility. 5M is diagnostic/refinement only
-    # and must not influence the score or any hard eligibility decision.
     trigger_quality = _clamp(_num(entry_15m.get("quality")), 0.0, 1.0)
+
+    family_result = evaluate_confirmation_families({
+        "setup": setup,
+        "momentum_quality": momentum_quality,
+        "rvol_15m": rv15,
+        "volatility_ok": volatility_ok,
+        "target_path_ok": levels.get("target_path_ok"),
+        "target_path_structural": levels.get("target_path_structural"),
+        "entry": price,
+        "tp": levels.get("tp"),
+        "atr": atr15,
+        "_candles_15m": c15,
+        "mexc_spread_pct": None,
+        "mexc_funding_rate": None,
+        "orderbook_imbalance": None,
+        "volume_delta_ratio": None,
+        "bid_depth": None,
+        "ask_depth": None,
+    })
 
     score, groups, families = _build_score(
         direction_ok=direction_ok,
@@ -1640,6 +1895,7 @@ def analyze_candles(
         retest_quality=_num((active_retest or {}).get("quality")),
         momentum_quality=momentum_quality,
         volume_quality=volume_quality,
+        family_result=family_result,
     )
 
     technical_candidate = bool(
@@ -1651,16 +1907,20 @@ def analyze_candles(
         and risk_ok
         and rr is not None
         and rr >= MIN_RR
+        and shock_veto_ok
         and score >= MIN_SCORE
-        and supporting_family_count >= MIN_SUPPORTING_FAMILIES
+        and family_result.get("passed_ok")
     )
 
+    supporting_family_count = int(family_result.get("passed", 0))
     report_progress(
         "ENGINE_STAGE_SCORE_DONE",
         {
             "score": score,
             "families": families,
             "supporting_families": supporting_family_count,
+            "available_families": family_result.get("available", 0),
+            "family_diversity_ok": family_result.get("diversity_ok", False),
             "technical_candidate": technical_candidate,
         },
     )
@@ -1690,8 +1950,15 @@ def analyze_candles(
     # an unacceptably small stop.
     if setup in {"LONG", "SHORT"} and not levels.get("trade_geometry_ok"):
         failures.append("trade geometry")
+    if setup in {"LONG", "SHORT"} and not shock_veto_ok:
+        failures.append(f"shock/liquidity veto: {shock_veto_reason}")
     if setup in {"LONG", "SHORT"} and not structure_quality_ok:
         failures.append("BOS/retest quality")
+    if setup in {"LONG", "SHORT"} and not family_result.get("passed_ok"):
+        failures.append(
+            f"confirmation families {family_result.get('passed', 0)}/"
+            f"{family_result.get('available', 0)} insufficient or lacking diversity"
+        )
     failures = list(dict.fromkeys(failures))
 
     reasons = []
@@ -1721,6 +1988,10 @@ def analyze_candles(
         reasons.append(f"Risk acceptable ({rr:.2f}R)")
     if volatility_ok:
         reasons.append("Volatility acceptable")
+    if shock_veto_ok:
+        reasons.append("Shock veto clear")
+    elif setup in {"LONG", "SHORT"}:
+        reasons.append(shock_veto_reason)
     if not levels.get("trade_geometry_ok"):
         reasons.append(str(levels.get("geometry_reason") or "Trade geometry rejected"))
     if not technical_candidate:
@@ -1851,14 +2122,22 @@ def analyze_candles(
         "volume_ok": volume_ok,
         "location_ok": location_ok,
         "volatility_ok": volatility_ok,
+        "shock_veto_ok": shock_veto_ok,
+        "shock_veto_reason": shock_veto_reason,
         "risk_ok": risk_ok,
         "sl_atr": levels.get("sl_atr", 0.0),
         "stop_distance_pct": levels.get("stop_distance_pct", 0.0),
         "stop_source": levels.get("stop_source"),
-        "tp1_distance_atr": levels.get("tp1_distance_atr", 0.0),
-        "tp2_distance_atr": levels.get("tp2_distance_atr", 0.0),
-        "tp1_distance_pct": levels.get("tp1_distance_pct", 0.0),
-        "tp2_distance_pct": levels.get("tp2_distance_pct", 0.0),
+        # Legacy aliases are internal/storage compatibility only; strategy uses one TP.
+        "tp": levels.get("tp"),
+        "tp1": levels.get("tp"),
+        "tp2": levels.get("tp"),
+        "tp_distance_atr": levels.get("tp_distance_atr", 0.0),
+        "tp_distance_pct": levels.get("tp_distance_pct", 0.0),
+        "tp1_distance_atr": levels.get("tp_distance_atr", 0.0),
+        "tp2_distance_atr": levels.get("tp_distance_atr", 0.0),
+        "tp1_distance_pct": levels.get("tp_distance_pct", 0.0),
+        "tp2_distance_pct": levels.get("tp_distance_pct", 0.0),
         "trade_geometry_ok": bool(levels.get("trade_geometry_ok")),
         "geometry_reason": levels.get("geometry_reason"),
         "target_path_ok": bool(levels.get("target_path_ok")),
@@ -1874,6 +2153,8 @@ def analyze_candles(
         "candle_time": int(c15[-1]["time"]),
         "setup_bos_time": active_bos.get("time") if active_bos else None,
         "setup_retest_time": active_retest.get("time") if active_retest else None,
+        "rolling_vwap_12h": _rolling_vwap(c15),
+        "flow_proxy_ratio": _backtest_flow_proxy(c15),
         **levels,
     }
 

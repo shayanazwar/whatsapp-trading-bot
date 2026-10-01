@@ -37,9 +37,12 @@ def test_simulator_tp1_then_sl():
     assert trade is not None
     assert trade.tp1_hit is True
     assert trade.tp2_hit is False
-    assert trade.sl_hit is True
-    assert trade.outcome == "SL"
-    assert trade.r_multiple == -1.0
+    assert trade.sl_hit is False
+    assert trade.breakeven_hit is True
+    assert trade.outcome == "BE"
+    assert trade.final_close_size == pytest.approx(0.5)
+    assert trade.remaining_position_size == pytest.approx(0.0)
+    assert trade.r_multiple == pytest.approx(0.6)
 
 
 def test_simulator_same_candle_sl_is_conservative():
@@ -85,7 +88,10 @@ def test_simulator_short_tp2():
     assert trade.outcome == "TP2"
     assert trade.tp1_hit is True
     assert trade.tp2_hit is True
-    assert trade.r_multiple == 2.0
+    assert trade.tp1_close_size == pytest.approx(0.5)
+    assert trade.final_close_size == pytest.approx(0.5)
+    assert trade.remaining_position_size == pytest.approx(0.0)
+    assert trade.r_multiple == pytest.approx(1.6)
 
 
 def test_report_metrics():
@@ -98,7 +104,7 @@ def test_report_metrics():
         future = (
             [candle(M5 * 2, 109, high=111, low=100)]
             if signal["setup"] == "LONG"
-            else [candle(M5 * 2, 101, high=105, low=89)]
+            else [candle(M5 * 2, 101, high=104, low=89)]
         )
         trades.append(simulate_trade(signal, future, signal_close_time_ms=M5, fee_rate=0.0, slippage_bps=0.0))
     trades = [trade for trade in trades if trade is not None]
@@ -106,9 +112,9 @@ def test_report_metrics():
     text = format_report(summary)
     assert "COINS TESTED: 298" in text
     assert "SIGNALS: 2" in text
-    assert "TP2 HIT: 1" in text
-    assert "WIN RATE: 50.0%" in text
-    assert "TOTAL R: +1.00R" in text
+    assert "TP2 HIT: 2" in text
+    assert "WIN RATE: 100.0%" in text
+    assert "TOTAL R: +3.20R" in text
 
 
 @pytest.mark.asyncio

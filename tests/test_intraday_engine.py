@@ -37,16 +37,22 @@ def test_long_short_stop_geometry_is_symmetric_and_uses_deepest_invalidation():
     assert abs(100 - long["stop_loss"]) == pytest.approx(abs(short["stop_loss"] - 100))
 
 
-def test_too_tight_stop_is_rejected_instead_of_inflating_rr():
+def test_structural_stop_has_no_fixed_percent_floor(monkeypatch):
+    monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
+        {"price": 102.0, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
+        {"price": 104.0, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
+    ])
     levels = calculate_trade_levels({
         "setup": "LONG", "price": 100.0, "atr": 1.0,
         "retest": {"low": 99.55, "high": 100.5},
         "protected_low": 99.50,
-        "target_frames": [],
+        "target_frames": [("15M", []), ("1H", [])],
     })
     assert levels["stop_distance_pct"] < 0.0075
-    assert levels["trade_geometry_ok"] is False
-    assert levels["rr"] is None
+    assert levels["sl_atr"] >= engine.MIN_SL_ATR
+    assert levels["trade_geometry_ok"] is True
+    assert levels["tp1"] == pytest.approx(102.0)
+    assert levels["tp2"] == pytest.approx(104.0)
 
 
 def test_target_path_does_not_skip_a_near_obstacle_and_requires_major_tp2(monkeypatch):
@@ -67,7 +73,7 @@ def test_target_path_does_not_skip_a_near_obstacle_and_requires_major_tp2(monkey
     assert levels["rr"] >= 2.0
 
 
-def test_high_precision_target_path_rejects_excessively_far_tp2(monkeypatch):
+def test_structural_target_path_allows_far_tp2_when_supported(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
         {"price": 103.5, "timeframe": "15M", "index": 10, "kind": "RESISTANCE"},
         {"price": 106.5, "timeframe": "1H", "index": 20, "kind": "RESISTANCE"},
@@ -78,8 +84,9 @@ def test_high_precision_target_path_rejects_excessively_far_tp2(monkeypatch):
         "protected_low": 98.5,
         "target_frames": [("15M", []), ("1H", [])],
     })
-    assert levels["trade_geometry_ok"] is False
-    assert "too far" in str(levels.get("geometry_reason"))
+    assert levels["trade_geometry_ok"] is True
+    assert levels["tp2"] == pytest.approx(106.5)
+    assert levels["rr"] > 2.0
 
 
 def test_15m_entry_confirmation_is_primary_and_mirrored(monkeypatch):
@@ -161,7 +168,7 @@ def test_report_has_direction_regime_drawdown_and_expectancy_metrics():
     t1 = simulate_trade(long_signal, [_candle(600_000, 100, 111, 100, 110)], signal_close_time_ms=300_000, fee_rate=0.0, slippage_bps=0.0)
     t2 = simulate_trade(short_signal, [_candle(900_000, 100, 105, 89, 90)], signal_close_time_ms=600_000, fee_rate=0.0, slippage_bps=0.0)
     summary = summarize(days=7, coins_selected=2, coins_tested=2, data_errors=0, trades=[t for t in (t1, t2) if t is not None])
-    assert summary.expectancy_r == pytest.approx(0.5)
+    assert summary.expectancy_r == pytest.approx(0.3)
     assert summary.max_drawdown_r >= 0
     assert set(summary.direction_stats) == {"LONG", "SHORT"}
     assert set(summary.regime_stats) == {"BULLISH", "BEARISH"}

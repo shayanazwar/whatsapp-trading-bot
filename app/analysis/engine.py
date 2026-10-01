@@ -30,34 +30,31 @@ TIMEFRAME_ALIASES = {
     "1D":"1d","1DAY":"1d","1W":"1w","1WEEK":"1w",
 }
 
-MIN_SCORE = 90
+MIN_SCORE = 82
 MIN_RR = 2.0
-MIN_FAMILIES = 6
-# Intraday geometry. These are hard safety gates, not score bonuses.
-MIN_SL_ATR = 0.65
-MAX_SL_ATR = 2.00
-MIN_STOP_DISTANCE_PCT = 0.0075   # 0.75% minimum stop distance
-MAX_STOP_DISTANCE_PCT = 0.0300   # 3.00% maximum stop distance
-MIN_ATR_PERCENTILE = 25.0
-MAX_ATR_PERCENTILE = 90.0
+MIN_FAMILIES = 5
+# Intraday geometry is structural. Percentage stop/target floors are deliberately
+# absent. ATR is used only as a volatility/buffer sanity check around structure.
+MIN_SL_ATR = 0.50
+MAX_SL_ATR = 2.50
+MIN_ATR_PERCENTILE = 20.0
+MAX_ATR_PERCENTILE = 95.0
 MAX_SETUP_AGE_15M = 8
-MAX_ENTRY_DISTANCE_ATR = 1.00
+MAX_ENTRY_DISTANCE_ATR = 3.00
 BOS_BUFFER_ATR = 0.10
 BOS_BUFFER_PCT = 0.0005
 BTC_SHOCK_ATR = 1.50
-ADX_TREND_MIN = 22.0
+ADX_TREND_MIN = 20.0
 EMA_TOLERANCE_PCT = 0.0025
-MIN_TRIGGER_RVOL = 1.15
+MIN_TRIGGER_RVOL = 1.10
 MIN_TRIGGER_BODY = 0.55
 RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
-MIN_TP1_R = 1.20
-MIN_TP2_R = 2.00
-MAX_TP2_R = 3.00
-MIN_TP1_ATR = 0.75
-MIN_TP2_ATR = 1.50
+# TP1 is the first meaningful structural obstacle; TP2 must clear 2R.
+MIN_TP1_ATR = 0.40
+MIN_TP2_ATR = 1.00
 INTRADAY_MAX_HOLD_MINUTES = 360
-ENGINE_VERSION = "gold-v3.0-high-precision"
+ENGINE_VERSION = "gold-v4.0-intraday-state-machine"
 
 
 class Candle(dict):
@@ -472,7 +469,8 @@ def _four_hour_regime(candles: List[Candle]) -> Dict[str, Any]:
                 bull_votes >= 5 and bull_votes > bear_votes)
     bear = bool(current < e200 and e21 <= e50 and adx >= ADX_TREND_MIN and
                 bear_votes >= 5 and bear_votes > bull_votes)
-    base.update({"bull":bull,"bear":bear,"regime":"BULLISH" if bull else "BEARISH" if bear else "NO_TRADE",
+    regime = "BULLISH" if bull else "BEARISH" if bear else "SIDEWAYS"
+    base.update({"bull":bull,"bear":bear,"regime":regime,
                  "bull_votes":bull_votes,"bear_votes":bear_votes})
     return base
 
@@ -502,8 +500,10 @@ def _one_hour_alignment(candles: List[Candle], regime4: Dict[str, Any]) -> Dict[
     long_slope = slope >= -0.0010
     short_slope = slope <= 0.0010
     lv, sv = sum((long_ema,long_structure,long_momentum,long_slope)), sum((short_ema,short_structure,short_momentum,short_slope))
-    long = bool(regime4.get("bull") and lv == 4 and lv > sv)
-    short = bool(regime4.get("bear") and sv == 4 and sv > lv)
+    # 1H decides direction. 4H is a regime/context filter handled separately,
+    # which lets a clear 1H trend trade through a sideways 4H regime.
+    long = bool(lv >= 3 and lv > sv)
+    short = bool(sv >= 3 and sv > lv)
     base.update({"long":long,"short":short,"long_votes":lv,"short_votes":sv,
                  "long_ema":long_ema,"short_ema":short_ema,
                  "long_structure":long_structure,"short_structure":short_structure,
@@ -843,45 +843,60 @@ def _fifteen_minute_entry_confirmation(
 
 def _five_minute_trigger(candles: List[Candle], side: str, setup_level: Optional[float]) -> Dict[str,Any]:
     empty={"ready":False,"long":False,"short":False,"quality":0.0,"rsi":50.0,"rvol":0.0,"atr":0.0,
-           "candle_time":0,"body_ratio":0.0,"trigger_type":"NONE","reason":"insufficient data"}
+           "candle_time":0,"body_ratio":0.0,"trigger_type":"NONE","reason":"insufficient data",
+           "bos_level":None,"volume_expanding":False}
     if len(candles)<30: return empty
-    cur,prev=candles[-1],candles[-2]
+    cur=candles[-1]
     o,h,l,close=float(cur["open"]),float(cur["high"]),float(cur["low"]),float(cur["close"])
-    ph,pl=float(prev["high"]),float(prev["low"])
     rng=max(h-l,1e-12)
     body=abs(close-o)/rng
-    r,rv,a=_safe_rsi([float(c["close"]) for c in candles]),_relative_volume(candles),_safe_atr(candles)
-    long_level=setup_level is None or close>setup_level
-    short_level=setup_level is None or close<setup_level
-    breakout_long=close>o and close>ph and long_level
-    breakout_short=close<o and close<pl and short_level
-    reclaim_long=close>o and long_level and (setup_level is None or l<=setup_level)
-    reclaim_short=close<o and short_level and (setup_level is None or h>=setup_level)
+    closes=[float(c["close"]) for c in candles]
+    r,rv,a=_safe_rsi(closes),_relative_volume(candles),_safe_atr(candles)
+    prior=candles[-6:-1]
+    prior_high=max(float(c["high"]) for c in prior) if prior else 0.0
+    prior_low=min(float(c["low"]) for c in prior) if prior else 0.0
+    prior_avg_volume=(sum(float(c["volume"]) for c in candles[-6:-1])/5.0) if len(candles)>=6 else 0.0
+    volume_expanding=bool(prior_avg_volume>0 and float(cur["volume"])>prior_avg_volume)
+    buffer=max(a*0.05, abs(close)*0.00025)
     close_location_long=(close-l)/rng
     close_location_short=(h-close)/rng
-    mom_long=r>=55.0 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY and close_location_long>=0.70
-    mom_short=r<=45.0 and rv>=MIN_TRIGGER_RVOL and body>=MIN_TRIGGER_BODY and close_location_short>=0.70
-    long_ok=(breakout_long or reclaim_long) and mom_long
-    short_ok=(breakout_short or reclaim_short) and mom_short
+    long_level_ok=setup_level is None or close>setup_level+buffer
+    short_level_ok=setup_level is None or close<setup_level-buffer
+    # Continuation BOS: current closed 5M candle must clear the recent 5-bar
+    # extreme and the 15M BOS level. This is causal and needs no future pivot.
+    bos_long=bool(close>prior_high+buffer and long_level_ok and close>o)
+    bos_short=bool(close<prior_low-buffer and short_level_ok and close<o)
+    strong_long=bool(body>=MIN_TRIGGER_BODY and close_location_long>=0.70 and r>=55.0)
+    strong_short=bool(body>=MIN_TRIGGER_BODY and close_location_short>=0.70 and r<=45.0)
+    long_ok=bos_long and strong_long and rv>=MIN_TRIGGER_RVOL and volume_expanding
+    short_ok=bos_short and strong_short and rv>=MIN_TRIGGER_RVOL and volume_expanding
     if side=="LONG":
-        ready, q, t = long_ok, _clamp((r-50)/15,0,1), "BREAKOUT" if breakout_long else "RECLAIM" if reclaim_long else "NONE"
+        ready=long_ok
+        q=_clamp(0.35*_clamp(body/0.70,0,1)+0.25*_clamp(rv/1.50,0,1)+0.20*_clamp(r/70.0,0,1)+0.20*(1.0 if volume_expanding else 0.0),0,1)
+        trigger_type="BOS_CONTINUATION" if bos_long else "NONE"
+        bos_level=float(max(prior_high, setup_level or prior_high))
     elif side=="SHORT":
-        ready, q, t = short_ok, _clamp((50-r)/15,0,1), "BREAKDOWN" if breakout_short else "RECLAIM" if reclaim_short else "NONE"
+        ready=short_ok
+        q=_clamp(0.35*_clamp(body/0.70,0,1)+0.25*_clamp(rv/1.50,0,1)+0.20*_clamp((100.0-r)/70.0,0,1)+0.20*(1.0 if volume_expanding else 0.0),0,1)
+        trigger_type="BOS_CONTINUATION" if bos_short else "NONE"
+        bos_level=float(min(prior_low, setup_level if setup_level is not None else prior_low))
     else:
-        ready,q,t=False,0.0,"NONE"
-    quality=_clamp(0.35*_clamp(body/0.70,0,1)+0.30*_clamp(rv/1.50,0,1)+0.35*q,0,1)
-    if ready: reason="confirmed"
+        ready,q,trigger_type,bos_level=False,0.0,"NONE",None
+    if ready: reason="confirmed 5M BOS + strong candle + expanding volume"
     elif side=="NONE": reason="not evaluated: no directional 15M setup"
-    elif rv<MIN_TRIGGER_RVOL: reason="5M relative volume below threshold"
+    elif not (bos_long if side=="LONG" else bos_short): reason="5M continuation BOS not confirmed"
     elif body<MIN_TRIGGER_BODY: reason="5M candle body too weak"
-    elif side=="LONG" and close_location_long<0.70: reason="5M LONG close location too weak"
-    elif side=="SHORT" and close_location_short<0.70: reason="5M SHORT close location too weak"
-    elif side=="LONG" and r<55.0: reason="5M LONG momentum below strict threshold"
-    elif side=="SHORT" and r>45.0: reason="5M SHORT momentum below strict threshold"
-    else: reason=f"5M {side} breakout/reclaim condition not met"
-    return {"ready":bool(ready),"long":bool(long_ok),"short":bool(short_ok),"quality":quality,
-            "rsi":r,"rvol":rv,"atr":a,"candle_time":int(cur["time"]),"body_ratio":body,"close_location": close_location_long if side=="LONG" else close_location_short,
-            "trigger_type":t,"reason":reason}
+    elif (close_location_long<0.70 if side=="LONG" else close_location_short<0.70): reason="5M close location too weak"
+    elif rv<MIN_TRIGGER_RVOL: reason="5M relative volume below threshold"
+    elif not volume_expanding: reason="5M volume is not expanding"
+    elif side=="LONG" and r<55.0: reason="5M LONG momentum below threshold"
+    elif side=="SHORT" and r>45.0: reason="5M SHORT momentum below threshold"
+    else: reason=f"5M {side} continuation condition not met"
+    return {"ready":bool(ready),"long":bool(long_ok),"short":bool(short_ok),"quality":q,
+            "rsi":r,"rvol":rv,"atr":a,"candle_time":int(cur["time"]),"body_ratio":body,
+            "close_location":close_location_long if side=="LONG" else close_location_short,
+            "trigger_type":trigger_type,"reason":reason,"bos_level":bos_level,
+            "volume_expanding":volume_expanding}
 
 
 
@@ -923,95 +938,79 @@ def _collect_structural_levels(frames, atr_value: float, entry: float, max_swing
 
 
 def _target_path(frames, side: str, entry: float, stop: float, atr_value: float):
-    """Choose realistic intraday structural targets without skipping obstacles."""
+    """Select TP1/TP2 from real structural levels; no fixed price-percent floors."""
     risk = abs(entry - stop)
     base = {
-        "ok": False,
-        "tp1": None,
-        "tp2": None,
-        "obstacle": None,
-        "risk": risk,
-        "structural": False,
-        "target_levels": [],
+        "ok": False, "tp1": None, "tp2": None, "obstacle": None,
+        "risk": risk, "structural": False, "target_levels": [],
     }
     if risk <= 0 or atr_value <= 0:
         base["reason"] = "zero risk or ATR"
         return base
 
     levels = _collect_structural_levels(frames, atr_value, entry)
-    clearance = max(0.10 * atr_value, entry * 0.0005)
+    clearance = max(0.30 * atr_value, entry * 0.0005)
     ordered = [
         x for x in levels
         if (x["price"] > entry + clearance if side == "LONG" else x["price"] < entry - clearance)
     ]
     ordered.sort(key=lambda x: x["price"], reverse=(side == "SHORT"))
-    base["target_levels"] = ordered[:8]
+    base["target_levels"] = ordered[:12]
     if not ordered:
         base["reason"] = "no confirmed structural target"
         return base
 
-    min1_distance = max(MIN_TP1_R * risk, MIN_TP1_ATR * atr_value)
-    min2_distance = max(MIN_TP2_R * risk, MIN_TP2_ATR * atr_value)
-
-    # Do not skip a nearer structural obstacle just to find a farther target.
-    # The first confirmed level is the first meaningful path obstacle.
-    first = ordered[0]
-    first_distance = abs(float(first["price"]) - entry)
-    if first_distance < min1_distance:
-        base.update({
-            "tp1": float(first["price"]),
-            "obstacle": float(first["price"]),
-            "reason": "nearest structural obstacle is too close for intraday TP1",
-            "structural": True,
-        })
+    # TP1 is the nearest meaningful obstacle. It is not fabricated and need not
+    # satisfy an arbitrary percentage target. The only floor is a small ATR-based
+    # separation so the target is not effectively the entry itself.
+    tp1_level = None
+    for level in ordered:
+        distance = abs(float(level["price"]) - entry)
+        if distance >= max(MIN_TP1_ATR * atr_value, clearance):
+            tp1_level = level
+            break
+    if tp1_level is None:
+        base["reason"] = "nearest structural obstacle is too close"
         return base
-
-    tp1_level = first
     tp1 = float(tp1_level["price"])
+    base["obstacle"] = tp1
 
-    # TP2 must be a meaningful higher-timeframe level. A 15M level can serve
-    # as TP1, but TP2 should normally represent 1H/4H/1D structure.
+    # TP2 must be the first meaningful higher-timeframe level beyond TP1 that
+    # provides the required final RR. There is deliberately no MAX_TP2_R cap.
     major = {"1H", "4H", "1D"}
     tp2_level = None
-    for level in ordered[1:]:
+    for level in ordered:
         price = float(level["price"])
         farther = price > tp1 + clearance if side == "LONG" else price < tp1 - clearance
+        if not farther:
+            continue
+        if str(level.get("timeframe")) not in major:
+            continue
         distance = abs(price - entry)
-        if farther and distance >= min2_distance and str(level.get("timeframe")) in major:
+        if distance >= MIN_TP2_ATR * atr_value and distance / risk >= MIN_RR:
             tp2_level = level
             break
 
     if tp2_level is None:
         base.update({
             "tp1": tp1,
-            "reason": "no higher-timeframe structural TP2 clears intraday distance",
+            "reason": "no higher-timeframe structural TP2 reaches minimum RR",
             "structural": True,
             "tp1_level": tp1_level,
         })
         return base
 
     tp2 = float(tp2_level["price"])
-    tp2_rr = abs(tp2 - entry) / risk
-    if tp2_rr > MAX_TP2_R:
-        base.update({
-            "tp1": tp1,
-            "reason": f"higher-timeframe TP2 is too far at {tp2_rr:.2f}R",
-            "structural": True,
-            "tp1_level": tp1_level,
-            "tp2_level": tp2_level,
-        })
-        return base
     base.update({
         "ok": True,
         "tp1": tp1,
         "tp2": tp2,
-        "reason": "nearest structural TP1 plus higher-timeframe structural TP2",
+        "reason": "structural TP1 + higher-timeframe structural TP2",
         "structural": True,
         "tp1_level": tp1_level,
         "tp2_level": tp2_level,
     })
     return base
-
 
 def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
     side = str(data.get("setup") or "").upper()
@@ -1040,36 +1039,27 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
             anchors.append(("15M_RETEST_LOW", _num(retest.get("low"))))
         if protected_low > 0 and protected_low < entry:
             anchors.append(("1H_PROTECTED_LOW", protected_low))
-        # Use the deepest relevant invalidation structure rather than the
-        # closest anchor. This prevents a tiny stop from manufacturing an
-        # inflated R multiple.
-        if anchors:
-            anchor = min(value for _, value in anchors)
-            names = "+".join(name for name, _ in anchors)
-            stop_source = f"DEEPEST({names})"
-        elif data.get("support") is not None and _num(data.get("support")) < entry:
-            anchor = _num(data.get("support"))
-            stop_source = "15M_SUPPORT"
-        else:
-            anchor = entry - atr15
-            stop_source = "ATR_FALLBACK"
+        if data.get("support") is not None and _num(data.get("support")) < entry:
+            anchors.append(("STRUCTURAL_SUPPORT", _num(data.get("support"))))
+        if not anchors:
+            return empty | {"entry": entry, "geometry_reason": "no structural invalidation anchor"}
+        anchor = min(value for _, value in anchors)
+        names = "+".join(name for name, _ in anchors)
+        stop_source = f"DEEPEST({names})"
         stop = anchor - 0.12 * atr15
     else:
-        anchors = []
+        anchors: list[tuple[str, float]] = []
         if retest.get("high") is not None and _num(retest.get("high")) > entry:
             anchors.append(("15M_RETEST_HIGH", _num(retest.get("high"))))
         if protected_high > entry:
             anchors.append(("1H_PROTECTED_HIGH", protected_high))
-        if anchors:
-            anchor = max(value for _, value in anchors)
-            names = "+".join(name for name, _ in anchors)
-            stop_source = f"DEEPEST({names})"
-        elif data.get("resistance") is not None and _num(data.get("resistance")) > entry:
-            anchor = _num(data.get("resistance"))
-            stop_source = "15M_RESISTANCE"
-        else:
-            anchor = entry + atr15
-            stop_source = "ATR_FALLBACK"
+        if data.get("resistance") is not None and _num(data.get("resistance")) > entry:
+            anchors.append(("STRUCTURAL_RESISTANCE", _num(data.get("resistance"))))
+        if not anchors:
+            return empty | {"entry": entry, "geometry_reason": "no structural invalidation anchor"}
+        anchor = max(value for _, value in anchors)
+        names = "+".join(name for name, _ in anchors)
+        stop_source = f"DEEPEST({names})"
         stop = anchor + 0.12 * atr15
 
     if (side == "LONG" and stop >= entry) or (side == "SHORT" and stop <= entry):
@@ -1079,14 +1069,10 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
     stop_pct = stop_distance / entry
     stop_atr = stop_distance / atr15
     geometry_reason = "OK"
-    if stop_pct < MIN_STOP_DISTANCE_PCT:
-        geometry_reason = f"stop distance {stop_pct * 100:.2f}% below intraday minimum"
-    elif stop_pct > MAX_STOP_DISTANCE_PCT:
-        geometry_reason = f"stop distance {stop_pct * 100:.2f}% above intraday maximum"
-    elif stop_atr < MIN_SL_ATR:
-        geometry_reason = f"stop distance {stop_atr:.2f} ATR below intraday minimum"
+    if stop_atr < MIN_SL_ATR:
+        geometry_reason = f"stop distance {stop_atr:.2f} ATR below structural safety floor"
     elif stop_atr > MAX_SL_ATR:
-        geometry_reason = f"stop distance {stop_atr:.2f} ATR above intraday maximum"
+        geometry_reason = f"stop distance {stop_atr:.2f} ATR above intraday volatility bound"
 
     if geometry_reason != "OK":
         return {
@@ -1118,6 +1104,7 @@ def calculate_trade_levels(data: Dict[str, Any]) -> Dict[str, Any]:
         and rr is not None
         and tp1_atr >= MIN_TP1_ATR
         and tp2_atr >= MIN_TP2_ATR
+        and rr >= MIN_RR
     )
     if not geometry_ok and geometry_reason == "OK":
         geometry_reason = str(path.get("reason") or "target path failed intraday geometry")
@@ -1215,11 +1202,28 @@ def calculate_confluence(data: Dict[str,Any]) -> Dict[str,Any]:
     return result
 
 
+def _direction_aligned(setup: str, regime: Dict[str, Any], alignment: Dict[str, Any]) -> bool:
+    """Apply the user's trend rule: never counter-trend; sideways 4H needs very clear 1H."""
+    if setup == "LONG":
+        if regime.get("bull"):
+            return bool(alignment.get("long"))
+        if regime.get("bear"):
+            return False
+        return bool(alignment.get("long") and int(alignment.get("long_votes", 0)) == 4)
+    if setup == "SHORT":
+        if regime.get("bear"):
+            return bool(alignment.get("short"))
+        if regime.get("bull"):
+            return False
+        return bool(alignment.get("short") and int(alignment.get("short_votes", 0)) == 4)
+    return False
+
+
 def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos_long, bos_short,
                          ret_long, ret_short, trigger_side, trigger, setup, momentum_ok, volume_ok,
                          location_ok, risk_ok, volatility_ok, score, families):
     failures=[]
-    if not (regime["bull"] or regime["bear"]): failures.append("4H regime")
+    if regime.get("regime") == "NO_TRADE": failures.append("4H regime data")
     if not (alignment["long"] or alignment["short"]): failures.append("1H alignment")
     directional_15m = long_candidate or short_candidate
     if not directional_15m:
@@ -1229,8 +1233,6 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
             failures.append("15M post-BOS retest")
         elif alignment["long"] or alignment["short"]:
             failures.append("15M directional setup")
-    if trigger_side in {"LONG","SHORT"} and not trigger.get("ready"):
-        failures.append("15M entry confirmation")
     if setup in {"LONG","SHORT"}:
         if not momentum_ok: failures.append("momentum")
         if not volume_ok: failures.append("volume/RVOL")
@@ -1241,10 +1243,9 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
         if families<MIN_FAMILIES: failures.append("confirmation families")
     if not failures:
         # Deterministic fallback: explain the first stage that stopped the pipeline.
-        if not (regime["bull"] or regime["bear"]): failures.append("4H regime")
+        if regime.get("regime") == "NO_TRADE": failures.append("4H regime data")
         elif not (alignment["long"] or alignment["short"]): failures.append("1H alignment")
         elif not directional_15m: failures.append("15M directional setup")
-        elif trigger_side in {"LONG","SHORT"} and not trigger.get("ready"): failures.append("15M entry confirmation")
         else: failures.append("technical hard gate")
     return list(dict.fromkeys(failures))
 
@@ -1446,8 +1447,7 @@ def analyze_candles(
         {"trigger_side": trigger_side, "ready": bool(entry_15m.get("ready"))},
     )
 
-    # 5M is execution refinement only. It can improve quality but can never
-    # manufacture a setup that the 15M primary confirmation did not produce.
+    # 5M is the immediate execution trigger for the validated 15M setup.
     refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level)
     if refinement_5m.get("ready") and retest_time is not None and int(refinement_5m["candle_time"]) < retest_time:
         refinement_5m = dict(refinement_5m)
@@ -1461,22 +1461,21 @@ def analyze_candles(
         },
     )
 
-    setup = trigger_side if entry_15m.get("ready") else "NO TRADE"
+    # 5M is the execution trigger. 15M BOS/retest defines the setup; a separate
+    # 15M momentum candle is not a mandatory second entry gate.
+    setup = trigger_side if structure_quality_ok else "NO TRADE"
 
-    sr_key = _cache_key("SR15", c15)
+    sr_key = _cache_key("SRACTIONABLE", c15)
     if sr_key in cache:
         support, resistance = cache[sr_key]
     else:
-        # Preserve the existing precedence exactly: level-cluster values are
-        # the baseline, and confirmed swing S/R replaces a side only when it
-        # actually exists.
-        support, resistance = _level_clusters(c15, atr15)
-        sr_highs, sr_lows = swings15
-        sr_support, sr_resistance = _support_resistance_from_swings(c15, sr_highs, sr_lows)
-        if sr_support is not None:
-            support = sr_support
-        if sr_resistance is not None:
-            resistance = sr_resistance
+        all_frames = [("1D", c1d), ("4H", c4), ("1H", c1), ("15M", c15)]
+        structural_levels = _collect_structural_levels(all_frames, atr15, price)
+        sr_clearance = max(0.35 * atr15, price * 0.0005)
+        supports = [float(x["price"]) for x in structural_levels if float(x["price"]) <= price - sr_clearance]
+        resistances = [float(x["price"]) for x in structural_levels if float(x["price"]) >= price + sr_clearance]
+        support = max(supports) if supports else None
+        resistance = min(resistances) if resistances else None
         cache[sr_key] = (support, resistance)
 
     atr_pct = _atr_percent(price, atr15)
@@ -1490,11 +1489,19 @@ def analyze_candles(
         and 0.0005 <= atr_pct <= 0.05
     )
     macd_line, macd_signal, macd_hist, macd_hist_delta = _macd_components(close15)
+    # The 5M trigger is the user's required momentum confirmation. Keep 15M
+    # momentum/volume as supporting evidence without making either a hidden
+    # duplicate hard gate.
     momentum_ok = bool(
-        (setup == "LONG" and 55.0 <= r15 <= 72.0 and macd_hist > 0 and macd_hist_delta >= 0.0)
+        refinement_5m.get("ready")
+        or (setup == "LONG" and 55.0 <= r15 <= 72.0 and macd_hist > 0 and macd_hist_delta >= 0.0)
         or (setup == "SHORT" and 28.0 <= r15 <= 45.0 and macd_hist < 0 and macd_hist_delta <= 0.0)
     )
-    volume_ok = bool(rv15 >= MIN_TRIGGER_RVOL and str(vol15).upper() == "INCREASING")
+    volume_ok = bool(
+        refinement_5m.get("ready")
+        and refinement_5m.get("volume_expanding")
+        and _num(refinement_5m.get("rvol")) >= MIN_TRIGGER_RVOL
+    )
     ema21_15 = _safe_ema(close15, 21)
     extension_atr = (abs(price - ema21_15) / atr15) if ema21_15 is not None and atr15 > 0 else 999.0
     ema_extension_ok = bool(
@@ -1545,22 +1552,19 @@ def analyze_candles(
         and levels.get("target_path_structural")
         and levels.get("trade_geometry_ok")
         and entry_distance <= MAX_ENTRY_DISTANCE_ATR
-        and ema_extension_ok
     )
 
-    direction_ok = bool(
-        (setup == "LONG" and alignment["long"] and regime["bull"])
-        or (setup == "SHORT" and alignment["short"] and regime["bear"])
-    )
+    direction_ok = _direction_aligned(setup, regime, alignment)
     structure_ok = bool(
         ((setup == "LONG" and bos_long and ret_long["valid"])
         or (setup == "SHORT" and bos_short and ret_short["valid"]))
         and structure_quality_ok
     )
-    setup_ok = bool(entry_15m.get("ready") and structure_ok and risk_ok and refinement_5m.get("ready"))
+    # Core 15M setup + mandatory 5M continuation confirmation.
+    setup_ok = bool(structure_ok and risk_ok and refinement_5m.get("ready"))
     trigger_quality = _clamp(
-        0.70 * _num(entry_15m.get("quality"))
-        + 0.30 * _num(refinement_5m.get("quality")),
+        0.30 * _num(entry_15m.get("quality"))
+        + 0.70 * _num(refinement_5m.get("quality")),
         0.0,
         1.0,
     )
@@ -1585,11 +1589,8 @@ def analyze_candles(
         and direction_ok
         and structure_ok
         and setup_ok
-        and momentum_ok
-        and volume_ok
-        and location_ok
-        and volatility_ok
         and risk_ok
+        and volatility_ok
         and rr is not None
         and rr >= MIN_RR
         and score >= MIN_SCORE
@@ -1629,14 +1630,10 @@ def analyze_candles(
     # an unacceptably small stop.
     if setup in {"LONG", "SHORT"} and not levels.get("trade_geometry_ok"):
         failures.append("trade geometry")
-    if setup in {"LONG", "SHORT"} and not entry_15m.get("ready"):
-        failures.append("15M entry confirmation")
     if setup in {"LONG", "SHORT"} and not refinement_5m.get("ready"):
         failures.append("5M trigger confirmation")
     if setup in {"LONG", "SHORT"} and not structure_quality_ok:
         failures.append("BOS/retest quality")
-    if setup in {"LONG", "SHORT"} and not ema_extension_ok:
-        failures.append("15M EMA extension")
     failures = list(dict.fromkeys(failures))
 
     reasons = []
@@ -1653,15 +1650,15 @@ def analyze_candles(
     if active_retest and active_retest.get("valid"):
         reasons.append(f"15M {trigger_side} retest confirmed")
     if entry_15m.get("ready"):
-        reasons.append(f"15M {entry_15m.get('trigger_type', 'ENTRY')} confirmed")
+        reasons.append(f"15M {entry_15m.get('trigger_type', 'SETUP')} confirmation supportive")
     if refinement_5m.get("ready"):
-        reasons.append("5M execution refinement confirmed")
+        reasons.append("5M BOS + strong candle + expanding volume confirmed")
     if momentum_ok:
         reasons.append("Momentum aligned")
     if volume_ok:
-        reasons.append("15M volume participation aligned")
+        reasons.append("5M volume participation aligned")
     if location_ok:
-        reasons.append("Intraday structural target path acceptable")
+        reasons.append("Structural target path acceptable")
     if risk_ok and rr is not None:
         reasons.append(f"Risk acceptable ({rr:.2f}R)")
     if volatility_ok:
@@ -1693,7 +1690,7 @@ def analyze_candles(
         "price": price,
         "setup": setup,
         "setup_candidate": setup if setup in {"LONG", "SHORT"} else "NO TRADE",
-        "trend_4h": "BULLISH" if regime["bull"] else "BEARISH" if regime["bear"] else "NO_TRADE",
+        "trend_4h": regime.get("regime", "NO_TRADE"),
         "regime": regime["regime"],
         "daily_structure_1d": daily_structure,
         "structure_1h": structure1,
@@ -1752,11 +1749,14 @@ def analyze_candles(
         "btc_filter_reason": "PENDING",
         "data_fresh": True,
         "signal_engine_version": ENGINE_VERSION,
-        "primary_entry_timeframe": "15M",
+        "primary_entry_timeframe": "5M",
+        "setup_timeframe": "15M",
         "intraday_max_hold_minutes": INTRADAY_MAX_HOLD_MINUTES,
         "trigger_side": trigger_side,
-        "trigger_5m": "REFINEMENT" if refinement_5m.get("ready") else "NOT_REQUIRED",
+        "trigger_5m": "BOS_CONTINUATION" if refinement_5m.get("ready") else "REQUIRED",
         "trigger_type_5m": refinement_5m.get("trigger_type", "NONE"),
+        "five_minute_bos_level": refinement_5m.get("bos_level"),
+        "five_minute_volume_expanding": bool(refinement_5m.get("volume_expanding")),
         "trigger_reason_5m": refinement_5m.get("reason", "not required"),
         "trigger_quality_5m": refinement_5m.get("quality", 0.0),
         "trigger_quality_15m": entry_15m.get("quality", 0.0),

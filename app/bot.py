@@ -283,7 +283,7 @@ class Bot:
             f"Support: {fmt_optional(data.get('support'))}\n"
             f"Resistance: {fmt_optional(data.get('resistance'))}\n"
             f"Score: {data.get('score', 'N/A')}/100\n"
-            f"Families: {data.get('confirmation_family_count', 0)}/6\n\n"
+            f"Families: {data.get('confirmation_families_passed', data.get('confirmation_family_count', 0))}/{data.get('confirmation_families_available', 8)}\n\n"
             f"Potential Setup: {data.get('setup', 'NO TRADE')}\n"
         )
 
@@ -292,8 +292,7 @@ class Bot:
             body += (
                 f"Entry: {fmt_optional(entry)}\n"
                 f"SL: {fmt_optional(data.get('stop_loss'))}\n"
-                f"TP1: {fmt_optional(data.get('tp1'))}\n"
-                f"TP2: {fmt_optional(data.get('tp2'))}\n"
+                f"TP: {fmt_optional(data.get('tp'))} ({data.get('target_timeframe', 'HTF')})\n"
                 f"RR: 1:{fmt_number(data.get('rr'), 2)}"
             )
 

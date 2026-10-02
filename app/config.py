@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     meta_graph_version: str = Field(default="v26.0", alias="META_GRAPH_VERSION")
     allowed_users: str = Field(default="", alias="ALLOWED_USERS")
 
+    # Telegram Bot API
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_allowed_users: str = Field(default="", alias="TELEGRAM_ALLOWED_USERS")
+    telegram_webhook_url: str = Field(default="", alias="TELEGRAM_WEBHOOK_URL")
+    telegram_webhook_secret: str = Field(default="", alias="TELEGRAM_WEBHOOK_SECRET")
+
     # Runtime / persistence
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
@@ -68,6 +74,10 @@ class Settings(BaseSettings):
     # against an old 5M legacy environment value by enforcing a sensible floor.
     max_signal_age_seconds: float = Field(default=1200.0, alias="MAX_SIGNAL_AGE_SECONDS")
     auto_signal_recipients: str = Field(default="", alias="AUTO_SIGNAL_RECIPIENTS")
+    auto_signal_telegram_recipients: str = Field(
+        default="",
+        alias="AUTO_SIGNAL_TELEGRAM_RECIPIENTS",
+    )
     test_symbols: str = Field(default="", alias="TEST_SYMBOLS")
 
     # Backtest resource controls
@@ -97,13 +107,31 @@ class Settings(BaseSettings):
         }
 
     @property
+    def telegram_allowed_user_set(self) -> set[str]:
+        return {
+            f"tg:{value.strip()}"
+            for value in self.telegram_allowed_users.split(",")
+            if value.strip()
+        }
+
+    @property
     def auto_signal_recipient_set(self) -> set[str]:
-        configured = {
+        whatsapp = {
             value.strip().replace("+", "")
             for value in self.auto_signal_recipients.split(",")
             if value.strip()
         }
-        return configured or self.allowed_user_set
+        telegram = {
+            f"tg:{value.strip()}"
+            for value in self.auto_signal_telegram_recipients.split(",")
+            if value.strip()
+        }
+
+        if not whatsapp:
+            whatsapp = self.allowed_user_set
+        if not telegram:
+            telegram = self.telegram_allowed_user_set
+        return whatsapp | telegram
 
     @property
     def test_symbol_list(self) -> list[str]:

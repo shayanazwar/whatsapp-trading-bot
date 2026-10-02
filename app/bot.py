@@ -15,6 +15,7 @@ try:
     from .database import Alert, Database
     from .market import MarketData, MarketRef, TIMEFRAME_ALIASES
     from .whatsapp import WhatsAppClient
+    from .telegram import TelegramClient
 except ImportError:
     from charts import ChartRenderer
     from formatting import fmt_price
@@ -24,10 +25,11 @@ except ImportError:
     from database import Alert, Database
     from market import MarketData, MarketRef, TIMEFRAME_ALIASES
     from whatsapp import WhatsAppClient
+    from telegram import TelegramClient
 
 LOGGER = logging.getLogger(__name__)
 
-HELP = """📈 WhatsApp Trading Bot
+HELP = """📈 Pak Trading Academy Trading Bot
 
 💰 PRICE
 PRICE BTCUSDT
@@ -71,34 +73,55 @@ class Bot:
         market: MarketData,
         whatsapp: WhatsAppClient,
         charts: ChartRenderer,
+        telegram: TelegramClient | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
         self.market = market
         self.whatsapp = whatsapp
+        self.telegram = telegram
         self.charts = charts
         self.backtest_runner: BacktestRunner | None = None
         self._last_inbound_phone: str | None = None
 
+    @staticmethod
+    def _is_telegram_target(target: str) -> bool:
+        return target.startswith("tg:") or target.startswith("telegram:")
+
+    async def _send_text(self, target: str, body: str):
+        if self._is_telegram_target(target):
+            if self.telegram is None:
+                raise RuntimeError("Telegram channel is not configured.")
+            return await self.telegram.send_text(target, body)
+        return await self.whatsapp.send_text(target, body)
+
+    async def _send_image(self, target: str, path: Path, caption: str | None = None):
+        if self._is_telegram_target(target):
+            if self.telegram is None:
+                raise RuntimeError("Telegram channel is not configured.")
+            return await self.telegram.send_image(target, path, caption)
+
+        media_id = await self.whatsapp.upload_image(path)
+        return await self.whatsapp.send_image(target, media_id, caption)
+
     def set_backtest_runner(self, runner: BacktestRunner) -> None:
         self.backtest_runner = runner
-
-    async def _keepalive(self) -> None:
-        LOGGER.info(
-            "BACKTEST KEEPALIVE COMMAND RECEIVED"
-        )
-
     async def handle(self, phone: str, text: str) -> None:
         cleaned = text.strip()
 
         if not cleaned:
             return
 
+        if self._is_telegram_target(phone):
+            allowed_targets = self.settings.telegram_allowed_user_set
+        else:
+            allowed_targets = self.settings.allowed_user_set
+
         if (
-            self.settings.allowed_user_set
-            and phone not in self.settings.allowed_user_set
+            allowed_targets
+            and phone not in allowed_targets
         ):
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 "⛔ This bot is private.",
             )
@@ -109,7 +132,7 @@ class Bot:
         match = COMMAND_RE.match(cleaned)
 
         if not match:
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 HELP,
             )
@@ -120,7 +143,7 @@ class Bot:
 
         try:
             if command in {"HELP", "MENU", "START"}:
-                await self.whatsapp.send_text(
+                await self._send_text(
                     phone,
                     HELP,
                 )
@@ -171,10 +194,6 @@ class Bot:
                     phone,
                     args,
                 )
-
-            elif command == "KEEPALIVE":
-                await self._keepalive()
-
             else:
                 # Friendly shortcut:
                 # "BTCUSDT 1H" means chart
@@ -190,7 +209,7 @@ class Bot:
                 cleaned,
             )
 
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 f"âŒ {exc}",
             )
@@ -222,7 +241,7 @@ class Bot:
                 "Could not get the current price."
             )
 
-        await self.whatsapp.send_text(
+        await self._send_text(
             phone,
             (
                 f"💰 {ref.symbol}\n"
@@ -249,7 +268,7 @@ class Bot:
             # Do not expose a Python traceback/type error to the WhatsApp user.
             if "NoneType" in str(exc) or "abs()" in str(exc):
                 LOGGER.exception("Incomplete analysis data for %s", raw_symbol)
-                await self.whatsapp.send_text(
+                await self._send_text(
                     phone,
                     f"âš ï¸ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
                 )
@@ -296,7 +315,7 @@ class Bot:
                 f"RR: 1:{fmt_number(data.get('rr'), 2)}"
             )
 
-        await self.whatsapp.send_text(phone, body)
+        await self._send_text(phone, body)
 
     async def _chart(
         self,
@@ -333,10 +352,9 @@ class Bot:
             if not path.is_file():
                 raise RuntimeError("Chart image was not created.")
 
-            media_id = await self.whatsapp.upload_image(path)
-            await self.whatsapp.send_image(
+            await self._send_image(
                 phone,
-                media_id,
+                path,
                 caption=(
                     f"📊 {ref.exchange.upper()} {ref.symbol} • {tf.upper()}\n"
                     f"EMA 21 / 50 / 100 / 200"
@@ -429,7 +447,7 @@ class Bot:
             target,
         )
 
-        await self.whatsapp.send_text(
+        await self._send_text(
             phone,
             (
                 f"âœ… Alert #{alert.id} created\n\n"
@@ -439,7 +457,7 @@ class Bot:
                 f"${fmt_price(target)}\n"
                 f"Current: "
                 f"${fmt_price(current)}\n\n"
-                f"You will receive one WhatsApp alert "
+                f"You will receive one alert "
                 f"when price crosses the target."
             ),
         )
@@ -454,7 +472,7 @@ class Bot:
         )
 
         if not alerts:
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 "🔔 No active alerts.",
             )
@@ -478,7 +496,7 @@ class Bot:
             "DELETE <id> to remove an alert."
         )
 
-        await self.whatsapp.send_text(
+        await self._send_text(
             phone,
             "\n".join(lines),
         )
@@ -502,7 +520,7 @@ class Bot:
                 phone
             )
 
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 f"ðŸ—‘ï¸ Deleted {count} active alert(s).",
             )
@@ -522,14 +540,14 @@ class Bot:
             phone,
         ):
 
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 f"ðŸ—‘ï¸ Alert #{alert_id} deleted.",
             )
 
         else:
 
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 f"âŒ Active alert #{alert_id} was not found.",
             )
@@ -551,7 +569,7 @@ class Bot:
         )
 
         if not results:
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 "No matching MEXC Futures markets found.",
             )
@@ -572,7 +590,7 @@ class Bot:
             "Charts use MEXC Futures. Example: CHART MEXC:BTCUSDT 1H"
         )
 
-        await self.whatsapp.send_text(
+        await self._send_text(
             phone,
             "\n".join(lines),
         )
@@ -602,7 +620,7 @@ class Bot:
             )
 
         if self.backtest_runner.is_running:
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 "â³ A backtest is already running. Please wait for it to finish.",
             )
@@ -610,7 +628,7 @@ class Bot:
 
         days = periods[period]
 
-        await self.whatsapp.send_text(
+        await self._send_text(
             phone,
             (
                 f"â³ BACKTEST {period} STARTED\n\n"
@@ -627,12 +645,12 @@ class Bot:
             except ImportError:
                 from app.backtest.report import format_report
 
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 format_report(summary),
             )
         except BacktestAlreadyRunning:
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 "â³ A backtest is already running. Please wait for it to finish.",
             )
@@ -641,7 +659,7 @@ class Bot:
                 "BACKTEST %s failed",
                 period,
             )
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 f"âŒ BACKTEST {period} failed: {exc}",
             )
@@ -673,7 +691,7 @@ class Bot:
 
         else:
 
-            await self.whatsapp.send_text(
+            await self._send_text(
                 phone,
                 HELP,
             )
@@ -694,7 +712,7 @@ class Bot:
             f"Alert #{alert.id} is now completed."
         )
 
-        await self.whatsapp.send_text(
+        await self._send_text(
             alert.phone,
             body,
         )

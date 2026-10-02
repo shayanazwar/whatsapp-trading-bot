@@ -24,6 +24,7 @@ from .charts import ChartRenderer
 from .config import get_settings
 from .database import Database
 from .market import MarketData
+from .telegram import TelegramClient
 from .whatsapp import WhatsAppClient
 
 
@@ -38,7 +39,7 @@ logger = logging.getLogger("whatsapp_bot")
 settings = get_settings()
 
 app = FastAPI(
-    title="Pak Trading Academy WhatsApp Bot"
+    title="Pak Trading Academy Dual-Channel Trading Bot"
 )
 
 
@@ -54,6 +55,8 @@ whatsapp = WhatsAppClient(
     graph_version=settings.meta_graph_version,
     app_secret=settings.meta_app_secret,
 )
+
+telegram = TelegramClient(settings.telegram_bot_token)
 
 charts = ChartRenderer(
     settings.chart_default_bars
@@ -84,6 +87,7 @@ bot = Bot(
     db=db,
     market=market,
     whatsapp=whatsapp,
+    telegram=telegram,
     charts=charts,
 )
 
@@ -113,6 +117,7 @@ mexc_universe = MexcUniverse(
 signal_manager = SignalManager(
     db=db,
     whatsapp=whatsapp,
+    telegram=telegram,
     recipients=settings.auto_signal_recipient_set,
     expiry_minutes=settings.signal_expiry_minutes,
 )
@@ -172,86 +177,29 @@ def keep_task(task: asyncio.Task) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def whatsapp_keepalive_loop() -> None:
-    """Inject one synthetic inbound ANALYZE command every 4 minutes.
-
-    The payload is sent through the same process_webhook() path used by
-    the real WhatsApp webhook receiver. The task itself is permanent for
-    the lifetime of the application and is not tied to backtest state.
-    """
-    while True:
-        try:
-            await asyncio.sleep(240)
-
-            phone = bot._last_inbound_phone
-            if not phone and settings.allowed_user_set:
-                phone = next(iter(settings.allowed_user_set))
-
-            if not phone:
-                logger.info(
-                    "BACKTEST KEEPALIVE | waiting for a real WhatsApp sender"
-                )
-                continue
-
-            message_id = f"internal-keepalive-{time.time_ns()}"
-            payload = {
-                "entry": [{
-                    "changes": [{
-                        "field": "messages",
-                        "value": {
-                            "messages": [{
-                                "id": message_id,
-                                "from": phone,
-                                "type": "text",
-                                "text": {"body": "ANALYZE BTCUSDT"},
-                            }]
-                        },
-                    }]
-                }]
-            }
-
-            logger.info(
-                "BACKTEST KEEPALIVE | synthetic WhatsApp message | id=%s from=%s command=ANALYZE BTCUSDT",
-                message_id,
-                phone,
-            )
-
-            task = asyncio.create_task(
-                process_webhook(payload),
-                name="whatsapp-keepalive-webhook",
-            )
-            keep_task(task)
-
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "BACKTEST KEEPALIVE | loop iteration failed; continuing"
-            )
-
-
 # ============================================================
 # CONFIG VALIDATION
 # ============================================================
 
 def _validate_runtime_config() -> None:
-    required = {
-        "META_PHONE_NUMBER_ID": settings.meta_phone_number_id,
-        "META_ACCESS_TOKEN": settings.meta_access_token,
-        "META_APP_SECRET": settings.meta_app_secret,
-    }
+    whatsapp_ready = bool(
+        settings.meta_phone_number_id
+        and settings.meta_access_token
+        and settings.meta_app_secret
+    )
+    telegram_ready = bool(settings.telegram_bot_token)
 
-    missing = [
-        key
-        for key, value in required.items()
-        if not value
-    ]
-
-    if missing:
+    if not whatsapp_ready and not telegram_ready:
         raise RuntimeError(
-            "Missing required configuration: "
-            + ", ".join(missing)
+            "No messaging channel is configured. Set WhatsApp credentials "
+            "or TELEGRAM_BOT_TOKEN."
         )
+
+    logger.info(
+        "Messaging channels configured: WhatsApp=%s Telegram=%s",
+        whatsapp_ready,
+        telegram_ready,
+    )
 
 
 # ============================================================
@@ -262,7 +210,13 @@ def _validate_runtime_config() -> None:
 async def root():
     return {
         "status": "online",
-        "service": "Pak Trading Academy WhatsApp Bot",
+        "service": "Pak Trading Academy Dual-Channel Trading Bot",
+        "whatsapp_configured": bool(
+            settings.meta_phone_number_id
+            and settings.meta_access_token
+            and settings.meta_app_secret
+        ),
+        "telegram_configured": bool(settings.telegram_bot_token),
         "scanner_enabled": settings.scanner_enabled,
         "auto_signal_enabled": settings.auto_signal_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
@@ -459,6 +413,77 @@ async def receive_webhook(
     )
 
 
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
+
+async def process_telegram_update(payload: dict) -> None:
+    message = payload.get("message") or payload.get("edited_message")
+    if not message:
+        return
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    text = (message.get("text") or "").strip()
+    if chat_id is None or not text:
+        return
+
+    target = f"tg:{chat_id}"
+    dedupe_id = f"telegram:{chat_id}:{message_id}" if message_id is not None else None
+
+    logger.info(
+        "Incoming Telegram message: update_id=%s message_id=%s chat_id=%s",
+        payload.get("update_id"),
+        message_id,
+        chat_id,
+    )
+
+    if dedupe_id and not db.mark_message_seen(dedupe_id):
+        logger.info("Ignoring duplicate Telegram message: %s", dedupe_id)
+        return
+
+    try:
+        await bot.handle(target, text)
+    except Exception:
+        logger.exception("Telegram bot command processing failed")
+
+
+@app.post("/telegram/webhook")
+async def receive_telegram_webhook(request: Request):
+    if not settings.telegram_bot_token:
+        return JSONResponse(
+            content={"status": "telegram_not_configured"},
+            status_code=503,
+        )
+
+    expected = settings.telegram_webhook_secret
+    if expected:
+        provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(provided, expected):
+            logger.warning("Telegram webhook secret verification FAILED")
+            return JSONResponse(
+                content={"status": "invalid_secret"},
+                status_code=403,
+            )
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        return JSONResponse(
+            content={"status": "invalid_json"},
+            status_code=400,
+        )
+
+    task = asyncio.create_task(
+        process_telegram_update(payload),
+        name="telegram-webhook",
+    )
+    keep_task(task)
+
+    return JSONResponse(content={"status": "ok"}, status_code=200)
+
 # ============================================================
 # STARTUP
 # ============================================================
@@ -473,7 +498,7 @@ async def startup_event():
     )
 
     logger.info(
-        "Pak Trading Academy WhatsApp Bot starting"
+        "Pak Trading Academy Dual-Channel Trading Bot starting"
     )
 
     logger.info(
@@ -520,20 +545,19 @@ async def startup_event():
     if settings.scanner_enabled:
         await scanner_scheduler.start()
 
-    keep_task(
-        asyncio.create_task(
-            whatsapp_keepalive_loop(),
-            name="whatsapp-backtest-keepalive",
-        )
-    )
+    if telegram.configured:
+        with suppress(Exception):
+            await telegram.set_my_commands()
 
-    logger.info(
-        "WhatsApp 4-minute keepalive started."
-    )
+        if settings.telegram_webhook_url:
+            await telegram.set_webhook(
+                settings.telegram_webhook_url,
+                secret_token=settings.telegram_webhook_secret,
+                drop_pending_updates=False,
+            )
+            logger.info("Telegram webhook configured: %s", settings.telegram_webhook_url)
 
-    logger.info(
-        "Bot startup complete."
-    )
+    logger.info("Bot startup complete.")
 
 
 # ============================================================
@@ -564,6 +588,9 @@ async def shutdown_event():
 
     with suppress(Exception):
         await whatsapp.close()
+
+    with suppress(Exception):
+        await telegram.close()
 
     logger.info(
         "Shutdown complete."

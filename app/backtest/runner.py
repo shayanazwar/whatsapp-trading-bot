@@ -1187,10 +1187,16 @@ class BacktestRunner:
             asyncio.create_task(_fetch_timeframe(self.client, "BTC_USDT", "15M", INTERVALS["15m"], starts["15m"], end)),
         ]
         try:
-            c4, c1, c15, c5 = await asyncio.wait_for(
+            c4, c1, c15 = await asyncio.wait_for(
                 asyncio.gather(*tasks),
                 timeout=SYMBOL_FETCH_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         except BaseException:
             for task in tasks:
                 if not task.done():

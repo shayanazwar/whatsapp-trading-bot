@@ -19,7 +19,6 @@ from app.backtest.runner import (
     BacktestAlreadyRunning,
     BacktestRunner,
     MAX_BACKTEST_SYMBOLS,
-    _bypass_5m_confirmation,
 )
 from app.backtest.simulator import simulate_trade
 
@@ -188,6 +187,40 @@ async def test_historical_kline_range_parser(monkeypatch):
     assert [row[0] for row in rows] == [1_000_000, 1_001_000, 2_000_000]
 
 
+@pytest.mark.asyncio
+async def test_fetch_btc_history_uses_only_three_required_context_timeframes(monkeypatch):
+    import app.backtest.runner as runner_module
+
+    responses = {
+        "4H": [[1000, 1, 2, 0, 1.5, 10]],
+        "1H": [[1000, 1, 2, 0, 1.5, 10]],
+        "15M": [[1000, 1, 2, 0, 1.5, 10]],
+    }
+    calls = []
+
+    async def fake_fetch_timeframe(_client, symbol, timeframe, *_args):
+        calls.append((symbol, timeframe))
+        return list(responses[timeframe])
+
+    monkeypatch.setattr(runner_module, "_fetch_timeframe", fake_fetch_timeframe)
+
+    runner = BacktestRunner.__new__(BacktestRunner)
+    runner.client = object()
+    history = await runner._fetch_btc_history(start=0, end=20_000_000)
+
+    assert calls == [
+        ("BTC_USDT", "4H"),
+        ("BTC_USDT", "1H"),
+        ("BTC_USDT", "15M"),
+    ]
+    assert history.symbol == "BTC_USDT"
+    assert history.candles_4h == responses["4H"]
+    assert history.candles_1h == responses["1H"]
+    assert history.candles_15m == responses["15M"]
+    assert history.candles_5m == []
+    assert history.candles_1d == []
+
+
 def test_engine_accepts_historical_timestamp_without_future_candle():
     now = 1_700_000_000_000 + 250 * H4
     result = analyze_candles(
@@ -264,24 +297,21 @@ def test_runner_candidate_discovery_does_not_call_5m_trigger(monkeypatch):
     assert diagnostics["STRUCTURE_WINDOW_REVISITS"] > 0
 
 
-def test_runner_bypasses_only_5m_rejection():
-    accepted = _bypass_5m_confirmation(
-        {
-            "technical_candidate": False,
-            "technical_gate_failures": ["5m_trigger_confirmation"],
-        }
-    )
-    assert accepted["technical_candidate"] is True
-    assert accepted["five_minute_confirmation_bypassed"] is True
-    assert accepted["technical_gate_failures"] == []
+def test_canonical_app_main_has_no_synthetic_whatsapp_keepalive():
+    main_source = open(
+        __import__("pathlib").Path(__file__).resolve().parents[1] / "app" / "main.py",
+        encoding="utf-8",
+    ).read()
+    assert "BACKTEST KEEPALIVE" not in main_source
+    assert "internal-keepalive" not in main_source
+    assert "ANALYZE BTCUSDT" not in main_source
 
-    mixed = _bypass_5m_confirmation(
-        {
-            "technical_candidate": False,
-            "technical_gate_failures": ["5m_trigger_confirmation", "1h_alignment"],
-        }
-    )
-    assert mixed["technical_candidate"] is False
+
+def test_runner_candidate_path_has_no_5m_confirmation_dependency():
+    import app.backtest.runner as runner_module
+    source = open(runner_module.__file__, encoding="utf-8").read()
+    assert "_bypass_5m_confirmation" not in source
+    assert "ENABLE_5M_REFINEMENT" not in source
 
 
 def test_runner_has_nonblocking_ipc_reader():
@@ -296,11 +326,11 @@ def test_runner_has_nonblocking_ipc_reader():
     assert "def reader()" in method_source
 
 
-def test_runner_uses_explicit_5m_bypass_flag():
+def test_runner_does_not_enable_5m_confirmation_gate():
     import app.backtest.runner as runner_module
     source = open(runner_module.__file__, encoding="utf-8").read()
-    assert '"_BACKTEST_DISABLE_5M_CONFIRMATION": True' in source
-    assert "_bypass_5m_confirmation(analysis)" in source
+    assert "_bypass_5m_confirmation" not in source
+    assert "ENABLE_5M_REFINEMENT" not in source
 
 
 def test_signal_key_is_based_on_15m_setup_timestamp():
@@ -337,17 +367,17 @@ def test_signal_validator_no_longer_requires_5m(monkeypatch):
     assert signal is not None
     assert signal.candle_time == data["candle_time"]
     assert signal.analysis["primary_entry_timeframe"] == "15M"
-    assert signal.analysis["five_minute_confirmation_bypassed"] is True
+    assert signal.analysis["primary_entry_timeframe"] == "15M"
 
 
-def test_signal_validator_ignores_5m_only_engine_failure(monkeypatch):
+def test_signal_validator_preserves_validation_rejections(monkeypatch):
     import app.automation.signal_validator as validator
 
     monkeypatch.setattr(validator.time, "time", lambda: 1_700_000_000 + 5 * 60)
     monkeypatch.setattr(
         validator,
         "validate_analysis",
-        lambda *args, **kwargs: (False, ["5m_trigger_confirmation"]),
+        lambda *args, **kwargs: (False, ["1h_alignment"]),
     )
     data = {
         "symbol": "ABC_USDT",
@@ -364,11 +394,11 @@ def test_signal_validator_ignores_5m_only_engine_failure(monkeypatch):
         min_rr=2.0,
         require_increasing_volume=True,
     )
-    assert signal is not None
-    assert reasons == []
+    assert signal is None
+    assert reasons == ["1h_alignment"]
 
 
-def test_signal_validator_keeps_non_5m_rejections(monkeypatch):
+def test_signal_validator_does_not_special_case_5m_rejections(monkeypatch):
     import app.automation.signal_validator as validator
 
     monkeypatch.setattr(validator.time, "time", lambda: 1_700_000_000 + 5 * 60)
@@ -392,7 +422,7 @@ def test_signal_validator_keeps_non_5m_rejections(monkeypatch):
         require_increasing_volume=True,
     )
     assert signal is None
-    assert reasons == ["1h_alignment"]
+    assert reasons == ["5m_trigger_confirmation", "1h_alignment"]
 
 
 def test_risk_math_and_level_ordering():

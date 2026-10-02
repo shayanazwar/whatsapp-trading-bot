@@ -109,12 +109,8 @@ def test_15m_entry_confirmation_is_primary_and_mirrored(monkeypatch):
     assert mirror_result["trigger_type"] in {"BREAKDOWN", "RECLAIM"}
 
 
-def test_high_precision_trigger_rejects_weak_5m_confirmation(monkeypatch):
-    candles = [_candle(i * 300_000, 100.0, 100.4, 99.6, 100.1, 1000) for i in range(30)]
-    candles[-1] = _candle(29 * 300_000, 100.0, 100.7, 99.9, 100.5, 1050)
-    result = engine._five_minute_trigger(engine.convert_candles(candles), "LONG", 100.0)
-    assert result["ready"] is False
-    assert "volume" in result["reason"] or "body" in result["reason"] or "close" in result["reason"]
+def test_engine_has_no_5m_confirmation_trigger():
+    assert not hasattr(engine, "_five_minute_trigger")
 
 
 def test_live_geometry_keeps_structural_stop_and_targets(monkeypatch):
@@ -124,7 +120,7 @@ def test_live_geometry_keeps_structural_stop_and_targets(monkeypatch):
         "tp": 106.5,
         "atr": 1.0,
     }
-    ok, reason = MexcScanner._validate_live_geometry(analysis, 100.1, "LONG", max_drift_pct=0.01)
+    ok, reason = MexcScanner._validate_live_geometry(analysis, 100.1, "LONG", max_drift_atr=0.20)
     assert ok, reason
     assert analysis["stop_loss"] == 98.5
     assert analysis["tp"] == 106.5
@@ -207,8 +203,10 @@ def test_intraday_structure_window_and_target_distance_are_widened():
     assert engine.MAX_SL_ATR == pytest.approx(3.50)
 
 
-def test_5m_refinement_is_disabled_from_engine_decision_path():
-    assert engine.ENABLE_5M_REFINEMENT is False
+def test_5m_confirmation_is_not_an_engine_decision_gate():
+    assert not hasattr(engine, "ENABLE_5M_REFINEMENT")
+    source = open(engine.__file__, encoding="utf-8").read()
+    assert "_five_minute_trigger" not in source
 
 
 def test_supporting_family_count_is_five_of_eight_with_diversity():

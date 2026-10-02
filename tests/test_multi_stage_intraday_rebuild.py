@@ -53,7 +53,7 @@ def test_single_tp_costs_reduce_realized_r():
 
 def test_live_geometry_requires_real_single_tp():
     analysis={"entry":100.0,"stop_loss":98.0,"tp":106.0,"atr":1.0}
-    ok, reason=MexcScanner._validate_live_geometry(analysis,100.0,"LONG",max_drift_pct=0.01)
+    ok, reason=MexcScanner._validate_live_geometry(analysis,100.0,"LONG",max_drift_atr=0.20)
     assert ok, reason
     assert analysis["tp"] == pytest.approx(106.0)
     assert analysis["tp_distance_atr"] == pytest.approx(6.0)

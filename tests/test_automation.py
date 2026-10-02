@@ -29,7 +29,7 @@ def _valid_analysis(side="LONG"):
         "htf_target_path":{"status":"PASS","value":3.0},
         "vwap_location":{"status":"PASS","value":0.5},
     }
-    return {"symbol":"BTC_USDT","price":100.0,"trend_4h":"BULLISH" if long else "BEARISH","structure_1h":"HH/HL" if long else "LH/LL","bos_15m":True,"ema_direction":"BULLISH" if long else "BEARISH","rsi":60.0 if long else 40.0,"rsi_5m":60.0 if long else 40.0,"atr":1.0,"atr_percentile":50,"volume":"INCREASING","rvol":1.5,"rvol_15m":1.5,"rvol_5m":1.5,"entry":100.0,"stop_loss":99.0 if long else 101.0,"tp":104.0 if long else 96.0,"rr":3.48,"setup":side,"setup_bos_time":fifteen-300000,"setup_retest_time":fifteen,"candle_time":fifteen,"direction_ok":True,"structure_ok":True,"setup_ok":True,"momentum_ok":True,"volume_ok":True,"location_ok":True,"futures_ok":True,"btc_filter_ok":True,"volatility_ok":True,"data_fresh":True,"target_path_structural":True,"shock_veto_ok":True,"confirmation_families":families,"confirmation_families_passed":6,"confirmation_families_available":6,"confirmation_family_diversity_ok":True,"confirmation_family_count":6,"supporting_family_count":6,"score":100,"sl_atr":1.0,"tp_distance_atr":4.0,"signal_blocked":False,"technical_candidate":True,"structure_quality_ok":True,"ema_extension_ok":True,"five_minute_ready":False,"five_minute_long":False,"five_minute_short":False,"mexc_spread_pct":0.0001,"max_mexc_spread_pct":0.001,"entry_drift_pct":0.0,"max_entry_drift_pct":0.002,"max_signal_age_seconds":1200,"estimated_round_trip_cost_pct":0.0015}
+    return {"symbol":"BTC_USDT","price":100.0,"trend_4h":"BULLISH" if long else "BEARISH","structure_1h":"HH/HL" if long else "LH/LL","bos_15m":True,"ema_direction":"BULLISH" if long else "BEARISH","rsi":60.0 if long else 40.0,"rsi_5m":60.0 if long else 40.0,"atr":1.0,"atr_percentile":50,"volume":"INCREASING","rvol":1.5,"rvol_15m":1.5,"rvol_5m":1.5,"entry":100.0,"stop_loss":99.0 if long else 101.0,"tp":104.0 if long else 96.0,"rr":3.48,"setup":side,"setup_bos_time":fifteen-300000,"setup_retest_time":fifteen,"candle_time":fifteen,"direction_ok":True,"structure_ok":True,"setup_ok":True,"momentum_ok":True,"volume_ok":True,"location_ok":True,"futures_ok":True,"btc_filter_ok":True,"volatility_ok":True,"data_fresh":True,"target_path_structural":True,"shock_veto_ok":True,"confirmation_families":families,"confirmation_families_passed":6,"confirmation_families_available":6,"confirmation_family_diversity_ok":True,"confirmation_family_count":6,"supporting_family_count":6,"score":100,"sl_atr":1.0,"tp_distance_atr":4.0,"signal_blocked":False,"technical_candidate":True,"structure_quality_ok":True,"trade_geometry_ok":True,"ema_extension_ok":True,"five_minute_ready":False,"five_minute_long":False,"five_minute_short":False,"mexc_spread_pct":0.0001,"max_mexc_spread_pct":0.001,"entry_drift_pct":0.0,"max_entry_drift_pct":0.002,"max_signal_age_seconds":1200,"estimated_round_trip_cost_pct":0.0015}
 
 
 def test_signature_is_deterministic():
@@ -104,7 +104,7 @@ def test_signal_format_uses_score_100():
     assert signal is not None, reasons
     text = format_signal(signal)
     assert "Score: 100/100" in text
-    assert "Families: 6/6" in text
+    assert "Optional evidence: 6/6 (informational)" in text
 
 
 class _FakeHeaders(dict):
@@ -188,14 +188,14 @@ def test_public_request_retries_http_429_and_honors_bounded_retry_count():
     asyncio.run(client.close())
 
 
-def test_live_scanner_stages_5m_and_1d_after_technical_prefilter(monkeypatch):
+def test_live_scanner_stages_15m_then_htf_without_5m_confirmation(monkeypatch):
     class FakeClient:
         def __init__(self):
             self.calls = []
 
         async def get_klines(self, symbol, interval, limit):
             self.calls.append((symbol, interval))
-            step = {"Hour4": 14_400_000, "Min60": 3_600_000, "Min15": 900_000, "Min5": 300_000, "Day1": 86_400_000}[interval]
+            step = {"Hour4": 14_400_000, "Min60": 3_600_000, "Min15": 900_000, "Day1": 86_400_000}[interval]
             end = int(time.time() * 1000)
             base = end - 259 * step
             return [[base + i * step, 100, 101, 99, 100, 1000] for i in range(260)]
@@ -207,32 +207,47 @@ def test_live_scanner_stages_5m_and_1d_after_technical_prefilter(monkeypatch):
     class FakeSignals:
         pass
 
-    old_helpers = (
-        __import__("app.automation.scanner", fromlist=["_four_hour_regime"])._four_hour_regime,
-        __import__("app.automation.scanner", fromlist=["_one_hour_alignment"])._one_hour_alignment,
-        __import__("app.automation.scanner", fromlist=["_bos_events"])._bos_events,
-        __import__("app.automation.scanner", fromlist=["_select_latest_bos_with_retest"])._select_latest_bos_with_retest,
-        __import__("app.automation.scanner", fromlist=["_fifteen_minute_entry_confirmation"])._fifteen_minute_entry_confirmation,
-        __import__("app.automation.scanner", fromlist=["analyze_candles"]).analyze_candles,
-    )
     import app.automation.scanner as scanner_module
 
-    def install(force_pass):
-        monkeypatch.setattr(scanner_module, "_four_hour_regime", lambda c: {"bull": force_pass, "bear": False, "regime": "BULLISH" if force_pass else "NO_TRADE"})
-        monkeypatch.setattr(scanner_module, "_one_hour_alignment", lambda c, r: {"long": force_pass, "short": False, "long_votes": 4 if force_pass else 0, "short_votes": 0})
-        monkeypatch.setattr(scanner_module, "_bos_events", lambda c, side: [{"level": 100, "time": c[-2]["time"], "strength": 1}] if side == "LONG" else [])
-        monkeypatch.setattr(scanner_module, "_select_latest_bos_with_retest", lambda c, side, events: ({"level": 100, "strength": 1}, {"valid": force_pass, "time": c[-2]["time"], "quality": 1.0, "rejection": True}) if side == "LONG" else (None, {"valid": False}))
-        monkeypatch.setattr(scanner_module, "_fifteen_minute_entry_confirmation", lambda *args: {"ready": force_pass, "quality": 1})
-        monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: {"setup": "NO TRADE"})
+    monkeypatch.setattr(
+        scanner_module,
+        "_four_hour_regime",
+        lambda c: {"bull": True, "bear": False, "regime": "BULLISH"},
+    )
+    monkeypatch.setattr(
+        scanner_module,
+        "_one_hour_alignment",
+        lambda c, r: {"long": True, "short": False, "long_votes": 4, "short_votes": 0},
+    )
+    monkeypatch.setattr(
+        scanner_module,
+        "_bos_events",
+        lambda c, side: [{"level": 100, "time": c[-2]["time"], "strength": 1}] if side == "LONG" else [],
+    )
+    monkeypatch.setattr(
+        scanner_module,
+        "_select_latest_bos_with_retest",
+        lambda c, side, events: (
+            {"level": 100, "strength": 1},
+            {"valid": True, "time": c[-2]["time"], "quality": 1.0, "rejection": True},
+        ) if side == "LONG" else (None, {"valid": False}),
+    )
+    monkeypatch.setattr(
+        scanner_module,
+        "analyze_candles",
+        lambda *args, **kwargs: {"setup": "NO TRADE"},
+    )
 
-    async def run(force_pass):
+    async def run():
         client = FakeClient()
-        install(force_pass)
-        scanner = MexcScanner(settings=Settings(scan_concurrency=4), client=client, universe=FakeUniverse(), signal_manager=FakeSignals())
+        scanner = MexcScanner(
+            settings=Settings(scan_concurrency=4),
+            client=client,
+            universe=FakeUniverse(),
+            signal_manager=FakeSignals(),
+        )
         await scanner.scan_once()
         return [interval for symbol, interval in client.calls if symbol == "X_USDT"]
 
-    rejected = asyncio.run(run(False))
-    passed = asyncio.run(run(True))
-    assert rejected == ["Hour4", "Min60", "Min15"]
-    assert passed == ["Hour4", "Min60", "Min15", "Min5", "Day1"]
+    calls = asyncio.run(run())
+    assert calls == ["Min15", "Hour4", "Min60", "Day1"]

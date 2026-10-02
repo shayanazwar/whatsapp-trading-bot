@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from ..database import Database
 from ..formatting import fmt_price
+from ..telegram import TelegramClient
 from ..whatsapp import WhatsAppClient
 from .signal_validator import ValidatedSignal
 
@@ -57,9 +58,11 @@ class SignalManager:
         whatsapp: WhatsAppClient,
         recipients: set[str],
         expiry_minutes: int,
+        telegram: TelegramClient | None = None,
     ) -> None:
         self.db = db
         self.whatsapp = whatsapp
+        self.telegram = telegram
         self.recipients = set(recipients)
         self.expiry_minutes = max(1, int(expiry_minutes))
 
@@ -138,7 +141,12 @@ class SignalManager:
         successful = 0
         for recipient in sorted(self.recipients):
             try:
-                await self.whatsapp.send_text(recipient, body)
+                if recipient.startswith("tg:") or recipient.startswith("telegram:"):
+                    if self.telegram is None:
+                        raise RuntimeError("Telegram channel is not configured.")
+                    await self.telegram.send_text(recipient, body)
+                else:
+                    await self.whatsapp.send_text(recipient, body)
                 successful += 1
             except Exception:
                 LOGGER.exception(

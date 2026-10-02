@@ -5,7 +5,7 @@ from __future__ import annotations
 V1.7 - deterministic pipeline.
 
 1D context -> 4H regime -> 1H directional evidence ->
-15M BOS/retest -> 15M entry confirmation -> momentum/volume/volatility ->
+15M BOS/retest -> supporting momentum/volume/volatility ->
 structural SL -> structural TP path -> RR -> technical candidate.
 
 This module never places orders.
@@ -30,15 +30,15 @@ TIMEFRAME_ALIASES = {
     "1D":"1d","1DAY":"1d","1W":"1w","1WEEK":"1w",
 }
 
-MIN_SCORE = 78
-MIN_RR = 2.50
+MIN_SCORE = 72
+MIN_RR = 2.00
 # Five supporting confirmation families out of eight, while 4H/1H/15M
 # remain structural prerequisites. Live-only families may abstain when data
 # is unavailable; they never auto-pass or auto-fail.
-MIN_CONFIRMATION_FAMILIES = 5
-MIN_AVAILABLE_CONFIRMATION_FAMILIES = 6
-MIN_FAMILIES = 5
-MIN_SUPPORTING_FAMILIES = 5
+MIN_CONFIRMATION_FAMILIES = 0  # legacy informational constant; never a signal gate
+MIN_AVAILABLE_CONFIRMATION_FAMILIES = 0  # legacy informational constant; never a signal gate
+MIN_FAMILIES = 0
+MIN_SUPPORTING_FAMILIES = 0
 # Intraday-swing geometry is volatility/structure based rather than percentage
 # based. The stop must clear a meaningful invalidation point with an ATR floor;
 # the single TP must be a real higher-timeframe structural target.
@@ -50,17 +50,14 @@ MAX_ATR_PERCENTILE = 95.0
 MAX_SETUP_AGE_15M = 32  # up to 8 hours for a causal BOS/retest window
 MAX_ENTRY_DISTANCE_ATR = 3.00
 BOS_BUFFER_ATR = 0.10
-BOS_BUFFER_PCT = 0.0005
 BTC_SHOCK_ATR = 1.50
-ADX_TREND_MIN = 20.0
-EMA_TOLERANCE_PCT = 0.0025
+ADX_TREND_MIN = 16.0
 MIN_TRIGGER_RVOL = 1.10
 MIN_TRIGGER_BODY = 0.55
 RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
 INTRADAY_MAX_HOLD_MINUTES = 360
-ENGINE_VERSION = "gold-v5.0-single-tp-5of8"
-ENABLE_5M_REFINEMENT = False
+ENGINE_VERSION = "gold-v5.1-structure-analysis-15m"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -483,9 +480,9 @@ def _four_hour_regime(candles: List[Candle]) -> Dict[str, Any]:
                       slope < 0.0, protected["state"] == "BEARISH",
                       recent["bear_score"] >= 1))
     bull = bool(current > e200 and e21 >= e50 and adx >= ADX_TREND_MIN and
-                bull_votes >= 5 and bull_votes > bear_votes)
+                bull_votes >= 4 and bull_votes > bear_votes)
     bear = bool(current < e200 and e21 <= e50 and adx >= ADX_TREND_MIN and
-                bear_votes >= 5 and bear_votes > bull_votes)
+                bear_votes >= 4 and bear_votes > bull_votes)
     regime = "BULLISH" if bull else "BEARISH" if bear else "SIDEWAYS"
     base.update({"bull":bull,"bear":bear,"regime":regime,
                  "bull_votes":bull_votes,"bear_votes":bear_votes})
@@ -507,15 +504,15 @@ def _one_hour_alignment(candles: List[Candle], regime4: Dict[str, Any]) -> Dict[
             "long_votes":0,"short_votes":0}
     if e21 is None or e50 is None:
         return base
-    tolerance = price * EMA_TOLERANCE_PCT
+    tolerance = max(a * 0.25, 1e-12)
     long_ema = price >= e50 - tolerance and e21 >= e50
     short_ema = price <= e50 + tolerance and e21 <= e50
     long_structure = structure == "HH/HL" or protected["state"] == "BULLISH" or recent["bull_score"] >= 1
     short_structure = structure == "LH/LL" or protected["state"] == "BEARISH" or recent["bear_score"] >= 1
-    long_momentum = r >= 50.0 and (e200 is None or price >= e200 * 0.995)
-    short_momentum = r <= 50.0 and (e200 is None or price <= e200 * 1.005)
-    long_slope = slope >= -0.0010
-    short_slope = slope <= 0.0010
+    long_momentum = r >= 50.0 and (e200 is None or price >= e200 - max(a * 0.50, 1e-12))
+    short_momentum = r <= 50.0 and (e200 is None or price <= e200 + max(a * 0.50, 1e-12))
+    long_slope = slope >= 0.0
+    short_slope = slope <= 0.0
     lv, sv = sum((long_ema,long_structure,long_momentum,long_slope)), sum((short_ema,short_structure,short_momentum,short_slope))
     # 1H decides direction. 4H is a regime/context filter handled separately,
     # which lets a clear 1H trend trade through a sideways 4H regime.
@@ -588,7 +585,7 @@ def _bos_events(
 
         close = float(candles[i]["close"])
         prev = float(candles[i - 1]["close"])
-        buffer = max(a * BOS_BUFFER_ATR, close * BOS_BUFFER_PCT)
+        buffer = max(a * BOS_BUFFER_ATR, 1e-12)
         last_eligible_pos = bisect_right(pivot_indices, i - 2) - 1
         if last_eligible_pos < 0:
             continue
@@ -720,8 +717,9 @@ def _pullback_retest(candles: List[Candle], side: str, bos: Optional[Dict[str,An
     if start >= end: return invalid
     level, a = float(bos["level"]), max(_num(bos.get("atr")),0)
     if a <= 0: return invalid
-    tol, penetration = max(a*RETEST_TOLERANCE_ATR,abs(level)*0.001), max(a*RETEST_PENETRATION_ATR,abs(level)*0.0025)
-    close_tol = max(a*0.20,abs(level)*0.0008)
+    tol = max(a * RETEST_TOLERANCE_ATR, 1e-12)
+    penetration = max(a * RETEST_PENETRATION_ATR, 1e-12)
+    close_tol = max(a * 0.20, 1e-12)
     for i in range(start,end):
         c=o=None
         o,h,l,close = float(candles[i]["open"]),float(candles[i]["high"]),float(candles[i]["low"]),float(candles[i]["close"])
@@ -764,11 +762,10 @@ def _fifteen_minute_entry_confirmation(
     rvol_value: Optional[float] = None,
     atr_value: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Primary intraday entry confirmation on the closed 15M candle.
+    """Measure closed-15M candle quality after a valid BOS/retest.
 
-    The 15M timeframe owns entry confirmation. The 5M trigger is only a
-    refinement and is never required to turn a valid intraday setup into a
-    signal.
+    This is supporting analysis only; it is not a separate lower-timeframe
+    confirmation gate.
     """
     empty = {
         "ready": False,
@@ -804,7 +801,7 @@ def _fifteen_minute_entry_confirmation(
                       "reason": "15M entry candle is not after retest"})
         return empty
 
-    buffer = max(a * 0.05, abs(setup_level) * 0.00025)
+    buffer = max(a * 0.05, 1e-12)
     close_location = (close - l) / rng if side == "LONG" else (h - close) / rng
     if side == "LONG":
         breakout = close > setup_level + buffer and close > o and close > ph
@@ -830,17 +827,17 @@ def _fifteen_minute_entry_confirmation(
     )
 
     if ready:
-        reason = "confirmed 15M intraday entry"
+        reason = "15M candle quality supportive"
     elif rv < MIN_TRIGGER_RVOL:
-        reason = "15M RVOL below strict threshold"
+        reason = "15M RVOL is below the preferred level"
     elif body < MIN_TRIGGER_BODY:
-        reason = "15M candle body too weak"
+        reason = "15M candle body is below the preferred level"
     elif close_location < 0.70:
         reason = "15M candle closed too far from directional extreme"
     elif side == "LONG" and r < 55.0:
-        reason = "15M LONG momentum below strict threshold"
+        reason = "15M LONG momentum is below the preferred level"
     elif side == "SHORT" and r > 45.0:
-        reason = "15M SHORT momentum below strict threshold"
+        reason = "15M SHORT momentum is below the preferred level"
     else:
         reason = f"15M {side} breakout/reclaim condition not met"
 
@@ -858,71 +855,12 @@ def _fifteen_minute_entry_confirmation(
     }
 
 
-def _five_minute_trigger(candles: List[Candle], side: str, setup_level: Optional[float]) -> Dict[str,Any]:
-    empty={"ready":False,"long":False,"short":False,"quality":0.0,"rsi":50.0,"rvol":0.0,"atr":0.0,
-           "candle_time":0,"body_ratio":0.0,"trigger_type":"NONE","reason":"insufficient data",
-           "bos_level":None,"volume_expanding":False}
-    if len(candles)<30: return empty
-    cur=candles[-1]
-    o,h,l,close=float(cur["open"]),float(cur["high"]),float(cur["low"]),float(cur["close"])
-    rng=max(h-l,1e-12)
-    body=abs(close-o)/rng
-    closes=[float(c["close"]) for c in candles]
-    r,rv,a=_safe_rsi(closes),_relative_volume(candles),_safe_atr(candles)
-    prior=candles[-6:-1]
-    prior_high=max(float(c["high"]) for c in prior) if prior else 0.0
-    prior_low=min(float(c["low"]) for c in prior) if prior else 0.0
-    prior_avg_volume=(sum(float(c["volume"]) for c in candles[-6:-1])/5.0) if len(candles)>=6 else 0.0
-    volume_expanding=bool(prior_avg_volume>0 and float(cur["volume"])>prior_avg_volume)
-    buffer=max(a*0.05, abs(close)*0.00025)
-    close_location_long=(close-l)/rng
-    close_location_short=(h-close)/rng
-    long_level_ok=setup_level is None or close>setup_level+buffer
-    short_level_ok=setup_level is None or close<setup_level-buffer
-    # Continuation BOS: current closed 5M candle must clear the recent 5-bar
-    # extreme and the 15M BOS level. This is causal and needs no future pivot.
-    bos_long=bool(close>prior_high+buffer and long_level_ok and close>o)
-    bos_short=bool(close<prior_low-buffer and short_level_ok and close<o)
-    strong_long=bool(body>=MIN_TRIGGER_BODY and close_location_long>=0.70 and r>=55.0)
-    strong_short=bool(body>=MIN_TRIGGER_BODY and close_location_short>=0.70 and r<=45.0)
-    long_ok=bos_long and strong_long and rv>=MIN_TRIGGER_RVOL and volume_expanding
-    short_ok=bos_short and strong_short and rv>=MIN_TRIGGER_RVOL and volume_expanding
-    if side=="LONG":
-        ready=long_ok
-        q=_clamp(0.35*_clamp(body/0.70,0,1)+0.25*_clamp(rv/1.50,0,1)+0.20*_clamp(r/70.0,0,1)+0.20*(1.0 if volume_expanding else 0.0),0,1)
-        trigger_type="BOS_CONTINUATION" if bos_long else "NONE"
-        bos_level=float(max(prior_high, setup_level or prior_high))
-    elif side=="SHORT":
-        ready=short_ok
-        q=_clamp(0.35*_clamp(body/0.70,0,1)+0.25*_clamp(rv/1.50,0,1)+0.20*_clamp((100.0-r)/70.0,0,1)+0.20*(1.0 if volume_expanding else 0.0),0,1)
-        trigger_type="BOS_CONTINUATION" if bos_short else "NONE"
-        bos_level=float(min(prior_low, setup_level if setup_level is not None else prior_low))
-    else:
-        ready,q,trigger_type,bos_level=False,0.0,"NONE",None
-    if ready: reason="confirmed 5M BOS + strong candle + expanding volume"
-    elif side=="NONE": reason="not evaluated: no directional 15M setup"
-    elif not (bos_long if side=="LONG" else bos_short): reason="5M continuation BOS not confirmed"
-    elif body<MIN_TRIGGER_BODY: reason="5M candle body too weak"
-    elif (close_location_long<0.70 if side=="LONG" else close_location_short<0.70): reason="5M close location too weak"
-    elif rv<MIN_TRIGGER_RVOL: reason="5M relative volume below threshold"
-    elif not volume_expanding: reason="5M volume is not expanding"
-    elif side=="LONG" and r<55.0: reason="5M LONG momentum below threshold"
-    elif side=="SHORT" and r>45.0: reason="5M SHORT momentum below threshold"
-    else: reason=f"5M {side} continuation condition not met"
-    return {"ready":bool(ready),"long":bool(long_ok),"short":bool(short_ok),"quality":q,
-            "rsi":r,"rvol":rv,"atr":a,"candle_time":int(cur["time"]),"body_ratio":body,
-            "close_location":close_location_long if side=="LONG" else close_location_short,
-            "trigger_type":trigger_type,"reason":reason,"bos_level":bos_level,
-            "volume_expanding":volume_expanding}
-
-
-
 def _level_clusters(candles: List[Candle], atr_value: float, lookback: int = 120):
     recent = candles[-lookback:] if len(candles) > lookback else candles
     if not recent:
         return None, None
     current = float(recent[-1]["close"])
-    tolerance = max(atr_value * 0.20, current * 0.001)
+    tolerance = max(atr_value * 0.20, 1e-12)
     highs = [float(c["high"]) for c in recent if float(c["high"]) > current + tolerance]
     lows = [float(c["low"]) for c in recent if float(c["low"]) < current - tolerance]
     return (max(lows) if lows else None, min(highs) if highs else None)
@@ -942,7 +880,7 @@ def _collect_structural_levels(frames, atr_value: float, entry: float, max_swing
                 raw.append({"price": float(p), "timeframe": timeframe, "index": idx, "kind": "SUPPORT"})
     if not raw:
         return []
-    tol = max(atr_value * 0.15, entry * 0.0005)
+    tol = max(atr_value * 0.15, 1e-12)
     raw.sort(key=lambda x: x["price"])
     priority = {"1D": 4, "4H": 3, "1H": 2, "15M": 1}
     clusters = []
@@ -976,7 +914,7 @@ def _target_path(frames, side: str, entry: float, stop: float, atr_value: float)
         return base
 
     levels = _collect_structural_levels(frames, atr_value, entry)
-    clearance = max(0.30 * atr_value, entry * 0.0005)
+    clearance = max(0.30 * atr_value, 1e-12)
     major = {"1H", "4H", "1D"}
     ordered = [
         x for x in levels
@@ -1104,12 +1042,11 @@ def _shock_veto(candles: List[Candle], side: str, atr_value: float) -> tuple[boo
     return True, "OK"
 
 def evaluate_confirmation_families(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Evaluate eight decorrelated supporting families.
+    """Evaluate eight optional supporting evidence families.
 
-    Status values are PASS/FAIL/ABSTAIN. Missing live-only data abstains; it
-    never becomes an implicit pass or fail. A signal requires at least five
-    passes with at least six families available, plus diversity across
-    momentum, flow/positioning, and liquidity/volatility.
+    Status values are PASS/FAIL/ABSTAIN. Missing live-only data abstains.
+    Family counts and diversity are diagnostic/reporting evidence only; they
+    never veto a structurally valid signal.
     """
     side = str(data.get("setup") or "").upper()
     result: Dict[str, Dict[str, Any]] = {}
@@ -1141,17 +1078,19 @@ def evaluate_confirmation_families(data: Dict[str, Any]) -> Dict[str, Any]:
     ask_depth = data.get("ask_depth")
     if spread is None and bid_depth is None and ask_depth is None:
         result["liquidity_quality"] = {
-            "status": "ABSTAIN", "value": None, "source": "MEXC order book unavailable"
+            "status": "ABSTAIN", "value": None, "source": "MEXC liquidity snapshot unavailable"
         }
     else:
         spread_v = _num(spread, 999.0)
         depth_total = _num(bid_depth) + _num(ask_depth)
         imbalance = abs(_num(data.get("orderbook_imbalance")))
         max_spread = _num(data.get("max_mexc_spread_pct"), 0.001)
+        spread_pass = spread is not None and spread_v <= max_spread
+        depth_ok = (bid_depth is None and ask_depth is None) or (depth_total > 0 and imbalance <= 0.85)
         result["liquidity_quality"] = {
-            "status": "PASS" if spread_v <= max_spread and depth_total > 0 and imbalance <= 0.85 else "FAIL",
+            "status": "PASS" if spread_pass and depth_ok else "FAIL",
             "value": {"spread_pct": spread_v, "depth": depth_total, "imbalance": imbalance},
-            "source": "MEXC spread+depth",
+            "source": "MEXC ticker spread (+optional depth)",
         }
 
     funding = data.get("mexc_funding_rate")
@@ -1236,17 +1175,20 @@ def evaluate_confirmation_families(data: Dict[str, Any]) -> Dict[str, Any]:
         or result["volatility_regime"]["status"] == "PASS"
     )
     diversity_ok = momentum_group and flow_group and liquidity_vol_group
-    passed_ok = passed >= MIN_CONFIRMATION_FAMILIES and available >= MIN_AVAILABLE_CONFIRMATION_FAMILIES and diversity_ok
+    # Supporting families are evidence, not a mandatory gate. Missing optional
+    # microstructure data must never manufacture a rejection of a structural setup.
+    supporting_quality_ok = bool(passed >= 2 or available == 0)
 
     return {
         "families": result,
         "passed": passed,
         "failed": failed,
         "available": available,
-        "required_passes": MIN_CONFIRMATION_FAMILIES,
-        "minimum_available": MIN_AVAILABLE_CONFIRMATION_FAMILIES,
+        "required_passes": 0,
+        "minimum_available": 0,
         "diversity_ok": diversity_ok,
-        "passed_ok": passed_ok,
+        "supporting_quality_ok": supporting_quality_ok,
+        "passed_ok": True,  # legacy field; intentionally non-gating
     }
 
 
@@ -1376,7 +1318,7 @@ def _build_score(*, direction_ok, structure_ok, setup_ok, momentum_ok, volume_ok
                  location_ok, futures_ok, volatility_ok, trigger_quality=0,
                  rvol=0, bos_quality=0, retest_quality=0, momentum_quality=None,
                  volume_quality=None, family_result=None):
-    """Build a quality score from structural prerequisites plus supporting families."""
+    """Build a structure-first score; optional confirmation families are informational."""
     if momentum_quality is None:
         momentum_quality = 1.0 if momentum_ok else 0.0
     if volume_quality is None:
@@ -1390,32 +1332,38 @@ def _build_score(*, direction_ok, structure_ok, setup_ok, momentum_ok, volume_ok
         1.0,
     )
 
-    families = family_result.get("families", {}) if isinstance(family_result, dict) else {}
-    family_weights = {
-        "momentum": 5,
-        "relative_volume": 4,
-        "volatility_regime": 4,
-        "liquidity_quality": 4,
-        "funding_crowding": 4,
-        "flow_pressure": 5,
-        "htf_target_path": 5,
-        "vwap_location": 4,
-    }
-    family_points = 0
-    for name, weight in family_weights.items():
-        if families.get(name, {}).get("status") == "PASS":
-            family_points += weight
+    # 50 points: 4H regime + 1H directional structure + 15M BOS/retest.
+    # This is the identity of the signal and cannot be diluted by optional data.
+    structure_points = 50 if (direction_ok and structure_ok and setup_ok) else 0
+
+    # 15 points: 15M setup quality (BOS/retest strength + candle quality).
+    setup_points = int(round(15.0 * setup_quality)) if setup_ok else 0
+
+    # 20 points: supporting analysis evidence, not exact price percentages and
+    # not a hard lower-timeframe/family gate.
+    analysis_quality = _clamp(
+        0.35 * _num(momentum_quality)
+        + 0.30 * _num(volume_quality)
+        + 0.20 * (1.0 if volatility_ok else 0.0)
+        + 0.15 * _num(trigger_quality),
+        0.0,
+        1.0,
+    )
+    analysis_points = int(round(20.0 * analysis_quality))
+
+    # 15 points: structural target/risk geometry. RR remains mathematically
+    # required by risk validation, but exact percent distances do not define a setup.
+    target_points = 10 if location_ok else 0
+    risk_points = 5 if (location_ok and direction_ok) else 0
 
     groups = {
-        "structure_prerequisites": 35 if (direction_ok and structure_ok and setup_ok) else 0,
-        "setup_quality": int(round(10 * setup_quality)) if setup_ok else 0,
-        "family_evidence": family_points,
-        "risk_geometry": 20 if location_ok else 0,
+        "structure_prerequisites": structure_points,
+        "setup_quality": setup_points,
+        "analysis_evidence": analysis_points,
+        "structural_target": target_points,
+        "risk_geometry": risk_points,
     }
     score = sum(groups.values())
-
-    # A non-ready 15M candle is not a separate hard gate; its quality simply
-    # influences setup_quality. This keeps the 15M BOS/retest prerequisite causal.
     return max(0, min(100, int(score))), groups, int(
         family_result.get("passed", 0) if isinstance(family_result, dict) else 0
     )
@@ -1483,13 +1431,13 @@ def _direction_aligned(setup: str, regime: Dict[str, Any], alignment: Dict[str, 
             return bool(alignment.get("long"))
         if regime.get("bear"):
             return False
-        return bool(alignment.get("long") and int(alignment.get("long_votes", 0)) == 4)
+        return bool(alignment.get("long") and int(alignment.get("long_votes", 0)) >= 3)
     if setup == "SHORT":
         if regime.get("bear"):
             return bool(alignment.get("short"))
         if regime.get("bull"):
             return False
-        return bool(alignment.get("short") and int(alignment.get("short_votes", 0)) == 4)
+        return bool(alignment.get("short") and int(alignment.get("short_votes", 0)) >= 3)
     return False
 
 
@@ -1511,8 +1459,6 @@ def _diagnostic_failures(regime, alignment, long_candidate, short_candidate, bos
         if not location_ok: failures.append("target path/location")
         if not risk_ok: failures.append("risk/RR")
         if score < MIN_SCORE: failures.append("score")
-        if supporting_family_count < MIN_SUPPORTING_FAMILIES:
-            failures.append("supporting confirmation families")
     if not failures:
         # Deterministic fallback: explain the first stage that stopped the pipeline.
         if regime.get("regime") == "NO_TRADE": failures.append("4H regime data")
@@ -1537,7 +1483,8 @@ def analyze_candles(
     c4 = closed_candle_rows(candles_4h, "4h", now)
     c1 = closed_candle_rows(candles_1h, "1h", now)
     c15 = closed_candle_rows(candles_15m, "15m", now)
-    c5 = closed_candle_rows(candles_5m or [], "5m", now)
+    # ``candles_5m`` remains accepted for backward-compatible callers, but it is
+    # intentionally ignored: lower-timeframe confirmation is not part of strategy.
     c1d = closed_candle_rows(candles_1d or [], "1d", now)
     for candles, tf, n in ((c4, "4h", 205), (c1, "1h", 205), (c15, "15m", 80)):
         ok, reason = _data_quality(candles, TIMEFRAME_MS[tf], n)
@@ -1718,31 +1665,8 @@ def analyze_candles(
         {"trigger_side": trigger_side, "ready": bool(entry_15m.get("ready"))},
     )
 
-    # 5M is intentionally disabled in the signal decision path. 15M BOS/retest
-    # is the authoritative setup/entry timeframe; 5M cannot affect eligibility,
-    # score, family count, rejection reasons, or signal identity.
-    if ENABLE_5M_REFINEMENT and len(c5) >= 30 and not bool(cache.get("_BACKTEST_DISABLE_5M_CONFIRMATION")):
-        refinement_5m = _five_minute_trigger(c5, trigger_side, trigger_level)
-    else:
-        refinement_5m = {
-            "ready": False, "long": False, "short": False, "quality": 0.0, "rsi": 50.0,
-            "rvol": 0.0, "atr": 0.0, "candle_time": 0, "body_ratio": 0.0,
-            "trigger_type": "DISABLED", "reason": "5M refinement disabled; 15M is authoritative",
-            "bos_level": None, "volume_expanding": False,
-        }
-    if refinement_5m.get("ready") and retest_time is not None and int(refinement_5m["candle_time"]) < retest_time:
-        refinement_5m = dict(refinement_5m)
-        refinement_5m.update({"ready": False, "long": False, "short": False, "trigger_type": "INVALID_BEFORE_RETEST"})
-
-    report_progress(
-        "ENGINE_STAGE_5M_DONE",
-        {
-            "ready": bool(refinement_5m.get("ready")),
-            "trigger_type": refinement_5m.get("trigger_type", "NONE"),
-        },
-    )
-
-    # 15M BOS/retest defines the setup; 5M is optional refinement only.
+    # 15M BOS/retest is authoritative. There is no lower-timeframe confirmation gate.
+    # 15M BOS/retest defines the setup; lower-timeframe confirmation is removed.
     setup = trigger_side if structure_quality_ok else "NO TRADE"
 
     sr_key = _cache_key("SRACTIONABLE", c15)
@@ -1751,7 +1675,7 @@ def analyze_candles(
     else:
         all_frames = [("1D", c1d), ("4H", c4), ("1H", c1), ("15M", c15)]
         structural_levels = _collect_structural_levels(all_frames, atr15, price)
-        sr_clearance = max(0.35 * atr15, price * 0.0005)
+        sr_clearance = max(0.35 * atr15, 1e-12)
         supports = [float(x["price"]) for x in structural_levels if float(x["price"]) <= price - sr_clearance]
         resistances = [float(x["price"]) for x in structural_levels if float(x["price"]) >= price + sr_clearance]
         support = max(supports) if supports else None
@@ -1766,7 +1690,6 @@ def analyze_candles(
     volatility_ok = bool(
         atr15 > 0
         and MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE
-        and 0.0005 <= atr_pct <= 0.05
     )
     shock_veto_ok, shock_veto_reason = _shock_veto(c15, setup, atr15) if setup in {"LONG", "SHORT"} else (False, "no active setup")
     macd_line, macd_signal, macd_hist, macd_hist_delta = _macd_components(close15)
@@ -1856,8 +1779,8 @@ def analyze_candles(
         or (setup == "SHORT" and bos_short and ret_short["valid"]))
         and structure_quality_ok
     )
-    # 4H/1H/15M remain structural prerequisites. 15M candle confirmation is
-    # supporting evidence and cannot independently invalidate a BOS/retest setup.
+    # 4H/1H/15M are the structural prerequisites. The 15M candle-quality signal
+    # is supporting evidence only; it cannot independently invalidate BOS/retest.
     setup_ok = bool(structure_ok)
     trigger_quality = _clamp(_num(entry_15m.get("quality")), 0.0, 1.0)
 
@@ -1909,7 +1832,6 @@ def analyze_candles(
         and rr >= MIN_RR
         and shock_veto_ok
         and score >= MIN_SCORE
-        and family_result.get("passed_ok")
     )
 
     supporting_family_count = int(family_result.get("passed", 0))
@@ -1954,11 +1876,6 @@ def analyze_candles(
         failures.append(f"shock/liquidity veto: {shock_veto_reason}")
     if setup in {"LONG", "SHORT"} and not structure_quality_ok:
         failures.append("BOS/retest quality")
-    if setup in {"LONG", "SHORT"} and not family_result.get("passed_ok"):
-        failures.append(
-            f"confirmation families {family_result.get('passed', 0)}/"
-            f"{family_result.get('available', 0)} insufficient or lacking diversity"
-        )
     failures = list(dict.fromkeys(failures))
 
     reasons = []
@@ -1976,8 +1893,6 @@ def analyze_candles(
         reasons.append(f"15M {trigger_side} retest confirmed")
     if entry_15m.get("ready"):
         reasons.append(f"15M {entry_15m.get('trigger_type', 'SETUP')} confirmation supportive")
-    if refinement_5m.get("ready"):
-        reasons.append("Optional 5M refinement confirmed")
     if momentum_ok:
         reasons.append("Momentum aligned")
     if volume_ok:
@@ -2053,7 +1968,6 @@ def analyze_candles(
         "ema200_1h": alignment["e200"],
         "ema_direction": ema_direction,
         "rsi": r15,
-        "rsi_5m": refinement_5m.get("rsi", 50.0),
         "rsi_15m_entry": entry_15m.get("rsi", 50.0),
         "macd": macd_line,
         "macd_signal": macd_signal,
@@ -2061,7 +1975,6 @@ def analyze_candles(
         "macd_hist_delta": macd_hist_delta,
         "atr": atr15,
         "atr_4h": regime["atr"],
-        "atr_5m": refinement_5m.get("atr", 0.0),
         "atr_pct": atr_pct,
         "atr_percentile": atr_rank,
         "adx_4h": regime["adx"],
@@ -2069,7 +1982,6 @@ def analyze_candles(
         "volume": vol15,
         "rvol": rv15,
         "rvol_15m": rv15,
-        "rvol_5m": refinement_5m.get("rvol", 0.0),
         "support": support,
         "resistance": resistance,
         "futures_context": "PENDING",
@@ -2078,16 +1990,11 @@ def analyze_candles(
         "btc_filter_reason": "PENDING",
         "data_fresh": True,
         "signal_engine_version": ENGINE_VERSION,
+        "signal_basis": "4H regime + 1H structure + 15M BOS/retest + ATR/structural geometry",
         "primary_entry_timeframe": "15M",
         "setup_timeframe": "15M",
         "intraday_max_hold_minutes": INTRADAY_MAX_HOLD_MINUTES,
         "trigger_side": trigger_side,
-        "trigger_5m": "BOS_CONTINUATION" if refinement_5m.get("ready") else "OPTIONAL",
-        "trigger_type_5m": refinement_5m.get("trigger_type", "NONE"),
-        "five_minute_bos_level": refinement_5m.get("bos_level"),
-        "five_minute_volume_expanding": bool(refinement_5m.get("volume_expanding")),
-        "trigger_reason_5m": refinement_5m.get("reason", "not required"),
-        "trigger_quality_5m": refinement_5m.get("quality", 0.0),
         "trigger_quality_15m": entry_15m.get("quality", 0.0),
         "entry_15m_close_location": entry_15m.get("close_location", 0.0),
         "structure_quality_ok": structure_quality_ok,
@@ -2098,12 +2005,6 @@ def analyze_candles(
         "trigger_quality": trigger_quality,
         "momentum_quality": momentum_quality,
         "volume_quality": volume_quality,
-        "five_minute_ready": bool(refinement_5m.get("ready")),
-        "five_minute_refinement_enabled": ENABLE_5M_REFINEMENT,
-        "five_minute_close_location": refinement_5m.get("close_location", 0.0),
-        "five_minute_long": bool(refinement_5m.get("long")),
-        "five_minute_short": bool(refinement_5m.get("short")),
-        "closed_5m_candle_time": refinement_5m.get("candle_time", 0),
         "entry_15m_ready": bool(entry_15m.get("ready")),
         "entry_15m_type": entry_15m.get("trigger_type", "NONE"),
         "entry_15m_reason": entry_15m.get("reason", "not ready"),
@@ -2162,5 +2063,5 @@ def analyze_candles(
 async def analyze_symbol(market, symbol: str) -> Dict[str,Any]:
     ref=await market.resolve(symbol)
     c1d=await market.ohlcv(ref,"1D",100); c4h=await market.ohlcv(ref,"4H",250)
-    c1h=await market.ohlcv(ref,"1H",250); c15=await market.ohlcv(ref,"15M",250); c5=await market.ohlcv(ref,"5M",250)
-    return analyze_candles(ref.symbol,c4h,c1h,c15,c5,c1d)
+    c1h=await market.ohlcv(ref,"1H",250); c15=await market.ohlcv(ref,"15M",250)
+    return analyze_candles(ref.symbol,c4h,c1h,c15,candles_1d=c1d)

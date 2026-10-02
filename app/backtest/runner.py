@@ -55,7 +55,7 @@ INTERVALS = {
 
 MAX_KLINE_POINTS = 2000
 REQUEST_TIMEOUT_SECONDS = 30
-MAX_SYMBOL_CONCURRENCY = 2
+MAX_SYMBOL_CONCURRENCY = 4
 MAX_BACKTEST_SYMBOLS = 200
 SYMBOL_FETCH_TIMEOUT_SECONDS = 120
 CHILD_BOOT_TIMEOUT_SECONDS = 30
@@ -73,41 +73,6 @@ CHILD_PROGRESS_INTERVAL_SECONDS = 5.0
 ENGINE_PROGRESS_MIN_INTERVAL_SECONDS = 5.0
 IPC_DRAIN_YIELD_EVERY = 100
 IPC_IDLE_SLEEP_SECONDS = 0.05
-
-FIVE_MINUTE_FAILURE_MARKERS = {
-    "5m_trigger_confirmation",
-    "5m_trigger",
-    "5m_confirmation",
-    "5m_entry_confirmation",
-}
-
-
-def _is_5m_only_failure(reason: Any) -> bool:
-    normalized = (
-        str(reason or "")
-        .strip()
-        .lower()
-        .replace(" ", "_")
-        .replace("-", "_")
-        .replace("/", "_")
-    )
-    return normalized in FIVE_MINUTE_FAILURE_MARKERS or "5m_trigger" in normalized
-
-
-def _bypass_5m_confirmation(analysis: dict[str, Any]) -> dict[str, Any]:
-    """Accept an analysis when 5M is the only failed technical gate."""
-    if bool(analysis.get("technical_candidate")):
-        return analysis
-
-    failures = [str(item) for item in (analysis.get("technical_gate_failures") or [])]
-    if not failures or not all(_is_5m_only_failure(item) for item in failures):
-        return analysis
-
-    patched = dict(analysis)
-    patched["technical_candidate"] = True
-    patched["technical_gate_failures"] = []
-    patched["five_minute_confirmation_bypassed"] = True
-    return patched
 
 IPC_TERMINAL_GRACE_SECONDS = 1.0
 
@@ -339,7 +304,7 @@ def _normalize_engine_reject_reason(reason: Any) -> str:
         "15m_post_bos_retest": "15M_RETEST",
         "15m_directional_setup": "15M_DIRECTIONAL_SETUP",
         "15m_entry_confirmation": "15M_ENTRY",
-        "5m_trigger_confirmation": "5M_TRIGGER",
+        "5m_trigger_confirmation": "5M_TRIGGER_SIMULATION_ONLY",
         "momentum": "MOMENTUM",
         "volume_rvol": "VOLUME_RVOL",
         "target_path_location": "TARGET_PATH_LOCATION",
@@ -1214,14 +1179,12 @@ class BacktestRunner:
             "4h": start - MIN_4H_WARMUP_MS,
             "1h": start - MIN_1H_WARMUP_MS,
             "15m": start - MIN_15M_WARMUP_MS,
-            "5m": start - MIN_5M_WARMUP_MS,
         }
 
         tasks = [
             asyncio.create_task(_fetch_timeframe(self.client, "BTC_USDT", "4H", INTERVALS["4h"], starts["4h"], end)),
             asyncio.create_task(_fetch_timeframe(self.client, "BTC_USDT", "1H", INTERVALS["1h"], starts["1h"], end)),
             asyncio.create_task(_fetch_timeframe(self.client, "BTC_USDT", "15M", INTERVALS["15m"], starts["15m"], end)),
-            asyncio.create_task(_fetch_timeframe(self.client, "BTC_USDT", "5M", INTERVALS["5m"], starts["5m"], end)),
         ]
         try:
             c4, c1, c15, c5 = await asyncio.wait_for(
@@ -1238,14 +1201,15 @@ class BacktestRunner:
         c4 = [row for row in c4 if _row_time(row) + H4_MS <= end]
         c1 = [row for row in c1 if _row_time(row) + H1_MS <= end]
         c15 = [row for row in c15 if _row_time(row) + M15_MS <= end]
-        c5 = [row for row in c5 if _row_time(row) + M5_MS <= end]
 
+        # BTC 5M is not part of signal confirmation or BTC regime context.
+        # Symbol 5M remains available later for historical trade-path simulation.
         return SymbolHistory(
             "BTC_USDT",
             c4,
             c1,
             c15,
-            c5,
+            [],
             [],
         )
 
@@ -1580,9 +1544,9 @@ class BacktestRunner:
         backtest_15m_context = _build_15m_backtest_context(c15)
 
         # The 15M prefilter only discovers causal BOS/retest setup windows.
-        # Do not pass ATR into the optional 15M entry-confirmation branch here:
-        # the authoritative strategy uses 5M as the execution trigger, so a
-        # A 15M entry candle must never be used as a separate candidate gate.
+        # The live strategy uses 15M structure as the setup timeframe.
+        # 5M candles are retained only for historical trade-path simulation,
+        # never as a live signal-confirmation gate.
         candidate_times = (
             self._find_15m_setup_windows(
                 c15,
@@ -1707,7 +1671,7 @@ class BacktestRunner:
 
         The Runner only supplies candidate timestamps from point-in-time BOS/retest
         detection. It does not independently reject a setup on HTF, 15M entry,
-        5M trigger, score, momentum, volume, geometry, RR, or volatility. Those
+        5M simulation candles, score, momentum, volume, geometry, RR, or volatility. Those
         decisions belong to analyze_candles().
         """
         symbol_started = time.monotonic()
@@ -1946,12 +1910,8 @@ class BacktestRunner:
                     cache={
                         "_BACKTEST_PROGRESS_CALLBACK": report_engine_progress,
                         "_BACKTEST_15M": backtest_15m_context,
-                        "_BACKTEST_DISABLE_5M_CONFIRMATION": True,
                     },
                 )
-                analysis = _bypass_5m_confirmation(analysis)
-                if analysis.get("five_minute_confirmation_bypassed"):
-                    diagnostics["FIVE_MINUTE_CONFIRMATION_BYPASSED"] += 1
                 elapsed_engine = time.monotonic() - engine_started
                 engine_success += 1
                 diagnostics["ENGINE_SUCCESS"] = engine_success
@@ -2038,9 +1998,6 @@ class BacktestRunner:
 
                 for reason in failures:
                     reason_text = str(reason)
-                    if _is_5m_only_failure(reason_text):
-                        diagnostics["LEGACY_5M_FAILURE_IGNORED"] += 1
-                        continue
                     bucket = _normalize_engine_reject_reason(reason_text)
                     diagnostics[f"ENGINE_REJECT_{bucket}"] += 1
 

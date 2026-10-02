@@ -300,7 +300,6 @@ def format_report(summary: BacktestSummary) -> str:
             "SIMULATION_NO_TRADE",
             "STRUCTURE_WINDOW_REVISITS",
             "DUPLICATE_STRUCTURE_SKIPPED",
-            "FIVE_MINUTE_CONFIRMATION_BYPASSED",
         )
         gate_lines = [(key, int(d.get(key, 0) or 0)) for key in gate_keys if key in d]
         reject_keys = sorted(

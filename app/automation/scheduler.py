@@ -10,11 +10,19 @@ LOGGER = logging.getLogger(__name__)
 
 
 class ScannerScheduler:
-    """Run the MEXC scanner every 2 minutes without overlapping scans."""
+    """Run the MEXC scanner on closed-15M boundaries without overlap."""
 
-    def __init__(self, scanner: MexcScanner, interval_seconds: int = 120) -> None:
+    def __init__(
+        self,
+        scanner: MexcScanner,
+        interval_seconds: int = 900,
+        alignment_seconds: int = 900,
+    ) -> None:
         self.scanner = scanner
-        self.interval_seconds = max(60, int(interval_seconds))
+        self.interval_seconds = max(900, int(interval_seconds))
+        # The signal engine is driven by closed 15M structure. Running more
+        # frequently cannot create new 15M information and only adds API/CPU load.
+        self.alignment_seconds = max(900, int(alignment_seconds), self.interval_seconds)
         self._task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._scan_lock = asyncio.Lock()
@@ -30,8 +38,9 @@ class ScannerScheduler:
         )
 
         LOGGER.info(
-            "MEXC scanner scheduler started (interval=%ss)",
+            "MEXC scanner scheduler started (interval=%ss alignment=%ss)",
             self.interval_seconds,
+            self.alignment_seconds,
         )
 
     async def stop(self) -> None:
@@ -66,22 +75,24 @@ class ScannerScheduler:
             except Exception:
                 LOGGER.exception("MEXC scanner cycle failed")
 
-    async def _sleep_until_next_scan(self) -> None:
+    async def _sleep_until_next_boundary(self) -> None:
+        now = int(time.time())
+        boundary = ((now // self.alignment_seconds) + 1) * self.alignment_seconds
+        # A small grace period lets exchanges publish the newly closed candle.
+        delay = max(0.0, boundary + 3 - time.time())
         try:
             await asyncio.wait_for(
                 self._stopping.wait(),
-                timeout=self.interval_seconds,
+                timeout=delay,
             )
         except asyncio.TimeoutError:
             pass
 
     async def _run(self) -> None:
-        # Run one scan immediately when scheduler starts.
+        # Run one scan immediately at startup, then align to closed 15M bars.
         await self.scan_now()
 
-        # Then scan every 2 minutes.
         while not self._stopping.is_set():
-            await self._sleep_until_next_scan()
-
+            await self._sleep_until_next_boundary()
             if not self._stopping.is_set():
                 await self.scan_now()

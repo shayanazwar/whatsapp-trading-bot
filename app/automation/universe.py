@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import time
 
 from .mexc_client import MexcClient
 
@@ -45,6 +46,7 @@ class MexcUniverse:
         client: MexcClient,
         max_symbols: int = TARGET_SCAN_SYMBOLS,
         test_symbols: list[str] | None = None,
+        refresh_seconds: int = 900,
     ) -> None:
 
         self.client = client
@@ -77,12 +79,18 @@ class MexcUniverse:
         ] = {}
 
         self._last_symbols: list[str] = []
+        self._refresh_seconds = max(900, int(refresh_seconds))
+        self._last_refresh_monotonic = 0.0
 
     # ============================================================
     # REFRESH UNIVERSE
     # ============================================================
 
     async def refresh(self) -> list[str]:
+
+        now = time.monotonic()
+        if self._last_symbols and (now - self._last_refresh_monotonic) < self._refresh_seconds:
+            return list(self._last_symbols)
 
         raw = await self.client.get_contracts()
 
@@ -419,6 +427,8 @@ class MexcUniverse:
             self.max_symbols,
             MIN_SCAN_SYMBOLS,
         )
+
+        self._last_refresh_monotonic = time.monotonic()
 
         return list(symbols)
 

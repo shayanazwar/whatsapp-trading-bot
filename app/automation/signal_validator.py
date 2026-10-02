@@ -15,11 +15,7 @@ from .risk_manager import (
     calculate_rr_after_costs,
     validate_levels,
 )
-from .setup_filter import (
-    MIN_CONFIRMATION_FAMILIES,
-    MIN_AVAILABLE_CONFIRMATION_FAMILIES,
-    validate_analysis,
-)
+from .setup_filter import validate_analysis
 
 FIFTEEN_MINUTE_MS = 900_000
 DEFAULT_MAX_SIGNAL_AGE_MS = 20 * 60 * 1000
@@ -80,7 +76,7 @@ def validate_signal(
     *,
     min_confluence: int,
     min_rr: float,
-    require_increasing_volume: bool,
+    require_increasing_volume: bool = False,
 ) -> tuple[ValidatedSignal | None, list[str]]:
     ok, reasons = validate_analysis(
         data,
@@ -90,13 +86,7 @@ def validate_signal(
     )
     reasons = [str(reason) for reason in (reasons or [])]
     if not ok:
-        non_5m_reasons = [reason for reason in reasons if "5m" not in reason.lower() and "five_minute" not in reason.lower()]
-        if non_5m_reasons:
-            return None, non_5m_reasons
-        # 5M is optional by architecture; a legacy 5M-only rejection cannot
-        # invalidate an otherwise valid 15M structural signal.
-        ok = True
-        reasons = []
+        return None, reasons
 
     side = str(data.get("setup") or "").upper()
     symbol = str(data.get("symbol") or "").strip().upper()
@@ -212,11 +202,9 @@ def validate_signal(
     analysis["tp_distance_pct"] = abs(tp - entry) / entry
     analysis["primary_entry_timeframe"] = "15M"
     analysis["signal_candle_timeframe"] = "15M"
-    analysis["five_minute_confirmation_bypassed"] = True
     # Remove legacy multi-stage fields from the user-facing analysis payload.
     analysis.pop("tp1", None)
     analysis.pop("tp2", None)
-    analysis.pop("closed_5m_candle_time", None)
 
     return (
         ValidatedSignal(

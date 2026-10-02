@@ -34,12 +34,11 @@ def format_signal(signal: ValidatedSignal) -> str:
         f"4H: {d.get('trend_4h', 'N/A')}\n"
         f"1H: {d.get('structure_1h', 'N/A')}\n"
         f"15M: {'BOS + RETEST' if d.get('bos_15m') and d.get('setup_retest_time') else 'N/A'}\n"
-        "5M: OPTIONAL\n"
         f"RSI: {float(d.get('rsi', 0) or 0):.1f}\n"
         f"RVOL: {float(d.get('rvol_15m', 0) or 0):.2f}x\n"
         f"Funding: {funding_text}\n"
         f"📈 Score: {score}/100\n"
-        f"✅ Families: {families}/{available}\n\n"
+        f"🧩 Optional evidence: {families}/{available} (informational)\n\n"
         "⚠️ Deterministic educational signal. Manage risk."
     )
 

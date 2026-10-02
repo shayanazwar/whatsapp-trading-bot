@@ -1,8 +1,28 @@
-# Project State — 2026-09-25
+# Project State — 2026-10-03
 
 ## Current release
 
-This package is the corrected deterministic MEXC Futures scanner release for the Pak Trading Academy WhatsApp bot.
+This package is the corrected deterministic MEXC Futures scanner release for the Pak Trading Academy bot, with **dual WhatsApp + Telegram messaging**.
+
+Messaging flow:
+
+```text
+MEXC signal / manual command
+        |
+        v
+     app.bot / SignalManager
+        |
+        +----> WhatsApp Cloud API
+        |
+        +----> Telegram Bot API
+```
+
+Telegram is an additional transport; the MEXC analysis/scanner remains the authoritative trading engine.
+
+The legacy 4-minute synthetic `ANALYZE BTCUSDT` keepalive has been removed. It no longer generates background chat spam.
+
+The live scanner decision path uses 4H regime + 1H alignment + 15M BOS/retest and does not require 5M confirmation.
+
 
 ## Canonical runtime
 
@@ -23,7 +43,6 @@ MEXC Futures data
   -> 4H regime
   -> 1H direction + protected structure
   -> 15M BOS + post-BOS retest
-  -> 5M trigger
   -> momentum / volume / volatility
   -> structural target path
   -> structural SL / RR
@@ -32,7 +51,7 @@ MEXC Futures data
   -> grouped 100-point score
   -> final validator (score >=82, RR >=2, families >=5/6)
   -> symbol/side cooldown
-  -> WhatsApp signal
+  -> WhatsApp + Telegram signal
 ```
 
 ## Safety state

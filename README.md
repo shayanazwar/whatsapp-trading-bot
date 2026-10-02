@@ -1,18 +1,18 @@
-# Pak Trading Academy WhatsApp Trading Bot
+# Pak Trading Academy Dual-Channel Trading Bot
 
-A WhatsApp-first cryptocurrency assistant with three separate paths:
+A dual-channel cryptocurrency assistant with three separate paths:
 
-1. Manual WhatsApp commands backed by MEXC Futures (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
-2. A new deterministic MEXC Futures market scanner that uses closed candles and sends WhatsApp trade signals when the configured confluence/risk gates pass.
+1. Manual commands available on WhatsApp and Telegram backed by MEXC Futures (`PRICE`, `ANALYZE`, `CHART`, `ALERT`, `SEARCH`).
+2. A deterministic MEXC Futures market scanner that uses closed candles and sends trade signals when the configured confluence/risk gates pass.
 3. A separately isolated MEXC Futures execution adapter. **Live execution is disabled in this build.**
 
 ## Current architecture
 
 ```text
-WhatsApp Cloud API
+WhatsApp Cloud API + Telegram Bot API
         |
         v
-   app.main webhook
+   app.main webhooks
         |
         v
       app.bot
@@ -32,7 +32,7 @@ MEXC Futures market data
    Universe + BTC filter
         |
         v
-   1D -> 4H -> 1H -> 15M -> 5M
+   1D -> 4H -> 1H -> 15M
         |
         v
    Deterministic analysis + structural targets
@@ -46,7 +46,7 @@ MEXC Futures market data
         v
    Signal validator
         |
-        +----> SQLite signal state + WhatsApp
+        +----> SQLite signal state + WhatsApp + Telegram
         |
         +----> execution gate (disabled)
 ```
@@ -118,7 +118,29 @@ The default hard gates are `Score >= 82/100`, `RR >= 2.0`, and at least `5/6` co
 
 The current scanner is designed to reject most apparent setups rather than force a signal every cycle. A clean `valid=0` result is not, by itself, a reason to weaken the gates; the logs now expose technical rejection stages for diagnosis.
 
-## Automatic WhatsApp signals
+## Dual-channel messaging
+
+WhatsApp and Telegram can run at the same time.
+
+Configure Telegram:
+
+```text
+TELEGRAM_BOT_TOKEN=<your token>
+TELEGRAM_ALLOWED_USERS=<chat id>,<chat id>
+AUTO_SIGNAL_TELEGRAM_RECIPIENTS=<chat id>,<chat id>
+```
+
+`AUTO_SIGNAL_RECIPIENTS` remains the WhatsApp recipient list. Telegram automatic-signal recipients are stored internally with the `tg:` prefix.
+
+For Render, either set `TELEGRAM_WEBHOOK_URL` to:
+
+```text
+https://<your-render-service>.onrender.com/telegram/webhook
+```
+
+or leave it blank and set the Telegram webhook manually with Telegram's `setWebhook` method.
+
+## Automatic signals
 
 Set:
 
@@ -128,13 +150,13 @@ AUTO_SIGNAL_ENABLED=true
 AUTO_TRADE_ENABLED=false
 ```
 
-Then configure either:
+Then configure the recipients:
 
 ```text
 AUTO_SIGNAL_RECIPIENTS=923xxxxxxxxx,923yyyyyyyyy
 ```
 
-or, when that is blank, `ALLOWED_USERS` is used as the recipient set.
+When WhatsApp recipients are blank, `ALLOWED_USERS` is used. When Telegram recipients are blank, `TELEGRAM_ALLOWED_USERS` is used.
 
 Example signal shape:
 
@@ -202,7 +224,7 @@ DELETE ALL
 SEARCH PEPE
 ```
 
-All market/trading functionality is now MEXC Futures based. WhatsApp remains the interface and notification layer.
+All market/trading functionality is MEXC Futures based. WhatsApp and Telegram are interface/notification layers.
 
 ## Local checks
 

@@ -35,6 +35,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("whatsapp_bot")
 
+# IMPORTANT: no synthetic BACKTEST/ANALYZE WhatsApp keepalive task exists in this canonical runtime.
+# Do not reintroduce a periodic message loop; backtests must remain user-triggered.
+
 
 settings = get_settings()
 

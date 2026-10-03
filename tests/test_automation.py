@@ -8,6 +8,7 @@ from app.automation.executor import ExecutionResult, MexcExecutor, build_limit_o
 from app.automation.mexc_client import MexcClient, build_query_string, build_signature
 from app.automation.risk_manager import TradePlan, calculate_contract_quantity, calculate_risk_amount, validate_levels
 from app.automation.scanner import MexcScanner
+from app.automation.setup_filter import validate_analysis
 from app.automation.signal_manager import format_signal, SignalManager
 from app.automation.signal_validator import ValidatedSignal, validate_signal
 from app.automation.universe import ContractMeta
@@ -251,3 +252,11 @@ def test_live_scanner_stages_15m_then_htf_without_5m_confirmation(monkeypatch):
 
     calls = asyncio.run(run())
     assert calls == ["Min15", "Hour4", "Min60", "Day1"]
+
+
+def test_validate_analysis_honors_configured_confluence_floor():
+    data = _valid_analysis("LONG")
+    data["score"] = 78
+    ok, reasons = validate_analysis(data, min_confluence=82, min_rr=2.0)
+    assert not ok
+    assert any("Score 78 < required 82" in reason for reason in reasons)

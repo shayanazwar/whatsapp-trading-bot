@@ -421,7 +421,7 @@ class MexcScanner:
                 and analysis.get("location_ok")
                 and analysis.get("risk_ok")
                 and analysis.get("shock_veto_ok")
-                and int(analysis.get("score", 0) or 0) >= 72
+                and int(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 72))
             )
 
             planned_entry = self._safe_float(analysis.get("entry"))
@@ -453,7 +453,7 @@ class MexcScanner:
 
             validated, reasons = validate_signal(
                 analysis,
-                min_confluence=72,
+                min_confluence=int(getattr(self.settings, "min_confluence", 72)),
                 min_rr=float(getattr(self.settings, "min_rr", 2.0)),
                 require_increasing_volume=bool(getattr(self.settings, "require_increasing_volume", False)),
             )

@@ -31,7 +31,7 @@ def validate_analysis(
     """Validate the final structural signal without a lower-timeframe/family gate."""
     reasons: list[str] = []
     score = int(_f(data.get("score"), 0))
-    required_score = MIN_SCORE
+    required_score = max(MIN_SCORE, int(min_confluence))
     if score < required_score:
         reasons.append(f"Score {score} < required {required_score}")
 

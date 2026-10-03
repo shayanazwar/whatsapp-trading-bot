@@ -67,8 +67,19 @@ class SignalManager:
         self.expiry_minutes = max(1, int(expiry_minutes))
 
     async def publish(self, signal: ValidatedSignal) -> bool:
+        existing = self.db.get_signal(signal.key)
+        retry_existing = bool(
+            existing and str(existing.status).upper() in {"SEND_FAILED", "NO_RECIPIENT"}
+        )
+        if existing and not retry_existing:
+            LOGGER.info(
+                "Duplicate structural setup blocked %s %s key=%s status=%s",
+                signal.symbol, signal.side, signal.key, existing.status,
+            )
+            return False
+
         last = self.db.get_last_signal_for_symbol_side(signal.symbol, signal.side)
-        if last:
+        if last and not retry_existing:
             try:
                 previous = json.loads(last.analysis_json)
             except Exception:
@@ -130,8 +141,14 @@ class SignalManager:
             created_at=created_at,
             expires_at=expires,
         )
-        if not inserted:
+        if not inserted and not retry_existing:
             return False
+
+        if retry_existing:
+            LOGGER.info(
+                "Retrying failed signal delivery %s %s key=%s previous_status=%s",
+                signal.symbol, signal.side, signal.key, existing.status if existing else "UNKNOWN",
+            )
 
         if not self.recipients:
             self.db.update_signal_status(signal.key, "NO_RECIPIENT")

@@ -211,7 +211,7 @@ class Bot:
 
             await self._send_text(
                 phone,
-                f"âŒ {exc}",
+                f"❌ {exc}",
             )
 
     async def _price(
@@ -270,7 +270,7 @@ class Bot:
                 LOGGER.exception("Incomplete analysis data for %s", raw_symbol)
                 await self._send_text(
                     phone,
-                    f"âš ï¸ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
+                    f"⚠️ Analysis data for {normalize_symbol_token(raw_symbol)} is incomplete.\nTry again after the next candle update.",
                 )
                 return
             raise
@@ -450,7 +450,7 @@ class Bot:
         await self._send_text(
             phone,
             (
-                f"âœ… Alert #{alert.id} created\n\n"
+                f"✅ Alert #{alert.id} created\n\n"
                 f"{ref.symbol}\n"
                 f"Condition: "
                 f"{condition.upper()} "
@@ -549,7 +549,7 @@ class Bot:
 
             await self._send_text(
                 phone,
-                f"âŒ Active alert #{alert_id} was not found.",
+                f"❌ Active alert #{alert_id} was not found.",
             )
 
     async def _search(
@@ -622,7 +622,7 @@ class Bot:
         if self.backtest_runner.is_running:
             await self._send_text(
                 phone,
-                "â³ A backtest is already running. Please wait for it to finish.",
+                "⏳ A backtest is already running. Please wait for it to finish.",
             )
             return
 
@@ -631,7 +631,7 @@ class Bot:
         await self._send_text(
             phone,
             (
-                f"â³ BACKTEST {period} STARTED\n\n"
+                f"⏳ BACKTEST {period} STARTED\n\n"
                 "Up to 200 eligible MEXC Futures coins will be tested.\n"
                 "No real trades will be executed.\n\n"
                 "I'll send the report here when finished."
@@ -652,7 +652,7 @@ class Bot:
         except BacktestAlreadyRunning:
             await self._send_text(
                 phone,
-                "â³ A backtest is already running. Please wait for it to finish.",
+                "⏳ A backtest is already running. Please wait for it to finish.",
             )
         except Exception as exc:
             LOGGER.exception(
@@ -661,7 +661,7 @@ class Bot:
             )
             await self._send_text(
                 phone,
-                f"âŒ BACKTEST {period} failed: {exc}",
+                f"❌ BACKTEST {period} failed: {exc}",
             )
     async def _shortcut(
         self,

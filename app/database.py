@@ -159,6 +159,14 @@ class Database:
             except sqlite3.IntegrityError:
                 return False
 
+    def is_message_seen(self, message_id: str) -> bool:
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM processed_messages WHERE message_id = ? LIMIT 1",
+                (message_id,),
+            ).fetchone()
+        return row is not None
+
     def create_signal_if_new(
         self,
         *,

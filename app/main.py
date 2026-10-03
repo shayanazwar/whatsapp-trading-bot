@@ -173,11 +173,26 @@ bot.set_backtest_runner(backtest_runner)
 # ============================================================
 
 _background_tasks: set[asyncio.Task] = set()
+_whatsapp_processing_messages: set[str] = set()
+
+
+def _log_background_task_result(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        logger.warning("Background task cancelled: %s", task.get_name())
+        return
+    try:
+        task.result()
+    except Exception:
+        logger.exception(
+            "Background task failed: %s",
+            task.get_name(),
+        )
 
 
 def keep_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(_log_background_task_result)
 
 
 # ============================================================
@@ -290,74 +305,79 @@ async def verify_webhook(
 # ============================================================
 
 async def process_webhook(payload: dict) -> None:
-    for entry in payload.get("entry", []):
+    try:
+        if not isinstance(payload, dict):
+            raise ValueError("WhatsApp webhook payload must be a JSON object")
 
-        for change in entry.get("changes", []):
+        entries = payload.get("entry") or []
+        logger.info("WHATSAPP WEBHOOK EVENT | entries=%d", len(entries) if isinstance(entries, list) else 0)
 
-            if change.get("field") != "messages":
-                continue
+        for entry in entries if isinstance(entries, list) else []:
+            for change in entry.get("changes", []) if isinstance(entry, dict) else []:
+                if change.get("field") != "messages":
+                    continue
 
-            value = change.get(
-                "value",
-                {},
-            )
-
-            for message in value.get(
-                "messages",
-                [],
-            ):
-
-                message_id = message.get("id")
-                message_type = message.get("type")
-                sender = message.get("from")
-
+                value = change.get("value") or {}
+                messages = value.get("messages") or []
                 logger.info(
-                    "Incoming message: id=%s type=%s from=%s",
-                    message_id,
-                    message_type,
-                    sender,
+                    "WHATSAPP MESSAGE BATCH | messages=%d phone_number_id=%s",
+                    len(messages) if isinstance(messages, list) else 0,
+                    (value.get("metadata") or {}).get("phone_number_id"),
                 )
 
-                if (
-                    message_id
-                    and not db.mark_message_seen(
-                        message_id
-                    )
-                ):
+                for message in messages if isinstance(messages, list) else []:
+                    if not isinstance(message, dict):
+                        logger.warning("Ignoring malformed WhatsApp message object")
+                        continue
+
+                    message_id = message.get("id")
+                    message_type = message.get("type")
+                    sender = message.get("from")
+
                     logger.info(
-                        "Ignoring duplicate message: %s",
-                        message_id,
-                    )
-                    continue
-
-                if message_type != "text":
-                    continue
-
-                text = (
-                    message
-                    .get("text", {})
-                    .get("body", "")
-                    .strip()
-                )
-
-                if not sender or not text:
-                    continue
-
-                logger.info(
-                    "Incoming text: %s",
-                    text,
-                )
-
-                try:
-                    await bot.handle(
-                        sender,
-                        text,
+                        "Incoming message: id=%s type=%s from=%s",
+                        message_id, message_type, sender,
                     )
 
-                except Exception:
-                    logger.exception(
-                        "Bot command processing failed"
-                    )
+                    if message_id:
+                        if message_id in _whatsapp_processing_messages:
+                            logger.info("Ignoring concurrently processing WhatsApp message: %s", message_id)
+                            continue
+                        if db.is_message_seen(message_id):
+                            logger.info("Ignoring already processed WhatsApp message: %s", message_id)
+                            continue
+                        _whatsapp_processing_messages.add(message_id)
+
+                    if message_type != "text":
+                        if message_id:
+                            _whatsapp_processing_messages.discard(message_id)
+                        continue
+                        logger.info("Ignoring non-text WhatsApp message: type=%s", message_type)
+                        continue
+
+                    try:
+                        text = ((message.get("text") or {}).get("body") or "").strip()
+                        if not sender or not text:
+                            logger.warning("Ignoring WhatsApp message with missing sender/text | id=%s", message_id)
+                            continue
+
+                        logger.info("Incoming WhatsApp text | from=%s text=%s", sender, text)
+                        await bot.handle(sender, text)
+
+                        if message_id:
+                            if not db.mark_message_seen(message_id):
+                                logger.debug("WhatsApp message was marked by a concurrent retry: %s", message_id)
+                    except Exception:
+                        logger.exception(
+                            "WhatsApp command processing failed; message remains retryable | from=%s text=%s id=%s",
+                            sender, text if 'text' in locals() else "", message_id,
+                        )
+                    finally:
+                        if message_id:
+                            _whatsapp_processing_messages.discard(message_id)
+    except Exception:
+        logger.exception("WHATSAPP WEBHOOK PROCESSING CRASHED")
+        raise
 
 
 # ============================================================
@@ -400,6 +420,11 @@ async def receive_webhook(
             },
             status_code=400,
         )
+
+    logger.info(
+        "WHATSAPP WEBHOOK RECEIVED | bytes=%d signature=valid",
+        len(body),
+    )
 
     task = asyncio.create_task(
         process_webhook(payload),

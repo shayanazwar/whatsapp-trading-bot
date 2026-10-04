@@ -255,11 +255,7 @@ class MexcUniverse:
             ) != 1:
                 continue
 
-            # API trading allowed
-            if not meta.api_allowed:
-                continue
-
-            # USDT perpetual futures
+            # USDT perpetual futures with public market-data access
             if (
                 meta.quote_coin != "USDT"
                 or meta.settle_coin != "USDT"

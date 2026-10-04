@@ -6,19 +6,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .risk_manager import (
-    MIN_RR,
-    MIN_SL_ATR,
-    MAX_SL_ATR,
-    MIN_TP_ATR,
-    TradePlan,
-    calculate_rr_after_costs,
-    validate_levels,
-)
+from .risk_manager import MIN_RR, MIN_SL_ATR, MAX_SL_ATR, MIN_TP_ATR, TradePlan, calculate_rr_after_costs, validate_levels
 from .setup_filter import validate_analysis
 
-FIFTEEN_MINUTE_MS = 900_000
-DEFAULT_MAX_SIGNAL_AGE_MS = 20 * 60 * 1000
+ONE_HOUR_MS = 3_600_000
+DEFAULT_MAX_SIGNAL_AGE_MS = 90 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -39,13 +31,13 @@ def make_signal_key(
     setup_bos_time: int | None = None,
     bos_level: float | None = None,
 ) -> str:
-    """Identity is the structural setup, not the current scan price."""
+    """Stable setup identity: symbol + direction + 4H BOS time + BOS level."""
     bos_time = setup_bos_time if setup_bos_time is not None else candle_time
     try:
         level_key = f"{float(bos_level):.12g}" if bos_level is not None else "NA"
     except (TypeError, ValueError):
         level_key = "NA"
-    raw = f"mexc|{symbol.upper()}|{side.upper()}|BOS:{bos_time}|LEVEL:{level_key}"
+    raw = f"mexc|{symbol.upper()}|{side.upper()}|BOS4H:{bos_time}|LEVEL:{level_key}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
@@ -61,12 +53,9 @@ def _single_tp(data: dict[str, Any]) -> float | None:
     try:
         if data.get("tp") is not None:
             return float(data["tp"])
-        # Read old persisted payloads, but require a single unambiguous target.
         tp1 = float(data["tp1"])
         tp2 = float(data["tp2"])
-        if abs(tp1 - tp2) > max(1e-12, abs(tp2) * 1e-9):
-            return None
-        return tp2
+        return tp2 if abs(tp1 - tp2) <= max(1e-12, abs(tp2) * 1e-9) else None
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -97,30 +86,26 @@ def validate_signal(
 
     candle_time = _ms(data.get("candle_time"))
     if candle_time is None:
-        return None, ["Missing normalized 15M candle timestamp"]
+        return None, ["Missing normalized 1H candle timestamp"]
 
     now_ms = int(time.time() * 1000)
-    if candle_time > now_ms + FIFTEEN_MINUTE_MS:
-        return None, ["15M candle timestamp is in the future"]
+    if candle_time > now_ms + ONE_HOUR_MS:
+        return None, ["1H candle timestamp is in the future"]
 
     try:
-        configured_age = (
-            data.get("max_signal_age_seconds")
-            if data.get("max_signal_age_seconds") is not None
-            else DEFAULT_MAX_SIGNAL_AGE_MS / 1000.0
-        )
+        configured_age = data.get("max_signal_age_seconds")
         max_age_ms = max(
-            FIFTEEN_MINUTE_MS,
-            int(float(configured_age) * 1000),
+            ONE_HOUR_MS,
+            int(float(configured_age) * 1000) if configured_age is not None else DEFAULT_MAX_SIGNAL_AGE_MS,
         )
     except (TypeError, ValueError):
         max_age_ms = DEFAULT_MAX_SIGNAL_AGE_MS
 
     signal_age_ms = now_ms - candle_time
     if signal_age_ms > max_age_ms:
-        return None, [f"15M setup age exceeds {max_age_ms / 1000:.0f}s"]
+        return None, [f"1H setup age exceeds {max_age_ms / 1000:.0f}s"]
     if signal_age_ms < 0:
-        return None, ["15M candle timestamp is unexpectedly in the future"]
+        return None, ["1H candle timestamp is unexpectedly in the future"]
 
     try:
         entry = float(data["entry"])
@@ -139,13 +124,13 @@ def validate_signal(
         return None, ["SHORT geometry must satisfy TP < Entry < SL"]
 
     required_rr = max(MIN_RR, float(min_rr or 0.0))
-    round_trip_cost_pct = float(
-        data.get("estimated_round_trip_cost_pct", 0.0015) or 0.0015
-    )
+    round_trip_cost_pct = float(data.get("estimated_round_trip_cost_pct", 0.0015) or 0.0015)
     funding = data.get("mexc_funding_rate")
     if funding is not None:
-        # Conservative allowance for up to two funding intervals.
-        round_trip_cost_pct += min(0.0010, abs(float(funding)) * 2.0)
+        try:
+            round_trip_cost_pct += min(0.0010, abs(float(funding)) * 2.0)
+        except (TypeError, ValueError):
+            return None, ["Invalid MEXC funding-rate value"]
 
     try:
         rr_gross = abs(tp - entry) / abs(entry - stop_loss)
@@ -156,64 +141,51 @@ def validate_signal(
             target=tp,
             round_trip_cost_pct=round_trip_cost_pct,
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, ZeroDivisionError):
         return None, ["Unable to calculate post-cost RR"]
 
     if rr_net + 1e-12 < required_rr:
         return None, [
-            f"Post-cost RR {rr_net:.2f} < required {required_rr:.2f} "
-            f"(gross {rr_gross:.2f})"
+            f"Post-cost RR {rr_net:.2f} < required {required_rr:.2f} (gross {rr_gross:.2f})"
         ]
 
     atr = float(data.get("atr") or 0.0)
-    sl_atr = abs(entry - stop_loss) / atr if atr > 0 else 0.0
-    tp_atr = abs(tp - entry) / atr if atr > 0 else 0.0
+    if atr <= 0:
+        return None, ["ATR is missing or non-positive"]
+    sl_atr = abs(entry - stop_loss) / atr
+    tp_atr = abs(tp - entry) / atr
     if sl_atr < MIN_SL_ATR or sl_atr > MAX_SL_ATR:
         return None, [f"SL distance {sl_atr:.2f} ATR outside safety bounds"]
     if tp_atr < MIN_TP_ATR:
         return None, [f"TP distance {tp_atr:.2f} ATR < minimum {MIN_TP_ATR:.2f}"]
 
-    plan = TradePlan(
-        side=side,
-        entry=entry,
-        stop_loss=stop_loss,
-        tp=tp,
-        rr=rr_net,
-    )
+    plan = TradePlan(side=side, entry=entry, stop_loss=stop_loss, tp=tp, rr=rr_net)
     level_ok, level_reason = validate_levels(plan, min_rr=required_rr)
     if not level_ok:
-        return None, [level_reason]
+        return None, [str(level_reason)]
 
     setup_bos_time = _ms(data.get("setup_bos_time"))
-    key = make_signal_key(
-        symbol,
-        side,
-        candle_time,
-        setup_bos_time=setup_bos_time,
-        bos_level=data.get("bos_15m_level", data.get("long_bos_level") if side == "LONG" else data.get("short_bos_level")),
-    )
+    bos_level = data.get("bos_4h_level")
+    if bos_level is None:
+        bos_level = data.get("long_bos_level") if side == "LONG" else data.get("short_bos_level")
+    key = make_signal_key(symbol, side, candle_time, setup_bos_time=setup_bos_time, bos_level=bos_level)
+
     analysis = dict(data)
-    analysis["tp"] = tp
-    analysis["rr"] = rr_net
-    analysis["rr_gross"] = rr_gross
-    analysis["rr_net"] = rr_net
-    analysis["estimated_round_trip_cost_pct"] = round_trip_cost_pct
-    analysis["tp_distance_atr"] = tp_atr
-    analysis["tp_distance_pct"] = abs(tp - entry) / entry
-    analysis["primary_entry_timeframe"] = "15M"
-    analysis["signal_candle_timeframe"] = "15M"
-    # Remove legacy multi-stage fields from the user-facing analysis payload.
+    analysis.update(
+        {
+            "tp": tp,
+            "rr": rr_net,
+            "rr_gross": rr_gross,
+            "rr_net": rr_net,
+            "estimated_round_trip_cost_pct": round_trip_cost_pct,
+            "sl_atr": sl_atr,
+            "tp_distance_atr": tp_atr,
+            "tp_distance_pct": abs(tp - entry) / entry,
+            "primary_entry_timeframe": "1H",
+            "signal_candle_timeframe": "1H",
+        }
+    )
     analysis.pop("tp1", None)
     analysis.pop("tp2", None)
 
-    return (
-        ValidatedSignal(
-            key=key,
-            symbol=symbol,
-            side=side,
-            candle_time=candle_time,
-            analysis=analysis,
-            plan=plan,
-        ),
-        [],
-    )
+    return ValidatedSignal(key=key, symbol=symbol, side=side, candle_time=candle_time, analysis=analysis, plan=plan), []

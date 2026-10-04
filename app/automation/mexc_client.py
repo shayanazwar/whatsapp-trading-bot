@@ -99,9 +99,9 @@ class MexcClient:
     ) -> None:
         self.settings = settings
 
-        self.base_url = (
-            settings.mexc_api_base_url.rstrip("/")
-        )
+        configured_base = settings.mexc_api_base_url.rstrip("/")
+        # Futures endpoints live on contract.mexc.com; normalize a legacy spot/API base.
+        self.base_url = "https://contract.mexc.com" if configured_base.endswith("api.mexc.com") else configured_base
 
         self.http = httpx.AsyncClient(
             timeout=20
@@ -545,7 +545,7 @@ class MexcClient:
 
         data = await self._request(
             "GET",
-            "/api/v1/contract/detail/country",
+            "/api/v1/contract/detail",
         )
 
         if isinstance(data, list):
@@ -780,16 +780,9 @@ class MexcClient:
     ) -> list[list[float | int]]:
 
         interval_seconds = {
-            "Min1": 60,
-            "Min5": 300,
-            "Min15": 900,
-            "Min30": 1800,
             "Min60": 3600,
             "Hour4": 14400,
-            "Hour8": 28800,
             "Day1": 86400,
-            "Week1": 604800,
-            "Month1": 2592000,
         }.get(interval)
 
         if interval_seconds is None:
@@ -912,16 +905,9 @@ class MexcClient:
         """
 
         interval_seconds = {
-            "Min1": 60,
-            "Min5": 300,
-            "Min15": 900,
-            "Min30": 1800,
             "Min60": 3600,
             "Hour4": 14400,
-            "Hour8": 28800,
             "Day1": 86400,
-            "Week1": 604800,
-            "Month1": 2592000,
         }.get(interval)
 
         if interval_seconds is None:

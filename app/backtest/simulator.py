@@ -6,7 +6,7 @@ from math import isfinite
 from typing import Any, Iterable, Mapping
 
 
-M5_MS = 300_000
+ONE_HOUR_MS = 3_600_000
 DEFAULT_FEE_RATE = 0.0004
 DEFAULT_SLIPPAGE_BPS = 2.0
 DEFAULT_MAX_HOLDING_MINUTES = 360
@@ -143,12 +143,10 @@ def _quality_snapshot(signal: Mapping[str, Any]) -> dict[str, float]:
         "confirmation_family_count",
         "confirmation_families_passed",
         "confirmation_families_available",
-        "bos_15m_strength",
-        "trigger_quality_15m",
-        "rvol_15m",
-        "rvol_5m",
+        "bos_4h_strength",
+        "trigger_quality_1h",
+        "rvol_1h",
         "rsi",
-        "rsi_5m",
         "adx_4h",
         "atr_percentile",
         "sl_atr",
@@ -342,9 +340,9 @@ def simulate_trade(
         if parsed is None:
             continue
         timestamp, _open_price, high, low, close = parsed
-        if timestamp < signal_time or timestamp + M5_MS <= signal_time:
+        if timestamp + ONE_HOUR_MS <= signal_time:
             continue
-        close_time = timestamp + M5_MS
+        close_time = timestamp + ONE_HOUR_MS
 
         if close_time > expiry_ts:
             if previous_close is None or previous_close_time is None:

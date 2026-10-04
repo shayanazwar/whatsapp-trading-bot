@@ -1,115 +1,53 @@
-# Project State — 2026-10-03
+# Project State — Pak Trading Academy WhatsApp Trading Bot
 
-## Current release
-
-This package is the corrected deterministic MEXC Futures scanner release for the Pak Trading Academy bot, with **dual WhatsApp + Telegram messaging**.
-
-Messaging flow:
+## Current architecture
 
 ```text
-MEXC signal / manual command
-        |
-        v
-     app.bot / SignalManager
-        |
-        +----> WhatsApp Cloud API
-        |
-        +----> Telegram Bot API
+MEXC Futures Data
+      ↓
+Universe Filter
+      ↓
+1D  → Macro Regime
+      ↓
+12H → Intermediate Bias (causally aggregated from completed 4H candles)
+      ↓
+4H  → Primary Structure / BOS / Retest / S&R
+      ↓
+1H  → Setup / Confirmation / Entry
+      ↓
+Risk → SL / TP / RR
+      ↓
+Final Validator
+      ↓
+Duplicate / Cooldown
+      ↓
+WhatsApp Dispatch
 ```
 
-Telegram is an additional transport; the MEXC analysis/scanner remains the authoritative trading engine.
+## Supported analysis timeframes
 
-The legacy 4-minute synthetic `ANALYZE BTCUSDT` keepalive has been removed. It no longer generates background chat spam.
+Only `1D`, `12H`, `4H`, and `1H` are valid analysis timeframes. The 12H series is built locally from exactly three contiguous completed 4H candles so no unsupported exchange interval is required.
 
-The live scanner decision path uses 4H regime + 1H alignment + 15M BOS/retest and does not require 5M confirmation.
+## Messaging
 
+WhatsApp is the only supported messaging interface. The inbound path is:
 
-## Canonical runtime
+`Meta Cloud API → FastAPI webhook → signature check → message extraction → command router → handler → WhatsApp send API`.
 
-```text
-Docker -> uvicorn app.main:app
-```
+Webhook retries remain retryable when processing fails, while successfully processed message IDs are persisted for idempotency.
 
-The `app/` package is canonical.
+## Backtesting
 
-## Deterministic decision flow
+The paper backtester supports `1D` and `7D` runs and uses only completed 1D/12H/4H/1H data. Historical decisions are evaluated at completed 1H closes, and future trade resolution is performed only on later 1H candles. Every run returns a report, including zero-signal runs.
 
-```text
-MEXC Futures data
-  -> data integrity / closed candles
-  -> 120-symbol universe
-  -> BTC market filter
-  -> 1D context
-  -> 4H regime
-  -> 1H direction + protected structure
-  -> 15M BOS + post-BOS retest
-  -> momentum / volume / volatility
-  -> structural target path
-  -> structural SL / RR
-  -> hard technical gates
-  -> MEXC executable quote / spread / index-fair / funding / depth / trade flow
-  -> grouped 100-point score
-  -> final validator (score >=82, RR >=2, families >=5/6)
-  -> symbol/side cooldown
-  -> WhatsApp + Telegram signal
-```
+## Risk model
 
-## Safety state
+Trade geometry is structural and higher-timeframe oriented. Stops are placed beyond invalidating structure with an ATR-based buffer, targets are anchored to higher-timeframe path/liquidity, and minimum post-cost RR is enforced.
 
-```text
-SCANNER_ENABLED=false
-AUTO_SIGNAL_ENABLED=false
-AUTO_TRADE_ENABLED=false
-ALLOW_LIVE_EXECUTION=false
-```
+## Operational diagnostics
 
-These are the package defaults.
+Scanner logs include aggregate counts for universe, data validation, each approved timeframe, structure, setup, momentum, volume, risk, RR, final signals, duplicates, and errors. WhatsApp dispatch logs include outbound acceptance IDs when Meta accepts a message.
 
-## Important limitations
+## Deployment
 
-The scanner is deterministic, but a target win rate such as 70–80% is not guaranteed. The score is an evidence score, not a probability.
-
-Live execution is deliberately disabled. Missing live-trading components still include post-fill reconciliation, protective-order verification, partial TP/break-even management, portfolio exposure controls and emergency recovery.
-
-## Finalized backtest/performance fixes — 2026-09-28
-
-The backtest path was audited against Render behavior showing only 2/300 symbols after ~769 seconds. The root causes were confirmed in `app/backtest/runner.py` and `app/analysis/engine.py`.
-
-Implemented fixes:
-
-- Backtest symbol concurrency is now effectively 4 instead of being hard-capped at 1.
-- Historical backtest slices no longer include the next/open candle; the previous `+1` slice introduced a look-ahead candle.
-- Historical BTC/symbol histories are explicitly trimmed to closed candles at the backtest end boundary.
-- 15M BOS/retest candidate-window generation now uses indexed/binary-search ranges instead of repeatedly scanning the complete candle history.
-- Candidate metadata preserves LONG and SHORT candidates independently when both occur at the same timestamp.
-- A cached 4H/1H higher-timeframe prefilter rejects candidates that the authoritative engine must reject anyway.
-- The exact authoritative 15M entry-confirmation gate is used as a semantics-preserving prefilter before expensive full-engine analysis.
-- Repeated BOS calculations inside `analyze_candles()` were reduced by computing each side's BOS event set once and reusing it for selection and diagnostics.
-- Backtest timing/progress instrumentation records data and analysis duration per symbol.
-- `4_USDT` is not treated as malformed: it is a real MEXC USDT perpetual contract and remains eligible subject to the normal contract filters.
-
-Live trading remains disabled. No strategy thresholds were weakened to manufacture signals.
-
-## Verification
-
-```text
-pytest -q
-35 passed
-python -m compileall -q app tests
-OK
-```
-
-## Finalized MEXC live scanner performance + rate-limit hardening — 2026-09-28
-
-Applied fixes:
-- Shared public MEXC request throttle with bounded retry/backoff/jitter and Retry-After handling.
-- Symbol-level scanner concurrency capped at 4.
-- Live scanner now stages requests: 4H/1H/15M first; 5M/1D only after mandatory 4H/1H/15M gates and exact 15M entry confirmation pass.
-- Full `analyze_candles()` remains authoritative; the new scanner prefilter only rejects symbols that cannot produce a LONG/SHORT setup under the same mandatory gates.
-- Existing backtest performance fixes remain in `app/backtest/runner.py`.
-- Existing look-ahead protection remains enabled for historical closed candles.
-- Existing deterministic strategy thresholds remain unchanged: `MIN_CONFLUENCE=82`, `MIN_RR=2.0`.
-- Live execution remains disabled by default: `AUTO_TRADE_ENABLED=false`, `ALLOW_LIVE_EXECUTION=false`.
-
-Verification target for this package: `pytest -q` and `python -m compileall -q app tests` must both pass before deployment.
-- Latest verification: `38 passed`; `compileall` OK.
+The production container starts `uvicorn app.main:app`. Runtime secrets remain environment variables and are never stored in replacement artifacts.

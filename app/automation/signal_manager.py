@@ -38,7 +38,11 @@ def format_signal(signal: ValidatedSignal) -> str:
 class SignalManager:
     """Persist and dispatch each 4H structural setup at most once."""
 
-    def __init__(self, db: Database, whatsapp: WhatsAppClient, recipients: set[str], expiry_minutes: int) -> None:
+    def __init__(self, db: Database, whatsapp: WhatsAppClient, recipients: set[str], expiry_minutes: int, **legacy_kwargs) -> None:
+        # Backward-compatible startup guard for deployments that briefly retain an older caller.
+        # Telegram is intentionally ignored and is not used by this class.
+        if "telegram" in legacy_kwargs:
+            LOGGER.warning("Ignoring obsolete Telegram SignalManager argument")
         self.db = db
         self.whatsapp = whatsapp
         self.recipients = set(recipients)

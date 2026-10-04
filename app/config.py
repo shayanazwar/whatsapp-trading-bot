@@ -142,6 +142,21 @@ class Settings(BaseSettings):
         ]
 
 
+def validate_whatsapp_settings(settings: Settings) -> None:
+    """Fail startup with a clear configuration error when WhatsApp is incomplete."""
+    required = {
+        "META_ACCESS_TOKEN": settings.meta_access_token,
+        "META_PHONE_NUMBER_ID": settings.meta_phone_number_id,
+        "META_VERIFY_TOKEN": settings.meta_verify_token,
+        "META_APP_SECRET": settings.meta_app_secret,
+    }
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        raise RuntimeError(
+            "Missing required WhatsApp configuration: " + ", ".join(missing)
+        )
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()

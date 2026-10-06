@@ -62,7 +62,8 @@ def test_1h_trigger_uses_completed_1h_bars_and_allows_retest_during_completed_4h
         engine.convert_candles(rows), "LONG", {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 48 * 3_600_000}
     )
     assert result["ready"] is True
-    assert result["candle_time"] == base + 59 * 3_600_000
+    assert result["candle_time"] == base + 49 * 3_600_000
+    assert result["confirmation_index"] == 49
 
 def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):
     base = 1_700_000_000_000
@@ -189,3 +190,29 @@ def test_retest_requires_meaningful_departure():
     rows[22] = candle(base + 22 * 14_400_000, 100.0, 100.3, 99.7, 99.9)
     out = engine._pullback_retest(engine.convert_candles(rows), "LONG", bos, max_bars=6)
     assert out["valid"] is False
+
+
+def test_direction_gate_uses_1d_only_not_4h_structure():
+    daily = {"bear": False, "bull": False}
+    assert engine._direction_aligned("LONG", daily, {}, "LH/LL") is True
+    assert engine._direction_aligned("SHORT", daily, {}, "HH/HL") is True
+    assert engine._direction_aligned("LONG", {"bear": True, "bull": False}, {}, "HH/HL") is False
+    assert engine._direction_aligned("SHORT", {"bear": False, "bull": True}, {}, "LH/LL") is False
+
+
+def test_1h_trigger_routes_extended_confirmation_to_limit(monkeypatch):
+    base = 1_700_000_000_000
+    rows = [candle(base + i * 3_600_000, 100.0, 100.4, 99.6, 100.1) for i in range(60)]
+    rows[48] = candle(base + 48 * 3_600_000, 99.8, 100.1, 99.7, 99.9, 2000)
+    rows[49] = candle(base + 49 * 3_600_000, 100.0, 101.4, 99.9, 101.2, 2000)
+    monkeypatch.setattr(engine, "_safe_atr", lambda candles: 1.0)
+    monkeypatch.setattr(engine, "_safe_rsi", lambda closes: 55.0)
+    monkeypatch.setattr(engine, "_relative_volume", lambda candles: 1.20)
+    result = engine._one_hour_trigger_confirmation(
+        engine.convert_candles(rows),
+        "LONG",
+        {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 48 * 3_600_000},
+    )
+    assert result["ready"] is True
+    assert result["entry_mode"] == "LIMIT"
+    assert result["limit_price"] == pytest.approx(100.50)

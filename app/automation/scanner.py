@@ -16,7 +16,7 @@ from ..analysis.engine import (
 )
 from ..config import Settings
 from .executor import MexcExecutor
-from .mexc_client import MexcClient
+from .mexc_client import MexcAPIError, MexcClient
 from .signal_manager import SignalManager
 from .signal_validator import validate_signal
 from .universe import MexcUniverse
@@ -253,11 +253,16 @@ class MexcScanner:
             except Exception as exc:
                 return self._reject(symbol, f"Ticker unavailable: {exc}", "EXECUTION", payload)
 
+            max_spread_config = float(getattr(self.settings, "max_mexc_spread_pct", 0.001))
+            # Configuration is historically stored as a fraction (0.001 = 0.1%).
+            max_spread_pct = max_spread_config * 100.0 if 0.0 < max_spread_config <= 1.0 else max_spread_config
             quote_ok, quote_reason, spread_pct = self._ticker_quality(
-                ticker, float(getattr(self.settings, "max_data_age_seconds", 15.0))
+                ticker,
+                float(getattr(self.settings, "max_data_age_seconds", 15.0)),
+                max_spread_pct=max_spread_pct,
             )
             analysis["mexc_spread_pct"] = spread_pct
-            analysis["max_allowed_spread_pct"] = 0.50
+            analysis["max_allowed_spread_pct"] = max_spread_pct
             if not quote_ok:
                 payload["rejected_execution"] = 1
                 return self._reject(symbol, quote_reason, "EXECUTION", payload)
@@ -273,7 +278,7 @@ class MexcScanner:
                 analysis,
                 min_confluence=int(getattr(self.settings, "min_confluence", 65)),
                 min_rr=float(getattr(self.settings, "min_rr", 2.0)),
-                require_increasing_volume=False,
+                require_increasing_volume=bool(getattr(self.settings, "require_increasing_volume", False)),
             )
             if signal is None:
                 payload["rejected_final"] = 1
@@ -300,12 +305,31 @@ class MexcScanner:
                 "candle_cache_hits": cache_hits,
                 "duplicate": 0,
             }
+        except MexcAPIError as exc:
+            LOGGER.warning(
+                "MEXC symbol data error | symbol=%s code=%s status=%s reason=%s",
+                symbol, exc.code, exc.status_code, exc,
+            )
+            return self._error(
+                symbol,
+                f"MEXC_API_ERROR code={exc.code or 'UNKNOWN'} status={exc.status_code or '-'}: {exc}",
+                {"candle_cache_hits": cache_hits},
+            )
         except Exception as exc:
             LOGGER.exception("MEXC symbol scan failed: %s", symbol)
-            return self._error(symbol, str(exc), {"candle_cache_hits": cache_hits})
+            return self._error(
+                symbol,
+                f"CALCULATION_ERROR {type(exc).__name__}: {exc}",
+                {"candle_cache_hits": cache_hits},
+            )
 
     @staticmethod
-    def _ticker_quality(ticker: dict[str, Any], max_age_seconds: float = 15.0) -> tuple[bool, str, float]:
+    def _ticker_quality(
+        ticker: dict[str, Any],
+        max_age_seconds: float = 15.0,
+        *,
+        max_spread_pct: float = 0.50,
+    ) -> tuple[bool, str, float]:
         def number(key: str) -> float | None:
             try:
                 value = float(ticker.get(key))
@@ -319,8 +343,12 @@ class MexcScanner:
         ask = number("ask1") or number("askPrice")
         if bid is not None and ask is not None and ask >= bid > 0:
             spread_pct = (ask - bid) / last * 100.0
-            if spread_pct > 0.50:
-                return False, f"Spread {spread_pct:.3f}% exceeds 0.500%", spread_pct
+            if spread_pct > float(max_spread_pct):
+                return (
+                    False,
+                    f"Spread {spread_pct:.3f}% exceeds {float(max_spread_pct):.3f}%",
+                    spread_pct,
+                )
         else:
             spread_pct = 0.0
         raw_ts = ticker.get("timestamp")

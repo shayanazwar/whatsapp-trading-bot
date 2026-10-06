@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlencode
@@ -35,6 +36,14 @@ class MexcAPIError(RuntimeError):
 class MexcOrderResponse:
     order_id: str
     raw: dict[str, Any]
+
+
+@dataclass
+class _PublicLimiterState:
+    lock: threading.Lock
+    request_times: list[float]
+    last_request_at: float = 0.0
+    pause_until: float = 0.0
 
 
 def build_query_string(
@@ -91,7 +100,13 @@ class MexcClient:
 
     Live trading remains controlled by the higher-level execution
     safety flags. This client only provides API communication.
+
+    Public request pacing is shared process-wide per MEXC base URL so
+    multiple client objects cannot independently burst the same API.
     """
+
+    _public_limiter_registry_lock = threading.Lock()
+    _public_limiter_states: dict[str, _PublicLimiterState] = {}
 
     def __init__(
         self,
@@ -113,22 +128,55 @@ class MexcClient:
         # --------------------------------------------------------------
         # SHARED PUBLIC API THROTTLE / RATE-LIMIT RECOVERY
         # --------------------------------------------------------------
-        # Keep all public REST calls behind one limiter so concurrent symbol
-        # scans cannot burst the MEXC endpoint. The defaults are deliberately
-        # conservative and configurable via environment variables.
-        self._public_request_lock = asyncio.Lock()
-        self._public_request_times: list[float] = []
-        self._public_last_request_at = 0.0
-        self._public_pause_until = 0.0
-        self._public_min_interval_seconds = max(0.0, float(getattr(settings, "mexc_public_min_interval_seconds", 0.20)))
-        self._public_window_seconds = max(0.1, float(getattr(settings, "mexc_public_window_seconds", 2.0)))
-        self._public_window_limit = max(1, int(getattr(settings, "mexc_public_window_limit", 8)))
-        self._public_max_retries = max(0, int(getattr(settings, "mexc_rate_limit_max_retries", 4)))
-        self._public_backoff_base_seconds = max(0.1, float(getattr(settings, "mexc_rate_limit_backoff_seconds", 2.0)))
-        self._public_backoff_cap_seconds = max(self._public_backoff_base_seconds, float(getattr(settings, "mexc_rate_limit_backoff_cap_seconds", 20.0)))
-        self._public_backoff_jitter_seconds = max(0.0, float(getattr(settings, "mexc_rate_limit_jitter_seconds", 0.25)))
+        with self._public_limiter_registry_lock:
+            self._public_limiter_state = self._public_limiter_states.setdefault(
+                self.base_url,
+                _PublicLimiterState(lock=threading.Lock(), request_times=[]),
+            )
+        # Kept as a compatibility/debug handle for existing tests/tools.
+        self._public_request_lock = self._public_limiter_state.lock
+        self._public_min_interval_seconds = max(
+            0.0,
+            float(getattr(settings, "mexc_public_min_interval_seconds", 0.20)),
+        )
+        self._public_window_seconds = max(
+            0.1,
+            float(getattr(settings, "mexc_public_window_seconds", 2.0)),
+        )
+        self._public_window_limit = max(
+            1,
+            int(getattr(settings, "mexc_public_window_limit", 8)),
+        )
+        self._public_max_retries = max(
+            0,
+            int(getattr(settings, "mexc_rate_limit_max_retries", 4)),
+        )
+        self._public_backoff_base_seconds = max(
+            0.1,
+            float(getattr(settings, "mexc_rate_limit_backoff_seconds", 2.0)),
+        )
+        self._public_backoff_cap_seconds = max(
+            self._public_backoff_base_seconds,
+            float(getattr(settings, "mexc_rate_limit_backoff_cap_seconds", 20.0)),
+        )
+        self._public_backoff_jitter_seconds = max(
+            0.0,
+            float(getattr(settings, "mexc_rate_limit_jitter_seconds", 0.25)),
+        )
         self._public_rate_limit_events = 0
         self._public_retry_events = 0
+
+        # Cache slow-changing discovery responses to avoid concurrent
+        # scanner/backtest tasks hammering the same endpoints.
+        self._contracts_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._tickers_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._contracts_cache_ttl = max(
+            30.0,
+            float(getattr(settings, "discovery_refresh_seconds", 900)),
+        )
+        self._tickers_cache_ttl = 15.0
+        self._contracts_cache_lock = asyncio.Lock()
+        self._tickers_cache_lock = asyncio.Lock()
 
     # ==================================================================
     # CONNECTION
@@ -229,32 +277,37 @@ class MexcClient:
             and (any(marker in message for marker in markers) or code in {"429", "418", "rate_limit"})
         )
 
-    async def _acquire_public_slot(self) -> None:
+    @staticmethod
+    def _endpoint_min_interval(url: str, configured: float) -> float:
+        if url.rstrip("/").endswith("/api/v1/contract/detail"):
+            return max(configured, 5.0)
+        return configured
+
+    async def _acquire_public_slot(self, url: str = "") -> None:
+        state = self._public_limiter_state
+        endpoint_interval = self._endpoint_min_interval(
+            url,
+            self._public_min_interval_seconds,
+        )
         while True:
-            async with self._public_request_lock:
+            with state.lock:
                 now = time.monotonic()
                 cutoff = now - self._public_window_seconds
-                self._public_request_times = [
-                    t for t in self._public_request_times if t > cutoff
+                state.request_times[:] = [
+                    t for t in state.request_times if t > cutoff
                 ]
+                waits = [max(0.0, state.pause_until - now)]
 
-                waits = [max(0.0, self._public_pause_until - now)]
-
-                if self._public_last_request_at > 0.0:
+                if state.last_request_at > 0.0:
                     waits.append(
-                        max(
-                            0.0,
-                            self._public_last_request_at
-                            + self._public_min_interval_seconds
-                            - now,
-                        )
+                        max(0.0, state.last_request_at + endpoint_interval - now)
                     )
 
-                if len(self._public_request_times) >= self._public_window_limit:
+                if len(state.request_times) >= self._public_window_limit:
                     waits.append(
                         max(
                             0.0,
-                            self._public_request_times[0]
+                            state.request_times[0]
                             + self._public_window_seconds
                             - now,
                         )
@@ -263,10 +316,9 @@ class MexcClient:
                 wait = max(waits, default=0.0)
                 if wait <= 0.0:
                     now = time.monotonic()
-                    self._public_request_times.append(now)
-                    self._public_last_request_at = now
+                    state.request_times.append(now)
+                    state.last_request_at = now
                     return
-
             await asyncio.sleep(wait)
 
     async def _apply_rate_limit_backoff(
@@ -288,9 +340,9 @@ class MexcClient:
             self._public_backoff_cap_seconds,
             max(retry_after or 0.0, exponential) + jitter,
         )
-        async with self._public_request_lock:
-            self._public_pause_until = max(
-                self._public_pause_until,
+        with self._public_limiter_state.lock:
+            self._public_limiter_state.pause_until = max(
+                self._public_limiter_state.pause_until,
                 time.monotonic() + delay,
             )
             self._public_rate_limit_events += 1
@@ -302,18 +354,56 @@ class MexcClient:
             self._public_max_retries,
         )
 
+    async def _apply_transient_backoff(self, attempt: int, reason: str) -> None:
+        exponential = min(
+            self._public_backoff_cap_seconds,
+            self._public_backoff_base_seconds * (2 ** attempt),
+        )
+        jitter = (
+            random.uniform(0.0, self._public_backoff_jitter_seconds)
+            if self._public_backoff_jitter_seconds > 0
+            else 0.0
+        )
+        delay = min(self._public_backoff_cap_seconds, exponential + jitter)
+        with self._public_limiter_state.lock:
+            self._public_limiter_state.pause_until = max(
+                self._public_limiter_state.pause_until,
+                time.monotonic() + delay,
+            )
+            self._public_retry_events += 1
+        LOGGER.warning(
+            "MEXC public transient error; backing off %.2fs (attempt %s/%s) | %s",
+            delay,
+            attempt + 1,
+            self._public_max_retries,
+            reason,
+        )
+
     async def _public_request(self, request_kwargs: dict[str, Any]) -> httpx.Response:
         max_attempts = self._public_max_retries + 1
         last_rate_limited: httpx.Response | None = None
+        url = str(request_kwargs.get("url") or "")
 
         for attempt in range(max_attempts):
-            await self._acquire_public_slot()
+            await self._acquire_public_slot(url)
             try:
                 response = await self.http.request(**request_kwargs)
-            except httpx.HTTPError as exc:
-                raise MexcAPIError(
-                    f"MEXC HTTP request failed: {exc}"
-                ) from exc
+            except httpx.TimeoutException as exc:
+                if attempt >= self._public_max_retries:
+                    raise MexcAPIError(
+                        f"MEXC public request timed out after {max_attempts} attempts: {exc}",
+                        code="TIMEOUT",
+                    ) from exc
+                await self._apply_transient_backoff(attempt, f"timeout: {exc}")
+                continue
+            except httpx.RequestError as exc:
+                if attempt >= self._public_max_retries:
+                    raise MexcAPIError(
+                        f"MEXC public request transport error after {max_attempts} attempts: {exc}",
+                        code="NETWORK_ERROR",
+                    ) from exc
+                await self._apply_transient_backoff(attempt, f"network: {exc}")
+                continue
 
             payload = self._response_payload(response)
             if self._is_rate_limited_response(response, payload):
@@ -327,7 +417,9 @@ class MexcClient:
                     raise MexcAPIError(
                         message,
                         code=(payload.get("code") if isinstance(payload, dict) else None),
-                        status_code=response.status_code if response.status_code in {418, 429, 503} else None,
+                        status_code=response.status_code
+                        if response.status_code in {418, 429, 503}
+                        else None,
                     )
                 await self._apply_rate_limit_backoff(attempt, response)
                 continue
@@ -337,7 +429,9 @@ class MexcClient:
         if last_rate_limited is not None:
             raise MexcAPIError(
                 f"MEXC public request rate limited after {max_attempts} attempts",
-                status_code=last_rate_limited.status_code if last_rate_limited.status_code in {418, 429, 503} else None,
+                status_code=last_rate_limited.status_code
+                if last_rate_limited.status_code in {418, 429, 503}
+                else None,
             )
         raise MexcAPIError("MEXC public request failed after retries")
 
@@ -542,29 +636,34 @@ class MexcClient:
     async def get_contracts(
         self,
     ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        cached = self._contracts_cache
+        if cached and now - cached[0] < self._contracts_cache_ttl:
+            return list(cached[1])
 
-        data = await self._request(
-            "GET",
-            "/api/v1/contract/detail",
-        )
+        async with self._contracts_cache_lock:
+            now = time.monotonic()
+            cached = self._contracts_cache
+            if cached and now - cached[0] < self._contracts_cache_ttl:
+                return list(cached[1])
 
-        if isinstance(data, list):
-            return [
-                x
-                for x in data
-                if isinstance(x, dict)
-            ]
+            data = await self._request(
+                "GET",
+                "/api/v1/contract/detail",
+            )
+            if isinstance(data, list):
+                rows = [x for x in data if isinstance(x, dict)]
+            elif isinstance(data, dict) and "symbol" in data:
+                rows = [data]
+            else:
+                raise MexcAPIError(
+                    "Unexpected MEXC contract response "
+                    f"shape: {type(data).__name__}",
+                    code="INVALID_RESPONSE",
+                )
 
-        if (
-            isinstance(data, dict)
-            and "symbol" in data
-        ):
-            return [data]
-
-        raise MexcAPIError(
-            "Unexpected MEXC contract response "
-            f"shape: {type(data).__name__}"
-        )
+            self._contracts_cache = (time.monotonic(), list(rows))
+            return list(rows)
 
     # ==================================================================
     # TICKERS
@@ -573,29 +672,34 @@ class MexcClient:
     async def get_tickers(
         self,
     ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        cached = self._tickers_cache
+        if cached and now - cached[0] < self._tickers_cache_ttl:
+            return list(cached[1])
 
-        data = await self._request(
-            "GET",
-            "/api/v1/contract/ticker",
-        )
+        async with self._tickers_cache_lock:
+            now = time.monotonic()
+            cached = self._tickers_cache
+            if cached and now - cached[0] < self._tickers_cache_ttl:
+                return list(cached[1])
 
-        if isinstance(data, list):
-            return [
-                x
-                for x in data
-                if isinstance(x, dict)
-            ]
+            data = await self._request(
+                "GET",
+                "/api/v1/contract/ticker",
+            )
+            if isinstance(data, list):
+                rows = [x for x in data if isinstance(x, dict)]
+            elif isinstance(data, dict) and "symbol" in data:
+                rows = [data]
+            else:
+                raise MexcAPIError(
+                    "Unexpected MEXC ticker response "
+                    f"shape: {type(data).__name__}",
+                    code="INVALID_RESPONSE",
+                )
 
-        if (
-            isinstance(data, dict)
-            and "symbol" in data
-        ):
-            return [data]
-
-        raise MexcAPIError(
-            "Unexpected MEXC ticker response "
-            f"shape: {type(data).__name__}"
-        )
+            self._tickers_cache = (time.monotonic(), list(rows))
+            return list(rows)
 
     async def get_ticker(
         self,

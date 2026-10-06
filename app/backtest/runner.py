@@ -9,6 +9,7 @@ from typing import Any
 
 from ..analysis.engine import analyze_candles
 from ..automation.mexc_client import MexcClient
+from ..automation.mexc_client import MexcAPIError
 from ..automation.signal_validator import make_signal_key, validate_signal
 from ..automation.universe import MexcUniverse
 from ..config import Settings
@@ -134,7 +135,7 @@ class BacktestRunner:
             analysis["max_signal_age_seconds"] = 10**9
             signal, reasons = validate_signal(
                 analysis,
-                min_confluence=int(getattr(self.settings, "min_confluence", 78)),
+                min_confluence=int(getattr(self.settings, "min_confluence", 65)),
                 min_rr=float(getattr(self.settings, "min_rr", 2.0)),
             )
             if signal is None:
@@ -195,15 +196,84 @@ class BacktestRunner:
             semaphore = asyncio.Semaphore(self.max_concurrency)
             results: list[tuple[list[SimulatedTrade], dict[str, int], int, int, int]] = []
 
+            progress_interval = max(
+                1.0,
+                float(getattr(self.settings, "backtest_progress_interval_seconds", 5.0)),
+            )
+            symbol_timeout = max(
+                10.0,
+                float(getattr(self.settings, "backtest_analysis_timeout_seconds", 120.0)),
+            )
+            progress_started = time.monotonic()
+            completed = 0
+            progress_lock = asyncio.Lock()
+
             async def one(symbol: str) -> None:
+                nonlocal completed, progress_started
                 async with semaphore:
                     try:
-                        history = await self._fetch_history(symbol, start_ms, end_ms)
-                        result = await asyncio.to_thread(self._simulate_symbol, history, start_ms, end_ms)
+                        history = await asyncio.wait_for(
+                            self._fetch_history(symbol, start_ms, end_ms),
+                            timeout=symbol_timeout,
+                        )
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._simulate_symbol,
+                                history,
+                                start_ms,
+                                end_ms,
+                            ),
+                            timeout=symbol_timeout,
+                        )
                         results.append(result)
+                    except asyncio.TimeoutError:
+                        LOGGER.warning(
+                            "BACKTEST DATA_ERROR | symbol=%s reason=SYMBOL_TIMEOUT timeout=%.1fs",
+                            symbol,
+                            symbol_timeout,
+                        )
+                        results.append(
+                            ([], {"SYMBOL_TIMEOUT": 1}, 1, 0, 0)
+                        )
+                    except MexcAPIError as exc:
+                        LOGGER.warning(
+                            "BACKTEST DATA_ERROR | symbol=%s code=%s status=%s reason=%s",
+                            symbol,
+                            exc.code,
+                            exc.status_code,
+                            exc,
+                        )
+                        code = str(exc.code or "MEXC_API_ERROR").upper()
+                        results.append(
+                            ([], {f"MEXC_API_ERROR_{code}": 1}, 1, 0, 0)
+                        )
                     except Exception as exc:
-                        LOGGER.exception("BACKTEST symbol failed | %s", symbol)
-                        results.append(([], {"SYMBOL_FETCH_ERROR": 1}, 1, 0, 0))
+                        LOGGER.exception(
+                            "BACKTEST CALCULATION_ERROR | symbol=%s type=%s reason=%s",
+                            symbol,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        results.append(
+                            ([], {f"SYMBOL_ERROR_{type(exc).__name__.upper()}": 1}, 1, 0, 0)
+                        )
+                    finally:
+                        async with progress_lock:
+                            completed += 1
+                            now = time.monotonic()
+                            if (
+                                completed == 1
+                                or completed == len(selected)
+                                or now - progress_started >= progress_interval
+                            ):
+                                elapsed = now - started
+                                LOGGER.info(
+                                    "BACKTEST PROGRESS | completed=%d/%d elapsed=%.1fs",
+                                    completed,
+                                    len(selected),
+                                    elapsed,
+                                )
+                                progress_started = now
 
             await asyncio.gather(*(one(symbol) for symbol in selected))
 

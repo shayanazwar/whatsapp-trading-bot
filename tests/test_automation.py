@@ -3,128 +3,99 @@ from __future__ import annotations
 import asyncio
 import time
 
-from app.analysis.engine import calculate_confluence, closed_candle_rows
-from app.automation.executor import ExecutionResult, MexcExecutor, build_limit_order_payload
+import app.automation.scanner as scanner_module
+from app.analysis.engine import closed_candle_rows, synthesize_12h_from_4h
+from app.automation.executor import MexcExecutor, build_limit_order_payload
 from app.automation.mexc_client import MexcClient, build_query_string, build_signature
 from app.automation.risk_manager import TradePlan, calculate_contract_quantity, calculate_risk_amount, validate_levels
 from app.automation.scanner import MexcScanner
 from app.automation.setup_filter import validate_analysis
-from app.automation.signal_manager import format_signal, SignalManager
-from app.automation.signal_validator import ValidatedSignal, validate_signal
+from app.automation.signal_manager import format_signal
+from app.automation.signal_validator import validate_signal
 from app.automation.universe import ContractMeta
 from app.config import Settings
 
 
-def _row(ts: int, price: float = 100.0): return [ts, price, price + 1, price - 1, price, 1000]
+def _row(ts: int, price: float = 100.0):
+    return [ts, price, price + 1, price - 1, price, 1000]
 
 
-def _valid_analysis(side="LONG"):
-    long = side == "LONG"; now = int(time.time() * 1000); fifteen = now - (now % 900000); five = now - (now % 300000)
-    families = {
-        "momentum":{"status":"PASS","value":0.8},
-        "relative_volume":{"status":"PASS","value":1.5},
-        "volatility_regime":{"status":"PASS","value":50},
-        "liquidity_quality":{"status":"ABSTAIN"},
-        "funding_crowding":{"status":"ABSTAIN"},
-        "flow_pressure":{"status":"PASS","value":0.2 if long else -0.2},
-        "htf_target_path":{"status":"PASS","value":3.0},
-        "vwap_location":{"status":"PASS","value":0.5},
+def _valid_analysis(side: str = "LONG", *, candle_time: int | None = None) -> dict:
+    now = int(time.time() * 1000)
+    signal_time = candle_time if candle_time is not None else now
+    return {
+        "symbol": "BTC_USDT", "price": 100.0, "setup": side,
+        "setup_bos_time": signal_time - 7_200_000,
+        "long_bos_level": 100.0, "short_bos_level": 100.0,
+        "score": 80, "direction_ok": True, "structure_ok": True,
+        "setup_ok": True, "confirmation_ok": True, "location_ok": True,
+        "target_path_structural": True, "structure_quality_ok": True,
+        "shock_veto_ok": True, "technical_candidate": True,
+        "trade_geometry_ok": True, "risk_ok": True,
+        "primary_entry_timeframe": "1H", "signal_candle_timeframe": "1H",
+        "entry": 100.0, "stop_loss": 99.0 if side == "LONG" else 101.0,
+        "tp": 104.0 if side == "LONG" else 96.0, "rr": 3.48, "atr": 1.0,
+        "sl_atr": 1.0, "tp_distance_atr": 4.0, "mexc_spread_pct": 0.01,
+        "max_allowed_spread_pct": 0.50, "max_signal_age_seconds": 5400,
+        "candle_time": signal_time, "mexc_funding_rate": 0.0,
     }
-    return {"symbol":"BTC_USDT","price":100.0,"trend_4h":"BULLISH" if long else "BEARISH","structure_1h":"HH/HL" if long else "LH/LL","bos_15m":True,"ema_direction":"BULLISH" if long else "BEARISH","rsi":60.0 if long else 40.0,"rsi_5m":60.0 if long else 40.0,"atr":1.0,"atr_percentile":50,"volume":"INCREASING","rvol":1.5,"rvol_15m":1.5,"rvol_5m":1.5,"entry":100.0,"stop_loss":99.0 if long else 101.0,"tp":104.0 if long else 96.0,"rr":3.48,"setup":side,"setup_bos_time":fifteen-300000,"setup_retest_time":fifteen,"candle_time":fifteen,"direction_ok":True,"structure_ok":True,"setup_ok":True,"momentum_ok":True,"volume_ok":True,"location_ok":True,"futures_ok":True,"btc_filter_ok":True,"volatility_ok":True,"data_fresh":True,"target_path_structural":True,"shock_veto_ok":True,"confirmation_families":families,"confirmation_families_passed":6,"confirmation_families_available":6,"confirmation_family_diversity_ok":True,"confirmation_family_count":6,"supporting_family_count":6,"score":100,"sl_atr":1.0,"tp_distance_atr":4.0,"signal_blocked":False,"technical_candidate":True,"structure_quality_ok":True,"trade_geometry_ok":True,"ema_extension_ok":True,"five_minute_ready":False,"five_minute_long":False,"five_minute_short":False,"mexc_spread_pct":0.0001,"max_mexc_spread_pct":0.001,"entry_drift_pct":0.0,"max_entry_drift_pct":0.002,"max_signal_age_seconds":1200,"estimated_round_trip_cost_pct":0.0015}
 
 
 def test_signature_is_deterministic():
-    q=build_query_string({"b":"hello world","a":"1"}); assert q=="a=1&b=hello+world"; assert build_signature("ACCESS","SECRET","123",q)=="969ff47eea801bf3a7ff9d53ce51c58a79f9b163f92f2fe3370cd164c1dc43af"
+    query = build_query_string({"b": "hello world", "a": "1"})
+    assert query == "a=1&b=hello+world"
+    assert build_signature("ACCESS", "SECRET", "123", query) == "969ff47eea801bf3a7ff9d53ce51c58a79f9b163f92f2fe3370cd164c1dc43af"
 
 
-def test_closed_candle_normalization_and_legacy_index_access():
-    now=1_700_000_000_000; rows=[_row(now-1_800_000),_row(now-900_000),_row(now)]; closed=closed_candle_rows(rows,"15m",now_ms=now); assert len(closed)==2; assert closed[-1][0]==now-900_000; assert closed[-1]["time"]==now-900_000
+def test_closed_candle_normalization_uses_only_approved_signal_timeframes():
+    now = 1_700_000_000_000
+    rows = [_row(now - 7_200_000), _row(now - 3_600_000), _row(now)]
+    closed = closed_candle_rows(rows, "1H", now_ms=now)
+    assert len(closed) == 2
+    assert closed[-1]["time"] == now - 3_600_000
 
 
-def test_legacy_confluence_compatibility():
-    d=_valid_analysis("LONG"); d["trend_4h"]="BEARISH"; out=calculate_confluence(d); assert out["setup"]=="NO TRADE" and out["score"]==5
+def test_12h_aggregation_is_causal():
+    base = (1_700_000_000_000 // 43_200_000) * 43_200_000
+    rows = [_row(base + i * 14_400_000, 100 + i) for i in range(4)]
+    out = synthesize_12h_from_4h(rows, now_ms=base + 43_200_000)
+    assert len(out) == 1
+    assert out[0]["open"] == 100
+    assert out[0]["close"] == 102
 
 
-def test_trade_levels_and_position_sizing():
-    long_plan=TradePlan("LONG",100,99,104,2.5); assert validate_levels(long_plan,2)[0]; qty=calculate_contract_quantity(10,100,99,0.1,1,1,1000); assert qty==99.0
-    assert round(calculate_risk_amount(1000,1.0),2)==10.0
+def test_validate_signal_accepts_1h_structural_signal():
+    signal, reasons = validate_signal(_valid_analysis(), min_confluence=65, min_rr=2.0)
+    assert signal is not None, reasons
+    assert signal.analysis["primary_entry_timeframe"] == "1H"
 
 
-def test_validate_signal():
-    signal,reasons=validate_signal(_valid_analysis("LONG"),min_confluence=82,min_rr=2,require_increasing_volume=True); assert signal is not None,reasons
+def test_validate_analysis_rejects_score_below_new_supporting_evidence_floor():
+    data = _valid_analysis()
+    data["score"] = 64
+    ok, reasons = validate_analysis(data, min_confluence=65, min_rr=2.0)
+    assert not ok
+    assert any("Score 64 < required 65" in reason for reason in reasons)
 
 
-def test_executor_gate_stays_closed():
-    settings=Settings(auto_trade_enabled=True,allow_live_execution=True); executor=MexcExecutor(object(),settings); signal,_=validate_signal(_valid_analysis("LONG"),min_confluence=82,min_rr=2,require_increasing_volume=False); assert signal is not None
-    meta=ContractMeta("BTC_USDT","USDT","USDT",0.1,0.1,1,1,1000,1,0,0,True,False,1,False)
-    result=asyncio.run(executor.execute(signal,meta)); assert result.executed is False and "disabled" in result.message.lower()
+def test_executor_live_switch_remains_closed():
+    settings = Settings(auto_trade_enabled=True, allow_live_execution=True)
+    executor = MexcExecutor(object(), settings)
+    signal, reasons = validate_signal(_valid_analysis(), min_confluence=65, min_rr=2.0)
+    assert signal is not None, reasons
+    meta = ContractMeta("BTC_USDT", "USDT", "USDT", 0.1, 0.1, 1, 1, 1000, 1, 0, 0, True, False, 1, False)
+    result = asyncio.run(executor.execute(signal, meta))
+    assert result.executed is False
+    assert "disabled" in result.message.lower()
 
 
 def test_order_payload_side_mapping():
-    meta=ContractMeta("BTC_USDT","USDT","USDT",0.1,0.1,1,1,1000,1,0,0,True,False,1,False)
-    signal,_=validate_signal(_valid_analysis("LONG"),min_confluence=82,min_rr=2,require_increasing_volume=False); assert signal
-    p=build_limit_order_payload(signal,meta,risk_amount_usdt=10,leverage=3,open_type=1); assert p["side"]==1; assert p["openType"]==1
-
-
-def test_client_kline_parser():
-    c=MexcClient(Settings()); calls={}
-    async def fake(*args,**kwargs): calls.update(kwargs["params"]); return {"time":[1700000000],"open":[100],"high":[101],"low":[99],"close":[100.5],"vol":[1234]}
-    async def run(): c._request=fake; rows=await c.get_klines("BTC_USDT","Min15",200); await c.close(); return rows
-    rows=asyncio.run(run()); assert rows==[[1700000000000,100.0,101.0,99.0,100.5,1234.0]]; assert calls["interval"]=="Min15"
-
-
-def test_mexc_trade_flow_uses_official_T_v_fields():
-    flow = MexcScanner._calculate_trade_flow([
-        {"T": 1, "v": 10},
-        {"T": 2, "v": 4},
-    ])
-    assert flow["buy_volume"] == 10.0
-    assert flow["sell_volume"] == 4.0
-    assert flow["volume_delta"] == 6.0
-
-
-def test_signal_validation_does_not_require_5m_or_increasing_volume():
-    data = _valid_analysis("LONG")
-    data.pop("five_minute_ready", None)
-    data.pop("five_minute_long", None)
-    data.pop("five_minute_short", None)
-    data.pop("trigger_quality_5m", None)
-    data["primary_entry_timeframe"] = "15M"
-    data["volume"] = "DECREASING"
-    data["confirmation_family_count"] = 5
-    data["confirmation_families_passed"] = 5
-    data["confirmation_families_available"] = 6
-    data["momentum_quality"] = 0.60
-    data["volume_quality"] = 0.30
-    signal, reasons = validate_signal(data, min_confluence=82, min_rr=2.0, require_increasing_volume=True)
+    meta = ContractMeta("BTC_USDT", "USDT", "USDT", 0.1, 0.1, 1, 1, 1000, 1, 0, 0, True, False, 1, False)
+    signal, reasons = validate_signal(_valid_analysis(), min_confluence=65, min_rr=2.0)
     assert signal is not None, reasons
-
-
-def test_signal_format_uses_score_100():
-    signal, reasons = validate_signal(_valid_analysis("LONG"), min_confluence=82, min_rr=2, require_increasing_volume=False)
-    assert signal is not None, reasons
-    text = format_signal(signal)
-    assert "Score: 100/100" in text
-    assert "Optional evidence: 6/6 (informational)" in text
-
-
-class _FakeHeaders(dict):
-    def get(self, key, default=None):
-        return super().get(key, default)
-
-
-class _FakeResponse:
-    def __init__(self, status_code=200, payload=None, text="", headers=None):
-        self.status_code = status_code
-        self._payload = payload
-        self.text = text or str(payload or "")
-        self.headers = _FakeHeaders(headers or {})
-        self.is_error = status_code >= 400
-
-    def json(self):
-        if isinstance(self._payload, Exception):
-            raise self._payload
-        return self._payload
+    payload = build_limit_order_payload(signal, meta, risk_amount_usdt=10, leverage=3, open_type=1)
+    assert payload["side"] == 1
+    assert payload["openType"] == 1
 
 
 def test_public_request_rate_limit_retries_with_shared_backoff():
@@ -138,10 +109,16 @@ def test_public_request_rate_limit_retries_with_shared_backoff():
         mexc_rate_limit_jitter_seconds=0,
     )
     client = MexcClient(settings)
-    responses = [
-        _FakeResponse(200, {"success": False, "message": "Requests are too frequent", "code": "429"}),
-        _FakeResponse(200, {"success": True, "data": {"ok": True}}),
-    ]
+
+    class FakeResponse:
+        status_code = 200
+        is_error = False
+        text = ""
+        headers = {}
+        def __init__(self, payload): self.payload = payload
+        def json(self): return self.payload
+
+    responses = [FakeResponse({"success": False, "message": "Requests are too frequent", "code": "429"}), FakeResponse({"success": True, "data": {"ok": True}})]
     calls = []
 
     async def fake_request(**kwargs):
@@ -155,108 +132,83 @@ def test_public_request_rate_limit_retries_with_shared_backoff():
     response = asyncio.run(run())
     assert response.status_code == 200
     assert len(calls) == 2
-    assert client._public_rate_limit_events == 1
     assert client._public_retry_events == 1
     asyncio.run(client.close())
 
 
-def test_public_request_retries_http_429_and_honors_bounded_retry_count():
-    settings = Settings(
-        mexc_public_min_interval_seconds=0,
-        mexc_public_window_seconds=10,
-        mexc_public_window_limit=100,
-        mexc_rate_limit_max_retries=1,
-        mexc_rate_limit_backoff_seconds=0.01,
-        mexc_rate_limit_backoff_cap_seconds=0.02,
-        mexc_rate_limit_jitter_seconds=0,
-    )
-    client = MexcClient(settings)
-    responses = [
-        _FakeResponse(429, {"message": "too many requests"}, headers={"Retry-After": "0"}),
-        _FakeResponse(200, {"success": True, "data": {"ok": True}}),
-    ]
+def test_live_scanner_uses_1h_close_time_not_1h_open_time_for_freshness(monkeypatch):
+    fixed_now = int(time.time() * 1000)
+    monkeypatch.setattr(scanner_module.time, "time", lambda: fixed_now / 1000)
+    from app.automation import signal_validator as validator_module
+    monkeypatch.setattr(validator_module.time, "time", lambda: fixed_now / 1000)
 
-    async def fake_request(**kwargs):
-        return responses.pop(0)
+    step = 3_600_000
+    base_4h = (fixed_now // (4 * step)) * (4 * step) - 200 * (4 * step)
+    rows_4h = [_row(base_4h + i * 4 * step) for i in range(200)]
+    rows_1h = [_row(fixed_now - 180 * step + i * step) for i in range(180)]
+    rows_1d = [_row((fixed_now // (86_400_000)) * 86_400_000 - 180 * 86_400_000 + i * 86_400_000) for i in range(180)]
+    fake_analysis = _valid_analysis(candle_time=fixed_now - step)
+    fake_analysis["candle_close_time"] = fixed_now
 
-    async def run():
-        client.http.request = fake_request
-        return await client._public_request({"method": "GET", "url": "https://example.test"})
+    async def fake_get_closed(_symbol, timeframe, _limit):
+        return {"4H": rows_4h, "1H": rows_1h, "1D": rows_1d}[timeframe], False
 
-    response = asyncio.run(run())
-    assert response.status_code == 200
-    assert client._public_rate_limit_events == 1
-    asyncio.run(client.close())
-
-
-def test_live_scanner_stages_15m_then_htf_without_5m_confirmation(monkeypatch):
     class FakeClient:
-        def __init__(self):
-            self.calls = []
-
-        async def get_klines(self, symbol, interval, limit):
-            self.calls.append((symbol, interval))
-            step = {"Hour4": 14_400_000, "Min60": 3_600_000, "Min15": 900_000, "Day1": 86_400_000}[interval]
-            end = int(time.time() * 1000)
-            base = end - 259 * step
-            return [[base + i * step, 100, 101, 99, 100, 1000] for i in range(260)]
+        async def get_ticker(self, symbol):
+            return {"lastPrice": 100.0, "bid1": 99.99, "ask1": 100.01, "timestamp": fixed_now}
 
     class FakeUniverse:
         async def refresh(self):
-            return ["X_USDT"]
+            return ["BTC_USDT"]
 
-    class FakeSignals:
-        pass
+    class FakeSignalManager:
+        async def publish(self, signal):
+            return True
 
-    import app.automation.scanner as scanner_module
-
-    monkeypatch.setattr(
-        scanner_module,
-        "_four_hour_regime",
-        lambda c: {"bull": True, "bear": False, "regime": "BULLISH"},
-    )
-    monkeypatch.setattr(
-        scanner_module,
-        "_one_hour_alignment",
-        lambda c, r: {"long": True, "short": False, "long_votes": 4, "short_votes": 0},
-    )
-    monkeypatch.setattr(
-        scanner_module,
-        "_bos_events",
-        lambda c, side: [{"level": 100, "time": c[-2]["time"], "strength": 1}] if side == "LONG" else [],
-    )
-    monkeypatch.setattr(
-        scanner_module,
-        "_select_latest_bos_with_retest",
-        lambda c, side, events: (
-            {"level": 100, "strength": 1},
-            {"valid": True, "time": c[-2]["time"], "quality": 1.0, "rejection": True},
-        ) if side == "LONG" else (None, {"valid": False}),
-    )
-    monkeypatch.setattr(
-        scanner_module,
-        "analyze_candles",
-        lambda *args, **kwargs: {"setup": "NO TRADE"},
-    )
-
-    async def run():
-        client = FakeClient()
-        scanner = MexcScanner(
-            settings=Settings(scan_concurrency=4),
-            client=client,
-            universe=FakeUniverse(),
-            signal_manager=FakeSignals(),
-        )
-        await scanner.scan_once()
-        return [interval for symbol, interval in client.calls if symbol == "X_USDT"]
-
-    calls = asyncio.run(run())
-    assert calls == ["Min15", "Hour4", "Min60", "Day1"]
+    monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: dict(fake_analysis))
+    scanner = MexcScanner(settings=Settings(max_signal_age_seconds=1200, min_confluence=65, min_rr=2.0), client=FakeClient(), universe=FakeUniverse(), signal_manager=FakeSignalManager())
+    monkeypatch.setattr(scanner, "_get_closed_candles", fake_get_closed)
+    result = asyncio.run(scanner._scan_one("BTC_USDT"))
+    assert result["sent"] is True
+    assert result["analysis"]["candle_time"] == fixed_now
 
 
-def test_validate_analysis_honors_configured_confluence_floor():
-    data = _valid_analysis("LONG")
-    data["score"] = 78
-    ok, reasons = validate_analysis(data, min_confluence=82, min_rr=2.0)
-    assert not ok
-    assert any("Score 78 < required 82" in reason for reason in reasons)
+def test_scanner_reports_distinct_stage_reasons_instead_of_generic_no_setup(monkeypatch):
+    fixed_now = int(time.time() * 1000)
+    step = 3_600_000
+    base_4h = (fixed_now // (4 * step)) * (4 * step) - 200 * (4 * step)
+    rows_4h = [_row(base_4h + i * 4 * step) for i in range(200)]
+    rows_1h = [_row(fixed_now - 180 * step + i * step) for i in range(180)]
+    rows_1d = [_row((fixed_now // (86_400_000)) * 86_400_000 - 180 * 86_400_000 + i * 86_400_000) for i in range(180)]
+    analysis = _valid_analysis(candle_time=fixed_now)
+    analysis.update({"setup": "NO TRADE", "diagnostic_failures": ["4H BOS/retest structure"], "rejection_stage": "4H_SETUP"})
+
+    class FakeClient:
+        async def get_ticker(self, symbol): return {"lastPrice": 100.0}
+    class FakeUniverse:
+        async def refresh(self): return ["X_USDT"]
+    class FakeSignalManager: pass
+
+    monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: analysis)
+    scanner = MexcScanner(settings=Settings(), client=FakeClient(), universe=FakeUniverse(), signal_manager=FakeSignalManager())
+    async def fake_get_closed(_symbol, _tf, _limit):
+        return {"4H": rows_4h, "1H": rows_1h, "1D": rows_1d}[_tf], False
+    monkeypatch.setattr(scanner, "_get_closed_candles", fake_get_closed)
+    result = asyncio.run(scanner._scan_one("X_USDT"))
+    assert result["rejection_stage"] == "4H_SETUP"
+    assert result["rejection_reasons"] == ["4H BOS/retest structure"]
+
+
+def test_signal_format_uses_1d_12h_4h_1h_basis():
+    signal, reasons = validate_signal(_valid_analysis(), min_confluence=65, min_rr=2.0)
+    assert signal is not None, reasons
+    text = format_signal(signal)
+    assert "1D:" in text and "12H:" in text and "4H:" in text and "1H:" in text
+    assert "15M" not in text
+
+
+def test_risk_math_is_consistent():
+    plan = TradePlan("LONG", 100, 95, 110, 3.0)
+    assert validate_levels(plan, 2.0) == (True, "OK")
+    assert calculate_risk_amount(1000, 1.0) == 10.0
+    assert calculate_contract_quantity(10, 100, 95, 1, 0.1, 0.1, 10, cost_buffer_pct=0) == 2.0

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.engine import APPROVED_TIMEFRAMES, synthesize_12h_from_4h
+from app.analysis.engine import APPROVED_TIMEFRAMES, TIMEFRAME_ALIASES as ENGINE_TIMEFRAME_ALIASES, synthesize_12h_from_4h
 from app.backtest.report import format_report, summarize
 from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner
 from app.backtest.simulator import simulate_trade
@@ -26,7 +26,7 @@ def candle(ts: int, close: float, *, spread: float = 2.0, volume: float = 100.0)
 
 def test_only_approved_timeframes_are_exposed():
     assert APPROVED_TIMEFRAMES == ("1D", "12H", "4H", "1H")
-    assert set(TIMEFRAME_ALIASES) == {"1H", "1HR", "1HOUR", "4H", "4HR", "4HOUR", "12H", "12HR", "12HOUR", "1D", "1DAY"}
+    assert set(ENGINE_TIMEFRAME_ALIASES) == {"1H", "1HR", "1HOUR", "4H", "4HR", "4HOUR", "12H", "12HR", "12HOUR", "1D", "1DAY"}
 
 
 def test_12h_is_causally_aggregated_from_contiguous_4h():
@@ -211,6 +211,7 @@ def test_bot_commands_are_whatsapp_only(tmp_path: Path):
     asyncio.run(bot.handle("923001234567", "HELP"))
     assert "BACKTEST 1D" in wa.texts[-1][1]
     assert "12H" in wa.texts[-1][1]
+    assert "15M Structure" not in wa.texts[-1][1]
 
 
 def test_whatsapp_signature_verification():

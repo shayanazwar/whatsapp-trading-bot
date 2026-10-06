@@ -2,74 +2,54 @@ from __future__ import annotations
 
 import pytest
 
-from app.analysis.engine import evaluate_confirmation_families
-from app.automation.scanner import MexcScanner
-from app.backtest.report import format_report, summarize
-from app.backtest.simulator import simulate_trade
+from app.analysis.engine import APPROVED_TIMEFRAMES, synthesize_12h_from_4h
+from app.automation.signal_validator import validate_signal
 
-M5 = 300_000
 
-def candle(ts, o, h, l, c, v=1000.0):
-    return [ts, o, h, l, c, v]
+def candle(ts, price):
+    return [ts, price, price + 1, price - 1, price, 1000.0]
 
-def signal(side="LONG", **overrides):
-    base = {"symbol":"TEST_USDT","setup":side,"entry":100.0,"stop_loss":95.0 if side == "LONG" else 105.0,"tp":110.0 if side == "LONG" else 90.0,"position_size":1.0,"contract_size":1.0}
-    base.update(overrides)
-    return base
 
-def test_single_tp_long_wins_without_partial_or_breakeven():
-    trade = simulate_trade(signal(), [candle(M5,100,111,100,110)], signal_close_time_ms=M5, fee_rate=0, slippage_bps=0)
-    assert trade is not None and trade.outcome == "TP"
-    assert trade.tp1_hit and trade.tp2_hit
-    assert trade.breakeven_hit is False
-    assert trade.tp1_close_size == pytest.approx(0)
-    assert trade.final_close_size == pytest.approx(1)
-    assert trade.remaining_position_size == pytest.approx(0)
-    assert trade.r_multiple == pytest.approx(2.0)
+def test_strategy_uses_only_1d_12h_4h_1h():
+    assert APPROVED_TIMEFRAMES == ("1D", "12H", "4H", "1H")
 
-def test_single_tp_long_stops_before_target():
-    trade = simulate_trade(signal(), [candle(M5,100,101,94,99)], signal_close_time_ms=M5, fee_rate=0, slippage_bps=0)
-    assert trade is not None and trade.outcome == "SL" and trade.sl_hit
-    assert trade.r_multiple == pytest.approx(-1.0)
 
-def test_same_bar_rule_is_deterministic():
-    future=[candle(M5,100,111,94,100)]
-    conservative=simulate_trade(signal(), future, signal_close_time_ms=M5, fee_rate=0, slippage_bps=0, same_bar_rule="SL_FIRST")
-    permissive=simulate_trade(signal(), future, signal_close_time_ms=M5, fee_rate=0, slippage_bps=0, same_bar_rule="TP_FIRST")
-    assert conservative is not None and conservative.outcome == "SL"
-    assert permissive is not None and permissive.outcome == "TP"
+def test_12h_is_built_only_from_three_contiguous_completed_4h_bars():
+    base = (1_700_000_000_000 // 43_200_000) * 43_200_000
+    rows = [candle(base + i * 14_400_000, 100 + i) for i in range(4)]
+    out = synthesize_12h_from_4h(rows, now_ms=base + 43_200_000 + 1)
+    assert len(out) == 1
+    assert out[0]["open"] == pytest.approx(100)
+    assert out[0]["close"] == pytest.approx(102)
+    assert out[0]["volume"] == pytest.approx(3000)
 
-def test_single_tp_expiry_realizes_previous_close():
-    future=[candle(M5+i*M5,100,101,99,100.5) for i in range(4)]
-    trade=simulate_trade(signal(), future, signal_close_time_ms=M5, fee_rate=0, slippage_bps=0, max_holding_minutes=10)
-    assert trade is not None and trade.outcome == "EXPIRED" and trade.expired
-    assert trade.hold_minutes is not None and trade.hold_minutes <= 10
 
-def test_single_tp_costs_reduce_realized_r():
-    trade=simulate_trade(signal(), [candle(M5,100,111,100,110)], signal_close_time_ms=M5, fee_rate=0.001, slippage_bps=10)
-    assert trade is not None and trade.outcome == "TP"
-    assert trade.fees_r > 0 and trade.slippage_r > 0
-    assert trade.r_multiple < trade.planned_rr
+def valid_analysis():
+    import time
+    now = int(time.time() * 1000)
+    return {
+        "symbol": "BTC_USDT", "setup": "LONG", "candle_time": now,
+        "setup_bos_time": 1_699_992_800_000, "bos_4h_level": 100.0,
+        "score": 80, "direction_ok": True, "structure_ok": True, "setup_ok": True,
+        "confirmation_ok": True, "location_ok": True, "target_path_structural": True,
+        "structure_quality_ok": True, "shock_veto_ok": True, "technical_candidate": True,
+        "trade_geometry_ok": True, "risk_ok": True, "primary_entry_timeframe": "1H",
+        "signal_candle_timeframe": "1H", "entry": 110.0, "stop_loss": 104.0, "tp": 128.0,
+        "rr": 3.0, "atr": 4.0, "sl_atr": 1.5, "tp_distance_atr": 4.5, "mexc_spread_pct": 0.01,
+        "max_allowed_spread_pct": 0.50, "max_signal_age_seconds": 5400,
+    }
 
-def test_live_geometry_requires_real_single_tp():
-    analysis={"entry":100.0,"stop_loss":98.0,"tp":106.0,"atr":1.0}
-    ok, reason=MexcScanner._validate_live_geometry(analysis,100.0,"LONG",max_drift_atr=0.20)
-    assert ok, reason
-    assert analysis["tp"] == pytest.approx(106.0)
-    assert analysis["tp_distance_atr"] == pytest.approx(6.0)
 
-def test_report_uses_single_tp_metrics():
-    trade=simulate_trade(signal(), [candle(M5,100,111,100,110)], signal_close_time_ms=M5, fee_rate=0, slippage_bps=0)
-    summary=summarize(days=7,coins_selected=1,coins_tested=1,data_errors=0,trades=[trade])
-    text=format_report(summary)
-    assert "TP HIT: 1" in text
-    assert "AVG TP DIST" in text
-    assert "Win rate = single TP before SL" in text
-    assert "TP1→BE" not in text
+def test_signal_validator_requires_1h_entry_and_structural_geometry():
+    data = valid_analysis()
+    signal, reasons = validate_signal(data, min_confluence=65, min_rr=2.0)
+    assert signal is not None, reasons
+    assert signal.analysis["primary_entry_timeframe"] == "1H"
 
-def test_confirmation_families_require_five_and_diversity():
-    data={"setup":"LONG","momentum_quality":0.8,"rvol_15m":1.5,"volatility_ok":True,"entry":100,"tp":105,"atr":1,"target_path_ok":True,"target_path_structural":True,"flow_proxy_ratio":0.2,"rolling_vwap_12h":99}
-    out=evaluate_confirmation_families(data)
-    assert out["passed"] >= 5
-    assert out["available"] >= 6
-    assert out["diversity_ok"] is True
+
+def test_signal_validator_rejects_non_1h_entry_timeframe():
+    data = valid_analysis()
+    data["primary_entry_timeframe"] = "15M"
+    signal, reasons = validate_signal(data, min_confluence=65, min_rr=2.0)
+    assert signal is None
+    assert any("Primary entry timeframe" in r for r in reasons)

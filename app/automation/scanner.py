@@ -211,7 +211,7 @@ class MexcScanner:
                 payload[f"pass_{tf.lower()}"] = 1
             payload["data_valid"] = 1
 
-            analysis = analyze_candles(symbol, c1d, c12, c4, c1)
+            analysis = analyze_candles(symbol, c1d, c12, c4, c1, btc_context=self._btc_context)
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
             payload["regime_pass"] = int(bool(stages.get("1D_REGIME")))

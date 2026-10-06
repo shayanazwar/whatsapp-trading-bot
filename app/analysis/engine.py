@@ -32,26 +32,34 @@ APPROVED_TIMEFRAMES = ("1D", "12H", "4H", "1H")
 
 MIN_SCORE = 65
 MIN_RR = 2.0
-MIN_SL_ATR = 1.0
-MAX_SL_ATR = 3.5
-MIN_TP_ATR = 2.0
-MIN_ATR_PERCENTILE = 10.0
+MIN_SL_ATR = 0.50
+MAX_SL_ATR = 1.25
+MIN_TP_ATR = 1.00
+MIN_ATR_PERCENTILE = 5.0
 MAX_ATR_PERCENTILE = 98.0
 BOS_BUFFER_ATR = 0.10
-RETEST_TOLERANCE_ATR = 0.35
-RETEST_PENETRATION_ATR = 0.65
-RETEST_INVALIDATION_ATR = 0.35
+RETEST_TOLERANCE_ATR = 0.25
+RETEST_PENETRATION_ATR = 0.75
+RETEST_INVALIDATION_ATR = 0.25
 MAX_SETUP_AGE_4H = 18  # 72h
-MAX_RETEST_BARS_4H = 10
-MAX_ENTRY_DISTANCE_ATR = 1.25  # measured from the 4H BOS level in 4H ATR
+MAX_RETEST_BARS_4H = 12
+MAX_ENTRY_DISTANCE_ATR = 0.40  # market-entry distance from retest zone edge
+MAX_LIMIT_ENTRY_DISTANCE_ATR = 1.25
+MIN_DEPARTURE_ATR = 0.75
+MAX_DEPARTURE_BARS_4H = 6
+MAX_RETEST_1H_BARS = 12
+RETEST_ZONE_FLOOR_ATR = 0.25
+RETEST_ZONE_CEILING_ATR = 0.75
+RETEST_WICK_MIN = 0.30
+LIMIT_ENTRY_EXPIRY_BARS = 2
 BTC_SHOCK_ATR = 2.0
 ADX_TREND_MIN = 14.0
 MIN_TRIGGER_BODY = 0.25
 MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 3
-DEFAULT_MAX_HOLD_MINUTES = 12 * 60
-ENGINE_VERSION = "gold-v8.1-1d-12h-4h-1h-balanced-retest"
+DEFAULT_MAX_HOLD_MINUTES = 72 * 60
+ENGINE_VERSION = "gold-v9.0-true-retest-geometry"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -412,57 +420,130 @@ def _bos_events(candles: list[Candle], side: str, lookback: int = 70) -> list[di
 
 
 def _pullback_retest(candles: list[Candle], side: str, bos: Optional[dict[str, Any]], max_bars: int = MAX_RETEST_BARS_4H) -> dict[str, Any]:
-    empty = {"valid": False, "index": None, "time": None, "level": bos.get("level") if bos else None, "quality": 0.0, "rejection": False, "low": None, "high": None}
-    if not bos:
+    empty = {
+        "valid": False, "index": None, "time": None, "level": bos.get("level") if bos else None,
+        "quality": 0.0, "rejection": False, "low": None, "high": None,
+        "zone_floor": None, "zone_ceiling": None, "departure_index": None,
+        "departure_time": None, "departure_atr": 0.0, "state": "IDLE",
+        "atr": _num((bos or {}).get("atr")),
+    }
+    if not bos or side not in {"LONG", "SHORT"}:
         return empty
-    start = int(bos["index"]) + 1
+    bos_index = int(bos["index"])
+    start = bos_index + 1
     end = min(len(candles), start + max_bars)
-    a = _num(bos.get("atr"))
-    if start >= end or a <= 0:
+    atr4 = _num(bos.get("atr"))
+    if start >= end or atr4 <= 0:
         return empty
+
     level = float(bos["level"])
-    tol = max(a * RETEST_TOLERANCE_ATR, 1e-12)
-    penetration = max(a * RETEST_PENETRATION_ATR, 1e-12)
+    bos_candle = candles[bos_index]
+    body_hi = max(float(bos_candle["open"]), float(bos_candle["close"]))
+    body_lo = min(float(bos_candle["open"]), float(bos_candle["close"]))
+    if side == "LONG":
+        zone_floor = level - RETEST_ZONE_FLOOR_ATR * atr4
+        zone_ceiling = min(max(level, body_hi), level + RETEST_ZONE_CEILING_ATR * atr4)
+    else:
+        zone_floor = max(level - RETEST_ZONE_CEILING_ATR * atr4, min(level, body_lo))
+        zone_ceiling = level + RETEST_ZONE_FLOOR_ATR * atr4
+
+    departed = False
+    departure_index = None
+    departure_atr = 0.0
+    touch_index = None
+    touch_low = None
+    touch_high = None
+
     for i in range(start, end):
         c = candles[i]
-        o, h, l, close = map(float, (c["open"], c["high"], c["low"], c["close"]))
-        rng = max(h - l, 1e-12)
-        if side == "LONG":
-            # Once price closes materially back below the broken level before a
-            # valid retest, the BOS is considered structurally failed.
-            if close < level - a * RETEST_INVALIDATION_ATR:
+        h, l, close = float(c["high"]), float(c["low"]), float(c["close"])
+
+        # A real retest must first have a meaningful displacement away from L.
+        if not departed:
+            if side == "LONG":
+                if close <= level and h < level + MIN_DEPARTURE_ATR * atr4:
+                    if close < zone_floor:
+                        return empty
+                    continue
+                if h >= level + MIN_DEPARTURE_ATR * atr4 and close > level:
+                    departed = True
+                    departure_index = i
+                    departure_atr = (h - level) / atr4
+                    continue
+                if close < zone_floor:
+                    return empty
+                continue
+            else:
+                if close >= level and l > level - MIN_DEPARTURE_ATR * atr4:
+                    if close > zone_ceiling:
+                        return empty
+                    continue
+                if l <= level - MIN_DEPARTURE_ATR * atr4 and close < level:
+                    departed = True
+                    departure_index = i
+                    departure_atr = (level - l) / atr4
+                    continue
+                if close > zone_ceiling:
+                    return empty
+                continue
+
+        # After departure, a setup may not run endlessly without retesting.
+        if touch_index is None:
+            if i - int(departure_index) > MAX_RETEST_BARS_4H:
                 return empty
-            intersects = l <= level + tol and h >= level - penetration
-            held = close >= level - a * RETEST_INVALIDATION_ATR
-            wick = min(o, close) - l
-            directional = close >= o
-        else:
-            if close > level + a * RETEST_INVALIDATION_ATR:
+            if side == "LONG" and h >= level + 3.0 * atr4:
                 return empty
-            intersects = h >= level - tol and l <= level + penetration
-            held = close <= level + a * RETEST_INVALIDATION_ATR
-            wick = h - max(o, close)
-            directional = close <= o
-        if not (intersects and held):
+            if side == "SHORT" and l <= level - 3.0 * atr4:
+                return empty
+            touched = l <= zone_ceiling and h >= zone_floor
+            if touched:
+                if side == "LONG" and close < zone_floor:
+                    return empty
+                if side == "SHORT" and close > zone_ceiling:
+                    return empty
+                touch_index = i
+                touch_low, touch_high = l, h
             continue
 
-        # A retest is valid only while the broken level remains defended.
-        # Look forward through the remaining setup window and invalidate the
-        # BOS if price subsequently closes materially back through the level.
-        invalidated = False
-        for j in range(i + 1, end):
-            future_close = float(candles[j]["close"])
-            if (side == "LONG" and future_close < level - a * RETEST_INVALIDATION_ATR) or (side == "SHORT" and future_close > level + a * RETEST_INVALIDATION_ATR):
-                invalidated = True
-                break
-        if invalidated:
+        touch_low = min(float(touch_low), l)
+        touch_high = max(float(touch_high), h)
+        if side == "LONG" and close < zone_floor:
             return empty
+        if side == "SHORT" and close > zone_ceiling:
+            return empty
+        if i - int(touch_index) > max_bars:
+            break
 
-        rejection = wick / rng >= 0.18
-        quality = _clamp(0.65 + (0.20 if rejection else 0) + (0.15 if directional else 0), 0, 1)
-        return {"valid": True, "index": i, "time": int(c["time"]), "level": level, "quality": quality, "rejection": rejection, "low": l, "high": h}
-    return empty
+    if not departed or departure_index is None or touch_index is None:
+        return empty
 
+    tc = candles[touch_index]
+    rng = max(float(tc["high"]) - float(tc["low"]), 1e-12)
+    if side == "LONG":
+        wick = min(float(tc["open"]), float(tc["close"])) - float(tc["low"])
+        directional = float(tc["close"]) >= float(tc["open"])
+    else:
+        wick = float(tc["high"]) - max(float(tc["open"]), float(tc["close"]))
+        directional = float(tc["close"]) <= float(tc["open"])
+    rejection = wick / rng >= RETEST_WICK_MIN
+    quality = _clamp(0.55 + (0.25 if rejection else 0.0) + (0.20 if directional else 0.0), 0, 1)
+    return {
+        "valid": True,
+        "index": touch_index,
+        "time": int(candles[touch_index]["time"]),
+        "level": level,
+        "quality": quality,
+        "rejection": rejection,
+        "low": float(touch_low),
+        "high": float(touch_high),
+        "zone_floor": float(zone_floor),
+        "zone_ceiling": float(zone_ceiling),
+        "departure_index": departure_index,
+        "departure_time": int(candles[departure_index]["time"]),
+        "departure_atr": float(departure_atr),
+        "atr": atr4,
+        "state": "RETEST_TOUCHED",
+    }
 
 def _select_latest_bos_with_retest(candles: list[Candle], side: str, events: Optional[list[dict[str, Any]]] = None) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     events = events if events is not None else _bos_events(candles, side)
@@ -481,109 +562,154 @@ def _select_latest_bos_with_retest(candles: list[Candle], side: str, events: Opt
     return None, empty
 
 
-def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level: Optional[float], retest_time: Optional[int]) -> dict[str, Any]:
+def _one_hour_trigger_confirmation(
+    candles: list[Candle],
+    side: str,
+    setup: Optional[dict[str, Any]] = None,
+    retest_time: Optional[int] = None,
+) -> dict[str, Any]:
+    # Backward compatibility: callers passing a bare level + retest time still work,
+    # but the production path supplies the full retest zone dictionary.
+    setup_dict = setup if isinstance(setup, dict) else {"level": setup, "time": retest_time}
     empty = {
         "ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": 0.0,
         "body_ratio": 0.0, "close_location": 0.0, "candle_time": 0,
         "trigger_type": "NONE", "reason": "insufficient data", "bars_after_retest": None,
+        "touched_level": False, "rejection_wick_ratio": 0.0, "entry_price": None,
+        "entry_mode": "MARKET", "limit_price": None, "zone_floor": None, "zone_ceiling": None,
+        "retest_low_1h": None, "retest_high_1h": None,
     }
-    if len(candles) < 40 or setup_level is None or side not in {"LONG", "SHORT"}:
+    if len(candles) < 40 or side not in {"LONG", "SHORT"}:
         return empty
-
-    closes = [float(c["close"]) for c in candles]
-    atr_value = _safe_atr(candles)
-    if atr_value <= 0:
-        empty["reason"] = "1H ATR unavailable"
+    level = _num(setup_dict.get("level"))
+    zone_floor = _num(setup_dict.get("zone_floor"))
+    zone_ceiling = _num(setup_dict.get("zone_ceiling"))
+    if zone_floor <= 0 or zone_ceiling <= 0 or level <= 0:
+        if retest_time is None:
+            empty["reason"] = "1H retest zone unavailable"
+            return empty
+        zone_floor = level - 0.25 * _safe_atr(candles)
+        zone_ceiling = level + 0.25 * _safe_atr(candles)
+    start_time = int(setup_dict.get("time") or retest_time or 0)
+    atr4 = max(_num(setup_dict.get("atr")), _safe_atr(candles))
+    atr1 = _safe_atr(candles)
+    if level <= 0 or atr1 <= 0 or atr4 <= 0 or start_time <= 0:
+        empty["reason"] = "1H retest zone/ATR unavailable"
         return empty
 
     latest_index = len(candles) - 1
     cur = candles[latest_index]
-    prev = candles[latest_index - 1]
-
-    bars_after_retest = None
-    if retest_time is not None:
-        retest_close_time = int(retest_time) + TIMEFRAME_MS["4h"]
-        if int(cur["time"]) < retest_close_time:
-            empty["candle_time"] = int(cur["time"])
-            empty["reason"] = "No 1H trigger after completed 4H retest"
-            return empty
-        trigger_base = next((i for i, c in enumerate(candles) if int(c["time"]) >= retest_close_time), None)
-        if trigger_base is None:
-            empty["candle_time"] = int(cur["time"])
-            empty["reason"] = "No 1H trigger window after completed 4H retest"
-            return empty
-        bars_after_retest = latest_index - (trigger_base - 1)
-        if bars_after_retest < 1 or bars_after_retest > MAX_TRIGGER_BARS_1H:
-            empty["candle_time"] = int(cur["time"])
-            empty["bars_after_retest"] = bars_after_retest
-            empty["reason"] = "Latest 1H bar is outside retest trigger window"
-            return empty
-
-    o, h, l, close = map(float, (cur["open"], cur["high"], cur["low"], cur["close"]))
-    ph, pl = float(prev["high"]), float(prev["low"])
-    rng = max(h - l, 1e-12)
-    body = abs(close - o) / rng
-    atr_i = _safe_atr(candles) or atr_value
+    empty["candle_time"] = int(cur["time"])
+    closes = [float(c["close"]) for c in candles]
     r = _safe_rsi(closes)
     rv = _relative_volume(candles)
-    buffer = max(atr_i * 0.05, 1e-12)
+    o, h, l, close = map(float, (cur["open"], cur["high"], cur["low"], cur["close"]))
+    rng = max(h - l, 1e-12)
+    body = abs(close - o) / rng
     loc = (close - l) / rng if side == "LONG" else (h - close) / rng
+    lower_wick = min(o, close) - l
+    upper_wick = h - max(o, close)
 
-    if side == "LONG":
-        breakout = close > setup_level + buffer and close > o and close >= ph
-        reclaim = close > setup_level + buffer and close > o and l <= setup_level + max(0.25 * atr_i, buffer)
-        continuation = close > setup_level + buffer and close > o and close > float(prev["close"])
-        directional = r >= 50.0
-        qmom = _clamp((r - 47.0) / 20.0, 0, 1)
-        trigger_type = "RECLAIM" if reclaim else "BREAKOUT"
+    start_idx = next((i for i, c in enumerate(candles) if int(c["time"]) >= start_time), None)
+    if start_idx is None:
+        empty["reason"] = "No 1H candles after retest"
+        return empty
+
+    touched = False
+    touch_idx = None
+    extreme_low = None
+    extreme_high = None
+    invalid = False
+    rejection_idx = None
+    rejection_wick = 0.0
+
+    for i in range(start_idx, latest_index + 1):
+        c = candles[i]
+        co, ch, cl, cc = map(float, (c["open"], c["high"], c["low"], c["close"]))
+        if not touched:
+            if cl <= zone_ceiling and ch >= zone_floor:
+                touched = True
+                touch_idx = i
+                extreme_low = cl
+                extreme_high = ch
+                if side == "LONG" and cc < zone_floor:
+                    invalid = True
+                    break
+                if side == "SHORT" and cc > zone_ceiling:
+                    invalid = True
+                    break
+            continue
+
+        extreme_low = min(float(extreme_low), cl)
+        extreme_high = max(float(extreme_high), ch)
+        if side == "LONG" and cc < zone_floor:
+            invalid = True
+            break
+        if side == "SHORT" and cc > zone_ceiling:
+            invalid = True
+            break
+
+        bars = i - int(touch_idx)
+        if bars > MAX_RETEST_1H_BARS:
+            break
+
+        crange = max(ch - cl, 1e-12)
+        if side == "LONG":
+            wick = min(co, cc) - cl
+            rejection = cc > level + max(0.03 * atr1, 1e-12) and (cc >= co or wick / crange >= RETEST_WICK_MIN)
+        else:
+            wick = ch - max(co, cc)
+            rejection = cc < level - max(0.03 * atr1, 1e-12) and (cc <= co or wick / crange >= RETEST_WICK_MIN)
+        if i == latest_index and rejection:
+            rejection_idx = i
+            rejection_wick = wick / crange
+
+    if invalid:
+        empty.update({"reason": "1H retest invalidated through zone floor", "touched_level": touched, "retest_low_1h": extreme_low, "retest_high_1h": extreme_high})
+        return empty
+    if not touched:
+        empty["reason"] = "No 1H retest touch in breakout zone"
+        return empty
+    bars_after_retest = latest_index - int(touch_idx)
+    if bars_after_retest > MAX_RETEST_1H_BARS:
+        empty.update({"bars_after_retest": bars_after_retest, "touched_level": True, "reason": "1H retest confirmation window expired", "retest_low_1h": extreme_low, "retest_high_1h": extreme_high})
+        return empty
+    if rejection_idx is None:
+        empty.update({"bars_after_retest": bars_after_retest, "touched_level": True, "reason": "Latest 1H bar is not a retest rejection/reclaim", "retest_low_1h": extreme_low, "retest_high_1h": extreme_high})
+        return empty
+
+    zone_edge = zone_ceiling if side == "LONG" else zone_floor
+    current_distance_atr = abs(close - zone_edge) / atr4
+    if current_distance_atr <= MAX_ENTRY_DISTANCE_ATR:
+        entry_price = close
+        entry_mode = "MARKET"
+        limit_price = None
+    elif current_distance_atr <= MAX_LIMIT_ENTRY_DISTANCE_ATR:
+        entry_price = zone_edge
+        entry_mode = "LIMIT"
+        limit_price = zone_edge
     else:
-        breakout = close < setup_level - buffer and close < o and close <= pl
-        reclaim = close < setup_level - buffer and close < o and h >= setup_level - max(0.25 * atr_i, buffer)
-        continuation = close < setup_level - buffer and close < o and close < float(prev["close"])
-        directional = r <= 50.0
-        qmom = _clamp((53.0 - r) / 20.0, 0, 1)
-        trigger_type = "RECLAIM" if reclaim else "BREAKOUT"
+        empty.update({"reason": f"1H confirmation too far from retest zone ({current_distance_atr:.2f} ATR4H)", "bars_after_retest": bars_after_retest, "touched_level": True, "retest_low_1h": extreme_low, "retest_high_1h": extreme_high})
+        return empty
 
-    trigger = bool((breakout or reclaim or continuation) and directional)
-    hard_execution = bool(
-        trigger
-        and body >= MIN_TRIGGER_BODY
-        and loc >= MIN_TRIGGER_CLOSE_LOCATION
-        and rv >= MIN_TRIGGER_RVOL
-    )
-
+    momentum_quality = _clamp(((r - 50.0) / 20.0) if side == "LONG" else ((50.0 - r) / 20.0), 0, 1)
     quality = _clamp(
-        0.38 * _clamp(body / 0.70, 0, 1)
-        + 0.27 * _clamp(rv / 1.5, 0, 1)
-        + 0.25 * qmom
-        + 0.10 * (1.0 if loc >= MIN_TRIGGER_CLOSE_LOCATION else 0.0),
+        0.30 * _clamp(body / 0.70, 0, 1)
+        + 0.20 * _clamp(rv / 1.5, 0, 1)
+        + 0.20 * momentum_quality
+        + 0.15 * _clamp(loc, 0, 1)
+        + 0.15 * _clamp(rejection_wick / 0.60, 0, 1),
         0, 1,
     )
-
-    if not trigger:
-        reason = "Latest 1H bar is not a qualifying post-retest confirmation"
-    elif not hard_execution:
-        reason = "1H trigger found but candle quality below minimum"
-    else:
-        reason = "1H post-retest execution confirmation"
-
     return {
-        "index": latest_index,
-        "ready": bool(hard_execution),
-        "quality": quality,
-        "rsi": r,
-        "rvol": rv,
-        "atr": atr_i,
-        "body_ratio": body,
-        "close_location": loc,
-        "candle_time": int(cur["time"]),
-        "trigger_type": trigger_type if trigger else "NONE",
-        "reason": reason,
-        "bars_after_retest": bars_after_retest,
-        "touched_level": bool(reclaim),
-        "rejection_wick_ratio": 0.0,
-        "previous_high": ph,
-        "previous_low": pl,
+        "index": latest_index, "ready": True, "quality": quality, "rsi": r, "rvol": rv,
+        "atr": atr1, "body_ratio": body, "close_location": loc, "candle_time": int(cur["time"]),
+        "trigger_type": "RETEST_RECLAIM", "reason": "Latest 1H retest rejection/reclaim",
+        "bars_after_retest": bars_after_retest, "touched_level": True,
+        "rejection_wick_ratio": rejection_wick, "previous_high": float(candles[latest_index - 1]["high"]),
+        "previous_low": float(candles[latest_index - 1]["low"]), "entry_price": entry_price,
+        "entry_mode": entry_mode, "limit_price": limit_price, "zone_floor": zone_floor,
+        "zone_ceiling": zone_ceiling, "retest_low_1h": extreme_low, "retest_high_1h": extreme_high,
     }
 
 def _collect_structural_levels(frames: Iterable[tuple[str, list[Candle]]], entry: float) -> list[dict[str, Any]]:
@@ -609,81 +735,120 @@ def _collect_structural_levels(frames: Iterable[tuple[str, list[Candle]]], entry
 
 def _target_path(frames: Iterable[tuple[str, list[Candle]]], side: str, entry: float, stop: float, atr_value: float) -> dict[str, Any]:
     risk = abs(entry - stop)
-    result = {"ok": False, "tp": None, "risk": risk, "structural": False, "target_levels": [], "target_timeframe": None, "blocking_level": None, "reason": "no target"}
+    result = {
+        "ok": False, "tp": None, "risk": risk, "structural": False, "target_levels": [],
+        "target_timeframe": None, "blocking_level": None, "reason": "no target",
+    }
     if risk <= 0 or atr_value <= 0:
         result["reason"] = "zero risk or ATR"
         return result
-    levels = _collect_structural_levels(frames, entry)
+
+    htf_frames = [(tf, candles) for tf, candles in frames if tf in {"1D", "12H", "4H"}]
+    levels = [x for x in _collect_structural_levels(htf_frames, entry) if x.get("timeframe") in {"1D", "12H", "4H"}]
+    if side == "LONG":
+        levels = [x for x in levels if x["kind"] == "RESISTANCE" and float(x["price"]) > entry]
+        levels.sort(key=lambda x: float(x["price"]))
+    else:
+        levels = [x for x in levels if x["kind"] == "SUPPORT" and float(x["price"]) < entry]
+        levels.sort(key=lambda x: float(x["price"]), reverse=True)
     result["target_levels"] = levels[:20]
-    minimum_distance = max(MIN_TP_ATR * atr_value, MIN_RR * risk)
-    candidates = [x for x in levels if x["timeframe"] in {"1D", "12H", "4H"} and (x["price"] > entry + minimum_distance if side == "LONG" else x["price"] < entry - minimum_distance)]
-    candidates.sort(key=lambda x: x["price"], reverse=side == "SHORT")
-    if not candidates:
-        result["reason"] = f"no HTF target reaches {minimum_distance:.6g} price distance"
+    if not levels:
+        result["reason"] = "no meaningful HTF opposing structure"
         return result
-    target = candidates[0]
-    result.update({"ok": True, "tp": float(target["price"]), "structural": True, "target_timeframe": target["timeframe"], "tp_level": target, "blocking_level": None, "reason": "single higher-timeframe structural target"})
+
+    # The nearest meaningful HTF obstacle governs TP. Never skip it merely to
+    # manufacture a higher planned RR.
+    obstacle = levels[0]
+    level_price = float(obstacle["price"])
+    front_run = 0.15 * atr_value
+    tp = level_price - front_run if side == "LONG" else level_price + front_run
+    if side == "LONG" and tp <= entry:
+        result.update({"reason": "nearest HTF resistance is too close", "blocking_level": obstacle})
+        return result
+    if side == "SHORT" and tp >= entry:
+        result.update({"reason": "nearest HTF support is too close", "blocking_level": obstacle})
+        return result
+    result.update({
+        "ok": True, "tp": tp, "structural": True, "target_timeframe": obstacle["timeframe"],
+        "tp_level": obstacle, "blocking_level": obstacle,
+        "reason": "nearest meaningful higher-timeframe opposing level",
+    })
     return result
+
 def calculate_trade_levels(data: dict[str, Any]) -> dict[str, Any]:
     side = str(data.get("setup") or "").upper()
-    entry = _num(data.get("price"))
+    price = _num(data.get("price"))
+    entry = _num(data.get("entry_price", price))
     atr_1h = _num(data.get("atr_1h", data.get("atr")))
     atr_4h = _num(data.get("atr_4h", data.get("atr")))
-    protected_low = _num(data.get("protected_low")) if data.get("protected_low") is not None else None
-    protected_high = _num(data.get("protected_high")) if data.get("protected_high") is not None else None
     retest = data.get("retest") or {}
+    entry_mode = str(data.get("entry_mode") or "MARKET").upper()
     if side not in {"LONG", "SHORT"} or entry <= 0 or atr_1h <= 0 or atr_4h <= 0:
         return {"entry": entry, "stop_loss": None, "tp": None, "rr": None, "trade_geometry_ok": False, "target_path_ok": False, "target_path_structural": False, "stop_source": None, "sl_atr": 0.0, "tp_distance_atr": 0.0, "geometry_reason": "invalid side/entry/ATR"}
-    buffer = max(0.25 * atr_4h, 0.10 * atr_1h)
+
+    zone_floor = _num(retest.get("zone_floor"))
+    zone_ceiling = _num(retest.get("zone_ceiling"))
+    retest_low = _num(data.get("retest_low_1h", retest.get("low"))) if data.get("retest_low_1h", retest.get("low")) is not None else None
+    retest_high = _num(data.get("retest_high_1h", retest.get("high"))) if data.get("retest_high_1h", retest.get("high")) is not None else None
+    buffer = max(0.20 * atr_4h, 0.50 * atr_1h)
+
     if side == "LONG":
-        retest_low = _num(retest.get("low")) if retest.get("low") is not None else None
-        bos_pivot = _num(data.get("bos_pivot_price")) if data.get("bos_pivot_price") is not None else None
-        anchors = [x for x in (retest_low, bos_pivot, protected_low) if x is not None and 0 < x < entry]
-        anchor = anchors[0] if anchors else entry - atr_4h
+        anchors = [x for x in (retest_low, zone_floor) if x is not None and x > 0 and x < entry]
+        if not anchors:
+            return {"entry": entry, "stop_loss": None, "tp": None, "rr": None, "trade_geometry_ok": False, "target_path_ok": False, "target_path_structural": False, "stop_source": None, "sl_atr": 0.0, "tp_distance_atr": 0.0, "geometry_reason": "missing retest structural anchor"}
+        anchor = min(anchors)
         stop = anchor - buffer
-        if entry - stop < MIN_SL_ATR * atr_4h:
-            stop = entry - MIN_SL_ATR * atr_4h
-        stop_source = "4H retest/BOS pivot + ATR buffer"
+        min_dist = max(MIN_SL_ATR * atr_4h, 1.0 * atr_1h)
+        if entry - stop < min_dist:
+            stop = entry - min_dist
+        stop_source = "1H retest extreme + 4H zone floor + ATR buffer"
     else:
-        retest_high = _num(retest.get("high")) if retest.get("high") is not None else None
-        bos_pivot = _num(data.get("bos_pivot_price")) if data.get("bos_pivot_price") is not None else None
-        anchors = [x for x in (retest_high, bos_pivot, protected_high) if x is not None and x > entry]
-        anchor = anchors[0] if anchors else entry + atr_4h
+        anchors = [x for x in (retest_high, zone_ceiling) if x is not None and x > 0 and x > entry]
+        if not anchors:
+            return {"entry": entry, "stop_loss": None, "tp": None, "rr": None, "trade_geometry_ok": False, "target_path_ok": False, "target_path_structural": False, "stop_source": None, "sl_atr": 0.0, "tp_distance_atr": 0.0, "geometry_reason": "missing retest structural anchor"}
+        anchor = max(anchors)
         stop = anchor + buffer
-        if stop - entry < MIN_SL_ATR * atr_4h:
-            stop = entry + MIN_SL_ATR * atr_4h
-        stop_source = "4H retest/BOS pivot + ATR buffer"
-    stop_atr = abs(entry - stop) / atr_4h
+        min_dist = max(MIN_SL_ATR * atr_4h, 1.0 * atr_1h)
+        if stop - entry < min_dist:
+            stop = entry + min_dist
+        stop_source = "1H retest extreme + 4H zone ceiling + ATR buffer"
+
+    sl_atr = abs(entry - stop) / atr_4h
+    if sl_atr > MAX_SL_ATR:
+        return {"entry": entry, "stop_loss": stop, "tp": None, "rr": None, "trade_geometry_ok": False, "target_path_ok": False, "target_path_structural": False, "stop_source": stop_source, "sl_atr": sl_atr, "tp_distance_atr": 0.0, "geometry_reason": f"SL distance {sl_atr:.2f} ATR4H exceeds maximum {MAX_SL_ATR:.2f}", "entry_mode": entry_mode}
+
     path = _target_path(data.get("target_frames", []), side, entry, stop, atr_4h)
     tp = _num(path.get("tp")) if path.get("tp") is not None else None
     if tp is None:
-        return {"entry": entry, "stop_loss": stop, "tp": None, "rr": None, "trade_geometry_ok": False, "target_path_ok": bool(path.get("ok")), "target_path_structural": bool(path.get("structural")), "stop_source": stop_source, "sl_atr": stop_atr, "tp_distance_atr": 0.0, "target_levels": path.get("target_levels", []), "target_timeframe": path.get("target_timeframe"), "blocking_level": path.get("blocking_level"), "target_path_reason": path.get("reason"), "geometry_reason": str(path.get("reason"))}
+        return {"entry": entry, "stop_loss": stop, "tp": None, "rr": None, "trade_geometry_ok": False, "target_path_ok": bool(path.get("ok")), "target_path_structural": bool(path.get("structural")), "stop_source": stop_source, "sl_atr": sl_atr, "tp_distance_atr": 0.0, "target_levels": path.get("target_levels", []), "target_timeframe": path.get("target_timeframe"), "blocking_level": path.get("blocking_level"), "target_path_reason": path.get("reason"), "geometry_reason": str(path.get("reason")), "entry_mode": entry_mode}
+
     reward = abs(tp - entry)
     rr_gross = reward / abs(entry - stop) if abs(entry - stop) > 0 else 0.0
     cost_pct = max(0.0, _num(data.get("estimated_round_trip_cost_pct"), 0.0015))
     cost = entry * cost_pct
     net_rr = max(0.0, reward - cost) / (abs(entry - stop) + cost) if abs(entry - stop) > 0 else 0.0
     tp_atr = reward / atr_4h
-    geometry_ok = bool(side == "LONG" and stop < entry < tp or side == "SHORT" and tp < entry < stop) and MIN_SL_ATR <= stop_atr <= MAX_SL_ATR and tp_atr >= MIN_TP_ATR and net_rr >= MIN_RR and path.get("structural")
-    return {"entry": entry, "stop_loss": stop, "tp": tp, "rr": net_rr, "rr_gross": rr_gross, "estimated_round_trip_cost_pct": cost_pct, "target_path_ok": bool(path.get("ok")), "target_path_structural": bool(path.get("structural")), "target_path_reason": path.get("reason"), "target_levels": path.get("target_levels", []), "target_timeframe": path.get("target_timeframe"), "blocking_level": path.get("blocking_level"), "stop_source": stop_source, "sl_atr": stop_atr, "stop_distance_pct": abs(entry - stop) / entry, "tp_distance_atr": tp_atr, "tp_distance_pct": reward / entry, "trade_geometry_ok": geometry_ok, "geometry_reason": "OK" if geometry_ok else "trade geometry failed"}
-
+    geometry_ok = bool(side == "LONG" and stop < entry < tp or side == "SHORT" and tp < entry < stop)
+    geometry_ok = geometry_ok and MIN_SL_ATR <= sl_atr <= MAX_SL_ATR and tp_atr >= MIN_TP_ATR and net_rr >= MIN_RR and bool(path.get("structural"))
+    return {
+        "entry": entry, "stop_loss": stop, "tp": tp, "rr": net_rr, "rr_gross": rr_gross,
+        "estimated_round_trip_cost_pct": cost_pct, "target_path_ok": bool(path.get("ok")),
+        "target_path_structural": bool(path.get("structural")), "target_path_reason": path.get("reason"),
+        "target_levels": path.get("target_levels", []), "target_timeframe": path.get("target_timeframe"),
+        "blocking_level": path.get("blocking_level"), "stop_source": stop_source, "sl_atr": sl_atr,
+        "stop_distance_pct": abs(entry - stop) / entry, "tp_distance_atr": tp_atr,
+        "tp_distance_pct": reward / entry, "trade_geometry_ok": geometry_ok,
+        "geometry_reason": "OK" if geometry_ok else "trade geometry failed", "entry_mode": entry_mode,
+        "entry_limit_price": data.get("limit_price"), "limit_entry_expiry_bars": LIMIT_ENTRY_EXPIRY_BARS,
+        "zone_floor": zone_floor, "zone_ceiling": zone_ceiling,
+    }
 
 def _direction_aligned(side: str, daily: dict[str, Any], bias: dict[str, Any], primary_structure: str, bos: Optional[dict[str, Any]] = None) -> bool:
-    bos_strength = _num((bos or {}).get("strength"))
     if side == "LONG":
-        if daily.get("bear") or bias.get("bear") or primary_structure == "LH/LL":
-            return False
-        directional_bias = bool(daily.get("bull") or bias.get("bull") or _num(bias.get("bull_votes")) >= 3)
-        recent_break = bos_strength >= 0.50
-        return bool(directional_bias or recent_break) and primary_structure != "LH/LL"
+        return not bool(daily.get("bear")) and primary_structure != "LH/LL"
     if side == "SHORT":
-        if daily.get("bull") or bias.get("bull") or primary_structure == "HH/HL":
-            return False
-        directional_bias = bool(daily.get("bear") or bias.get("bear") or _num(bias.get("bear_votes")) >= 3)
-        recent_break = bos_strength >= 0.50
-        return bool(directional_bias or recent_break) and primary_structure != "HH/HL"
+        return not bool(daily.get("bull")) and primary_structure != "HH/HL"
     return False
-
 
 def _shock_veto(candles: list[Candle], side: str, atr_value: float) -> tuple[bool, str]:
     if not candles or atr_value <= 0:
@@ -726,26 +891,33 @@ def evaluate_confirmation_families(data: dict[str, Any]) -> dict[str, Any]:
 
 def _build_score(
     *,
-    structure_quality: float,
-    trigger_quality: float,
-    momentum_quality: float,
-    volume_quality: float,
-    volatility_quality: float,
-    location_quality: float,
-    risk_quality: float,
+    twelve_h_context: float = 0.0,
+    retest_quality: float = 0.0,
+    entry_efficiency: float = 0.0,
+    momentum_quality: float = 0.0,
+    volume_quality: float = 0.0,
+    volatility_quality: float = 0.0,
+    # Backward-compatible aliases for older tests/integrations.
+    structure_quality: float | None = None,
+    trigger_quality: float | None = None,
+    location_quality: float | None = None,
+    risk_quality: float | None = None,
 ) -> tuple[int, dict[str, int]]:
-    """Score only supporting evidence; mandatory gates are not double-counted."""
+    if structure_quality is not None and retest_quality == 0.0:
+        retest_quality = structure_quality
+    if trigger_quality is not None and entry_efficiency == 0.0:
+        entry_efficiency = trigger_quality
+    if location_quality is not None and twelve_h_context == 0.0:
+        twelve_h_context = location_quality
     groups = {
-        "structure_quality": int(round(25 * _clamp(structure_quality, 0, 1))),
-        "entry_quality": int(round(15 * _clamp(trigger_quality, 0, 1))),
-        "momentum": int(round(15 * _clamp(momentum_quality, 0, 1))),
+        "12h_context": int(round(20 * _clamp(twelve_h_context, 0, 1))),
+        "retest_absorption": int(round(25 * _clamp(retest_quality, 0, 1))),
+        "entry_efficiency": int(round(25 * _clamp(entry_efficiency, 0, 1))),
+        "momentum": int(round(10 * _clamp(momentum_quality, 0, 1))),
         "volume": int(round(10 * _clamp(volume_quality, 0, 1))),
         "volatility": int(round(10 * _clamp(volatility_quality, 0, 1))),
-        "location": int(round(10 * _clamp(location_quality, 0, 1))),
-        "risk_geometry": int(round(15 * _clamp(risk_quality, 0, 1))),
     }
     return max(0, min(100, sum(groups.values()))), groups
-
 
 def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[bool, str]:
     if len(candles) < minimum:
@@ -759,18 +931,31 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
     return True, "OK"
 
 
-def build_btc_context(candles_1d: list, candles_12h: list, candles_4h: list, candles_1h: list) -> dict[str, Any]:
+def build_btc_context(candles_1d: list, candles_12h: list | None, candles_4h: list, candles_1h: list | None = None) -> dict[str, Any]:
     try:
         daily = _macro_regime(convert_candles(candles_1d))
-        bias = _intermediate_bias(convert_candles(candles_12h), daily)
         c4 = convert_candles(candles_4h)
-        c1 = convert_candles(candles_1h)
-        a = _safe_atr(c1)
-        move = (float(c1[-1]["close"]) - float(c1[-2]["close"])) / a if len(c1) >= 2 and a > 0 else 0.0
-        return {"ok": True, "bull_1d": bool(daily.get("bull")), "bear_1d": bool(daily.get("bear")), "bull_12h": bool(bias.get("bull")), "bear_12h": bool(bias.get("bear")), "structure_4h": _structure_from_swings(*_swing_points(c4)), "move_1h_atr": move, "candle_time_1h": int(c1[-1]["time"]) if c1 else 0}
+        a4 = _safe_atr(c4)
+        structure_4h = _structure_from_swings(*_swing_points(c4))
+        e50_4h = _safe_ema([float(c["close"]) for c in c4], 50)
+        last_close = float(c4[-1]["close"]) if c4 else 0.0
+        bull_4h = bool(e50_4h is not None and last_close > e50_4h and structure_4h != "LH/LL")
+        bear_4h = bool(e50_4h is not None and last_close < e50_4h and structure_4h != "HH/HL")
+        move4 = (last_close - float(c4[-2]["close"])) / a4 if len(c4) >= 2 and a4 > 0 else 0.0
+        move1 = 0.0
+        c1 = convert_candles(candles_1h or [])
+        if len(c1) >= 2:
+            a1 = _safe_atr(c1)
+            move1 = (float(c1[-1]["close"]) - float(c1[-2]["close"])) / a1 if a1 > 0 else 0.0
+        return {
+            "ok": True, "bull_1d": bool(daily.get("bull")), "bear_1d": bool(daily.get("bear")),
+            "bull_4h": bull_4h, "bear_4h": bear_4h, "structure_4h": structure_4h,
+            "move_4h_atr": move4, "move_1h_atr": move1,
+            "candle_time_4h": int(c4[-1]["time"]) if c4 else 0,
+            "candle_time_1h": int(c1[-1]["time"]) if c1 else 0,
+        }
     except Exception as exc:
         return {"ok": False, "reason": str(exc)}
-
 
 def btc_filter_ok(side: str, context: dict[str, Any], *, is_btc: bool = False) -> tuple[bool, str]:
     if is_btc:
@@ -778,21 +963,20 @@ def btc_filter_ok(side: str, context: dict[str, Any], *, is_btc: bool = False) -
     if not context or not context.get("ok"):
         return True, "BTC context unavailable; filter abstained"
     side = str(side).upper()
-    move = _num(context.get("move_1h_atr"))
+    move4 = _num(context.get("move_4h_atr"))
     if side == "LONG":
-        if context.get("bear_1d") or context.get("bear_12h") or context.get("structure_4h") == "LH/LL":
-            return False, "BTC higher-timeframe bias is bearish against LONG"
-        if move <= -BTC_SHOCK_ATR:
-            return False, "BTC 1H shock against LONG"
+        if context.get("bear_1d") and context.get("bear_4h"):
+            return False, "BTC 1D and 4H regime is bearish against LONG"
+        if move4 <= -BTC_SHOCK_ATR:
+            return False, "BTC 4H shock against LONG"
     elif side == "SHORT":
-        if context.get("bull_1d") or context.get("bull_12h") or context.get("structure_4h") == "HH/HL":
-            return False, "BTC higher-timeframe bias is bullish against SHORT"
-        if move >= BTC_SHOCK_ATR:
-            return False, "BTC 1H shock against SHORT"
+        if context.get("bull_1d") and context.get("bull_4h"):
+            return False, "BTC 1D and 4H regime is bullish against SHORT"
+        if move4 >= BTC_SHOCK_ATR:
+            return False, "BTC 4H shock against SHORT"
     else:
         return False, "Invalid side"
     return True, "OK"
-
 
 def calculate_confluence(data: dict[str, Any]) -> dict[str, Any]:
     return dict(data)
@@ -800,15 +984,15 @@ def calculate_confluence(data: dict[str, Any]) -> dict[str, Any]:
 
 def _diagnostic_failures(data: dict[str, Any]) -> list[str]:
     checks = [
-        (not data.get("direction_ok"), "1D/12H/4H direction"),
-        (not data.get("structure_ok"), "4H BOS/retest structure"),
+        (not data.get("direction_ok"), "1D/4H direction"),
+        (not data.get("structure_ok"), "4H BOS/departure/retest structure"),
         (not data.get("setup_ok"), "4H setup side"),
         (not data.get("confirmation_ok"), "1H confirmation"),
-        (not data.get("volatility_ok"), "1H volatility regime"),
-        (not data.get("target_path_ok"), "HTF target path"),
         (not data.get("entry_distance_ok"), "1H entry distance"),
+        (not data.get("target_path_ok"), "HTF target path"),
         (not data.get("risk_ok"), "structural risk/RR"),
         (not data.get("shock_veto_ok"), "shock veto"),
+        (not data.get("btc_filter_ok"), "BTC regime"),
         (int(data.get("score", 0) or 0) < MIN_SCORE, f"quality score {int(data.get('score', 0) or 0)}<{MIN_SCORE}"),
     ]
     return list(dict.fromkeys(label for failed, label in checks if failed))
@@ -823,6 +1007,7 @@ def analyze_candles(
     *,
     now_ms: Optional[int] = None,
     cache: Optional[dict[str, Any]] = None,
+    btc_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     c1d = closed_candle_rows(candles_1d or [], "1D", now)
@@ -843,133 +1028,193 @@ def analyze_candles(
 
     long_candidate = bool(bos_long and ret_long.get("valid"))
     short_candidate = bool(bos_short and ret_short.get("valid"))
-    side = "LONG" if long_candidate and not short_candidate else "SHORT" if short_candidate and not long_candidate else "NONE"
-    if side == "NONE" and long_candidate and short_candidate:
+    if long_candidate and not short_candidate:
+        side = "LONG"
+    elif short_candidate and not long_candidate:
+        side = "SHORT"
+    elif long_candidate and short_candidate:
         side = "LONG" if _num(bos_long.get("strength")) >= _num(bos_short.get("strength")) else "SHORT"
+    else:
+        side = "NONE"
 
     active_bos = bos_long if side == "LONG" else bos_short if side == "SHORT" else None
-    active_retest = ret_long if side == "LONG" else ret_short if side == "SHORT" else {}
-    level = _num(active_bos.get("level")) if active_bos else None
-    trigger = _one_hour_trigger_confirmation(c1, side, level, active_retest.get("time")) if side in {"LONG", "SHORT"} else {"ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": _safe_atr(c1), "body_ratio": 0.0, "close_location": 0.0, "candle_time": int(c1[-1]["time"]), "trigger_type": "NONE", "reason": "no active setup", "bars_after_retest": None}
-    # Keep the structural side even when the 1H trigger is absent so risk/path diagnostics remain visible.
+    active_retest = dict(ret_long if side == "LONG" else ret_short if side == "SHORT" else {})
     setup = side if side in {"LONG", "SHORT"} else "NO TRADE"
-
     price = float(c1[-1]["close"])
     atr1 = _safe_atr(c1)
     atr4 = _safe_atr(c4)
+
+    direction_ok = _direction_aligned(side, daily, bias, primary_structure, active_bos)
+    structure_ok = bool(active_bos and active_retest.get("valid") and _num(active_bos.get("strength")) >= 0.50)
+    setup_ok = side in {"LONG", "SHORT"}
+    trigger = _one_hour_trigger_confirmation(c1, side, active_retest) if setup_ok else {"ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": atr1, "body_ratio": 0.0, "close_location": 0.0, "candle_time": int(c1[-1]["time"]), "trigger_type": "NONE", "reason": "no active setup", "bars_after_retest": None, "entry_price": None, "entry_mode": "MARKET", "limit_price": None}
+    confirmation_ok = bool(trigger.get("ready"))
+
+    if trigger.get("retest_low_1h") is not None:
+        active_retest["low"] = trigger.get("retest_low_1h")
+    if trigger.get("retest_high_1h") is not None:
+        active_retest["high"] = trigger.get("retest_high_1h")
+
     rsi1 = _safe_rsi([float(c["close"]) for c in c1])
     rvol1 = _relative_volume(c1)
     macd_line, macd_signal, macd_hist, macd_delta = _macd_components([float(c["close"]) for c in c1])
-    momentum_quality = _clamp(((rsi1 - 50.0) / 20.0) if setup == "LONG" else ((50.0 - rsi1) / 20.0) if setup == "SHORT" else 0.0, 0.0, 1.0)
+    momentum_quality = _clamp(((rsi1 - 50.0) / 20.0) if setup == "LONG" else ((50.0 - rsi1) / 20.0) if setup == "SHORT" else 0.0, 0, 1)
     if (setup == "LONG" and macd_hist > 0) or (setup == "SHORT" and macd_hist < 0):
         momentum_quality = _clamp(momentum_quality + 0.20, 0, 1)
-    if (setup == "LONG" and macd_delta >= 0) or (setup == "SHORT" and macd_delta <= 0):
-        momentum_quality = _clamp(momentum_quality + 0.10, 0, 1)
     atr_rank = _atr_percentile(c1)
-    volatility_ok = MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE and atr1 > 0
-
-    direction_ok = _direction_aligned(side, daily, bias, primary_structure, active_bos)
-    structure_quality = _clamp(0.60 * _num((active_bos or {}).get("strength")) + 0.40 * _num(active_retest.get("quality")), 0, 1) if active_bos and active_retest else 0.0
-    structure_ok = bool(active_bos and active_retest.get("valid") and _num(active_bos.get("strength")) >= 0.50 and _num(active_retest.get("quality")) >= 0.65)
-    confirmation_ok = bool(trigger.get("ready"))
-    setup_ok = side in {"LONG", "SHORT"}
-    macro_ok = bool(
-        (daily.get("bull") and not daily.get("bear"))
-        or (daily.get("bear") and not daily.get("bull"))
-        or (daily.get("regime") == "SIDEWAYS" and (bias.get("bull") or bias.get("bear")))
-    )
+    volatility_ok = bool(atr1 > 0 and atr_rank <= MAX_ATR_PERCENTILE)
 
     frames = [("1D", c1d), ("12H", c12), ("4H", c4), ("1H", c1)]
-    bos_pivot_price = None
-    if active_bos and active_bos.get("swing_index") is not None:
-        pivot_index = int(active_bos["swing_index"])
-        if 0 <= pivot_index < len(c4):
-            bos_pivot_price = float(c4[pivot_index]["low"] if side == "LONG" else c4[pivot_index]["high"])
-    levels = calculate_trade_levels({"setup": setup, "price": price, "atr_1h": atr1, "atr_4h": atr4, "protected_low": protected4.get("protected_low"), "protected_high": protected4.get("protected_high"), "bos_pivot_price": bos_pivot_price, "retest": active_retest, "target_frames": frames, "estimated_round_trip_cost_pct": 0.0015})
-    entry_distance_atr = abs(price - _num(active_retest.get("level"))) / atr4 if active_retest.get("level") is not None and atr4 > 0 else float("inf")
-    entry_distance_ok = bool(active_retest and active_retest.get("level") is not None and entry_distance_atr <= MAX_ENTRY_DISTANCE_ATR)
+    levels = calculate_trade_levels({
+        "setup": setup, "price": price,
+        "entry_price": trigger.get("entry_price") if trigger.get("entry_price") is not None else price,
+        "entry_mode": trigger.get("entry_mode", "MARKET"), "limit_price": trigger.get("limit_price"),
+        "atr_1h": atr1, "atr_4h": atr4, "retest": active_retest,
+        "target_frames": frames, "estimated_round_trip_cost_pct": 0.0015,
+    })
+
+    zone_edge = _num(trigger.get("zone_ceiling")) if side == "LONG" else _num(trigger.get("zone_floor")) if side == "SHORT" else 0.0
+    entry_distance_atr = abs(price - zone_edge) / atr4 if zone_edge > 0 and atr4 > 0 else float("inf")
+    entry_distance_ok = bool(
+        trigger.get("entry_mode") == "LIMIT" and entry_distance_atr <= MAX_LIMIT_ENTRY_DISTANCE_ATR
+        or trigger.get("entry_mode") == "MARKET" and entry_distance_atr <= MAX_ENTRY_DISTANCE_ATR
+    )
     target_path_ok = bool(levels.get("target_path_ok") and levels.get("target_path_structural"))
-    location_ok = bool(target_path_ok and entry_distance_ok and _num(levels.get("tp_distance_atr")) >= MIN_TP_ATR)
+    location_ok = bool(target_path_ok)
     risk_ok = bool(levels.get("trade_geometry_ok") and _num(levels.get("rr")) >= MIN_RR)
     shock_ok, shock_reason = _shock_veto(c1, setup, atr1) if setup in {"LONG", "SHORT"} else (True, "No active setup")
 
-    volatility_quality = 0.0
-    if atr1 > 0 and MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE:
-        volatility_quality = 1.0 if 25 <= atr_rank <= 85 else 0.75
+    # Supporting score: no duplicated hard-gate inputs.
+    twelve_h_context = 1.0 if bias.get("structure") == ("HH/HL" if side == "LONG" else "LH/LL") else 0.60 if bias.get("structure") == "RANGE" else 0.30 if setup in {"LONG", "SHORT"} else 0.0
+    retest_quality = _clamp(0.65 * _num(active_retest.get("quality")) + 0.35 * _num(trigger.get("quality")), 0, 1)
+    entry_efficiency = _clamp(1.0 - entry_distance_atr / max(MAX_LIMIT_ENTRY_DISTANCE_ATR, 1e-9), 0, 1) if math.isfinite(entry_distance_atr) else 0.0
+    volatility_quality = 0.95 if 25 <= atr_rank <= 85 else 0.70 if 5 <= atr_rank <= 98 else 0.30
     volume_quality = _clamp(0.65 * _clamp(rvol1 / 1.5, 0, 1) + 0.35 * (1.0 if volume_status(c1) == "INCREASING" else 0.55 if volume_status(c1) == "NORMAL" else 0.25), 0, 1)
-    location_quality = 1.0 if location_ok else 0.0
-    rr = _num(levels.get("rr"))
-    if levels.get("trade_geometry_ok") and rr > MIN_RR:
-        location_quality = max(location_quality, _clamp((rr - MIN_RR) / 3.0 + 0.65, 0, 1))
-    risk_quality = _clamp((rr / 4.0) if rr > 0 else 0.0, 0, 1) if risk_ok else 0.25 if levels.get("target_path_structural") else 0.0
-
     score, score_groups = _build_score(
-        structure_quality=structure_quality,
-        trigger_quality=_num(trigger.get("quality")),
-        momentum_quality=momentum_quality,
-        volume_quality=volume_quality,
-        volatility_quality=volatility_quality,
-        location_quality=location_quality,
-        risk_quality=risk_quality,
+        twelve_h_context=twelve_h_context, retest_quality=retest_quality,
+        entry_efficiency=entry_efficiency, momentum_quality=momentum_quality,
+        volume_quality=volume_quality, volatility_quality=volatility_quality,
     )
-    technical_candidate = bool(setup in {"LONG", "SHORT"} and direction_ok and structure_ok and setup_ok and confirmation_ok and volatility_ok and location_ok and risk_ok and shock_ok and score >= MIN_SCORE)
-    family_result = evaluate_confirmation_families({"setup": setup, "momentum_quality": momentum_quality, "rvol_1h": rvol1, "atr_percentile": atr_rank, "target_path_structural": levels.get("target_path_structural"), "rolling_vwap_12h": _rolling_vwap(c12), "price": price, "structure_quality_ok": structure_ok, "structure_quality": structure_quality, "trigger_quality": trigger.get("quality")})
 
-    failures = _diagnostic_failures({"direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok, "volatility_ok": volatility_ok, "location_ok": location_ok, "risk_ok": risk_ok, "shock_veto_ok": shock_ok, "score": score})
+    btc_ok, btc_reason = btc_filter_ok(side, btc_context or {"ok": False}, is_btc=symbol.upper().startswith("BTC")) if setup_ok else (True, "No active setup")
+    technical_candidate = bool(
+        setup_ok and direction_ok and structure_ok and confirmation_ok and entry_distance_ok
+        and location_ok and risk_ok and shock_ok and btc_ok and score >= MIN_SCORE
+    )
+
+    family_result = evaluate_confirmation_families({
+        "setup": setup, "momentum_quality": momentum_quality, "rvol_1h": rvol1,
+        "atr_percentile": atr_rank, "target_path_structural": levels.get("target_path_structural"),
+        "rolling_vwap_12h": _rolling_vwap(c12), "price": price,
+        "structure_quality": retest_quality, "trigger_quality": trigger.get("quality"),
+    })
+
+    stage_status = {
+        "1D_REGIME": bool(daily.get("bull") or daily.get("bear") or daily.get("regime") == "SIDEWAYS"),
+        "12H_BIAS": bias.get("structure") in {"HH/HL", "LH/LL", "RANGE"},
+        "4H_SETUP": bool(active_bos and active_retest.get("valid")),
+        "1H_TRIGGER": confirmation_ok,
+        "ENTRY_DISTANCE": entry_distance_ok,
+        "TARGET_PATH": target_path_ok,
+        "RISK": risk_ok,
+        "RR": _num(levels.get("rr")) >= MIN_RR,
+        "QUALITY": score >= MIN_SCORE,
+        "BTC": btc_ok,
+        "SHOCK": shock_ok,
+    }
+    stage_failures = {
+        "1D_REGIME": [] if stage_status["1D_REGIME"] else [str(daily.get("regime") or "unknown")],
+        "12H_BIAS": [] if stage_status["12H_BIAS"] else ["no 12H structural context"],
+        "4H_SETUP": [] if stage_status["4H_SETUP"] else ["no confirmed 4H BOS/departure/retest"],
+        "1H_TRIGGER": [] if confirmation_ok else [str(trigger.get("reason") or "no 1H retest rejection")],
+        "ENTRY_DISTANCE": [] if entry_distance_ok else [f"entry distance {entry_distance_atr:.2f} ATR4H exceeds execution limit"],
+        "TARGET_PATH": [] if target_path_ok else [str(levels.get("target_path_reason") or "no nearest HTF target")],
+        "RISK": [] if risk_ok else [str(levels.get("geometry_reason") or "risk geometry failed")],
+        "RR": [] if stage_status["RR"] else [f"RR {_num(levels.get('rr')):.2f} < {MIN_RR:.2f}"],
+        "QUALITY": [] if stage_status["QUALITY"] else [f"score {score} < {MIN_SCORE}"],
+        "BTC": [] if btc_ok else [btc_reason],
+        "SHOCK": [] if shock_ok else [shock_reason],
+    }
+    failures = _diagnostic_failures({
+        "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok,
+        "confirmation_ok": confirmation_ok, "volatility_ok": volatility_ok,
+        "target_path_ok": target_path_ok, "entry_distance_ok": entry_distance_ok,
+        "risk_ok": risk_ok, "shock_veto_ok": shock_ok, "score": score,
+        "btc_filter_ok": btc_ok,
+    })
+
+    retest_out = dict(active_retest)
+    retest_out.update({
+        "zone_floor": trigger.get("zone_floor", retest_out.get("zone_floor")),
+        "zone_ceiling": trigger.get("zone_ceiling", retest_out.get("zone_ceiling")),
+        "retest_low_1h": trigger.get("retest_low_1h"), "retest_high_1h": trigger.get("retest_high_1h"),
+        "state": "CONFIRMED" if confirmation_ok else "RETEST_TOUCHED",
+    })
     reasons = []
     if daily.get("regime") != "SIDEWAYS": reasons.append(f"1D macro regime: {daily.get('regime')}")
-    if bias.get("bull") or bias.get("bear"): reasons.append(f"12H bias aligned: {'BULLISH' if bias.get('bull') else 'BEARISH'}")
-    if structure_ok: reasons.append(f"4H {side} BOS + retest confirmed")
-    if confirmation_ok: reasons.append(f"1H {trigger.get('trigger_type')} confirmation")
-    if location_ok: reasons.append("HTF target path acceptable")
+    reasons.append(f"12H context: {bias.get('structure')}")
+    if structure_ok: reasons.append(f"4H {side} BOS + departure + retest confirmed")
+    if confirmation_ok: reasons.append("1H retest rejection/reclaim")
+    if location_ok: reasons.append("Nearest HTF target available")
     if risk_ok: reasons.append(f"Post-cost RR {float(levels.get('rr') or 0):.2f}")
     if not technical_candidate: reasons.append("Technical candidate gate failed")
 
     return {
         "symbol": symbol.upper(), "price": price, "setup": setup, "setup_candidate": side,
-        "regime_1d": daily.get("regime"), "trend_4h": daily.get("regime"), "bias_12h": "BULLISH" if bias.get("bull") else "BEARISH" if bias.get("bear") else "SIDEWAYS",
-        "daily_structure_1d": daily.get("structure"), "structure_12h": bias.get("structure"), "structure_4h": primary_structure, "structure_1h": "HH/HL" if trigger.get("rsi", 50) >= 50 and setup == "LONG" else "LH/LL" if setup == "SHORT" else "RANGE",
+        "regime_1d": daily.get("regime"), "trend_4h": primary_structure,
+        "bias_12h": "BULLISH" if bias.get("bull") else "BEARISH" if bias.get("bear") else "NEUTRAL",
+        "daily_structure_1d": daily.get("structure"), "structure_12h": bias.get("structure"), "structure_4h": primary_structure,
         "protected_structure_4h": protected4.get("state"), "protected_high": protected4.get("protected_high"), "protected_low": protected4.get("protected_low"),
-        "one_hour_long_votes": int(bias.get("bull_votes", 0)), "one_hour_short_votes": int(bias.get("bear_votes", 0)),
-        "bos_4h": bool(active_bos), "bos_4h_time": active_bos.get("time") if active_bos else None, "bos_4h_strength": _num((active_bos or {}).get("strength")),
-        "long_bos_level": bos_long.get("level") if bos_long else None, "short_bos_level": bos_short.get("level") if bos_short else None,
-        "long_retest": bool(ret_long.get("valid")), "short_retest": bool(ret_short.get("valid")), "long_retest_time": ret_long.get("time"), "short_retest_time": ret_short.get("time"), "retest": active_retest or {},
-        "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"), "ema21_12h": bias.get("e21"), "ema50_12h": bias.get("e50"), "ema21_4h": _safe_ema([float(c["close"]) for c in c4], 21), "ema50_4h": _safe_ema([float(c["close"]) for c in c4], 50), "ema21_1h": _safe_ema([float(c["close"]) for c in c1], 21), "ema50_1h": _safe_ema([float(c["close"]) for c in c1], 50),
+        "bos_4h": bool(active_bos), "bos_4h_time": active_bos.get("time") if active_bos else None,
+        "bos_4h_strength": _num((active_bos or {}).get("strength")), "long_bos_level": bos_long.get("level") if bos_long else None,
+        "short_bos_level": bos_short.get("level") if bos_short else None, "long_retest": bool(ret_long.get("valid")),
+        "short_retest": bool(ret_short.get("valid")), "long_retest_time": ret_long.get("time"), "short_retest_time": ret_short.get("time"),
+        "retest": retest_out,
+        "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"),
+        "ema21_12h": bias.get("e21"), "ema50_12h": bias.get("e50"),
+        "ema21_4h": _safe_ema([float(c["close"]) for c in c4], 21), "ema50_4h": _safe_ema([float(c["close"]) for c in c4], 50),
+        "ema21_1h": _safe_ema([float(c["close"]) for c in c1], 21), "ema50_1h": _safe_ema([float(c["close"]) for c in c1], 50),
         "ema_direction": "BULLISH" if _num(_safe_ema([float(c["close"]) for c in c1], 21)) >= _num(_safe_ema([float(c["close"]) for c in c1], 50)) else "BEARISH",
-        "rsi": rsi1, "rsi_1h_entry": trigger.get("rsi", rsi1), "macd": macd_line, "macd_signal": macd_signal, "macd_hist": macd_hist, "macd_hist_delta": macd_delta,
-        "atr": atr1, "atr_1h": atr1, "atr_4h": atr4, "atr_pct": atr1 / price if price > 0 else 0.0, "atr_percentile": atr_rank,
-        "adx_1d": daily.get("adx"), "ema50_slope_1d": daily.get("slope"), "volume": volume_status(c1), "rvol": rvol1, "rvol_1h": rvol1,
-        "support": max([x["price"] for x in _collect_structural_levels(frames, price) if x["price"] < price], default=None), "resistance": min([x["price"] for x in _collect_structural_levels(frames, price) if x["price"] > price], default=None),
-        "futures_context": "PENDING", "futures_ok": True, "btc_filter_ok": False, "btc_filter_reason": "PENDING", "data_fresh": True,
-        "signal_engine_version": ENGINE_VERSION, "signal_basis": "1D macro + 12H bias + 4H BOS/retest + 1H confirmation + structural SL/TP/RR", "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
-        "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side, "trigger_quality": trigger.get("quality", 0.0), "trigger_type": trigger.get("trigger_type", "NONE"), "trigger_reason": trigger.get("reason", ""), "trigger_close_location": trigger.get("close_location", 0.0), "structure_quality_ok": structure_ok,
-        "momentum_quality": momentum_quality, "volume_quality": volume_quality, "entry_1h_ready": bool(trigger.get("ready")), "shock_veto_ok": shock_ok, "shock_veto_reason": shock_reason,
-        "score": score, "score_groups": score_groups, "confirmation_families": family_result.get("families", {}), "confirmation_families_passed": int(family_result.get("passed", 0)), "confirmation_families_available": int(family_result.get("available", 0)), "confirmation_family_diversity_ok": bool(family_result.get("diversity_ok")),
-        "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok, "momentum_ok": momentum_quality >= 0.45, "volume_ok": volume_quality >= 0.50, "location_ok": location_ok, "volatility_ok": volatility_ok, "risk_ok": risk_ok,
-        "stage_status": {
-            "1D_REGIME": bool(daily.get("bull") or daily.get("bear") or daily.get("regime") == "SIDEWAYS"),
-            "12H_BIAS": bool(bias.get("bull") or bias.get("bear")),
-            "4H_SETUP": bool(active_bos and active_retest.get("valid")),
-            "1H_TRIGGER": bool(trigger.get("ready")),
-            "QUALITY": bool(score >= MIN_SCORE),
-            "RISK": bool(risk_ok),
-            "RR": bool(rr >= MIN_RR),
-        },
-        "stage_failures": {
-            "1D_REGIME": [] if (daily.get("bull") or daily.get("bear") or daily.get("regime") == "SIDEWAYS") else [str(daily.get("regime") or "unknown")],
-            "12H_BIAS": [] if (bias.get("bull") or bias.get("bear")) else ["no directional 12H bias"],
-            "4H_SETUP": [] if (active_bos and active_retest.get("valid")) else ["no confirmed 4H BOS/retest"],
-            "1H_TRIGGER": [] if trigger.get("ready") else [str(trigger.get("reason") or "no 1H trigger")],
-            "QUALITY": [] if score >= MIN_SCORE else [f"score {score} < {MIN_SCORE}"],
-            "RISK": [] if risk_ok else [str(levels.get("geometry_reason") or "risk geometry failed")],
-            "RR": [] if rr >= MIN_RR else [f"RR {rr:.2f} < {MIN_RR:.2f}"],
-        },
-        "technical_candidate": technical_candidate, "signal_blocked": not technical_candidate, "rejection_stage": None if technical_candidate else ("1H_TRIGGER" if setup_ok and structure_ok and direction_ok and not confirmation_ok else "4H_SETUP" if setup_ok and not structure_ok else "DIRECTION" if setup_ok else "SETUP"), "technical_gate_failures": failures, "diagnostic_failures": failures, "reasons": reasons,
-        "entry": levels.get("entry"), "stop_loss": levels.get("stop_loss"), "tp": levels.get("tp"), "rr": levels.get("rr"), "rr_gross": levels.get("rr_gross"), "sl_atr": levels.get("sl_atr", 0.0), "stop_distance_pct": levels.get("stop_distance_pct", 0.0), "tp_distance_atr": levels.get("tp_distance_atr", 0.0), "tp_distance_pct": levels.get("tp_distance_pct", 0.0), "target_path_ok": levels.get("target_path_ok", False), "target_path_structural": levels.get("target_path_structural", False), "target_path_reason": levels.get("target_path_reason"), "target_timeframe": levels.get("target_timeframe"), "target_levels": levels.get("target_levels", []), "blocking_level": levels.get("blocking_level"), "entry_distance_atr": entry_distance_atr, "entry_distance_ok": entry_distance_ok, "stop_source": levels.get("stop_source"), "trade_geometry_ok": levels.get("trade_geometry_ok", False), "geometry_reason": levels.get("geometry_reason"),
-        "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "trigger_candle_open_time": trigger.get("candle_time"), "setup_bos_time": active_bos.get("time") if active_bos else None, "setup_retest_time": active_retest.get("time") if active_retest else None,
-        "rolling_vwap_12h": _rolling_vwap(c12), "flow_proxy_ratio": _backtest_flow_proxy(c1), "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
+        "rsi": rsi1, "rsi_1h_entry": trigger.get("rsi", rsi1), "macd": macd_line, "macd_signal": macd_signal,
+        "macd_hist": macd_hist, "macd_hist_delta": macd_delta, "atr": atr1, "atr_1h": atr1, "atr_4h": atr4,
+        "atr_pct": atr1 / price if price > 0 else 0.0, "atr_percentile": atr_rank, "adx_1d": daily.get("adx"),
+        "ema50_slope_1d": daily.get("slope"), "volume": volume_status(c1), "rvol": rvol1, "rvol_1h": rvol1,
+        "support": max([x["price"] for x in _collect_structural_levels(frames, price) if x["price"] < price], default=None),
+        "resistance": min([x["price"] for x in _collect_structural_levels(frames, price) if x["price"] > price], default=None),
+        "futures_context": "PENDING", "futures_ok": True, "btc_filter_ok": btc_ok, "btc_filter_reason": btc_reason, "btc_context": btc_context or {"ok": False},
+        "data_fresh": True, "signal_engine_version": ENGINE_VERSION,
+        "signal_basis": "1D macro + 12H context + 4H BOS/departure/retest + 1H rejection + structural SL/nearest HTF TP",
+        "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
+        "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
+        "trigger_quality": trigger.get("quality", 0.0), "trigger_type": trigger.get("trigger_type", "NONE"),
+        "trigger_reason": trigger.get("reason", ""), "trigger_close_location": trigger.get("close_location", 0.0),
+        "structure_quality_ok": structure_ok, "momentum_quality": momentum_quality, "volume_quality": volume_quality,
+        "volatility_quality": volatility_quality, "entry_efficiency": entry_efficiency, "twelve_h_context_quality": twelve_h_context,
+        "entry_mode": trigger.get("entry_mode", "MARKET"), "limit_price": trigger.get("limit_price"),
+        "limit_entry_expiry_bars": LIMIT_ENTRY_EXPIRY_BARS, "entry_1h_ready": confirmation_ok,
+        "shock_veto_ok": shock_ok, "shock_veto_reason": shock_reason, "score": score, "score_groups": score_groups,
+        "confirmation_families": family_result.get("families", {}), "confirmation_families_passed": int(family_result.get("passed", 0)),
+        "confirmation_families_available": int(family_result.get("available", 0)), "confirmation_family_diversity_ok": bool(family_result.get("diversity_ok")),
+        "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok,
+        "momentum_ok": momentum_quality >= 0.45, "volume_ok": volume_quality >= 0.50, "location_ok": location_ok,
+        "volatility_ok": volatility_ok, "risk_ok": risk_ok, "entry_distance_ok": entry_distance_ok,
+        "stage_status": stage_status, "stage_failures": stage_failures, "technical_candidate": technical_candidate,
+        "signal_blocked": not technical_candidate,
+        "rejection_stage": next((k for k,v in [("DIRECTION",direction_ok),("4H_SETUP",structure_ok and setup_ok),("1H_TRIGGER",confirmation_ok),("ENTRY_DISTANCE",entry_distance_ok),("TARGET_PATH",target_path_ok),("RISK",risk_ok),("BTC",btc_ok),("QUALITY",score>=MIN_SCORE)] if not v), None),
+        "technical_gate_failures": failures, "diagnostic_failures": failures, "reasons": reasons,
+        "entry": levels.get("entry"), "stop_loss": levels.get("stop_loss"), "tp": levels.get("tp"), "rr": levels.get("rr"), "rr_gross": levels.get("rr_gross"),
+        "sl_atr": levels.get("sl_atr", 0.0), "stop_distance_pct": levels.get("stop_distance_pct", 0.0), "tp_distance_atr": levels.get("tp_distance_atr", 0.0),
+        "tp_distance_pct": levels.get("tp_distance_pct", 0.0), "target_path_ok": levels.get("target_path_ok", False),
+        "target_path_structural": levels.get("target_path_structural", False), "target_path_reason": levels.get("target_path_reason"),
+        "target_timeframe": levels.get("target_timeframe"), "target_levels": levels.get("target_levels", []), "blocking_level": levels.get("blocking_level"),
+        "entry_distance_atr": entry_distance_atr, "entry_distance_ok": entry_distance_ok, "entry_price_reference": price,
+        "stop_source": levels.get("stop_source"), "trade_geometry_ok": levels.get("trade_geometry_ok", False), "geometry_reason": levels.get("geometry_reason"),
+        "entry_limit_price": levels.get("entry_limit_price"), "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"])+TIMEFRAME_MS["1h"],
+        "candle_time": int(c1[-1]["time"])+TIMEFRAME_MS["1h"], "trigger_candle_open_time": trigger.get("candle_time"),
+        "setup_bos_time": active_bos.get("time") if active_bos else None, "setup_retest_time": active_retest.get("time") if active_retest else None,
+        "rolling_vwap_12h": _rolling_vwap(c12), "flow_proxy_ratio": _backtest_flow_proxy(c1),
+        "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
     }
-
 
 def _rolling_vwap(candles: list[Candle], window: int = 48) -> float | None:
     rows = candles[-window:] if len(candles) > window else candles

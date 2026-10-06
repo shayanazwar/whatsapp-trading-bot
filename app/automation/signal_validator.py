@@ -149,7 +149,7 @@ def validate_signal(
             f"Post-cost RR {rr_net:.2f} < required {required_rr:.2f} (gross {rr_gross:.2f})"
         ]
 
-    atr = float(data.get("atr") or 0.0)
+    atr = float(data.get("atr_4h") or data.get("atr") or 0.0)
     if atr <= 0:
         return None, ["ATR is missing or non-positive"]
     sl_atr = abs(entry - stop_loss) / atr

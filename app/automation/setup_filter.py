@@ -68,7 +68,7 @@ def validate_analysis(
     if rr + 1e-12 < required_rr:
         reasons.append(f"RR {rr:.2f} < required {required_rr:.2f}")
 
-    sl_atr = _f(data.get("sl_atr"), 999.0)
+    sl_atr = _f(data.get("sl_atr_4h", data.get("sl_atr")), 999.0)
     if sl_atr < MIN_SL_ATR:
         reasons.append(f"SL distance {sl_atr:.2f} ATR < minimum {MIN_SL_ATR:.2f}")
     elif sl_atr > MAX_SL_ATR:

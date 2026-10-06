@@ -1,27 +1,20 @@
-MEXC ENGINE V8 RETEST/GEOMETRY PATCH
+MEXC ENGINE V8.1 — OVER-FILTERING CORRECTION
 
-Changed production file:
-- app/analysis/engine.py
+This patch corrects the V8 over-tightening that produced zero signals.
 
-Validation test update:
-- tests/test_intraday_engine.py
+Changed in app/analysis/engine.py:
+- 4H BOS strength floor restored from 0.60 to 0.50.
+- 4H retest quality restored to the prior non-zero base scoring while keeping BOS invalidation.
+- Retest invalidation tolerance widened to 0.35 ATR(4H).
+- 1H trigger remains tied to the latest closed 1H candle, but confirms the already-established 4H retest instead of requiring a second 1H touch + wick rejection.
+- Added a modest post-retest continuation confirmation path.
+- 1H trigger body minimum reduced to 0.25 (from V8's 0.40) to avoid eliminating ordinary confirmation candles.
+- Entry-distance cap relaxed from 0.60 ATR(4H) to 1.25 ATR(4H).
+- Target-path selection restored to the prior 1D/12H/4H structural target logic so V8 does not reject nearly every setup because the nearest HTF level is below 2R.
+- Score threshold, MIN_RR=2.0, HTF direction hierarchy, timeframes, causal 12H aggregation, simulator, and integrations are unchanged.
 
-Core changes:
-- 4H BOS strength floor: 0.60
-- 4H retest invalidation on close through BOS level
-- 4H retest quality made meaningful (no unconditional 0.65 base pass)
-- 1H entry trigger must be the latest completed 1H candle
-- 1H trigger now requires a genuine retest-rejection candle
-- Entry distance capped at 0.60 ATR(4H) from BOS level
-- Stop prefers retest extreme / BOS pivot instead of an unrelated older protected swing
-- Target path now respects the nearest opposing HTF level instead of skipping blockers to satisfy RR
-- Added target-path/entry-distance diagnostic fields
-- Engine version bumped to gold-v8.0-1d-12h-4h-1h-retest-geometry
+Validation:
+- 73/73 tests passed.
+- Python compile check passed.
 
-Intentionally NOT changed:
-- 1D/12H/4H direction filter
-- SCORE >= 65
-- MIN_RR = 2.0
-- lower timeframes in analysis
-- WhatsApp/MEXC/production integrations
-- backtest honesty/accounting fix already present in the supplied ZIP
+Important: The purpose of this patch is to remove the accidental V8 over-filtering. It does not claim profitability. Run the next 7D backtest and compare TP/SL/expiry, Total R, Expectancy and Profit Factor.

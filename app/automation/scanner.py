@@ -243,10 +243,12 @@ class MexcScanner:
                     reasons = (analysis.get("stage_failures") or {}).get(stage) or [fallback]
                     return self._reject(symbol, reasons, stage, payload)
 
+            # BTC regime is observational at setup-generation time. The portfolio
+            # layer can use it for sizing/concurrency without suppressing valid
+            # structural coin setups here.
             btc_ok, btc_reason = btc_filter_ok(side, self._btc_context, is_btc=symbol.upper().startswith("BTC"))
-            if not btc_ok:
-                payload["rejected_btc"] = 1
-                return self._reject(symbol, btc_reason, "BTC", payload)
+            payload["btc_would_block"] = int(not btc_ok)
+            payload["btc_filter_reason"] = btc_reason
 
             try:
                 ticker = await self.client.get_ticker(symbol)

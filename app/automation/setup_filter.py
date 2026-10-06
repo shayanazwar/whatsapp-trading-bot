@@ -39,7 +39,7 @@ def validate_analysis(
         return False, reasons
 
     hard_flags = (
-        ("direction_ok", "1D/12H/4H directional alignment failed"),
+        ("direction_ok", "1D macro directional boundary failed"),
         ("structure_ok", "4H BOS/retest structure failed"),
         ("setup_ok", "1H setup failed"),
         ("confirmation_ok", "1H confirmation failed"),

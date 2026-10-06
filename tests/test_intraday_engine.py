@@ -30,24 +30,29 @@ def test_direction_alignment_uses_side_specific_votes_and_allows_recent_bos_in_r
     assert engine._direction_aligned("SHORT", daily, neutral, "RANGE", {"strength": 0.8}) is True
 
 
-def test_1h_trigger_accepts_recent_qualifying_bar_within_three_bar_window(monkeypatch):
+def test_1h_trigger_must_be_the_latest_retest_rejection_bar(monkeypatch):
     base = 1_700_000_000_000
     rows = [candle(base + i * 3_600_000, 100, 100.4, 99.6, 100.1) for i in range(50)]
-    rows[47] = candle(base + 47 * 3_600_000, 100.0, 100.2, 99.7, 100.1)
-    rows[48] = candle(base + 48 * 3_600_000, 100.2, 101.4, 100.1, 101.2, 1500)
-    rows[49] = candle(base + 49 * 3_600_000, 101.1, 101.5, 100.8, 101.3, 1500)
+    rows[48] = candle(base + 48 * 3_600_000, 100.0, 101.6, 99.0, 101.3, 1500)
+    rows[49] = candle(base + 49 * 3_600_000, 101.2, 101.5, 100.8, 101.3, 1500)
     monkeypatch.setattr(engine, "_safe_atr", lambda candles: 1.0)
     monkeypatch.setattr(engine, "_safe_rsi", lambda closes: 55.0)
     monkeypatch.setattr(engine, "_relative_volume", lambda candles: 1.10)
 
-    # retest_time is the OPEN of the 4H retest candle. The trigger must only
-    # be evaluated after that entire 4H candle has closed.
     retest_open = base + 44 * 3_600_000
     result = engine._one_hour_trigger_confirmation(
         engine.convert_candles(rows), "LONG", 100.0, retest_time=retest_open
     )
+    assert result["ready"] is False
+    assert result["trigger_type"] == "NONE"
+
+    rows[49] = candle(base + 49 * 3_600_000, 100.0, 101.7, 99.0, 101.35, 1500)
+    result = engine._one_hour_trigger_confirmation(
+        engine.convert_candles(rows), "LONG", 100.0, retest_time=retest_open
+    )
     assert result["ready"] is True
-    assert result["trigger_type"] in {"BREAKOUT", "RECLAIM"}
+    assert result["trigger_type"] == "RETEST_REJECTION"
+    assert result["index"] == 49
     assert 1 <= result["bars_after_retest"] <= engine.MAX_TRIGGER_BARS_1H
 
 
@@ -86,7 +91,7 @@ def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):
     assert result["ready"] is False
 
 
-def test_structural_stop_is_symmetric_and_buffered():
+def test_structural_stop_prefers_retest_extreme_and_is_symmetric():
     long = calculate_trade_levels({
         "setup": "LONG", "price": 100.0, "atr_1h": 0.5, "atr_4h": 1.0,
         "retest": {"low": 99.5, "high": 101.0}, "protected_low": 98.5,
@@ -97,14 +102,16 @@ def test_structural_stop_is_symmetric_and_buffered():
         "retest": {"low": 99.0, "high": 100.5}, "protected_high": 101.5,
         "target_frames": [],
     })
-    assert long["stop_source"].startswith("4H protected")
-    assert short["stop_source"].startswith("4H protected")
+    assert long["stop_source"].startswith("4H retest/BOS pivot")
+    assert short["stop_source"].startswith("4H retest/BOS pivot")
+    assert long["stop_loss"] == pytest.approx(99.0)
+    assert short["stop_loss"] == pytest.approx(101.0)
     assert abs(100 - long["stop_loss"]) == pytest.approx(abs(short["stop_loss"] - 100))
     assert long["sl_atr"] >= engine.MIN_SL_ATR
     assert short["sl_atr"] >= engine.MIN_SL_ATR
 
 
-def test_target_path_uses_nearest_confirmed_htf_level_that_meets_geometry(monkeypatch):
+def test_target_path_rejects_a_nearby_htf_blocker_instead_of_skipping_it(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
         {"price": 101.0, "timeframe": "4H", "index": 1, "kind": "RESISTANCE"},
         {"price": 104.5, "timeframe": "12H", "index": 2, "kind": "RESISTANCE"},
@@ -115,8 +122,23 @@ def test_target_path_uses_nearest_confirmed_htf_level_that_meets_geometry(monkey
         "retest": {"low": 99.0}, "protected_low": 99.0,
         "target_frames": [("1D", []), ("12H", []), ("4H", [])],
     })
+    assert levels["target_path_structural"] is False
+    assert levels["blocking_level"]["price"] == pytest.approx(101.0)
+
+
+def test_target_path_uses_nearest_unblocked_htf_level(monkeypatch):
+    monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
+        {"price": 103.0, "timeframe": "4H", "index": 1, "kind": "RESISTANCE"},
+        {"price": 104.5, "timeframe": "12H", "index": 2, "kind": "RESISTANCE"},
+        {"price": 108.0, "timeframe": "1D", "index": 3, "kind": "RESISTANCE"},
+    ])
+    levels = calculate_trade_levels({
+        "setup": "LONG", "price": 100.0, "atr_1h": 1.0, "atr_4h": 1.0,
+        "retest": {"low": 99.0}, "protected_low": 99.0,
+        "target_frames": [("1D", []), ("12H", []), ("4H", [])],
+    })
     assert levels["target_path_structural"] is True
-    assert levels["tp"] == pytest.approx(104.5)
+    assert levels["tp"] == pytest.approx(103.0)
     assert levels["rr"] >= engine.MIN_RR
 
 
@@ -128,6 +150,26 @@ def test_target_path_fails_without_a_real_higher_timeframe_target(monkeypatch):
     result = engine._target_path([("1D", []), ("12H", []), ("4H", []), ("1H", [])], "LONG", 100.0, 99.0, 1.0)
     assert result["ok"] is False
     assert result["structural"] is False
+
+
+
+
+def test_retest_is_invalidated_by_later_close_through_bos_level():
+    base = 1_700_000_000_000
+    rows = [
+        candle(base + 0 * 14_400_000, 100.0, 100.2, 99.8, 100.0),
+        candle(base + 1 * 14_400_000, 101.0, 102.0, 100.8, 101.5),
+        candle(base + 2 * 14_400_000, 101.4, 101.7, 99.8, 100.9),
+        candle(base + 3 * 14_400_000, 100.8, 100.9, 99.4, 99.6),
+        candle(base + 4 * 14_400_000, 99.5, 100.0, 99.2, 99.5),
+    ]
+    result = engine._pullback_retest(
+        engine.convert_candles(rows),
+        "LONG",
+        {"index": 1, "level": 100.0, "atr": 1.0},
+        max_bars=4,
+    )
+    assert result["valid"] is False
 
 
 def test_quality_score_is_supporting_evidence_only_and_stays_bounded():

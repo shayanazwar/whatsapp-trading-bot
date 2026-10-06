@@ -115,10 +115,44 @@ class BacktestRunner:
             c1 = [x for x in history.candles_1h if int(float(x[0])) + ONE_HOUR_MS <= signal_close_ms]
             try:
                 analysis = analyze_candles(history.symbol, c1d, None, c4, c1, now_ms=signal_close_ms)
+            except ValueError as exc:
+                # Analysis ValueErrors are data/analysis precondition failures (for
+                # example an insufficient or gapped timeframe window).  Do not count
+                # the same symbol-level data defect once per 1H decision candle.
+                # The old behavior inflated one bad history into hundreds of
+                # ENGINE_ERROR_ValueError entries and obscured the real failure.
+                data_errors += 1
+                reason = str(exc).strip() or "ValueError"
+                normalized = (
+                    reason.upper()
+                    .replace(" ", "_")
+                    .replace(":", "")
+                    .replace("/", "_")
+                )[:120]
+                inc("ENGINE_DATA_ERRORS")
+                inc("ENGINE_DATA_QUALITY_ERROR")
+                inc(f"ENGINE_DATA_QUALITY_{normalized}")
+                LOGGER.warning(
+                    "BACKTEST DATA_QUALITY_ERROR | symbol=%s signal_close_ms=%s reason=%s",
+                    history.symbol,
+                    signal_close_ms,
+                    reason,
+                )
+                # A malformed/insufficient analysis window cannot become valid
+                # again for the remaining candles of this short backtest window;
+                # stop this symbol here instead of repeating the same failure.
+                break
             except Exception as exc:
                 data_errors += 1
                 inc("ENGINE_DATA_ERRORS")
                 inc(f"ENGINE_ERROR_{type(exc).__name__}")
+                LOGGER.exception(
+                    "BACKTEST ENGINE_ERROR | symbol=%s signal_close_ms=%s type=%s reason=%s",
+                    history.symbol,
+                    signal_close_ms,
+                    type(exc).__name__,
+                    exc,
+                )
                 continue
 
             inc("CANDLES_EVALUATED")

@@ -102,10 +102,11 @@ class MexcScanner:
             "pass_12h": 0,
             "pass_4h": 0,
             "pass_1h": 0,
-            "structure_pass": 0,
+            "regime_pass": 0,
+            "bias_pass": 0,
             "setup_pass": 0,
-            "momentum_pass": 0,
-            "volume_pass": 0,
+            "trigger_pass": 0,
+            "quality_pass": 0,
             "risk_pass": 0,
             "rr_pass": 0,
             "final_pass": 0,
@@ -118,28 +119,38 @@ class MexcScanner:
             "rejected_final": 0,
             "duplicate": 0,
             "cache_hits": 0,
+            "reason_counts": Counter(),
         }
 
     def _merge_result(self, stats: dict[str, int], result: dict[str, Any]) -> None:
         for key in stats:
+            if key in {"reason_counts"}:
+                continue
             if key in result and isinstance(result[key], (int, bool)):
                 stats[key] += int(result[key])
         if result.get("rejection_stage"):
             stats["rejected"] += 1
         if result.get("error"):
             stats["errors"] += 1
+        for reason in result.get("rejection_reasons") or []:
+            stats["reason_counts"][str(reason)] += 1
 
-    def _log_stats(self, stats: dict[str, int]) -> None:
+    def _log_stats(self, stats: dict[str, Any]) -> None:
         LOGGER.info(
             "MEXC GATE REPORT | symbols=%d data=%d 1D=%d 12H=%d 4H=%d 1H=%d "
-            "structure=%d setup=%d momentum=%d volume=%d risk=%d rr=%d final=%d "
+            "regime=%d bias=%d setup=%d trigger=%d quality=%d risk=%d rr=%d final=%d "
             "sent=%d rejected=%d btc=%d execution=%d duplicate=%d errors=%d cache_hits=%d",
             stats["symbols"], stats["data_valid"], stats["pass_1d"], stats["pass_12h"],
-            stats["pass_4h"], stats["pass_1h"], stats["structure_pass"], stats["setup_pass"],
-            stats["momentum_pass"], stats["volume_pass"], stats["risk_pass"], stats["rr_pass"],
-            stats["final_pass"], stats["sent"], stats["rejected"], stats["rejected_btc"],
-            stats["rejected_execution"], stats["duplicate"], stats["errors"], stats["cache_hits"],
+            stats["pass_4h"], stats["pass_1h"], stats["regime_pass"], stats["bias_pass"],
+            stats["setup_pass"], stats["trigger_pass"], stats["quality_pass"], stats["risk_pass"],
+            stats["rr_pass"], stats["final_pass"], stats["sent"], stats["rejected"],
+            stats["rejected_btc"], stats["rejected_execution"], stats["duplicate"], stats["errors"],
+            stats["cache_hits"],
         )
+        reasons = stats.get("reason_counts") or {}
+        if reasons:
+            top = reasons.most_common(8) if hasattr(reasons, "most_common") else sorted(reasons.items(), key=lambda x: (-x[1], x[0]))[:8]
+            LOGGER.info("MEXC REJECTION REASONS | %s", " | ".join(f"{reason}={count}" for reason, count in top))
 
     async def _get_closed_candles(self, symbol: str, timeframe: str, limit: int) -> tuple[list[Any], bool]:
         tf = timeframe.upper()
@@ -193,7 +204,7 @@ class MexcScanner:
             c12 = synthesize_12h_from_4h(c4)
 
             mins = {"1D": 120, "12H": 60, "4H": 180, "1H": 180}
-            payload = {"candle_cache_hits": cache_hits}
+            payload: dict[str, Any] = {"candle_cache_hits": cache_hits}
             for tf, rows in (("1D", c1d), ("12H", c12), ("4H", c4), ("1H", c1)):
                 if len(rows) < mins[tf]:
                     return self._reject(symbol, f"Insufficient closed {tf} candles ({len(rows)}<{mins[tf]})", "DATA", payload)
@@ -202,22 +213,39 @@ class MexcScanner:
 
             analysis = analyze_candles(symbol, c1d, c12, c4, c1)
             payload["analysis"] = analysis
-            side = str(analysis.get("setup") or "").upper()
-            if side not in {"LONG", "SHORT"}:
-                return self._reject(symbol, "; ".join(analysis.get("diagnostic_failures") or ["No valid 4H + 1H setup"]), "SETUP", payload)
+            stages = analysis.get("stage_status") or {}
+            payload["regime_pass"] = int(bool(stages.get("1D_REGIME")))
+            payload["bias_pass"] = int(bool(stages.get("12H_BIAS")))
+            payload["setup_pass"] = int(bool(analysis.get("structure_ok") and analysis.get("setup_ok")))
+            payload["trigger_pass"] = int(bool(stages.get("1H_TRIGGER")))
+            payload["quality_pass"] = int(bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))))
+            payload["risk_pass"] = int(bool(stages.get("RISK", analysis.get("risk_ok", False))))
+            payload["rr_pass"] = int(bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))))
 
-            payload["structure_pass"] = int(bool(analysis.get("structure_ok")))
-            payload["setup_pass"] = int(bool(analysis.get("setup_ok") and analysis.get("confirmation_ok")))
-            payload["momentum_pass"] = int(bool(float(analysis.get("momentum_quality", 0) or 0) > 0))
-            payload["volume_pass"] = int(bool(float(analysis.get("volume_quality", 0) or 0) > 0))
-            payload["risk_pass"] = int(bool(analysis.get("risk_ok")))
-            payload["rr_pass"] = int(float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))
-            for k in ("structure_pass", "setup_pass", "momentum_pass", "volume_pass", "risk_pass", "rr_pass"):
-                if not payload[k]:
-                    return self._reject(symbol, analysis.get("rejection_reasons") or analysis.get("diagnostic_failures") or [k], k.upper(), payload)
+            side = str(analysis.get("setup") or "").upper()
+            failures = analysis.get("diagnostic_failures") or ["No actionable setup"]
+            if side not in {"LONG", "SHORT"}:
+                stage = str(analysis.get("rejection_stage") or "SETUP")
+                return self._reject(symbol, failures, stage, payload)
+
+            # Check all strategy stages for diagnostics; reject at the first failed gate.
+            # Reject at the first failed strategy gate while retaining all stage counters.
+            ordered = [
+                ("DIRECTION", bool(analysis.get("direction_ok")), "1D/12H/4H direction"),
+                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H BOS/retest setup"),
+                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H execution trigger"),
+                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), f"Quality score {analysis.get('score', 0)} < {int(getattr(self.settings, "min_confluence", 65))}"),
+                ("RISK", bool(stages.get("RISK", analysis.get("risk_ok", False))), "Structural risk model"),
+                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))), f"Post-cost RR {float(analysis.get('rr', 0) or 0):.2f} < {float(getattr(self.settings, "min_rr", 2.0)):.2f}"),
+            ]
+            for stage, passed, fallback in ordered:
+                if not passed:
+                    reasons = (analysis.get("stage_failures") or {}).get(stage) or [fallback]
+                    return self._reject(symbol, reasons, stage, payload)
 
             btc_ok, btc_reason = btc_filter_ok(side, self._btc_context, is_btc=symbol.upper().startswith("BTC"))
             if not btc_ok:
+                payload["rejected_btc"] = 1
                 return self._reject(symbol, btc_reason, "BTC", payload)
 
             try:
@@ -231,16 +259,24 @@ class MexcScanner:
             analysis["mexc_spread_pct"] = spread_pct
             analysis["max_allowed_spread_pct"] = 0.50
             if not quote_ok:
+                payload["rejected_execution"] = 1
                 return self._reject(symbol, quote_reason, "EXECUTION", payload)
-            analysis["candle_time"] = int(c1[-1]["time"])
+
+            # MEXC kline timestamps are candle-open timestamps. Decision time is the
+            # close of the completed 1H candle; use that consistently for freshness
+            # validation and signal identity.
+            candle_close_time = int(analysis.get("candle_close_time") or (int(c1[-1]["time"]) + TIMEFRAME_MS["1H"]))
+            analysis["candle_time"] = candle_close_time
             analysis["max_signal_age_seconds"] = int(getattr(self.settings, "max_signal_age_seconds", 5400))
 
             signal, reasons = validate_signal(
                 analysis,
-                min_confluence=int(getattr(self.settings, "min_confluence", 78)),
+                min_confluence=int(getattr(self.settings, "min_confluence", 65)),
                 min_rr=float(getattr(self.settings, "min_rr", 2.0)),
+                require_increasing_volume=False,
             )
             if signal is None:
+                payload["rejected_final"] = 1
                 return self._reject(symbol, reasons, "FINAL", payload)
 
             payload["final_pass"] = 1
@@ -262,6 +298,7 @@ class MexcScanner:
                 "final_pass": 1,
                 "analysis": analysis,
                 "candle_cache_hits": cache_hits,
+                "duplicate": 0,
             }
         except Exception as exc:
             LOGGER.exception("MEXC symbol scan failed: %s", symbol)

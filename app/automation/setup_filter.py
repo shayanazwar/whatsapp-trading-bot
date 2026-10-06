@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-MIN_SCORE = 78
+MIN_SCORE = 65
 MIN_RR = 2.00
 MIN_CONFIRMATION_FAMILIES = 0
 MIN_AVAILABLE_CONFIRMATION_FAMILIES = 0
 MIN_SL_ATR = 1.00
 MAX_SL_ATR = 3.50
-MIN_TP_ATR = 2.50
+MIN_TP_ATR = 2.00
 
 
 def _f(value: Any, default: float = 0.0) -> float:

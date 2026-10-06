@@ -8,7 +8,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 MIN_RR = 2.00
 MIN_SL_ATR = 1.00
 MAX_SL_ATR = 3.50
-MIN_TP_ATR = 2.50
+MIN_TP_ATR = 2.00
 DEFAULT_COST_BUFFER_PCT = 0.0015  # 0.15% round-trip conservative buffer
 
 

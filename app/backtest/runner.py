@@ -22,6 +22,7 @@ MAX_HOLD_MINUTES = 7_200  # 5 days
 WARMUP_1D = 300 * 86_400_000
 WARMUP_4H = 45 * 86_400_000
 WARMUP_1H = 20 * 86_400_000
+MAX_BACKTEST_SYMBOLS = 200
 
 
 class BacktestAnalysisTimeout(TimeoutError):
@@ -186,7 +187,7 @@ class BacktestRunner:
         try:
             start_ms, end_ms = self._period(int(days))
             symbols = await self.universe.refresh()
-            selected = symbols[: max(1, int(getattr(self.settings, "backtest_max_symbols", len(symbols))))]
+            selected = symbols[: max(1, min(MAX_BACKTEST_SYMBOLS, int(getattr(self.settings, "backtest_max_symbols", MAX_BACKTEST_SYMBOLS))))]
             LOGGER.info("BACKTEST %sD START | period=%s..%s symbols=%d", days, start_ms, end_ms, len(selected))
             if not selected:
                 return summarize(days=days, period_start_ms=start_ms, period_end_ms=end_ms, coins_selected=0, coins_tested=0, data_errors=0, execution_errors=0, rejected_setups=0, trades=[], diagnostics={"NO_SYMBOLS": 1})
@@ -218,6 +219,7 @@ class BacktestRunner:
                     diagnostics[key] = diagnostics.get(key, 0) + int(value)
 
             diagnostics["SYMBOLS_TESTED"] = len(results)
+            diagnostics["CURRENT_UNIVERSE_SNAPSHOT_BIAS"] = 1
             diagnostics["REJECTED_SETUPS"] = rejected
             diagnostics["BACKTEST_SECONDS"] = int(time.monotonic() - started)
             summary = summarize(

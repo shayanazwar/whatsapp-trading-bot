@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 import app.automation.scanner as scanner_module
 from app.analysis.engine import closed_candle_rows, synthesize_12h_from_4h
 from app.automation.executor import MexcExecutor, build_limit_order_payload
@@ -134,6 +136,56 @@ def test_public_request_rate_limit_retries_with_shared_backoff():
     assert len(calls) == 2
     assert client._public_retry_events == 1
     asyncio.run(client.close())
+
+
+def test_mexc_clients_share_public_rate_limiter_state():
+    settings = Settings(
+        mexc_public_min_interval_seconds=0.0,
+        mexc_public_window_seconds=2.0,
+        mexc_public_window_limit=8,
+    )
+    first = MexcClient(settings)
+    second = MexcClient(settings)
+    assert first._public_limiter_state is second._public_limiter_state
+    asyncio.run(first.close())
+    asyncio.run(second.close())
+
+
+def test_mexc_discovery_responses_are_coalesced():
+    settings = Settings()
+    client = MexcClient(settings)
+    calls = {"contracts": 0, "tickers": 0}
+
+    async def fake_request(method, path, **kwargs):
+        if path.endswith("/contract/detail"):
+            calls["contracts"] += 1
+            return [{"symbol": "BTC_USDT"}]
+        calls["tickers"] += 1
+        return [{"symbol": "BTC_USDT", "amount24": 1}]
+
+    async def run():
+        client._request = fake_request
+        first_contracts = await client.get_contracts()
+        second_contracts = await client.get_contracts()
+        first_tickers = await client.get_tickers()
+        second_tickers = await client.get_tickers()
+        return first_contracts, second_contracts, first_tickers, second_tickers
+
+    contracts1, contracts2, tickers1, tickers2 = asyncio.run(run())
+    assert contracts1 == contracts2 == [{"symbol": "BTC_USDT"}]
+    assert tickers1 == tickers2 == [{"symbol": "BTC_USDT", "amount24": 1}]
+    assert calls == {"contracts": 1, "tickers": 1}
+    asyncio.run(client.close())
+
+
+def test_scanner_spread_limit_uses_configured_percentage():
+    ticker = {"lastPrice": 100.0, "bid1": 99.9, "ask1": 100.1}
+    ok, _, spread = MexcScanner._ticker_quality(ticker, 15, max_spread_pct=0.25)
+    assert ok
+    assert spread == pytest.approx(0.2)
+    ok, reason, _ = MexcScanner._ticker_quality(ticker, 15, max_spread_pct=0.10)
+    assert not ok
+    assert "0.100%" in reason
 
 
 def test_live_scanner_uses_1h_close_time_not_1h_open_time_for_freshness(monkeypatch):

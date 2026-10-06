@@ -40,12 +40,37 @@ def test_1h_trigger_accepts_recent_qualifying_bar_within_three_bar_window(monkey
     monkeypatch.setattr(engine, "_safe_rsi", lambda closes: 55.0)
     monkeypatch.setattr(engine, "_relative_volume", lambda candles: 1.10)
 
+    # retest_time is the OPEN of the 4H retest candle. The trigger must only
+    # be evaluated after that entire 4H candle has closed.
+    retest_open = base + 44 * 3_600_000
     result = engine._one_hour_trigger_confirmation(
-        engine.convert_candles(rows), "LONG", 100.0, retest_time=base + 47 * 3_600_000
+        engine.convert_candles(rows), "LONG", 100.0, retest_time=retest_open
     )
     assert result["ready"] is True
     assert result["trigger_type"] in {"BREAKOUT", "RECLAIM"}
     assert 1 <= result["bars_after_retest"] <= engine.MAX_TRIGGER_BARS_1H
+
+
+def test_1h_trigger_does_not_use_bar_inside_open_4h_retest(monkeypatch):
+    base = 1_700_000_000_000
+    rows = [candle(base + i * 3_600_000, 100, 100.4, 99.6, 100.1) for i in range(60)]
+    # This bar sits inside the 4H retest candle and would qualify if the
+    # trigger incorrectly used the retest OPEN as its causal boundary.
+    rows[48] = candle(base + 48 * 3_600_000, 100.2, 101.5, 100.1, 101.3, 2000)
+    rows[49] = candle(base + 49 * 3_600_000, 101.2, 101.6, 100.8, 101.4, 2000)
+    monkeypatch.setattr(engine, "_safe_atr", lambda candles: 1.0)
+    monkeypatch.setattr(engine, "_safe_rsi", lambda closes: 55.0)
+    monkeypatch.setattr(engine, "_relative_volume", lambda candles: 1.20)
+
+    result = engine._one_hour_trigger_confirmation(
+        engine.convert_candles(rows),
+        "LONG",
+        100.0,
+        retest_time=base + 48 * 3_600_000,
+    )
+    assert result["ready"] is False
+    assert result["candle_time"] >= base + 52 * 3_600_000
+    assert result["candle_time"] not in {base + 48 * 3_600_000, base + 49 * 3_600_000}
 
 
 def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):

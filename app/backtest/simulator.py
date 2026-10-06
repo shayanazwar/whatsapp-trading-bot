@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 ONE_HOUR_MS = 3_600_000
 DEFAULT_FEE_RATE = 0.0004
 DEFAULT_SLIPPAGE_BPS = 2.0
-DEFAULT_MAX_HOLDING_MINUTES = 360
+DEFAULT_MAX_HOLDING_MINUTES = 72 * 60
 DEFAULT_SAME_BAR_RULE = "SL_FIRST"
 VALID_SAME_BAR_RULES = {"SL_FIRST", "TP_FIRST"}
 
@@ -345,8 +345,11 @@ def simulate_trade(
                 entry_exec = entry  # passive fill: no adverse market-order slippage
                 fill_ts = timestamp
             else:
-                entry_exec = _adverse_slippage(entry, side, is_entry=True, slippage_bps=slippage_bps)
-                fill_ts = signal_time
+                # Signal is produced at the completed 1H close; market execution
+                # occurs at the next 1H open, then receives adverse slippage.
+                base_entry = _open_price if timestamp >= signal_close_time_ms else entry
+                entry_exec = _adverse_slippage(base_entry, side, is_entry=True, slippage_bps=slippage_bps)
+                fill_ts = timestamp
 
             if not isfinite(entry_exec) or entry_exec <= 0:
                 return None

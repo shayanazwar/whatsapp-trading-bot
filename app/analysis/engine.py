@@ -40,18 +40,18 @@ MAX_ATR_PERCENTILE = 98.0
 BOS_BUFFER_ATR = 0.10
 RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
-RETEST_INVALIDATION_ATR = 0.20
+RETEST_INVALIDATION_ATR = 0.35
 MAX_SETUP_AGE_4H = 18  # 72h
 MAX_RETEST_BARS_4H = 10
-MAX_ENTRY_DISTANCE_ATR = 0.60  # measured from the 4H BOS level in 4H ATR
+MAX_ENTRY_DISTANCE_ATR = 1.25  # measured from the 4H BOS level in 4H ATR
 BTC_SHOCK_ATR = 2.0
 ADX_TREND_MIN = 14.0
-MIN_TRIGGER_BODY = 0.40
+MIN_TRIGGER_BODY = 0.25
 MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 3
 DEFAULT_MAX_HOLD_MINUTES = 12 * 60
-ENGINE_VERSION = "gold-v8.0-1d-12h-4h-1h-retest-geometry"
+ENGINE_VERSION = "gold-v8.1-1d-12h-4h-1h-balanced-retest"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -459,7 +459,7 @@ def _pullback_retest(candles: list[Candle], side: str, bos: Optional[dict[str, A
             return empty
 
         rejection = wick / rng >= 0.18
-        quality = _clamp(0.35 + (0.30 if rejection else 0) + (0.35 if directional else 0), 0, 1)
+        quality = _clamp(0.65 + (0.20 if rejection else 0) + (0.15 if directional else 0), 0, 1)
         return {"valid": True, "index": i, "time": int(c["time"]), "level": level, "quality": quality, "rejection": rejection, "low": l, "high": h}
     return empty
 
@@ -471,7 +471,7 @@ def _select_latest_bos_with_retest(candles: list[Candle], side: str, events: Opt
     for bos in reversed(events):
         # Use a moderate structural-strength floor; the 1H trigger and risk model
         # provide the additional quality checks later in the pipeline.
-        if _num(bos.get("strength")) < 0.60:
+        if _num(bos.get("strength")) < 0.50:
             continue
         if latest - int(bos["index"]) > MAX_SETUP_AGE_4H:
             continue
@@ -498,6 +498,9 @@ def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level
 
     latest_index = len(candles) - 1
     cur = candles[latest_index]
+    prev = candles[latest_index - 1]
+
+    bars_after_retest = None
     if retest_time is not None:
         retest_close_time = int(retest_time) + TIMEFRAME_MS["4h"]
         if int(cur["time"]) < retest_close_time:
@@ -515,10 +518,7 @@ def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level
             empty["bars_after_retest"] = bars_after_retest
             empty["reason"] = "Latest 1H bar is outside retest trigger window"
             return empty
-    else:
-        bars_after_retest = None
 
-    prev = candles[latest_index - 1]
     o, h, l, close = map(float, (cur["open"], cur["high"], cur["low"], cur["close"]))
     ph, pl = float(prev["high"]), float(prev["low"])
     rng = max(h - l, 1e-12)
@@ -526,53 +526,50 @@ def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level
     atr_i = _safe_atr(candles) or atr_value
     r = _safe_rsi(closes)
     rv = _relative_volume(candles)
+    buffer = max(atr_i * 0.05, 1e-12)
     loc = (close - l) / rng if side == "LONG" else (h - close) / rng
-    touch_tolerance = max(0.20 * atr_i, 1e-12)
 
     if side == "LONG":
-        touched = l <= setup_level + touch_tolerance
-        held = close > setup_level + max(0.05 * atr_i, 1e-12)
-        wick = min(o, close) - l
-        directional = close > o
-        rsi_ok = r >= 50.0
+        breakout = close > setup_level + buffer and close > o and close >= ph
+        reclaim = close > setup_level + buffer and close > o and l <= setup_level + max(0.25 * atr_i, buffer)
+        continuation = close > setup_level + buffer and close > o and close > float(prev["close"])
+        directional = r >= 50.0
         qmom = _clamp((r - 47.0) / 20.0, 0, 1)
+        trigger_type = "RECLAIM" if reclaim else "BREAKOUT"
     else:
-        touched = h >= setup_level - touch_tolerance
-        held = close < setup_level - max(0.05 * atr_i, 1e-12)
-        wick = h - max(o, close)
-        directional = close < o
-        rsi_ok = r <= 50.0
+        breakout = close < setup_level - buffer and close < o and close <= pl
+        reclaim = close < setup_level - buffer and close < o and h >= setup_level - max(0.25 * atr_i, buffer)
+        continuation = close < setup_level - buffer and close < o and close < float(prev["close"])
+        directional = r <= 50.0
         qmom = _clamp((53.0 - r) / 20.0, 0, 1)
+        trigger_type = "RECLAIM" if reclaim else "BREAKOUT"
 
-    wick_ratio = wick / rng
-    rejection = wick_ratio >= 0.25
-    trigger = bool(touched and held and directional and rejection)
+    trigger = bool((breakout or reclaim or continuation) and directional)
     hard_execution = bool(
         trigger
         and body >= MIN_TRIGGER_BODY
         and loc >= MIN_TRIGGER_CLOSE_LOCATION
         and rv >= MIN_TRIGGER_RVOL
-        and rsi_ok
     )
 
     quality = _clamp(
-        0.30 * _clamp(body / 0.70, 0, 1)
-        + 0.25 * _clamp(rv / 1.5, 0, 1)
-        + 0.20 * qmom
-        + 0.15 * _clamp(wick_ratio / 0.60, 0, 1)
+        0.38 * _clamp(body / 0.70, 0, 1)
+        + 0.27 * _clamp(rv / 1.5, 0, 1)
+        + 0.25 * qmom
         + 0.10 * (1.0 if loc >= MIN_TRIGGER_CLOSE_LOCATION else 0.0),
         0, 1,
     )
 
     if not trigger:
-        reason = "Latest 1H bar is not a retest rejection trigger"
+        reason = "Latest 1H bar is not a qualifying post-retest confirmation"
     elif not hard_execution:
-        reason = "1H retest rejection found but candle quality below minimum"
+        reason = "1H trigger found but candle quality below minimum"
     else:
-        reason = "1H retest rejection confirmation"
+        reason = "1H post-retest execution confirmation"
+
     return {
         "index": latest_index,
-        "ready": hard_execution,
+        "ready": bool(hard_execution),
         "quality": quality,
         "rsi": r,
         "rvol": rv,
@@ -580,15 +577,14 @@ def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level
         "body_ratio": body,
         "close_location": loc,
         "candle_time": int(cur["time"]),
-        "trigger_type": "RETEST_REJECTION" if trigger else "NONE",
+        "trigger_type": trigger_type if trigger else "NONE",
         "reason": reason,
         "bars_after_retest": bars_after_retest,
-        "touched_level": touched,
-        "rejection_wick_ratio": wick_ratio,
+        "touched_level": bool(reclaim),
+        "rejection_wick_ratio": 0.0,
         "previous_high": ph,
         "previous_low": pl,
     }
-
 
 def _collect_structural_levels(frames: Iterable[tuple[str, list[Candle]]], entry: float) -> list[dict[str, Any]]:
     raw: list[dict[str, Any]] = []
@@ -613,60 +609,21 @@ def _collect_structural_levels(frames: Iterable[tuple[str, list[Candle]]], entry
 
 def _target_path(frames: Iterable[tuple[str, list[Candle]]], side: str, entry: float, stop: float, atr_value: float) -> dict[str, Any]:
     risk = abs(entry - stop)
-    result = {
-        "ok": False, "tp": None, "risk": risk, "structural": False,
-        "target_levels": [], "target_timeframe": None, "blocking_level": None,
-        "reason": "no target",
-    }
+    result = {"ok": False, "tp": None, "risk": risk, "structural": False, "target_levels": [], "target_timeframe": None, "blocking_level": None, "reason": "no target"}
     if risk <= 0 or atr_value <= 0:
         result["reason"] = "zero risk or ATR"
         return result
-
-    levels = [
-        x for x in _collect_structural_levels(frames, entry)
-        if x["timeframe"] in {"1D", "12H", "4H"}
-    ]
+    levels = _collect_structural_levels(frames, entry)
     result["target_levels"] = levels[:20]
-    if not levels:
-        result["reason"] = "no opposing higher-timeframe structural level"
+    minimum_distance = max(MIN_TP_ATR * atr_value, MIN_RR * risk)
+    candidates = [x for x in levels if x["timeframe"] in {"1D", "12H", "4H"} and (x["price"] > entry + minimum_distance if side == "LONG" else x["price"] < entry - minimum_distance)]
+    candidates.sort(key=lambda x: x["price"], reverse=side == "SHORT")
+    if not candidates:
+        result["reason"] = f"no HTF target reaches {minimum_distance:.6g} price distance"
         return result
-
-    if side == "LONG":
-        opposing = sorted((x for x in levels if x["price"] > entry), key=lambda x: x["price"])
-    else:
-        opposing = sorted((x for x in levels if x["price"] < entry), key=lambda x: x["price"], reverse=True)
-    if not opposing:
-        result["reason"] = "no opposing higher-timeframe structural level"
-        return result
-
-    nearest = opposing[0]
-    distance = abs(float(nearest["price"]) - entry)
-    result["blocking_level"] = nearest
-    result["target_timeframe"] = nearest["timeframe"]
-
-    minimum_distance = MIN_TP_ATR * atr_value
-    if distance < minimum_distance:
-        result["reason"] = f"nearest HTF obstacle is too close ({distance:.6g} < {minimum_distance:.6g})"
-        return result
-
-    cost_pct = 0.0015
-    cost = entry * cost_pct
-    net_rr = max(0.0, distance - cost) / (risk + cost)
-    if net_rr < MIN_RR:
-        result["reason"] = f"nearest HTF target RR {net_rr:.2f} < {MIN_RR:.2f}; no clear target path"
-        return result
-
-    result.update({
-        "ok": True,
-        "tp": float(nearest["price"]),
-        "structural": True,
-        "target_timeframe": nearest["timeframe"],
-        "tp_level": nearest,
-        "reason": "nearest unblocked higher-timeframe structural target",
-    })
+    target = candidates[0]
+    result.update({"ok": True, "tp": float(target["price"]), "structural": True, "target_timeframe": target["timeframe"], "tp_level": target, "blocking_level": None, "reason": "single higher-timeframe structural target"})
     return result
-
-
 def calculate_trade_levels(data: dict[str, Any]) -> dict[str, Any]:
     side = str(data.get("setup") or "").upper()
     entry = _num(data.get("price"))
@@ -913,7 +870,7 @@ def analyze_candles(
 
     direction_ok = _direction_aligned(side, daily, bias, primary_structure, active_bos)
     structure_quality = _clamp(0.60 * _num((active_bos or {}).get("strength")) + 0.40 * _num(active_retest.get("quality")), 0, 1) if active_bos and active_retest else 0.0
-    structure_ok = bool(active_bos and active_retest.get("valid") and _num(active_bos.get("strength")) >= 0.60 and _num(active_retest.get("quality")) >= 0.65)
+    structure_ok = bool(active_bos and active_retest.get("valid") and _num(active_bos.get("strength")) >= 0.50 and _num(active_retest.get("quality")) >= 0.65)
     confirmation_ok = bool(trigger.get("ready"))
     setup_ok = side in {"LONG", "SHORT"}
     macro_ok = bool(

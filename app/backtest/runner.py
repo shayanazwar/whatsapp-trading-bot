@@ -63,8 +63,12 @@ class BacktestRunner:
 
     @staticmethod
     def _period(days: int) -> tuple[int, int]:
+        # End the historical decision window far enough in the past that the
+        # configured forward holding horizon is available for trade resolution.
+        # This prevents current-day backtests from turning still-open trades into
+        # artificial EXPIRED results simply because the API has no future candles.
         end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        end_ms = int(end_dt.timestamp() * 1000)
+        end_ms = int(end_dt.timestamp() * 1000) - MAX_HOLD_MINUTES * 60_000
         start_ms = end_ms - int(days) * 86_400_000
         return start_ms, end_ms
 

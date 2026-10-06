@@ -284,9 +284,9 @@ def simulate_trade(
         slippage_cash += slip_cash
         return exit_exec
 
-    def build_trade(outcome: str, ts: int | None, expired: bool = False) -> SimulatedTrade | None:
+    def build_trade(outcome: str, ts: int | None, expired: bool = False, close_position: bool = True) -> SimulatedTrade | None:
         hold = None if ts is None else _hold_minutes(signal_time, ts)
-        net_r = realized_pnl / initial_risk_cash if initial_risk_cash > 0 else None
+        net_r = realized_pnl / initial_risk_cash if close_position and initial_risk_cash > 0 else None
         if net_r is not None and not isfinite(net_r):
             net_r = None
         fees_r = (entry_fee + exit_fees) / initial_risk_cash
@@ -316,21 +316,21 @@ def simulate_trade(
             quality=_quality_snapshot(signal),
             initial_position_size=initial_size,
             tp1_close_size=0.0,
-            final_close_size=initial_size,
-            remaining_position_size=0.0,
+            final_close_size=initial_size if close_position else 0.0,
+            remaining_position_size=0.0 if close_position else initial_size,
             breakeven_hit=False,
             original_stop_loss=stop,
             breakeven_stop=None,
             tp1_execution=None,
             breakeven_execution=None,
-            final_exit_execution=final_exec,
+            final_exit_execution=final_exec if close_position else None,
             realized_pnl=realized_pnl,
             gross_pnl=gross_pnl,
             entry_fee=entry_fee,
             exit_fees=exit_fees,
             position_contract_size=contract_size,
             same_bar_rule=rule,
-            state="FINALIZED",
+            state="FINALIZED" if close_position else "OPEN",
         )
 
     expiry_ts = int(signal_time + max_hold * 60_000)
@@ -388,7 +388,7 @@ def simulate_trade(
 
     if previous_close is None or previous_close_time is None:
         return None
-    final_exec = execute_exit(previous_close)
-    if final_exec is None:
-        return None
-    return build_trade("EXPIRED", previous_close_time, expired=True)
+    # The historical data window ended before the configured holding horizon.
+    # Do not force-close the position and misclassify it as EXPIRED; it is still
+    # OPEN and therefore must be excluded from closed-trade performance metrics.
+    return build_trade("OPEN", previous_close_time, expired=False, close_position=False)

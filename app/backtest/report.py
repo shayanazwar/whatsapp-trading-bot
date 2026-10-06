@@ -86,7 +86,7 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         long_signals=sum(str(t.side).upper() == "LONG" for t in ordered),
         short_signals=sum(str(t.side).upper() == "SHORT" for t in ordered),
         resolved=len(resolved),
-        unresolved=sum(t.r_multiple is None for t in ordered),
+        unresolved=sum(str(t.outcome).upper() == "OPEN" for t in ordered),
         tp_hits=wins,
         sl_hits=losses,
         expired=expired,

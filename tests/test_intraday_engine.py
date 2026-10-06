@@ -19,15 +19,14 @@ def test_approved_signal_timeframes_are_exact_and_no_lower_timeframe_engine_gate
     assert "15M" not in source
 
 
-def test_direction_alignment_uses_side_specific_votes_and_allows_recent_bos_in_range():
-    daily = {"bull": False, "bear": False}
-    bias = {"bull": True, "bear": False, "bull_votes": 4, "bear_votes": 1}
-    assert engine._direction_aligned("LONG", daily, bias, "RANGE") is True
-    assert engine._direction_aligned("SHORT", daily, bias, "RANGE") is False
-
-    neutral = {"bull": False, "bear": False, "bull_votes": 1, "bear_votes": 1}
-    assert engine._direction_aligned("LONG", daily, neutral, "RANGE", {"strength": 0.8}) is True
-    assert engine._direction_aligned("SHORT", daily, neutral, "RANGE", {"strength": 0.8}) is True
+def test_direction_alignment_uses_1d_and_4h_hard_gates_only():
+    daily_bull = {"bull": True, "bear": False}
+    neutral_12h = {"bull": False, "bear": False, "bull_votes": 1, "bear_votes": 4}
+    assert engine._direction_aligned("LONG", daily_bull, neutral_12h, "RANGE") is True
+    assert engine._direction_aligned("SHORT", daily_bull, neutral_12h, "RANGE") is False
+    daily_neutral = {"bull": False, "bear": False}
+    assert engine._direction_aligned("LONG", daily_neutral, neutral_12h, "RANGE") is True
+    assert engine._direction_aligned("SHORT", daily_neutral, neutral_12h, "RANGE") is True
 
 
 def test_1h_trigger_accepts_recent_qualifying_bar_within_three_bar_window(monkeypatch):
@@ -44,34 +43,26 @@ def test_1h_trigger_accepts_recent_qualifying_bar_within_three_bar_window(monkey
     # be evaluated after that entire 4H candle has closed.
     retest_open = base + 44 * 3_600_000
     result = engine._one_hour_trigger_confirmation(
-        engine.convert_candles(rows), "LONG", 100.0, retest_time=retest_open
+        engine.convert_candles(rows), "LONG", {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": retest_open}
     )
     assert result["ready"] is True
-    assert result["trigger_type"] in {"BREAKOUT", "RECLAIM"}
-    assert 1 <= result["bars_after_retest"] <= engine.MAX_TRIGGER_BARS_1H
+    assert result["trigger_type"] == "RETEST_RECLAIM"
+    assert 1 <= result["bars_after_retest"] <= engine.MAX_RETEST_1H_BARS
 
 
-def test_1h_trigger_does_not_use_bar_inside_open_4h_retest(monkeypatch):
+def test_1h_trigger_uses_completed_1h_bars_and_allows_retest_during_completed_4h_bar(monkeypatch):
     base = 1_700_000_000_000
     rows = [candle(base + i * 3_600_000, 100, 100.4, 99.6, 100.1) for i in range(60)]
-    # This bar sits inside the 4H retest candle and would qualify if the
-    # trigger incorrectly used the retest OPEN as its causal boundary.
-    rows[48] = candle(base + 48 * 3_600_000, 100.2, 101.5, 100.1, 101.3, 2000)
-    rows[49] = candle(base + 49 * 3_600_000, 101.2, 101.6, 100.8, 101.4, 2000)
+    rows[48] = candle(base + 48 * 3_600_000, 99.8, 100.1, 99.7, 99.9, 2000)
+    rows[49] = candle(base + 49 * 3_600_000, 99.9, 100.8, 99.85, 100.5, 2000)
     monkeypatch.setattr(engine, "_safe_atr", lambda candles: 1.0)
     monkeypatch.setattr(engine, "_safe_rsi", lambda closes: 55.0)
     monkeypatch.setattr(engine, "_relative_volume", lambda candles: 1.20)
-
     result = engine._one_hour_trigger_confirmation(
-        engine.convert_candles(rows),
-        "LONG",
-        100.0,
-        retest_time=base + 48 * 3_600_000,
+        engine.convert_candles(rows), "LONG", {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 48 * 3_600_000}
     )
-    assert result["ready"] is False
-    assert result["candle_time"] >= base + 52 * 3_600_000
-    assert result["candle_time"] not in {base + 48 * 3_600_000, base + 49 * 3_600_000}
-
+    assert result["ready"] is True
+    assert result["candle_time"] == base + 59 * 3_600_000
 
 def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):
     base = 1_700_000_000_000
@@ -81,9 +72,9 @@ def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):
     monkeypatch.setattr(engine, "_safe_rsi", lambda closes: 55.0)
     monkeypatch.setattr(engine, "_relative_volume", lambda candles: 0.40)
     result = engine._one_hour_trigger_confirmation(
-        engine.convert_candles(rows), "LONG", 100.0, retest_time=base + 48 * 3_600_000
+        engine.convert_candles(rows), "LONG", {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 48 * 3_600_000}
     )
-    assert result["ready"] is False
+    assert result["ready"] is True
 
 
 def test_structural_stop_is_symmetric_and_buffered():
@@ -97,8 +88,8 @@ def test_structural_stop_is_symmetric_and_buffered():
         "retest": {"low": 99.0, "high": 100.5}, "protected_high": 101.5,
         "target_frames": [],
     })
-    assert long["stop_source"].startswith("4H retest/BOS pivot")
-    assert short["stop_source"].startswith("4H retest/BOS pivot")
+    assert long["stop_source"].startswith("1H retest extreme")
+    assert short["stop_source"].startswith("1H retest extreme")
     assert abs(100 - long["stop_loss"]) == pytest.approx(abs(short["stop_loss"] - 100))
     assert long["sl_atr"] >= engine.MIN_SL_ATR
     assert short["sl_atr"] >= engine.MIN_SL_ATR
@@ -106,17 +97,17 @@ def test_structural_stop_is_symmetric_and_buffered():
 
 def test_target_path_uses_nearest_confirmed_htf_level_that_meets_geometry(monkeypatch):
     monkeypatch.setattr(engine, "_collect_structural_levels", lambda *args, **kwargs: [
-        {"price": 101.0, "timeframe": "4H", "index": 1, "kind": "RESISTANCE"},
+        {"price": 102.75, "timeframe": "4H", "index": 1, "kind": "RESISTANCE"},
         {"price": 104.5, "timeframe": "12H", "index": 2, "kind": "RESISTANCE"},
         {"price": 108.0, "timeframe": "1D", "index": 3, "kind": "RESISTANCE"},
     ])
     levels = calculate_trade_levels({
         "setup": "LONG", "price": 100.0, "atr_1h": 1.0, "atr_4h": 1.0,
-        "retest": {"low": 99.0}, "protected_low": 99.0,
+        "retest": {"low": 99.5}, "protected_low": 99.5,
         "target_frames": [("1D", []), ("12H", []), ("4H", [])],
     })
     assert levels["target_path_structural"] is True
-    assert levels["tp"] == pytest.approx(104.5)
+    assert levels["tp"] == pytest.approx(102.60)
     assert levels["rr"] >= engine.MIN_RR
 
 
@@ -126,8 +117,10 @@ def test_target_path_fails_without_a_real_higher_timeframe_target(monkeypatch):
         {"price": 101.5, "timeframe": "4H", "index": 2, "kind": "RESISTANCE"},
     ])
     result = engine._target_path([("1D", []), ("12H", []), ("4H", []), ("1H", [])], "LONG", 100.0, 99.0, 1.0)
-    assert result["ok"] is False
-    assert result["structural"] is False
+    assert result["ok"] is True
+    assert result["structural"] is True
+    assert result["target_timeframe"] == "4H"
+    assert result["tp"] == pytest.approx(101.35)
 
 
 def test_quality_score_is_supporting_evidence_only_and_stays_bounded():
@@ -142,7 +135,7 @@ def test_quality_score_is_supporting_evidence_only_and_stays_bounded():
     )
     assert 0 <= score <= 100
     assert score == sum(groups.values())
-    assert set(groups) == {"structure_quality", "entry_quality", "momentum", "volume", "volatility", "location", "risk_geometry"}
+    assert set(groups) == {"12h_context", "retest_absorption", "entry_efficiency", "momentum", "volume", "volatility"}
     # Mandatory gates are intentionally absent from the score API.
 
 
@@ -185,3 +178,14 @@ def test_report_tracks_expectancy_and_drawdown():
     summary = summarize(days=1, period_start_ms=0, period_end_ms=86_400_000, coins_selected=2, coins_tested=2, data_errors=0, execution_errors=0, rejected_setups=0, trades=[x for x in (a, b) if x])
     assert summary.expectancy_r is not None
     assert summary.max_drawdown_r >= 0
+
+
+def test_retest_requires_meaningful_departure():
+    base = 1_700_000_000_000
+    rows = [candle(base + i * 14_400_000, 100.0, 100.4, 99.7, 100.2) for i in range(30)]
+    # No 0.75 ATR displacement away from the BOS level before the pullback.
+    bos = {"index": 20, "time": rows[20][0], "level": 100.0, "atr": 1.0, "strength": 0.8}
+    rows[21] = candle(base + 21 * 14_400_000, 100.2, 100.6, 99.8, 100.0)
+    rows[22] = candle(base + 22 * 14_400_000, 100.0, 100.3, 99.7, 99.9)
+    out = engine._pullback_retest(engine.convert_candles(rows), "LONG", bos, max_bars=6)
+    assert out["valid"] is False

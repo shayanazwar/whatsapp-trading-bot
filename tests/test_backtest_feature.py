@@ -20,16 +20,16 @@ def test_backtest_universe_is_capped_at_200_symbols():
     assert MAX_BACKTEST_SYMBOLS == 200
 
 
-def test_backtest_runner_supports_only_documented_1d_and_7d_windows():
+def test_backtest_runner_supports_documented_validation_windows():
     class EmptyUniverse:
         async def refresh(self): return []
     runner = BacktestRunner(client=None, universe=EmptyUniverse(), settings=Settings(), max_concurrency=1)
-    for days in (1, 7):
+    for days in (1, 7, 30, 60, 90):
         summary = asyncio.run(runner.run(days))
         assert summary.days == days
         assert summary.signals == 0
     with pytest.raises(ValueError):
-        asyncio.run(runner.run(30))
+        asyncio.run(runner.run(15))
 
 
 def test_backtest_rejects_concurrent_job():
@@ -89,3 +89,18 @@ def test_zero_trade_report_is_rendered_with_bias_diagnostic():
     text = format_report(summary)
     assert "Signals: 0" in text
     assert "CURRENT_UNIVERSE_SNAPSHOT_BIAS" in text
+
+
+def test_simulator_limit_entry_and_mfe_mae_tracking():
+    signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100.0, "limit_price": 100.0, "entry_mode": "LIMIT", "stop_loss": 98.0, "tp": 104.0}
+    future = [
+        candle(3_600_000, 101.0, 103.0, 100.2, 102.0),
+        candle(7_200_000, 102.0, 105.0, 99.8, 103.0),
+    ]
+    trade = simulate_trade(signal, future, signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0, max_holding_minutes=180)
+    assert trade is not None
+    assert trade.entry_mode == "LIMIT"
+    assert trade.entry_filled_time_ms == 7_200_000
+    assert trade.outcome == "TP"
+    assert trade.mfe_r >= 2.0
+    assert trade.mae_r >= 0.1

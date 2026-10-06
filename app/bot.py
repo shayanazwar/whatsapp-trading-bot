@@ -50,10 +50,9 @@ SEARCH PEPE
 🧪 BACKTEST
 BACKTEST 1D
 BACKTEST 7D
-BACKTEST 30D
-BACKTEST 90D
 
-⏱ 5M • 15M • 1H • 4H • 1D
+⏱ SIGNAL: 1D • 12H • 4H • 1H
+CHART: MEXC-supported timeframes
 """
 
 COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
@@ -295,7 +294,7 @@ class Bot:
             f"ðŸ§  {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
             f"4H Trend: {data.get('trend_4h', 'N/A')}\n"
             f"1H Structure: {data.get('structure_1h', 'N/A')}\n"
-            f"15M Structure: {data.get('bos_15m', 'N/A')}\n"
+            f"4H BOS: {data.get('bos_4h', 'N/A')}\n"
             f"EMA 21/50: {data.get('ema_direction', 'N/A')}\n"
             f"RSI: {fmt_number(data.get('rsi'))}\n"
             f"Volume: {data.get('volume', 'N/A')}\n"
@@ -610,13 +609,11 @@ class Bot:
         periods = {
             "1D": 1,
             "7D": 7,
-            "30D": 30,
-            "90D": 90,
         }
 
         if period not in periods:
             raise ValueError(
-                "Usage: BACKTEST 1D, BACKTEST 7D, BACKTEST 30D, or BACKTEST 90D"
+                "Usage: BACKTEST 1D or BACKTEST 7D"
             )
 
         if self.backtest_runner.is_running:

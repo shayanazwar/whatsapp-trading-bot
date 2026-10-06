@@ -59,8 +59,8 @@ class Settings(BaseSettings):
     mexc_rate_limit_backoff_cap_seconds: float = Field(default=20.0, alias="MEXC_RATE_LIMIT_BACKOFF_CAP_SECONDS")
     mexc_rate_limit_jitter_seconds: float = Field(default=0.25, alias="MEXC_RATE_LIMIT_JITTER_SECONDS")
     candle_limit: int = Field(default=250, alias="CANDLE_LIMIT")
-    min_confluence: int = Field(default=78, alias="MIN_CONFLUENCE")
-    min_rr: float = Field(default=2.5, alias="MIN_RR")
+    min_confluence: int = Field(default=65, alias="MIN_CONFLUENCE")
+    min_rr: float = Field(default=2.0, alias="MIN_RR")
     max_entry_drift_pct: float = Field(default=0.002, alias="MAX_ENTRY_DRIFT_PCT")
     estimated_round_trip_cost_pct: float = Field(default=0.0015, alias="ESTIMATED_ROUND_TRIP_COST_PCT")
     max_mexc_spread_pct: float = Field(default=0.001, alias="MAX_MEXC_SPREAD_PCT")
@@ -70,9 +70,8 @@ class Settings(BaseSettings):
     trade_flow_limit: int = Field(default=100, alias="TRADE_FLOW_LIMIT")
     require_increasing_volume: bool = Field(default=True, alias="REQUIRE_INCREASING_VOLUME")
     signal_expiry_minutes: int = Field(default=30, alias="SIGNAL_EXPIRY_MINUTES")
-    # 15M is now the signal identity/freshness clock. The validator also protects
-    # against an old 5M legacy environment value by enforcing a sensible floor.
-    max_signal_age_seconds: float = Field(default=1200.0, alias="MAX_SIGNAL_AGE_SECONDS")
+    # Signal freshness is measured from the CLOSE of the completed 1H entry candle.
+    max_signal_age_seconds: float = Field(default=5400.0, alias="MAX_SIGNAL_AGE_SECONDS")
     auto_signal_recipients: str = Field(default="", alias="AUTO_SIGNAL_RECIPIENTS")
     auto_signal_telegram_recipients: str = Field(
         default="",

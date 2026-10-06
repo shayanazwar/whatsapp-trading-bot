@@ -8,6 +8,7 @@ from typing import Optional
 
 from .automation.mexc_client import MexcClient
 from .config import Settings
+from .analysis.engine import closed_candle_rows, synthesize_12h_from_4h
 
 LOGGER = logging.getLogger(__name__)
 
@@ -171,9 +172,12 @@ class MarketData:
         if ref.exchange.lower() != "mexc":
             raise ValueError("Only MEXC Futures market data is supported.")
         tf = TIMEFRAME_ALIASES.get(timeframe.upper(), timeframe.lower())
+        if tf == "12h":
+            raw = await self.mexc.get_klines(ref.symbol, "Hour4", max(9, int(limit) * 3 + 6))
+            return synthesize_12h_from_4h(raw)[: int(limit)]
         interval = _MEXC_INTERVALS.get(tf)
         if interval is None:
-            raise ValueError("MEXC Futures supports: 1M, 5M, 15M, 30M, 1H, 4H, 8H, 1D, 1W")
+            raise ValueError("Unsupported market timeframe: 12H is synthesized from completed 4H candles; otherwise use a MEXC-supported interval.")
         return await self.mexc.get_klines(ref.symbol, interval, limit)
 
     async def executable_price(self, ref: MarketRef, side: str) -> float:

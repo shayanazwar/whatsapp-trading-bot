@@ -30,26 +30,27 @@ TIMEFRAME_ALIASES = {
 }
 APPROVED_TIMEFRAMES = ("1D", "12H", "4H", "1H")
 
-MIN_SCORE = 78
+MIN_SCORE = 65
 MIN_RR = 2.0
 MIN_SL_ATR = 1.0
 MAX_SL_ATR = 3.5
-MIN_TP_ATR = 2.5
-MIN_ATR_PERCENTILE = 20.0
-MAX_ATR_PERCENTILE = 95.0
+MIN_TP_ATR = 2.0
+MIN_ATR_PERCENTILE = 10.0
+MAX_ATR_PERCENTILE = 98.0
 BOS_BUFFER_ATR = 0.10
 RETEST_TOLERANCE_ATR = 0.35
 RETEST_PENETRATION_ATR = 0.65
-MAX_SETUP_AGE_4H = 12  # 48h
-MAX_RETEST_BARS_4H = 8
-MAX_ENTRY_DISTANCE_ATR = 2.5
-BOS_BUFFER_ATR = 0.10
+MAX_SETUP_AGE_4H = 18  # 72h
+MAX_RETEST_BARS_4H = 10
+MAX_ENTRY_DISTANCE_ATR = 2.75
 BTC_SHOCK_ATR = 2.0
 ADX_TREND_MIN = 14.0
-MIN_TRIGGER_RVOL = 0.90
-MIN_TRIGGER_BODY = 0.45
+MIN_TRIGGER_BODY = 0.40
+MIN_TRIGGER_CLOSE_LOCATION = 0.58
+MIN_TRIGGER_RVOL = 0.70
+MAX_TRIGGER_BARS_1H = 3
 DEFAULT_MAX_HOLD_MINUTES = 12 * 60
-ENGINE_VERSION = "gold-v6.0-1d-12h-4h-1h"
+ENGINE_VERSION = "gold-v7.0-1d-12h-4h-1h"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -58,6 +59,7 @@ CONFIRMATION_FAMILY_NAMES = (
     "target_path",
     "vwap_location",
     "structure_quality",
+    "entry_quality",
 )
 
 
@@ -447,9 +449,9 @@ def _select_latest_bos_with_retest(candles: list[Candle], side: str, events: Opt
     latest = len(candles) - 1
     empty = _pullback_retest(candles, side, None)
     for bos in reversed(events):
-        # Weak breaks are not eligible structural setups. Skipping them here
-        # prevents a noisy late event from masking an earlier valid BOS/retest.
-        if _num(bos.get("strength")) < 0.55:
+        # Use a moderate structural-strength floor; the 1H trigger and risk model
+        # provide the additional quality checks later in the pipeline.
+        if _num(bos.get("strength")) < 0.50:
             continue
         if latest - int(bos["index"]) > MAX_SETUP_AGE_4H:
             continue
@@ -460,37 +462,92 @@ def _select_latest_bos_with_retest(candles: list[Candle], side: str, events: Opt
 
 
 def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level: Optional[float], retest_time: Optional[int]) -> dict[str, Any]:
-    empty = {"ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": 0.0, "body_ratio": 0.0, "close_location": 0.0, "candle_time": 0, "trigger_type": "NONE", "reason": "insufficient data"}
+    empty = {
+        "ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": 0.0,
+        "body_ratio": 0.0, "close_location": 0.0, "candle_time": 0,
+        "trigger_type": "NONE", "reason": "insufficient data", "bars_after_retest": None,
+    }
     if len(candles) < 40 or setup_level is None or side not in {"LONG", "SHORT"}:
         return empty
-    cur, prev = candles[-1], candles[-2]
-    if retest_time is not None and int(cur["time"]) <= int(retest_time):
-        empty["candle_time"] = int(cur["time"])
-        empty["reason"] = "1H confirmation is not after retest"
-        return empty
-    o, h, l, close = map(float, (cur["open"], cur["high"], cur["low"], cur["close"]))
-    ph, pl = float(prev["high"]), float(prev["low"])
-    rng = max(h - l, 1e-12)
-    body = abs(close - o) / rng
+
+    closes = [float(c["close"]) for c in candles]
     atr_value = _safe_atr(candles)
-    r = _safe_rsi([float(c["close"]) for c in candles])
-    rv = _relative_volume(candles)
-    buffer = max(atr_value * 0.05, 1e-12)
-    loc = (close - l) / rng if side == "LONG" else (h - close) / rng
-    if side == "LONG":
-        breakout = close > setup_level + buffer and close > o and close >= ph
-        reclaim = close > setup_level + buffer and close > o and l <= setup_level + buffer
-        momentum = r >= 52.0
-        qmom = _clamp((r - 48.0) / 18.0, 0, 1)
-    else:
-        breakout = close < setup_level - buffer and close < o and close <= pl
-        reclaim = close < setup_level - buffer and close < o and h >= setup_level - buffer
-        momentum = r <= 48.0
-        qmom = _clamp((52.0 - r) / 18.0, 0, 1)
-    ready = (breakout or reclaim) and momentum and body >= MIN_TRIGGER_BODY and loc >= 0.62 and rv >= MIN_TRIGGER_RVOL
-    quality = _clamp(0.40 * _clamp(body / 0.70, 0, 1) + 0.30 * _clamp(rv / 1.5, 0, 1) + 0.30 * qmom, 0, 1)
-    reason = "1H confirmation supportive" if ready else "1H confirmation below preferred quality"
-    return {"ready": bool(ready), "quality": quality, "rsi": r, "rvol": rv, "atr": atr_value, "body_ratio": body, "close_location": loc, "candle_time": int(cur["time"]), "trigger_type": "BREAKOUT" if breakout else "RECLAIM" if reclaim else "NONE", "reason": reason}
+    if atr_value <= 0:
+        empty["reason"] = "1H ATR unavailable"
+        return empty
+
+    latest_index = len(candles) - 1
+    start_index = max(1, latest_index - MAX_TRIGGER_BARS_1H + 1)
+    retest_idx = None
+    if retest_time is not None:
+        for i, c in enumerate(candles):
+            if int(c["time"]) == int(retest_time):
+                retest_idx = i
+                break
+
+    candidates: list[dict[str, Any]] = []
+    for i in range(start_index, latest_index + 1):
+        if retest_idx is not None and i <= retest_idx:
+            continue
+        cur, prev = candles[i], candles[i - 1]
+        o, h, l, close = map(float, (cur["open"], cur["high"], cur["low"], cur["close"]))
+        ph, pl = float(prev["high"]), float(prev["low"])
+        rng = max(h - l, 1e-12)
+        body = abs(close - o) / rng
+        atr_i = _safe_atr(candles[: i + 1])
+        if atr_i <= 0:
+            atr_i = atr_value
+        r = _safe_rsi(closes[: i + 1])
+        rv = _relative_volume(candles[: i + 1])
+        buffer = max(atr_i * 0.05, 1e-12)
+        loc = (close - l) / rng if side == "LONG" else (h - close) / rng
+
+        if side == "LONG":
+            breakout = close > setup_level + buffer and close > o and close >= ph
+            reclaim = close > setup_level + buffer and close > o and l <= setup_level + buffer
+            directional = r >= 50.0
+            qmom = _clamp((r - 47.0) / 20.0, 0, 1)
+        else:
+            breakout = close < setup_level - buffer and close < o and close <= pl
+            reclaim = close < setup_level - buffer and close < o and h >= setup_level - buffer
+            directional = r <= 50.0
+            qmom = _clamp((53.0 - r) / 20.0, 0, 1)
+
+        trigger = breakout or reclaim
+        if not trigger or not directional:
+            continue
+        quality = _clamp(
+            0.38 * _clamp(body / 0.70, 0, 1)
+            + 0.27 * _clamp(rv / 1.5, 0, 1)
+            + 0.25 * qmom
+            + 0.10 * (1.0 if loc >= MIN_TRIGGER_CLOSE_LOCATION else 0.0),
+            0, 1,
+        )
+        hard_execution = body >= MIN_TRIGGER_BODY and loc >= MIN_TRIGGER_CLOSE_LOCATION and rv >= MIN_TRIGGER_RVOL
+        candidates.append({
+            "index": i,
+            "ready": bool(hard_execution),
+            "quality": quality,
+            "rsi": r,
+            "rvol": rv,
+            "atr": atr_i,
+            "body_ratio": body,
+            "close_location": loc,
+            "candle_time": int(cur["time"]),
+            "trigger_type": "BREAKOUT" if breakout else "RECLAIM",
+            "bars_after_retest": None if retest_idx is None else i - retest_idx,
+            "reason": "1H execution confirmation" if hard_execution else "1H trigger found but candle quality below minimum",
+        })
+
+    if not candidates:
+        empty["candle_time"] = int(candles[-1]["time"])
+        empty["reason"] = "No 1H breakout/reclaim trigger in recent window" if retest_idx is None else "No qualifying 1H trigger after retest"
+        return empty
+
+    # Prefer the most recent qualifying trigger; a recent trigger with adequate
+    # candle quality is more actionable than an older, technically stronger one.
+    candidates.sort(key=lambda item: (bool(item["ready"]), int(item["index"]), float(item["quality"])), reverse=True)
+    return candidates[0]
 
 
 def _collect_structural_levels(frames: Iterable[tuple[str, list[Candle]]], entry: float) -> list[dict[str, Any]]:
@@ -573,15 +630,20 @@ def calculate_trade_levels(data: dict[str, Any]) -> dict[str, Any]:
     return {"entry": entry, "stop_loss": stop, "tp": tp, "rr": net_rr, "rr_gross": rr_gross, "estimated_round_trip_cost_pct": cost_pct, "target_path_ok": bool(path.get("ok")), "target_path_structural": bool(path.get("structural")), "target_path_reason": path.get("reason"), "target_levels": path.get("target_levels", []), "target_timeframe": path.get("target_timeframe"), "stop_source": stop_source, "sl_atr": stop_atr, "stop_distance_pct": abs(entry - stop) / entry, "tp_distance_atr": tp_atr, "tp_distance_pct": reward / entry, "trade_geometry_ok": geometry_ok, "geometry_reason": "OK" if geometry_ok else "trade geometry failed"}
 
 
-def _direction_aligned(side: str, daily: dict[str, Any], bias: dict[str, Any], primary_structure: str) -> bool:
+def _direction_aligned(side: str, daily: dict[str, Any], bias: dict[str, Any], primary_structure: str, bos: Optional[dict[str, Any]] = None) -> bool:
+    bos_strength = _num((bos or {}).get("strength"))
     if side == "LONG":
         if daily.get("bear") or bias.get("bear") or primary_structure == "LH/LL":
             return False
-        return bool(primary_structure == "HH/HL" and (daily.get("bull") or bias.get("bull") or bias.get("votes", 0) >= 3))
+        directional_bias = bool(daily.get("bull") or bias.get("bull") or _num(bias.get("bull_votes")) >= 3)
+        recent_break = bos_strength >= 0.50
+        return bool(directional_bias or recent_break) and primary_structure != "LH/LL"
     if side == "SHORT":
         if daily.get("bull") or bias.get("bull") or primary_structure == "HH/HL":
             return False
-        return bool(primary_structure == "LH/LL" and (daily.get("bear") or bias.get("bear") or bias.get("votes", 0) >= 3))
+        directional_bias = bool(daily.get("bear") or bias.get("bear") or _num(bias.get("bear_votes")) >= 3)
+        recent_break = bos_strength >= 0.50
+        return bool(directional_bias or recent_break) and primary_structure != "HH/HL"
     return False
 
 
@@ -600,32 +662,49 @@ def _shock_veto(candles: list[Candle], side: str, atr_value: float) -> tuple[boo
 
 def evaluate_confirmation_families(data: dict[str, Any]) -> dict[str, Any]:
     side = str(data.get("setup") or "").upper()
-    rvol = _num(data.get("rvol_1h", data.get("rvol")))
-    momentum = _num(data.get("momentum_quality"))
+    momentum = _clamp(_num(data.get("momentum_quality")), 0, 1)
+    rvol = max(0.0, _num(data.get("rvol_1h", data.get("rvol"))))
     atr_rank = _num(data.get("atr_percentile"), 50.0)
     vwap = _num(data.get("rolling_vwap_12h"), _num(data.get("price")))
     price = _num(data.get("price"))
+    structure_quality = _clamp(_num(data.get("structure_quality")), 0, 1)
+    trigger_quality = _clamp(_num(data.get("trigger_quality")), 0, 1)
+    path_ok = bool(data.get("target_path_structural"))
+    vwap_ok = bool((price >= vwap and side == "LONG") or (price <= vwap and side == "SHORT"))
+    volatility_ok = bool(MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE)
+
     families = {
-        "momentum": {"status": "PASS" if side == "LONG" and momentum >= 0.55 or side == "SHORT" and momentum >= 0.55 else "FAIL", "value": momentum},
+        "structure_quality": {"status": "PASS" if structure_quality >= 0.60 else "FAIL", "value": structure_quality},
+        "entry_quality": {"status": "PASS" if trigger_quality >= 0.55 else "FAIL", "value": trigger_quality},
+        "momentum": {"status": "PASS" if momentum >= 0.55 else "FAIL", "value": momentum},
         "relative_volume": {"status": "PASS" if rvol >= 1.0 else "FAIL", "value": rvol},
-        "volatility_regime": {"status": "PASS" if MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE else "FAIL", "value": atr_rank},
-        "target_path": {"status": "PASS" if data.get("target_path_structural") else "FAIL", "value": bool(data.get("target_path_structural"))},
-        "vwap_location": {"status": "PASS" if (price >= vwap and side == "LONG") or (price <= vwap and side == "SHORT") else "FAIL", "value": vwap},
-        "structure_quality": {"status": "PASS" if data.get("structure_quality_ok") else "FAIL", "value": _num(data.get("structure_quality"))},
+        "volatility_regime": {"status": "PASS" if volatility_ok else "FAIL", "value": atr_rank},
+        "target_path": {"status": "PASS" if path_ok else "FAIL", "value": path_ok},
+        "vwap_location": {"status": "PASS" if vwap_ok else "FAIL", "value": vwap},
     }
     passed = sum(1 for item in families.values() if item["status"] == "PASS")
-    return {"families": families, "passed": passed, "available": len(families), "diversity_ok": passed >= 3, "supporting_quality_ok": passed >= 3}
+    return {"families": families, "passed": passed, "available": len(families), "diversity_ok": passed >= 4, "supporting_quality_ok": passed >= 4}
 
 
-def _build_score(*, direction_ok: bool, structure_ok: bool, setup_ok: bool, confirmation_ok: bool, macro_ok: bool, momentum_quality: float, volume_quality: float, volatility_ok: bool, location_ok: bool, risk_ok: bool) -> tuple[int, dict[str, int]]:
+def _build_score(
+    *,
+    structure_quality: float,
+    trigger_quality: float,
+    momentum_quality: float,
+    volume_quality: float,
+    volatility_quality: float,
+    location_quality: float,
+    risk_quality: float,
+) -> tuple[int, dict[str, int]]:
+    """Score only supporting evidence; mandatory gates are not double-counted."""
     groups = {
-        "structure_prerequisites": 45 if (direction_ok and structure_ok and setup_ok and confirmation_ok) else 0,
-        "macro_alignment": 15 if macro_ok else 0,
-        "momentum": int(round(10 * _clamp(momentum_quality, 0, 1))),
-        "volume": int(round(8 * _clamp(volume_quality, 0, 1))),
-        "volatility": 7 if volatility_ok else 0,
-        "target_path": 10 if location_ok else 0,
-        "risk_geometry": 5 if risk_ok else 0,
+        "structure_quality": int(round(25 * _clamp(structure_quality, 0, 1))),
+        "entry_quality": int(round(15 * _clamp(trigger_quality, 0, 1))),
+        "momentum": int(round(15 * _clamp(momentum_quality, 0, 1))),
+        "volume": int(round(10 * _clamp(volume_quality, 0, 1))),
+        "volatility": int(round(10 * _clamp(volatility_quality, 0, 1))),
+        "location": int(round(10 * _clamp(location_quality, 0, 1))),
+        "risk_geometry": int(round(15 * _clamp(risk_quality, 0, 1))),
     }
     return max(0, min(100, sum(groups.values()))), groups
 
@@ -685,13 +764,13 @@ def _diagnostic_failures(data: dict[str, Any]) -> list[str]:
     checks = [
         (not data.get("direction_ok"), "1D/12H/4H direction"),
         (not data.get("structure_ok"), "4H BOS/retest structure"),
-        (not data.get("setup_ok"), "1H setup"),
+        (not data.get("setup_ok"), "4H setup side"),
         (not data.get("confirmation_ok"), "1H confirmation"),
-        (not data.get("volatility_ok"), "volatility"),
-        (not data.get("location_ok"), "target path"),
-        (not data.get("risk_ok"), "risk/RR"),
+        (not data.get("volatility_ok"), "1H volatility regime"),
+        (not data.get("location_ok"), "HTF target path / entry distance"),
+        (not data.get("risk_ok"), "structural risk/RR"),
         (not data.get("shock_veto_ok"), "shock veto"),
-        (int(data.get("score", 0) or 0) < MIN_SCORE, "score"),
+        (int(data.get("score", 0) or 0) < MIN_SCORE, f"quality score {int(data.get('score', 0) or 0)}<{MIN_SCORE}"),
     ]
     return list(dict.fromkeys(label for failed, label in checks if failed))
 
@@ -723,8 +802,8 @@ def analyze_candles(
     bos_long, ret_long = _select_latest_bos_with_retest(c4, "LONG")
     bos_short, ret_short = _select_latest_bos_with_retest(c4, "SHORT")
 
-    long_candidate = bool(bos_long and ret_long.get("valid") and primary_structure == "HH/HL")
-    short_candidate = bool(bos_short and ret_short.get("valid") and primary_structure == "LH/LL")
+    long_candidate = bool(bos_long and ret_long.get("valid"))
+    short_candidate = bool(bos_short and ret_short.get("valid"))
     side = "LONG" if long_candidate and not short_candidate else "SHORT" if short_candidate and not long_candidate else "NONE"
     if side == "NONE" and long_candidate and short_candidate:
         side = "LONG" if _num(bos_long.get("strength")) >= _num(bos_short.get("strength")) else "SHORT"
@@ -732,8 +811,9 @@ def analyze_candles(
     active_bos = bos_long if side == "LONG" else bos_short if side == "SHORT" else None
     active_retest = ret_long if side == "LONG" else ret_short if side == "SHORT" else {}
     level = _num(active_bos.get("level")) if active_bos else None
-    trigger = _one_hour_trigger_confirmation(c1, side, level, active_retest.get("time")) if side in {"LONG", "SHORT"} else {"ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": _safe_atr(c1), "body_ratio": 0.0, "close_location": 0.0, "candle_time": int(c1[-1]["time"]), "trigger_type": "NONE", "reason": "no active setup"}
-    setup = side if trigger.get("ready") else "NO TRADE"
+    trigger = _one_hour_trigger_confirmation(c1, side, level, active_retest.get("time")) if side in {"LONG", "SHORT"} else {"ready": False, "quality": 0.0, "rsi": 50.0, "rvol": 0.0, "atr": _safe_atr(c1), "body_ratio": 0.0, "close_location": 0.0, "candle_time": int(c1[-1]["time"]), "trigger_type": "NONE", "reason": "no active setup", "bars_after_retest": None}
+    # Keep the structural side even when the 1H trigger is absent so risk/path diagnostics remain visible.
+    setup = side if side in {"LONG", "SHORT"} else "NO TRADE"
 
     price = float(c1[-1]["close"])
     atr1 = _safe_atr(c1)
@@ -746,27 +826,49 @@ def analyze_candles(
         momentum_quality = _clamp(momentum_quality + 0.20, 0, 1)
     if (setup == "LONG" and macd_delta >= 0) or (setup == "SHORT" and macd_delta <= 0):
         momentum_quality = _clamp(momentum_quality + 0.10, 0, 1)
-    volume_quality = _clamp(0.75 * _clamp(rvol1 / 1.5, 0, 1) + 0.25 * (1.0 if volume_status(c1) == "INCREASING" else 0.5), 0, 1)
     atr_rank = _atr_percentile(c1)
     volatility_ok = MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE and atr1 > 0
 
-    direction_ok = _direction_aligned(setup, daily, bias, primary_structure)
-    structure_ok = bool(active_bos and active_retest.get("valid") and _num(active_bos.get("strength")) >= 0.55 and _num(active_retest.get("quality")) >= 0.65)
+    direction_ok = _direction_aligned(side, daily, bias, primary_structure, active_bos)
+    structure_quality = _clamp(0.60 * _num((active_bos or {}).get("strength")) + 0.40 * _num(active_retest.get("quality")), 0, 1) if active_bos and active_retest else 0.0
+    structure_ok = bool(active_bos and active_retest.get("valid") and _num(active_bos.get("strength")) >= 0.50 and _num(active_retest.get("quality")) >= 0.65)
     confirmation_ok = bool(trigger.get("ready"))
     setup_ok = side in {"LONG", "SHORT"}
-    macro_ok = bool((daily.get("bull") and bias.get("bull")) or (daily.get("bear") and bias.get("bear")) or (daily.get("regime") == "SIDEWAYS" and bias.get("votes", 0) >= 3))
+    macro_ok = bool(
+        (daily.get("bull") and not daily.get("bear"))
+        or (daily.get("bear") and not daily.get("bull"))
+        or (daily.get("regime") == "SIDEWAYS" and (bias.get("bull") or bias.get("bear")))
+    )
 
     frames = [("1D", c1d), ("12H", c12), ("4H", c4), ("1H", c1)]
     levels = calculate_trade_levels({"setup": setup, "price": price, "atr_1h": atr1, "atr_4h": atr4, "protected_low": protected4.get("protected_low"), "protected_high": protected4.get("protected_high"), "retest": active_retest, "target_frames": frames, "estimated_round_trip_cost_pct": 0.0015})
-    location_ok = bool(levels.get("target_path_ok") and levels.get("target_path_structural") and _num(levels.get("tp_distance_atr")) >= MIN_TP_ATR)
+    target_distance_atr = abs(price - _num(active_retest.get("level"))) / atr1 if active_retest.get("level") is not None and atr1 > 0 else float("inf")
+    target_distance_ok = bool(active_retest and active_retest.get("level") is not None and target_distance_atr <= MAX_ENTRY_DISTANCE_ATR)
+    location_ok = bool(levels.get("target_path_ok") and levels.get("target_path_structural") and target_distance_ok and _num(levels.get("tp_distance_atr")) >= MIN_TP_ATR)
     risk_ok = bool(levels.get("trade_geometry_ok") and _num(levels.get("rr")) >= MIN_RR)
     shock_ok, shock_reason = _shock_veto(c1, setup, atr1) if setup in {"LONG", "SHORT"} else (True, "No active setup")
-    target_distance_ok = bool(active_retest and active_retest.get("level") is not None and atr1 > 0 and abs(price - _num(active_retest.get("level"))) / atr1 <= MAX_ENTRY_DISTANCE_ATR)
-    location_ok = location_ok and target_distance_ok
 
-    score, score_groups = _build_score(direction_ok=direction_ok, structure_ok=structure_ok, setup_ok=setup_ok, confirmation_ok=confirmation_ok, macro_ok=macro_ok, momentum_quality=momentum_quality, volume_quality=volume_quality, volatility_ok=volatility_ok, location_ok=location_ok, risk_ok=risk_ok)
+    volatility_quality = 0.0
+    if atr1 > 0 and MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE:
+        volatility_quality = 1.0 if 25 <= atr_rank <= 85 else 0.75
+    volume_quality = _clamp(0.65 * _clamp(rvol1 / 1.5, 0, 1) + 0.35 * (1.0 if volume_status(c1) == "INCREASING" else 0.55 if volume_status(c1) == "NORMAL" else 0.25), 0, 1)
+    location_quality = 1.0 if location_ok else 0.0
+    rr = _num(levels.get("rr"))
+    if levels.get("trade_geometry_ok") and rr > MIN_RR:
+        location_quality = max(location_quality, _clamp((rr - MIN_RR) / 3.0 + 0.65, 0, 1))
+    risk_quality = _clamp((rr / 4.0) if rr > 0 else 0.0, 0, 1) if risk_ok else 0.25 if levels.get("target_path_structural") else 0.0
+
+    score, score_groups = _build_score(
+        structure_quality=structure_quality,
+        trigger_quality=_num(trigger.get("quality")),
+        momentum_quality=momentum_quality,
+        volume_quality=volume_quality,
+        volatility_quality=volatility_quality,
+        location_quality=location_quality,
+        risk_quality=risk_quality,
+    )
     technical_candidate = bool(setup in {"LONG", "SHORT"} and direction_ok and structure_ok and setup_ok and confirmation_ok and volatility_ok and location_ok and risk_ok and shock_ok and score >= MIN_SCORE)
-    family_result = evaluate_confirmation_families({"setup": setup, "momentum_quality": momentum_quality, "rvol_1h": rvol1, "atr_percentile": atr_rank, "target_path_structural": levels.get("target_path_structural"), "rolling_vwap_12h": _rolling_vwap(c12), "price": price, "structure_quality_ok": structure_ok, "structure_quality": _num(active_retest.get("quality"))})
+    family_result = evaluate_confirmation_families({"setup": setup, "momentum_quality": momentum_quality, "rvol_1h": rvol1, "atr_percentile": atr_rank, "target_path_structural": levels.get("target_path_structural"), "rolling_vwap_12h": _rolling_vwap(c12), "price": price, "structure_quality_ok": structure_ok, "structure_quality": structure_quality, "trigger_quality": trigger.get("quality")})
 
     failures = _diagnostic_failures({"direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok, "volatility_ok": volatility_ok, "location_ok": location_ok, "risk_ok": risk_ok, "shock_veto_ok": shock_ok, "score": score})
     reasons = []
@@ -799,9 +901,27 @@ def analyze_candles(
         "momentum_quality": momentum_quality, "volume_quality": volume_quality, "entry_1h_ready": bool(trigger.get("ready")), "shock_veto_ok": shock_ok, "shock_veto_reason": shock_reason,
         "score": score, "score_groups": score_groups, "confirmation_families": family_result.get("families", {}), "confirmation_families_passed": int(family_result.get("passed", 0)), "confirmation_families_available": int(family_result.get("available", 0)), "confirmation_family_diversity_ok": bool(family_result.get("diversity_ok")),
         "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok, "momentum_ok": momentum_quality >= 0.45, "volume_ok": volume_quality >= 0.50, "location_ok": location_ok, "volatility_ok": volatility_ok, "risk_ok": risk_ok,
-        "technical_candidate": technical_candidate, "signal_blocked": not technical_candidate, "rejection_stage": None if technical_candidate else "TECHNICAL", "technical_gate_failures": failures, "reasons": reasons,
+        "stage_status": {
+            "1D_REGIME": bool(daily.get("bull") or daily.get("bear") or daily.get("regime") == "SIDEWAYS"),
+            "12H_BIAS": bool(bias.get("bull") or bias.get("bear")),
+            "4H_SETUP": bool(active_bos and active_retest.get("valid")),
+            "1H_TRIGGER": bool(trigger.get("ready")),
+            "QUALITY": bool(score >= MIN_SCORE),
+            "RISK": bool(risk_ok),
+            "RR": bool(rr >= MIN_RR),
+        },
+        "stage_failures": {
+            "1D_REGIME": [] if (daily.get("bull") or daily.get("bear") or daily.get("regime") == "SIDEWAYS") else [str(daily.get("regime") or "unknown")],
+            "12H_BIAS": [] if (bias.get("bull") or bias.get("bear")) else ["no directional 12H bias"],
+            "4H_SETUP": [] if (active_bos and active_retest.get("valid")) else ["no confirmed 4H BOS/retest"],
+            "1H_TRIGGER": [] if trigger.get("ready") else [str(trigger.get("reason") or "no 1H trigger")],
+            "QUALITY": [] if score >= MIN_SCORE else [f"score {score} < {MIN_SCORE}"],
+            "RISK": [] if risk_ok else [str(levels.get("geometry_reason") or "risk geometry failed")],
+            "RR": [] if rr >= MIN_RR else [f"RR {rr:.2f} < {MIN_RR:.2f}"],
+        },
+        "technical_candidate": technical_candidate, "signal_blocked": not technical_candidate, "rejection_stage": None if technical_candidate else ("1H_TRIGGER" if setup_ok and structure_ok and direction_ok and not confirmation_ok else "4H_SETUP" if setup_ok and not structure_ok else "DIRECTION" if setup_ok else "SETUP"), "technical_gate_failures": failures, "diagnostic_failures": failures, "reasons": reasons,
         "entry": levels.get("entry"), "stop_loss": levels.get("stop_loss"), "tp": levels.get("tp"), "rr": levels.get("rr"), "rr_gross": levels.get("rr_gross"), "sl_atr": levels.get("sl_atr", 0.0), "stop_distance_pct": levels.get("stop_distance_pct", 0.0), "tp_distance_atr": levels.get("tp_distance_atr", 0.0), "tp_distance_pct": levels.get("tp_distance_pct", 0.0), "target_path_ok": levels.get("target_path_ok", False), "target_path_structural": levels.get("target_path_structural", False), "target_path_reason": levels.get("target_path_reason"), "target_timeframe": levels.get("target_timeframe"), "target_levels": levels.get("target_levels", []), "stop_source": levels.get("stop_source"), "trade_geometry_ok": levels.get("trade_geometry_ok", False), "geometry_reason": levels.get("geometry_reason"),
-        "candle_time": int(c1[-1]["time"]), "setup_bos_time": active_bos.get("time") if active_bos else None, "setup_retest_time": active_retest.get("time") if active_retest else None,
+        "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "trigger_candle_open_time": trigger.get("candle_time"), "setup_bos_time": active_bos.get("time") if active_bos else None, "setup_retest_time": active_retest.get("time") if active_retest else None,
         "rolling_vwap_12h": _rolling_vwap(c12), "flow_proxy_ratio": _backtest_flow_proxy(c1), "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
     }
 

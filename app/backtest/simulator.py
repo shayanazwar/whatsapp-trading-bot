@@ -55,6 +55,14 @@ class SimulatedTrade:
     position_contract_size: float = 1.0
     same_bar_rule: str = DEFAULT_SAME_BAR_RULE
     state: str = "FINALIZED"
+    entry_filled_time_ms: int | None = None
+    entry_mode: str = "MARKET"
+    mae_r: float | None = None
+    mfe_r: float | None = None
+    mfe_1r_hit: bool = False
+    mfe_1_5r_hit: bool = False
+    time_to_1r_minutes: float | None = None
+    time_to_1_5r_minutes: float | None = None
 
     @property
     def tp(self) -> float:
@@ -238,40 +246,36 @@ def simulate_trade(
         return None
 
     rule = _same_bar_rule(same_bar_rule if same_bar_rule is not None else signal.get("same_bar_rule"))
-    entry_exec = _adverse_slippage(entry, side, is_entry=True, slippage_bps=slippage_bps)
-    if not isfinite(entry_exec) or entry_exec <= 0:
-        return None
-    if side == "LONG" and not (stop < entry_exec < tp):
-        return None
-    if side == "SHORT" and not (tp < entry_exec < stop):
-        return None
+    entry_mode = str(signal.get("entry_mode") or "MARKET").upper()
+    limit_price = _number(signal.get("limit_price", signal.get("entry")))
+    limit_expiry_minutes = max(1.0, float(signal.get("limit_entry_expiry_minutes", 120.0)))
 
-    risk_exec = abs(entry_exec - stop)
-    initial_risk_cash = risk_exec * initial_size * contract_size
-    if risk_exec <= 0 or initial_risk_cash <= 0 or not isfinite(initial_risk_cash):
-        return None
-
-    entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
-    if not isfinite(entry_fee):
-        return None
-
-    realized_pnl = -entry_fee
+    entry_exec: float | None = None
+    fill_ts: int | None = None
+    risk_exec = 0.0
+    initial_risk_cash = 0.0
+    entry_fee = 0.0
+    realized_pnl = 0.0
     gross_pnl = 0.0
     exit_fees = 0.0
-    slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
+    slippage_cash = 0.0
     tp_hit = sl_hit = False
     final_exec: float | None = None
     final_ts: int | None = None
     previous_close: float | None = None
     previous_close_time: int | None = None
+    mae_r = 0.0
+    mfe_r = 0.0
+    mfe_1r_hit = False
+    mfe_1_5r_hit = False
+    time_to_1r_minutes: float | None = None
+    time_to_1_5r_minutes: float | None = None
 
     def execute_exit(base_price: float) -> float | None:
         nonlocal realized_pnl, gross_pnl, exit_fees, slippage_cash
-        if not isfinite(base_price) or base_price <= 0:
+        if not isfinite(base_price) or base_price <= 0 or entry_exec is None:
             return None
-        exit_exec = _adverse_slippage(
-            base_price, side, is_entry=False, slippage_bps=slippage_bps
-        )
+        exit_exec = _adverse_slippage(base_price, side, is_entry=False, slippage_bps=slippage_bps)
         pnl_per_unit = exit_exec - entry_exec if side == "LONG" else entry_exec - exit_exec
         gross = pnl_per_unit * initial_size * contract_size
         fee = abs(exit_exec) * initial_size * contract_size * fee_rate
@@ -285,72 +289,105 @@ def simulate_trade(
         return exit_exec
 
     def build_trade(outcome: str, ts: int | None, expired: bool = False, close_position: bool = True) -> SimulatedTrade | None:
-        hold = None if ts is None else _hold_minutes(signal_time, ts)
+        hold = None if ts is None or fill_ts is None else _hold_minutes(fill_ts, ts)
         net_r = realized_pnl / initial_risk_cash if close_position and initial_risk_cash > 0 else None
         if net_r is not None and not isfinite(net_r):
             net_r = None
-        fees_r = (entry_fee + exit_fees) / initial_risk_cash
-        slip_r = slippage_cash / initial_risk_cash
+        denominator = initial_risk_cash if initial_risk_cash > 0 else 0.0
+        fees_r = (entry_fee + exit_fees) / denominator if denominator else 0.0
+        slip_r = slippage_cash / denominator if denominator else 0.0
+        planned_rr = abs(tp - entry) / planned_risk if planned_risk > 0 else 0.0
         return SimulatedTrade(
-            symbol=symbol,
-            side=side,
-            signal_time_ms=signal_time,
-            entry=entry,
-            stop_loss=stop,
-            tp1=tp,
-            tp2=tp,
-            planned_rr=abs(tp - entry) / planned_risk,
-            tp1_hit=tp_hit,
-            tp2_hit=tp_hit,
-            sl_hit=sl_hit,
-            outcome=outcome,
-            r_multiple=net_r,
-            exit_time_ms=ts,
-            hold_minutes=hold,
-            fees_r=fees_r,
-            slippage_r=slip_r,
-            entry_execution=entry_exec,
-            exit_execution=final_exec,
-            expired=expired,
-            regime=str(signal.get("regime") or signal.get("trend_4h") or "UNKNOWN"),
-            quality=_quality_snapshot(signal),
-            initial_position_size=initial_size,
-            tp1_close_size=0.0,
-            final_close_size=initial_size if close_position else 0.0,
+            symbol=symbol, side=side, signal_time_ms=signal_time, entry=entry,
+            stop_loss=stop, tp1=tp, tp2=tp, planned_rr=planned_rr,
+            tp1_hit=tp_hit, tp2_hit=tp_hit, sl_hit=sl_hit, outcome=outcome,
+            r_multiple=net_r, exit_time_ms=ts, hold_minutes=hold, fees_r=fees_r,
+            slippage_r=slip_r, entry_execution=entry_exec, exit_execution=final_exec,
+            expired=expired, regime=str(signal.get("regime") or signal.get("trend_4h") or "UNKNOWN"),
+            quality=_quality_snapshot(signal), initial_position_size=initial_size,
+            tp1_close_size=0.0, final_close_size=initial_size if close_position else 0.0,
             remaining_position_size=0.0 if close_position else initial_size,
-            breakeven_hit=False,
-            original_stop_loss=stop,
-            breakeven_stop=None,
-            tp1_execution=None,
-            breakeven_execution=None,
-            final_exit_execution=final_exec if close_position else None,
-            realized_pnl=realized_pnl,
-            gross_pnl=gross_pnl,
-            entry_fee=entry_fee,
-            exit_fees=exit_fees,
-            position_contract_size=contract_size,
-            same_bar_rule=rule,
-            state="FINALIZED" if close_position else "OPEN",
+            breakeven_hit=False, original_stop_loss=stop, breakeven_stop=None,
+            tp1_execution=final_exec if tp_hit else None, breakeven_execution=None,
+            final_exit_execution=final_exec if close_position else None, realized_pnl=realized_pnl,
+            gross_pnl=gross_pnl, entry_fee=entry_fee, exit_fees=exit_fees,
+            position_contract_size=contract_size, same_bar_rule=rule,
+            state="FINALIZED" if close_position else "OPEN", entry_filled_time_ms=fill_ts, entry_mode=entry_mode,
+            mae_r=mae_r if fill_ts is not None else None, mfe_r=mfe_r if fill_ts is not None else None,
+            mfe_1r_hit=mfe_1r_hit, mfe_1_5r_hit=mfe_1_5r_hit,
+            time_to_1r_minutes=time_to_1r_minutes, time_to_1_5r_minutes=time_to_1_5r_minutes,
         )
 
     expiry_ts = int(signal_time + max_hold * 60_000)
+    limit_expiry_ts = int(signal_time + limit_expiry_minutes * 60_000)
 
     for candle in future_candles:
         parsed = _candle_values(candle)
         if parsed is None:
             continue
         timestamp, _open_price, high, low, close = parsed
-        if timestamp + ONE_HOUR_MS <= signal_time:
-            continue
         close_time = timestamp + ONE_HOUR_MS
+        if close_time <= signal_time:
+            continue
+
+        # Passive retest limit: no position exists until price actually trades through
+        # the requested limit. If not filled within the expiry window, the order dies.
+        if entry_exec is None:
+            if entry_mode == "LIMIT":
+                if timestamp > limit_expiry_ts:
+                    return None
+                if limit_price is None or not isfinite(limit_price) or limit_price <= 0:
+                    return None
+                fills = low <= limit_price if side == "LONG" else high >= limit_price
+                if not fills:
+                    continue
+                entry = float(limit_price)
+                entry_exec = entry  # passive fill: no adverse market-order slippage
+                fill_ts = timestamp
+            else:
+                entry_exec = _adverse_slippage(entry, side, is_entry=True, slippage_bps=slippage_bps)
+                fill_ts = signal_time
+
+            if not isfinite(entry_exec) or entry_exec <= 0:
+                return None
+            if side == "LONG" and not (stop < entry_exec < tp):
+                return None
+            if side == "SHORT" and not (tp < entry_exec < stop):
+                return None
+            risk_exec = abs(entry_exec - stop)
+            initial_risk_cash = risk_exec * initial_size * contract_size
+            if risk_exec <= 0 or initial_risk_cash <= 0 or not isfinite(initial_risk_cash):
+                return None
+            entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
+            realized_pnl = -entry_fee
+            slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
+            # A limit order can fill inside this candle; without intrabar sequencing,
+            # the same deterministic SL_FIRST/TP_FIRST rule is used after the fill.
 
         if close_time > expiry_ts:
             if previous_close is None or previous_close_time is None:
-                return None
+                previous_close = close
+                previous_close_time = close_time
             final_exec = execute_exit(previous_close)
             if final_exec is None:
                 return None
             return build_trade("EXPIRED", previous_close_time, expired=True)
+
+        # Track normalized adverse/favorable excursion before resolving the bar.
+        if risk_exec > 0 and entry_exec is not None:
+            if side == "LONG":
+                mae_r = max(mae_r, max(0.0, entry_exec - low) / risk_exec)
+                current_mfe = max(0.0, high - entry_exec) / risk_exec
+            else:
+                mae_r = max(mae_r, max(0.0, high - entry_exec) / risk_exec)
+                current_mfe = max(0.0, entry_exec - low) / risk_exec
+            mfe_r = max(mfe_r, current_mfe)
+            if current_mfe >= 1.0 and not mfe_1r_hit:
+                mfe_1r_hit = True
+                time_to_1r_minutes = _hold_minutes(fill_ts, close_time)
+            if current_mfe >= 1.5 and not mfe_1_5r_hit:
+                mfe_1_5r_hit = True
+                time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
 
         if side == "LONG":
             sl_touched = low <= stop
@@ -386,9 +423,9 @@ def simulate_trade(
         previous_close = close
         previous_close_time = close_time
 
+    if entry_exec is None:
+        return None
     if previous_close is None or previous_close_time is None:
         return None
-    # The historical data window ended before the configured holding horizon.
-    # Do not force-close the position and misclassify it as EXPIRED; it is still
-    # OPEN and therefore must be excluded from closed-trade performance metrics.
     return build_trade("OPEN", previous_close_time, expired=False, close_position=False)
+

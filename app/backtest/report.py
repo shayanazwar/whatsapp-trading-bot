@@ -35,6 +35,10 @@ class BacktestSummary:
     profit_factor: float | None
     max_drawdown_r: float
     max_losing_streak: int
+    avg_mae_r: float | None = None
+    avg_mfe_r: float | None = None
+    market_entries: int = 0
+    limit_entries: int = 0
     diagnostics: Mapping[str, int] = field(default_factory=dict)
 
 
@@ -72,6 +76,9 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
     diagnostics_out.setdefault("TP_HIT", wins)
     diagnostics_out.setdefault("SL_HIT", losses)
     diagnostics_out.setdefault("EXPIRED", expired)
+    diagnostics_out.setdefault("PORTFOLIO_SKIPPED", 0)
+    mae_values = [float(t.mae_r) for t in ordered if t.mae_r is not None and math.isfinite(float(t.mae_r))]
+    mfe_values = [float(t.mfe_r) for t in ordered if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
     return BacktestSummary(
         days=days,
         period_start_ms=period_start_ms,
@@ -98,6 +105,10 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         profit_factor=pf,
         max_drawdown_r=drawdown,
         max_losing_streak=max_streak,
+        avg_mae_r=mean(mae_values) if mae_values else None,
+        avg_mfe_r=mean(mfe_values) if mfe_values else None,
+        market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
+        limit_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() == "LIMIT"),
         diagnostics=diagnostics_out,
     )
 
@@ -134,6 +145,8 @@ def format_report(summary: BacktestSummary) -> str:
         f"📐 Profit Factor: {pf}",
         f"📉 Max Drawdown: {summary.max_drawdown_r:.2f}R",
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
+        f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r)}R / {_fmt(summary.avg_mfe_r)}R",
+        f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
         f"⚠️ Data Errors: {summary.data_errors}",
         f"⚠️ Execution Errors: {summary.execution_errors}",

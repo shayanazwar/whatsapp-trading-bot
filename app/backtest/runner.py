@@ -19,7 +19,7 @@ from .simulator import SimulatedTrade, simulate_trade
 LOGGER = logging.getLogger(__name__)
 
 ONE_HOUR_MS = 3_600_000
-MAX_HOLD_MINUTES = 7_200  # 5 days
+MAX_HOLD_MINUTES = 72 * 60
 WARMUP_1D = 300 * 86_400_000
 WARMUP_4H = 45 * 86_400_000
 WARMUP_1H = 20 * 86_400_000
@@ -87,13 +87,24 @@ class BacktestRunner:
         )
         return SymbolHistory(symbol=symbol, candles_1d=candles_1d, candles_4h=candles_4h, candles_1h=candles_1h)
 
+    async def _fetch_btc_history(self, start_ms: int, end_ms: int) -> SymbolHistory:
+        async def fetch(interval: str, left: int, right: int, limit: int = 2000) -> list:
+            rows = await self.client.get_klines_range("BTC_USDT", interval, left, right, limit=limit)
+            return rows or []
+        c1d, c4, c1 = await asyncio.gather(
+            fetch("Day1", start_ms - WARMUP_1D, end_ms + MAX_HOLD_MINUTES * 60_000),
+            fetch("Hour4", start_ms - WARMUP_4H, end_ms + MAX_HOLD_MINUTES * 60_000),
+            fetch("Min60", start_ms - WARMUP_1H, end_ms + MAX_HOLD_MINUTES * 60_000),
+        )
+        return SymbolHistory("BTC_USDT", c1d, c4, c1)
+
     @staticmethod
     def _prefix(rows: list, decision_close_ms: int) -> list:
         # Candles are identified by opening timestamp; decision_close is the first
         # moment at which a candle ending at that time is allowed into the strategy.
         return [row for row in rows if int(float(row[0])) + ONE_HOUR_MS <= decision_close_ms]
 
-    def _simulate_symbol(self, history: SymbolHistory, start_ms: int, end_ms: int) -> tuple[list[SimulatedTrade], dict[str, int], int, int, int]:
+    def _simulate_symbol(self, history: SymbolHistory, start_ms: int, end_ms: int, btc_history: SymbolHistory | None = None) -> tuple[list[SimulatedTrade], dict[str, int], int, int, int]:
         trades: list[SimulatedTrade] = []
         diag: dict[str, int] = {}
         rejected = 0
@@ -118,7 +129,15 @@ class BacktestRunner:
             c4 = [x for x in history.candles_4h if int(float(x[0])) + 14_400_000 <= signal_close_ms]
             c1 = [x for x in history.candles_1h if int(float(x[0])) + ONE_HOUR_MS <= signal_close_ms]
             try:
-                analysis = analyze_candles(history.symbol, c1d, None, c4, c1, now_ms=signal_close_ms)
+                btc_context = None
+                if btc_history is not None:
+                    btc1d = [x for x in btc_history.candles_1d if int(float(x[0])) + 86_400_000 <= signal_close_ms]
+                    btc4 = [x for x in btc_history.candles_4h if int(float(x[0])) + 14_400_000 <= signal_close_ms]
+                    btc1 = [x for x in btc_history.candles_1h if int(float(x[0])) + ONE_HOUR_MS <= signal_close_ms]
+                    if len(btc1d) >= 210 and len(btc4) >= 180 and len(btc1) >= 180:
+                        from ..analysis.engine import build_btc_context
+                        btc_context = build_btc_context(btc1d, None, btc4, btc1)
+                analysis = analyze_candles(history.symbol, c1d, None, c4, c1, now_ms=signal_close_ms, btc_context=btc_context)
             except ValueError as exc:
                 # Analysis ValueErrors are data/analysis precondition failures (for
                 # example an insufficient or gapped timeframe window).  Do not count
@@ -165,6 +184,25 @@ class BacktestRunner:
                 failures = analysis.get("technical_gate_failures") or ["technical_candidate"]
                 for failure in failures[:5]:
                     inc("REJECT_" + str(failure).upper().replace(" ", "_"))
+
+                # Exclusive first-fail telemetry makes gate bottlenecks measurable.
+                ordered_fails = [
+                    ("DIRECTION", analysis.get("direction_ok") is not True),
+                    ("4H_SETUP", not (analysis.get("structure_ok") is True and analysis.get("setup_ok") is True)),
+                    ("1H_CONFIRMATION", analysis.get("confirmation_ok") is not True),
+                    ("ENTRY_DISTANCE", analysis.get("entry_distance_ok") is not True),
+                    ("HTF_TARGET_PATH", analysis.get("location_ok") is not True),
+                    ("STRUCTURAL_RISK_RR", analysis.get("risk_ok") is not True),
+                    ("SHOCK", analysis.get("shock_veto_ok") is not True),
+                    ("BTC_REGIME", analysis.get("btc_filter_ok") is not True),
+                    ("QUALITY", int(analysis.get("score", 0) or 0) < 65),
+                ]
+                first_fail = next((name for name, failed in ordered_fails if failed), "TECHNICAL_CANDIDATE")
+                inc("FIRST_FAIL_" + first_fail)
+
+                # Shadow score-only rejects without allowing them into production.
+                if 55 <= int(analysis.get("score", 0) or 0) < 65 and all(not failed for name, failed in ordered_fails[:-1]):
+                    inc("SHADOW_SCORE_55_64")
                 continue
 
             inc("CANDIDATES_DISCOVERED")
@@ -216,8 +254,8 @@ class BacktestRunner:
         return trades, diag, data_errors, execution_errors, rejected
 
     async def run(self, days: int) -> BacktestSummary:
-        if int(days) not in {1, 7}:
-            raise ValueError("Backtest period must be 1D or 7D")
+        if int(days) not in {1, 7, 30, 60, 90}:
+            raise ValueError("Backtest period must be 1D, 7D, 30D, 60D, or 90D")
         async with self._run_lock:
             if self._running:
                 raise BacktestAlreadyRunning("A backtest is already running")
@@ -233,6 +271,15 @@ class BacktestRunner:
 
             semaphore = asyncio.Semaphore(self.max_concurrency)
             results: list[tuple[list[SimulatedTrade], dict[str, int], int, int, int]] = []
+            btc_history: SymbolHistory | None = None
+            try:
+                btc_history = await self._fetch_btc_history(start_ms, end_ms)
+                LOGGER.info("BTC BACKTEST CONTEXT READY | candles_1d=%d candles_4h=%d candles_1h=%d", len(btc_history.candles_1d), len(btc_history.candles_4h), len(btc_history.candles_1h))
+            except Exception as exc:
+                diagnostics_btc_error = {"BTC_CONTEXT_FETCH_ERROR": 1}
+                LOGGER.warning("BTC BACKTEST CONTEXT unavailable: %s", exc)
+            else:
+                diagnostics_btc_error = {}
 
             progress_interval = max(
                 1.0,
@@ -260,6 +307,7 @@ class BacktestRunner:
                                 history,
                                 start_ms,
                                 end_ms,
+                                btc_history,
                             ),
                             timeout=symbol_timeout,
                         )
@@ -316,7 +364,7 @@ class BacktestRunner:
             await asyncio.gather(*(one(symbol) for symbol in selected))
 
             trades: list[SimulatedTrade] = []
-            diagnostics: dict[str, int] = {}
+            diagnostics: dict[str, int] = dict(diagnostics_btc_error)
             data_errors = execution_errors = rejected = 0
             for symbol_trades, symbol_diag, de, ee, rj in results:
                 trades.extend(symbol_trades)
@@ -325,6 +373,26 @@ class BacktestRunner:
                 rejected += rj
                 for key, value in symbol_diag.items():
                     diagnostics[key] = diagnostics.get(key, 0) + int(value)
+
+            # Portfolio-level causal controls: correlated universe signals are not
+            # allowed to become unlimited simultaneous directional exposure.
+            max_total = max(1, int(getattr(self.settings, "backtest_max_open_positions", 4)))
+            max_same = max(1, int(getattr(self.settings, "backtest_max_same_direction", 2)))
+            max_risk = max(0.1, float(getattr(self.settings, "backtest_total_open_risk_r", 3.0)))
+            portfolio_sorted = sorted(trades, key=lambda t: (int(t.entry_filled_time_ms or t.signal_time_ms), t.symbol, t.side))
+            accepted_portfolio: list[SimulatedTrade] = []
+            active_portfolio: list[SimulatedTrade] = []
+            for trade in portfolio_sorted:
+                et = int(trade.entry_filled_time_ms or trade.signal_time_ms)
+                active_portfolio = [x for x in active_portfolio if int(x.exit_time_ms or 0) > et]
+                same_dir = sum(str(x.side).upper() == str(trade.side).upper() for x in active_portfolio)
+                open_risk = float(len(active_portfolio))
+                if len(active_portfolio) >= max_total or same_dir >= max_same or open_risk + 1.0 > max_risk:
+                    diagnostics["PORTFOLIO_SKIPPED"] = diagnostics.get("PORTFOLIO_SKIPPED", 0) + 1
+                    continue
+                accepted_portfolio.append(trade)
+                active_portfolio.append(trade)
+            trades = accepted_portfolio
 
             diagnostics["SYMBOLS_TESTED"] = len(results)
             diagnostics["CURRENT_UNIVERSE_SNAPSHOT_BIAS"] = 1

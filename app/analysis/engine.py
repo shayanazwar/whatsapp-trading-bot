@@ -479,15 +479,24 @@ def _one_hour_trigger_confirmation(candles: list[Candle], side: str, setup_level
     latest_index = len(candles) - 1
     start_index = max(1, latest_index - MAX_TRIGGER_BARS_1H + 1)
     retest_idx = None
+    trigger_start_idx = start_index
     if retest_time is not None:
-        for i, c in enumerate(candles):
-            if int(c["time"]) == int(retest_time):
-                retest_idx = i
-                break
+        # retest_time is the OPEN of the completed 4H retest candle. A 1H
+        # trigger is only causally valid after that 4H candle has CLOSED.
+        retest_close_time = int(retest_time) + TIMEFRAME_MS["4h"]
+        eligible = [
+            i for i, c in enumerate(candles)
+            if int(c["time"]) >= retest_close_time
+        ]
+        if not eligible:
+            empty["reason"] = "No 1H trigger window after completed 4H retest"
+            return empty
+        trigger_start_idx = max(start_index, eligible[0])
+        retest_idx = eligible[0] - 1
 
     candidates: list[dict[str, Any]] = []
-    for i in range(start_index, latest_index + 1):
-        if retest_idx is not None and i <= retest_idx:
+    for i in range(trigger_start_idx, latest_index + 1):
+        if retest_time is not None and int(candles[i]["time"]) < int(retest_time) + TIMEFRAME_MS["4h"]:
             continue
         cur, prev = candles[i], candles[i - 1]
         o, h, l, close = map(float, (cur["open"], cur["high"], cur["low"], cur["close"]))
@@ -716,8 +725,8 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
     times = [int(c["time"]) for c in candles[-minimum:]]
     if any(b <= a for a, b in zip(times, times[1:])):
         return False, f"{timeframe}: non-monotonic timestamps"
-    if len(times) >= 2 and times[-1] - times[-2] > interval * 2:
-        return False, f"{timeframe}: recent candle gap"
+    if any(b - a > interval for a, b in zip(times, times[1:])):
+        return False, f"{timeframe}: candle gap inside analysis window"
     return True, "OK"
 
 

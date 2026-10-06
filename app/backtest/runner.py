@@ -179,6 +179,8 @@ class BacktestRunner:
                 continue
 
             inc("CANDLES_EVALUATED")
+            if analysis.get("btc_filter_ok") is False:
+                inc("BTC_WOULD_BLOCK")
             if not analysis.get("technical_candidate"):
                 rejected += 1
                 failures = analysis.get("technical_gate_failures") or ["technical_candidate"]

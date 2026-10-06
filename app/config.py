@@ -85,6 +85,9 @@ class Settings(BaseSettings):
     backtest_analysis_timeout_seconds: float = Field(default=120.0, alias="BACKTEST_ANALYSIS_TIMEOUT_SECONDS")
     backtest_child_boot_timeout_seconds: float = Field(default=30.0, alias="BACKTEST_CHILD_BOOT_TIMEOUT_SECONDS")
     backtest_progress_interval_seconds: float = Field(default=5.0, alias="BACKTEST_PROGRESS_INTERVAL_SECONDS")
+    backtest_max_open_positions: int = Field(default=4, alias="BACKTEST_MAX_OPEN_POSITIONS")
+    backtest_max_same_direction: int = Field(default=2, alias="BACKTEST_MAX_SAME_DIRECTION")
+    backtest_total_open_risk_r: float = Field(default=3.0, alias="BACKTEST_TOTAL_OPEN_RISK_R")
 
     # Additional live-trading kill switch
     allow_live_execution: bool = Field(default=False, alias="ALLOW_LIVE_EXECUTION")

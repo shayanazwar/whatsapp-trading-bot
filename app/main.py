@@ -60,7 +60,9 @@ mexc_executor = MexcExecutor(mexc_client, settings)
 mexc_scanner = MexcScanner(client=mexc_client, settings=settings, universe=mexc_universe, signal_manager=signal_manager, executor=mexc_executor)
 scanner_scheduler = ScannerScheduler(mexc_scanner, interval_seconds=settings.scan_interval_seconds)
 
-backtest_mexc_client = MexcClient(settings)
+# Share the process-wide MEXC client with live scanning so public API
+# throttling, connection pooling, and response caches apply to both paths.
+backtest_mexc_client = mexc_client
 backtest_universe = MexcUniverse(backtest_mexc_client, max_symbols=settings.backtest_max_symbols, test_symbols=settings.test_symbol_list)
 backtest_runner = BacktestRunner(client=backtest_mexc_client, universe=backtest_universe, settings=settings, max_concurrency=settings.backtest_symbol_concurrency)
 bot.set_backtest_runner(backtest_runner)
@@ -253,8 +255,6 @@ async def shutdown_event() -> None:
         await market.close()
     with suppress(Exception):
         await mexc_client.close()
-    with suppress(Exception):
-        await backtest_mexc_client.close()
     with suppress(Exception):
         await whatsapp.close()
     logger.info("Shutdown complete")

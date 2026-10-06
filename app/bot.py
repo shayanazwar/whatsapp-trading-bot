@@ -291,7 +291,7 @@ class Bot:
                 return "N/A"
 
         body = (
-            f"ðŸ§  {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
+            f"🧠 {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
             f"4H Trend: {data.get('trend_4h', 'N/A')}\n"
             f"1H Structure: {data.get('structure_1h', 'N/A')}\n"
             f"4H BOS: {data.get('bos_4h', 'N/A')}\n"

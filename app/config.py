@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
-    scan_interval_seconds: int = Field(default=300, alias="SCAN_INTERVAL_SECONDS")
+    scan_interval_seconds: int = Field(default=3600, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")
     scan_concurrency: int = Field(default=4, alias="SCAN_CONCURRENCY")
     mexc_public_min_interval_seconds: float = Field(default=0.20, alias="MEXC_PUBLIC_MIN_INTERVAL_SECONDS")
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     max_data_age_seconds: float = Field(default=5.0, alias="MAX_DATA_AGE_SECONDS")
     orderbook_levels: int = Field(default=10, alias="ORDERBOOK_LEVELS")
     trade_flow_limit: int = Field(default=100, alias="TRADE_FLOW_LIMIT")
-    require_increasing_volume: bool = Field(default=True, alias="REQUIRE_INCREASING_VOLUME")
+    require_increasing_volume: bool = Field(default=False, alias="REQUIRE_INCREASING_VOLUME")
     signal_expiry_minutes: int = Field(default=30, alias="SIGNAL_EXPIRY_MINUTES")
     # Signal freshness is measured from the CLOSE of the completed 1H entry candle.
     max_signal_age_seconds: float = Field(default=5400.0, alias="MAX_SIGNAL_AGE_SECONDS")

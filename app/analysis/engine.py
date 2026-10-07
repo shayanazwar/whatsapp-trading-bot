@@ -9,6 +9,8 @@ MEXC Futures does not expose a native 12H kline interval, so 12H candles are
 causally synthesized from three completed 4H candles.
 """
 
+import hashlib
+import json
 import math
 import os
 import time
@@ -436,27 +438,84 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-V11_MIN_RR = 1.60
-# Controlled threshold experiment. Default preserves the frozen V11 control.
-V11_MIN_IMPULSE_ATR = _env_float(
-    "V11_MIN_IMPULSE_ATR", 2.50, minimum=0.50, maximum=8.00
-)
-# Controlled A/B experiment switch. Default preserves the frozen V11 control.
-# SWEEP = current V11 stop; 4H_ORIGIN = experimental HTF structural stop.
-V11_SL_MODE = str(os.getenv("V11_SL_MODE", "SWEEP")).strip().upper() or "SWEEP"
-if V11_SL_MODE not in {"SWEEP", "4H_ORIGIN"}:
-    V11_SL_MODE = "SWEEP"
-# Controlled sweep -> current-reclaim search-window experiment. The final
-# reclaim must still be on the current 1H decision candle; this parameter only
-# controls how far back the causal sweep may be relative to that reclaim.
-V11_MAX_TRIGGER_BARS = _env_int(
-    "V11_MAX_TRIGGER_BARS", 6, minimum=1, maximum=24
-)
-# Controlled SHORT experiment. When enabled, only 1D RANGE structure may
-# bypass the normal daily short permission, and the normal 12H/4H/1H gates
-# remain mandatory. Default is OFF.
-V11_SHORT_RANGE_RELAXED = _env_bool("V11_SHORT_RANGE_RELAXED", False)
+# ---------------------------------------------------------------------------
+# V11 runtime configuration
+# ---------------------------------------------------------------------------
+# The strategy remains 1D -> 12H -> 4H -> 1H.  These values are read at
+# decision time rather than frozen into module-import constants so Render/env
+# changes cannot silently leave the engine using an older parameter value.
 
+def _env_float_no_clamp(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if math.isfinite(value) else float(default)
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    return raw.strip() if raw is not None and raw.strip() else default
+
+
+def _normalise_sl_mode(value: str) -> str:
+    value = str(value or "").strip().upper()
+    return value if value in {"SWEEP", "4H_ORIGIN"} else "SWEEP"
+
+
+def get_v11_runtime_config() -> dict[str, Any]:
+    accuracy_mode = _env_bool("V11_ACCURACY_MODE", True)
+    return {
+        "accuracy_mode": accuracy_mode,
+        "min_rr": max(0.50, _env_float_no_clamp("V11_MIN_RR", 1.60)),
+        "min_impulse_atr": max(0.50, _env_float_no_clamp("V11_MIN_IMPULSE_ATR", 2.50)),
+        "sl_mode": _normalise_sl_mode(
+            _env_str("V11_SL_MODE", "4H_ORIGIN" if accuracy_mode else "SWEEP")
+        ),
+        "reclaim_max_bars": max(1, min(24, int(round(_env_float_no_clamp(
+            "V11_MAX_TRIGGER_BARS", 3 if accuracy_mode else 6
+        ))))),
+        "reclaim_recency_bars": max(0, min(6, int(round(_env_float_no_clamp(
+            "V11_MAX_RECLAIM_RECENCY_BARS", 2 if accuracy_mode else 0
+        ))))),
+        "short_range_relaxed": _env_bool("V11_SHORT_RANGE_RELAXED", False),
+        "max_entry_extension_atr": max(0.0, _env_float_no_clamp(
+            "V11_MAX_ENTRY_EXTENSION_ATR", 0.75 if accuracy_mode else 0.0
+        )),
+        "max_target_r": max(0.0, _env_float_no_clamp(
+            "V11_MAX_TARGET_R", 2.50 if accuracy_mode else 0.0
+        )),
+        "require_breakout_quality": _env_bool(
+            "V11_REQUIRE_BREAKOUT_QUALITY", False
+        ),
+        "min_breakout_body_ratio": _clamp(_env_float_no_clamp(
+            "V11_MIN_BREAKOUT_BODY_RATIO", 0.50
+        ), 0.0, 1.0),
+        "min_breakout_range_atr": max(0.0, _env_float_no_clamp(
+            "V11_MIN_BREAKOUT_RANGE_ATR", 0.20
+        )),
+        "max_retest_depth": _clamp(_env_float_no_clamp(
+            "V11_MAX_RETEST_DEPTH", 0.70 if accuracy_mode else 1.0
+        ), 0.0, 1.5),
+    }
+
+
+def v11_runtime_config_fingerprint(config: dict[str, Any] | None = None) -> str:
+    cfg = config or get_v11_runtime_config()
+    payload = json.dumps(cfg, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+# Compatibility exports for older callers.  Decision functions use the runtime
+# config directly, so these are diagnostic snapshots only.
+V11_MIN_RR = 1.60
+V11_MIN_IMPULSE_ATR = 2.50
+V11_SL_MODE = "SWEEP"
+V11_MAX_TRIGGER_BARS = 6
+V11_SHORT_RANGE_RELAXED = False
 V11_SETUP_MAX_4H_BARS = 30
 V11_STOP_BUFFER_ATR_4H = 0.20
 V11_STOP_BUFFER_ATR_1H = 0.15
@@ -565,13 +624,15 @@ def _v11_context_12h(candles: list[Candle], side: str) -> dict[str, Any]:
     }
 
 
-def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> list[dict[str, Any]]:
+def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Find completed 4H impulse legs without future leakage.
 
     Pivots are 3/3, so a pivot is only used after its three right-side candles
     are closed. Multiple active candidates are returned; the caller may select
     the newest still-valid setup rather than forcing a single latest-only setup.
     """
+    cfg = config or get_v11_runtime_config()
+    min_impulse_atr = float(cfg["min_impulse_atr"])
     if side not in {"LONG", "SHORT"} or len(candles) < 30:
         return []
     highs, lows = _swing_points(candles, left=3, right=3)
@@ -593,8 +654,17 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 continue
             leg = hi_price - lo_price
             atr4 = _num(atrs[hi_idx] if hi_idx < len(atrs) else 0.0)
-            if atr4 <= 0 or leg < V11_MIN_IMPULSE_ATR * atr4:
+            if atr4 <= 0 or leg < min_impulse_atr * atr4:
                 continue
+            prior_high_idx = highs[hi_pos - 1][0]
+            breakout_idx = next((idx for idx in range(prior_high_idx + 1, hi_idx + 1) if float(candles[idx]["close"]) > float(prior_high)), None)
+            breakout_body_ratio = 0.0
+            breakout_range_atr = 0.0
+            if breakout_idx is not None:
+                bc = candles[breakout_idx]
+                brange = max(float(bc["high"]) - float(bc["low"]), 1e-12)
+                breakout_body_ratio = abs(float(bc["close"]) - float(bc["open"])) / brange
+                breakout_range_atr = brange / atr4 if atr4 > 0 else 0.0
             events.append({
                 "side": side, "low_idx": lo_idx, "high_idx": hi_idx,
                 "low": float(lo_price), "high": float(hi_price),
@@ -602,6 +672,10 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 "structure_label": "HH/HL",
                 "high_time": int(candles[hi_idx]["time"]),
                 "low_time": int(candles[lo_idx]["time"]),
+                "breakout_idx": breakout_idx,
+                "breakout_time": int(candles[breakout_idx]["time"]) if breakout_idx is not None else None,
+                "breakout_body_ratio": breakout_body_ratio,
+                "breakout_range_atr": breakout_range_atr,
             })
     else:
         for lo_pos, (lo_idx, lo_price) in enumerate(lows):
@@ -619,8 +693,17 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 continue
             leg = hi_price - lo_price
             atr4 = _num(atrs[lo_idx] if lo_idx < len(atrs) else 0.0)
-            if atr4 <= 0 or leg < V11_MIN_IMPULSE_ATR * atr4:
+            if atr4 <= 0 or leg < min_impulse_atr * atr4:
                 continue
+            prior_low_idx = lows[lo_pos - 1][0]
+            breakout_idx = next((idx for idx in range(prior_low_idx + 1, lo_idx + 1) if float(candles[idx]["close"]) < float(prior_low)), None)
+            breakout_body_ratio = 0.0
+            breakout_range_atr = 0.0
+            if breakout_idx is not None:
+                bc = candles[breakout_idx]
+                brange = max(float(bc["high"]) - float(bc["low"]), 1e-12)
+                breakout_body_ratio = abs(float(bc["close"]) - float(bc["open"])) / brange
+                breakout_range_atr = brange / atr4 if atr4 > 0 else 0.0
             events.append({
                 "side": side, "low_idx": lo_idx, "high_idx": hi_idx,
                 "low": float(lo_price), "high": float(hi_price),
@@ -628,6 +711,10 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 "structure_label": "LH/LL",
                 "high_time": int(candles[hi_idx]["time"]),
                 "low_time": int(candles[lo_idx]["time"]),
+                "breakout_idx": breakout_idx,
+                "breakout_time": int(candles[breakout_idx]["time"]) if breakout_idx is not None else None,
+                "breakout_body_ratio": breakout_body_ratio,
+                "breakout_range_atr": breakout_range_atr,
             })
     return sorted(events, key=lambda x: int(x["high_idx"] if side == "LONG" else x["low_idx"]))
 
@@ -684,13 +771,23 @@ def _v11_value_touched(candles_1h: list[Candle], start_time: int, zone: dict[str
     return False, None, None, None
 
 
-def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max_bars: int = V11_MAX_TRIGGER_BARS) -> dict[str, Any]:
+def _v11_liquidity_trigger(
+    candles: list[Candle],
+    start_idx: int,
+    side: str,
+    max_bars: int | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Causal sweep + reclaim trigger.
 
     The swept level is derived only from the three candles immediately before
-    the sweep candle. The reclaim candle must close back through that level.
-    No centered pivot is used for the trigger.
+    the sweep candle. Reclaim is confirmed only by a later completed 1H close.
+    The function returns the most recent valid sweep/reclaim inside the window,
+    allowing the caller to decide whether that confirmation is still fresh.
     """
+    cfg = config or get_v11_runtime_config()
+    window = int(max_bars if max_bars is not None else cfg["reclaim_max_bars"])
+    window = max(1, min(24, window))
     empty = {
         "ready": False, "sweep_idx": None, "reclaim_idx": None, "swept_level": None,
         "rvol": 0.0, "body_ratio": 0.0, "close_location": 0.0,
@@ -698,7 +795,8 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
     }
     if start_idx < 3 or start_idx >= len(candles):
         return empty
-    end = min(len(candles) - 1, start_idx + max_bars)
+    end = min(len(candles) - 1, start_idx + window)
+    latest: dict[str, Any] | None = None
     for i in range(start_idx, end + 1):
         prior = candles[max(0, i - 3):i]
         if len(prior) < 3:
@@ -706,20 +804,12 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
         c = candles[i]
         if side == "LONG":
             level = min(float(x["low"]) for x in prior)
-            # A liquidity sweep is a wick through the prior liquidity pool.
-            # The documented V11 sequence is sweep -> subsequent reclaim, so
-            # the sweep candle must breach the level but does not need to close
-            # beyond it. Requiring a close below/above the level turns many
-            # ordinary stop-runs into breakouts and suppresses valid setups.
             swept = float(c["low"]) < level
         else:
             level = max(float(x["high"]) for x in prior)
             swept = float(c["high"]) > level
         if not swept:
             continue
-        # Reclaim may occur on any subsequent candle within the full V11.2
-        # trigger window. The previous implementation unintentionally limited
-        # this to only the next 1–2 candles despite max_bars=6.
         for j in range(i + 1, end + 1):
             r = candles[j]
             ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
@@ -735,14 +825,21 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
             if not reclaimed:
                 continue
             rvol = _relative_volume(candles[:j + 1], 20)
-            quality = _clamp(0.45 + 0.20 * _clamp(body / 0.50, 0, 1) + 0.20 * _clamp(rvol / 1.20, 0, 1) + 0.15 * _clamp(close_loc / 0.70, 0, 1), 0, 1)
-            return {
+            quality = _clamp(
+                0.45
+                + 0.20 * _clamp(body / 0.50, 0, 1)
+                + 0.20 * _clamp(rvol / 1.20, 0, 1)
+                + 0.15 * _clamp(close_loc / 0.70, 0, 1),
+                0, 1,
+            )
+            latest = {
                 "ready": True, "sweep_idx": i, "reclaim_idx": j, "swept_level": level,
                 "rvol": rvol, "body_ratio": body, "close_location": close_loc,
                 "quality": quality, "reason": "liquidity sweep absorbed and reclaimed",
                 "trigger_time": int(r["time"]), "sweep_time": int(c["time"]),
+                "bars_from_sweep": int(j - i),
             }
-    return empty
+    return latest or empty
 
 
 def _v11_target(c4: list[Candle], c12: list[Candle], c1d: list[Candle], entry: float, side: str, impulse: dict[str, Any]) -> dict[str, Any]:
@@ -851,12 +948,14 @@ def _v11_analyze_side(
     daily: dict[str, Any],
     cost_pct: float,
     btc_context: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
+    cfg = config or get_v11_runtime_config()
     context = _v11_context_12h(c12, side)
     short_range_exception = bool(
         side == "SHORT"
-        and V11_SHORT_RANGE_RELAXED
+        and bool(cfg["short_range_relaxed"])
         and str(daily.get("structure") or "").upper() == "RANGE"
         and str(context.get("structure") or "").upper() == "LH/LL"
         and not bool(context.get("hostile"))
@@ -894,10 +993,10 @@ def _v11_analyze_side(
 
     e21_4 = _safe_ema([float(c["close"]) for c in c4], 21)
     e50_4 = _safe_ema([float(c["close"]) for c in c4], 50)
-    impulses = _v11_find_impulses(c4, side)
+    impulses = _v11_find_impulses(c4, side, config=cfg)
     if not impulses:
         return reject(
-            f"{side}: no completed 4H HH/HL or LH/LL impulse >= {V11_MIN_IMPULSE_ATR:.2f} ATR",
+            f"{side}: no completed 4H HH/HL or LH/LL impulse >= {float(cfg['min_impulse_atr']):.2f} ATR",
             diagnostic_key=f"4H:{int(c4[-1]['time'])}",
         )
 
@@ -943,12 +1042,19 @@ def _v11_analyze_side(
                 continue
             if float(touch_candle["low"]) <= zhigh and float(touch_candle["high"]) >= zlow:
                 touched_value = True
-                candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side)
-                if candidate_trigger.get("ready") and int(candidate_trigger.get("reclaim_idx", -1)) == len(c1) - 1:
-                    trigger = candidate_trigger
-                    break
+                candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side, config=cfg)
+                if not candidate_trigger.get("ready"):
+                    continue
+                reclaim_idx = int(candidate_trigger.get("reclaim_idx", -1))
+                recency = len(c1) - 1 - reclaim_idx
+                if recency > int(cfg["reclaim_recency_bars"]):
+                    continue
+                trigger = candidate_trigger
         if not trigger:
-            last_reason = f"{side}: value zone touched={touched_value}, but no 1H sweep -> later reclaim completed on current candle"
+            last_reason = (
+                f"{side}: value zone touched={touched_value}, but no fresh 1H sweep -> reclaim "
+                f"within {int(cfg['reclaim_recency_bars'])} bar(s)"
+            )
             continue
 
         trigger_idx = int(trigger["reclaim_idx"])
@@ -958,7 +1064,44 @@ def _v11_analyze_side(
         sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
-        if V11_SL_MODE == "4H_ORIGIN":
+        entry_extension_atr = (
+            abs(entry - float(trigger["swept_level"])) / atr1 if atr1 > 0 else 999.0
+        )
+        if float(cfg["max_entry_extension_atr"]) > 0 and entry_extension_atr > float(cfg["max_entry_extension_atr"]):
+            last_reason = (
+                f"{side}: entry extension {entry_extension_atr:.2f} ATR > "
+                f"max {float(cfg['max_entry_extension_atr']):.2f} ATR"
+            )
+            continue
+        retest_depth = (
+            (float(impulse["high"]) - sweep_low) / float(impulse["leg"])
+            if side == "LONG" and float(impulse["leg"]) > 0
+            else (sweep_high - float(impulse["low"])) / float(impulse["leg"])
+            if side == "SHORT" and float(impulse["leg"]) > 0
+            else 999.0
+        )
+        if float(cfg["max_retest_depth"]) < 1.5 and retest_depth > float(cfg["max_retest_depth"]):
+            last_reason = (
+                f"{side}: retest depth {retest_depth:.2f} > max "
+                f"{float(cfg['max_retest_depth']):.2f} of impulse"
+            )
+            continue
+        if cfg["require_breakout_quality"]:
+            body_ratio = float(impulse.get("breakout_body_ratio") or 0.0)
+            range_atr = float(impulse.get("breakout_range_atr") or 0.0)
+            if body_ratio < float(cfg["min_breakout_body_ratio"]):
+                last_reason = (
+                    f"{side}: breakout body ratio {body_ratio:.2f} < "
+                    f"{float(cfg['min_breakout_body_ratio']):.2f}"
+                )
+                continue
+            if range_atr < float(cfg["min_breakout_range_atr"]):
+                last_reason = (
+                    f"{side}: breakout range {range_atr:.2f} ATR < "
+                    f"{float(cfg['min_breakout_range_atr']):.2f} ATR"
+                )
+                continue
+        if str(cfg["sl_mode"]).upper() == "4H_ORIGIN":
             # Controlled experiment only: invalidate the completed 4H impulse,
             # rather than placing the stop inside the 1H sweep noise.
             if side == "LONG":
@@ -1001,10 +1144,16 @@ def _v11_analyze_side(
             continue
 
         rr_gross = abs(tp - entry) / risk
+        if float(cfg["max_target_r"]) > 0 and rr_gross > float(cfg["max_target_r"]):
+            last_reason = (
+                f"{side}: structural target {rr_gross:.2f}R exceeds accuracy cap "
+                f"{float(cfg['max_target_r']):.2f}R"
+            )
+            continue
         cost_price = entry * max(0.0, cost_pct)
         rr_net = (abs(tp - entry) - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
-        if rr_net < V11_MIN_RR:
-            last_reason = f"{side}: post-cost RR {rr_net:.2f} < required {V11_MIN_RR:.2f} (gross {rr_gross:.2f})"
+        if rr_net < float(cfg["min_rr"]):
+            last_reason = f"{side}: post-cost RR {rr_net:.2f} < required {float(cfg['min_rr']):.2f} (gross {rr_gross:.2f})"
             continue
 
         atr_rank = _atr_percentile(c4)
@@ -1045,7 +1194,19 @@ def _v11_analyze_side(
             "impulse": impulse, "value_zone": zone, "trigger": trigger,
             "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr_net, "rr_gross": rr_gross,
             "atr_4h": atr4, "atr_1h": atr1, "sl_atr": sl_atr,
+            "entry_extension_atr": entry_extension_atr,
+            "retest_depth": retest_depth,
+            "reclaim_recency_bars": len(c1) - 1 - trigger_idx,
+            "breakout_body_ratio": float(impulse.get("breakout_body_ratio") or 0.0),
+            "breakout_range_atr": float(impulse.get("breakout_range_atr") or 0.0),
+            "breakout_time": impulse.get("breakout_time"),
             "tp_distance_atr": abs(tp - entry) / atr4 if atr4 > 0 else 0.0,
+            "entry_extension_atr": entry_extension_atr,
+            "retest_depth": retest_depth,
+            "reclaim_recency_bars": len(c1) - 1 - trigger_idx,
+            "breakout_body_ratio": float(impulse.get("breakout_body_ratio") or 0.0),
+            "breakout_range_atr": float(impulse.get("breakout_range_atr") or 0.0),
+            "breakout_time": impulse.get("breakout_time"),
             "target": target, "target_path": target_path, "score": score, "score_groups": score_groups,
             "atr_percentile": atr_rank, "btc_filter_ok": True, "btc_filter_reason": btc_reason,
             "value_deep": deep, "value_quality": value_quality, "shock_ok": shock_ok,
@@ -1077,11 +1238,13 @@ def _v11_empty(
     side_failures: list[str] | None = None,
 ) -> dict[str, Any]:
     price = float(c1[-1]["close"])
+    cfg = get_v11_runtime_config()
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
         "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
-        "sl_mode": V11_SL_MODE,
+        "v11_runtime_config": cfg, "v11_config_fingerprint": v11_runtime_config_fingerprint(cfg),
+        "sl_mode": cfg["sl_mode"],
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
         "technical_gate_failures": list(side_failures or [reason]),
@@ -1122,6 +1285,7 @@ def analyze_candles(
     Authoritative timeframes: 1D / 12H / 4H / 1H only.
     """
     now = int(now_ms if now_ms is not None else time.time() * 1000)
+    cfg = get_v11_runtime_config()
     c1d = closed_candle_rows(candles_1d or [], "1D", now)
     c4 = closed_candle_rows(candles_4h or [], "4H", now)
     c1 = closed_candle_rows(candles_1h or [], "1H", now)
@@ -1136,7 +1300,7 @@ def analyze_candles(
     side_failures: list[str] = []
     side_diagnostics: list[dict[str, Any]] = []
     for side in ("LONG", "SHORT"):
-        result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
+        result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cfg)
         if result.get("candidate"):
             candidates.append(result)
             side_diagnostics.append({"side": side, "candidate": True, "primary_failure": None, "diagnostic_key": result.get("diagnostic_key")})
@@ -1168,7 +1332,7 @@ def analyze_candles(
         "1D_REGIME": True, "12H_BIAS": not bool(context.get("hostile")), "4H_SETUP": True,
         "1H_TRIGGER": True, "ENTRY_DISTANCE": True, "VOLATILITY": True,
         "CONFIRMATION_FAMILIES": True, "TARGET_PATH": target_ok and target_clear,
-        "RISK": geometry_ok, "RR": rr >= V11_MIN_RR, "QUALITY": True,
+        "RISK": geometry_ok, "RR": rr >= float(cfg["min_rr"]), "QUALITY": True,
         "BTC": btc_ok, "SHOCK": bool(chosen.get("shock_ok", True)),
     }
     stage_failures = {k: [] for k in stage_status}
@@ -1213,15 +1377,23 @@ def analyze_candles(
         "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
         "signal_engine_version": ENGINE_VERSION,
         "signal_basis": "1D macro vote → 12H health → 4H impulse/pullback into value → 1H liquidity sweep/reclaim → next 1H open",
+        "v11_runtime_config": cfg, "v11_config_fingerprint": v11_runtime_config_fingerprint(cfg),
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
         "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),
         "trigger_type": "LIQUIDITY_SWEEP_RECLAIM", "trigger_reason": trigger.get("reason"),
         "trigger_close_location": float(trigger.get("close_location", 0.0)),
         "structure_quality_ok": True, "trade_geometry_ok": geometry_ok,
+        "entry_extension_atr": float(chosen.get("entry_extension_atr", 0.0)),
+        "retest_depth": float(chosen.get("retest_depth", 0.0)),
+        "reclaim_recency_bars": int(chosen.get("reclaim_recency_bars", 0)),
+        "breakout_body_ratio": float(chosen.get("breakout_body_ratio", 0.0)),
+        "breakout_range_atr": float(chosen.get("breakout_range_atr", 0.0)),
+        "breakout_time": chosen.get("breakout_time"),
         "momentum_quality": 0.5, "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
         "volatility_quality": 1.0 if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else 0.5,
-        "entry_efficiency": 1.0, "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
+        "entry_efficiency": _clamp(1.0 - (entry_extension_atr / max(float(cfg["max_entry_extension_atr"]), 1e-9)) if float(cfg["max_entry_extension_atr"]) > 0 else 1.0, 0.0, 1.0),
+        "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
         "entry_mode": "MARKET", "limit_price": None, "entry_1h_ready": True,
         "shock_veto_ok": bool(chosen.get("shock_ok", True)), "shock_veto_reason": "OK",
         "score": score, "score_groups": chosen["score_groups"],
@@ -1229,7 +1401,7 @@ def analyze_candles(
         "confirmation_family_diversity_ok": True,
         "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok,
         "momentum_ok": True, "volume_ok": True, "location_ok": bool(target_ok and target_clear), "volatility_ok": True,
-        "risk_ok": geometry_ok, "rr_ok": rr >= V11_MIN_RR, "entry_distance_ok": True,
+        "risk_ok": geometry_ok, "rr_ok": rr >= float(cfg["min_rr"]), "entry_distance_ok": True,
         "stage_status": stage_status, "stage_failures": stage_failures, "technical_candidate": bool(geometry_ok and rr >= V11_MIN_RR and btc_ok),
         "signal_blocked": False, "rejection_stage": None, "technical_gate_failures": [], "diagnostic_failures": [],
         "side_diagnostics": side_diagnostics, "primary_rejection_reason": None,
@@ -1254,13 +1426,14 @@ def analyze_candles(
             if V11_SL_MODE == "4H_ORIGIN"
             else "liquidity-sweep structural invalidation + volatility buffer"
         ),
-        "sl_mode": V11_SL_MODE,
+        "sl_mode": cfg["sl_mode"],
         "geometry_reason": "OK", "entry_limit_price": None, "limit_entry_expiry_minutes": 0,
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "trigger_candle_open_time": trigger.get("trigger_time"),
         "setup_impulse_high_time": impulse.get("high_time"), "setup_impulse_low_time": impulse.get("low_time"),
+        "setup_breakout_time": impulse.get("breakout_time"),
         "setup_pullback_touch_time": int(c1[int(trigger["sweep_idx"])]["time"]),
         "setup_retest_time": trigger.get("trigger_time"), "setup_retest_1h_time": trigger.get("trigger_time"),
         "setup_bos_time": None, "setup_departure_time": None,
@@ -1271,6 +1444,7 @@ def analyze_candles(
         "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
         "btc_filter_ok": btc_ok, "btc_filter_reason": chosen.get("btc_filter_reason", "OK"), "btc_would_block": not btc_ok,
         "btc_risk_mode": "OBSERVE", "btc_context": btc_context or {"ok": False},
+        "v11_runtime_config": cfg, "v11_config_fingerprint": v11_runtime_config_fingerprint(cfg),
     }
 
 

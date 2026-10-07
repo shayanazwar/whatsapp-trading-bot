@@ -6,6 +6,7 @@ from statistics import mean
 from typing import Any, Mapping, Sequence
 
 from .simulator import SimulatedTrade
+from ..analysis.engine import get_v11_runtime_config, v11_runtime_config_fingerprint
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,10 @@ class BacktestSummary:
     max_losing_streak: int
     avg_mae_r: float | None = None
     avg_mfe_r: float | None = None
+    tp_reach_1r_pct: float | None = None
+    tp_reach_1_5r_pct: float | None = None
+    tp_reach_2r_pct: float | None = None
+    tp_reach_2_5r_pct: float | None = None
     market_entries: int = 0
     limit_entries: int = 0
     diagnostics: Mapping[str, int] = field(default_factory=dict)
@@ -90,6 +95,8 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
     diagnostics_out.setdefault("PORTFOLIO_SKIPPED", 0)
     mae_values = [float(t.mae_r) for t in ordered if t.mae_r is not None and math.isfinite(float(t.mae_r))]
     mfe_values = [float(t.mfe_r) for t in ordered if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
+    reachable = [float(t.mfe_r) for t in ordered if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
+    reach = lambda level: (100.0 * sum(1 for value in reachable if value >= level) / len(reachable)) if reachable else None
     return BacktestSummary(
         days=days,
         period_start_ms=period_start_ms,
@@ -120,6 +127,10 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         max_losing_streak=max_streak,
         avg_mae_r=mean(mae_values) if mae_values else None,
         avg_mfe_r=mean(mfe_values) if mfe_values else None,
+        tp_reach_1r_pct=reach(1.0),
+        tp_reach_1_5r_pct=reach(1.5),
+        tp_reach_2r_pct=reach(2.0),
+        tp_reach_2_5r_pct=reach(2.5),
         market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
         limit_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() == "LIMIT"),
         diagnostics=diagnostics_out,
@@ -139,6 +150,7 @@ def format_report(summary: BacktestSummary) -> str:
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
         f"Timeframes: {' / '.join(summary.timeframes)}",
+        f"V11 Config Fingerprint: {v11_runtime_config_fingerprint(get_v11_runtime_config())}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",
         f"📡 Signals: {summary.signals}",
@@ -160,6 +172,7 @@ def format_report(summary: BacktestSummary) -> str:
         f"📉 Max Drawdown: {summary.max_drawdown_r:.2f}R",
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
         f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r)}R / {_fmt(summary.avg_mfe_r)}R",
+        f"📊 MFE Reach: 1R {_fmt(summary.tp_reach_1r_pct, 1, '%')} | 1.5R {_fmt(summary.tp_reach_1_5r_pct, 1, '%')} | 2R {_fmt(summary.tp_reach_2r_pct, 1, '%')} | 2.5R {_fmt(summary.tp_reach_2_5r_pct, 1, '%')}",
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
         f"⚠️ Data Errors: {summary.data_errors}",
@@ -171,20 +184,32 @@ def format_report(summary: BacktestSummary) -> str:
         lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
     if summary.diagnostics:
         active_experiments = []
+        accuracy_mode = int(summary.diagnostics.get("V11_RUNTIME_ACCURACY_MODE", 0))
         sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))
         impulse_x100 = int(summary.diagnostics.get("V11_MIN_IMPULSE_ATR_X100", 250))
         trigger_bars = int(summary.diagnostics.get("V11_MAX_TRIGGER_BARS", 6))
+        recency_bars = int(summary.diagnostics.get("V11_MAX_RECLAIM_RECENCY_BARS", 0))
+        max_ext_x100 = int(summary.diagnostics.get("V11_MAX_ENTRY_EXTENSION_ATR_X100", 0))
+        max_tp_x100 = int(summary.diagnostics.get("V11_MAX_TARGET_R_X100", 0))
         short_relaxed = int(summary.diagnostics.get("V11_SHORT_RANGE_RELAXED", 0))
+        if accuracy_mode:
+            active_experiments.append("ACCURACY_MODE=ON")
         if sl_origin:
             active_experiments.append("SL=4H_ORIGIN")
         if impulse_x100 != 250:
             active_experiments.append(f"4H_IMPULSE={impulse_x100 / 100.0:.2f}ATR")
         if trigger_bars != 6:
-            active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
+            active_experiments.append(f"SWEEP_RECLAIM={trigger_bars}B")
+        if recency_bars:
+            active_experiments.append(f"RECLAIM_FRESH<={recency_bars}B")
+        if max_ext_x100:
+            active_experiments.append(f"ENTRY_EXT<={max_ext_x100 / 100.0:.2f}ATR")
+        if max_tp_x100:
+            active_experiments.append(f"TARGET_R<={max_tp_x100 / 100.0:.2f}")
         if short_relaxed:
             active_experiments.append("SHORT_RANGE_RELAXED=ON")
         if active_experiments:
-            lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
+            lines.insert(4, "🧪 V11 Config: " + " | ".join(active_experiments))
         lines.extend(("", "GATE DIAGNOSTICS"))
         important = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))
         lines.extend(f"{key}: {value}" for key, value in important[:20])

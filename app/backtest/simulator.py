@@ -168,6 +168,11 @@ def _quality_snapshot(signal: Mapping[str, Any]) -> dict[str, float]:
         "one_hour_long_votes",
         "one_hour_short_votes",
         "macd_hist_delta",
+        "entry_extension_atr",
+        "retest_depth",
+        "reclaim_recency_bars",
+        "breakout_body_ratio",
+        "breakout_range_atr",
     ):
         value = signal.get(key)
         if value is None:

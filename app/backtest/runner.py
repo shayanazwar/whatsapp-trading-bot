@@ -31,14 +31,12 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from ..analysis.engine import (
-    V11_MAX_TRIGGER_BARS,
-    V11_MIN_IMPULSE_ATR,
-    V11_SHORT_RANGE_RELAXED,
-    V11_SL_MODE,
     analyze_candles,
     build_btc_context,
     convert_candles,
+    get_v11_runtime_config,
     synthesize_12h_from_4h,
+    v11_runtime_config_fingerprint,
 )
 from ..automation.mexc_client import MexcAPIError, MexcClient
 from ..automation.universe import MexcUniverse
@@ -881,10 +879,25 @@ class BacktestRunner:
         diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int(
             (time.monotonic() - symbol_started) * 1000
         )
-        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
-        diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
-        diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
-        diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
+        runtime_cfg = get_v11_runtime_config()
+        diagnostics["V11_RUNTIME_ACCURACY_MODE"] = 1 if bool(runtime_cfg["accuracy_mode"]) else 0
+        diagnostics["V11_MIN_RR_X100"] = int(round(float(runtime_cfg["min_rr"]) * 100))
+        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(runtime_cfg["min_impulse_atr"]) * 100))
+        diagnostics["V11_MAX_TRIGGER_BARS"] = int(runtime_cfg["reclaim_max_bars"])
+        diagnostics["V11_MAX_RECLAIM_RECENCY_BARS"] = int(runtime_cfg["reclaim_recency_bars"])
+        diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(runtime_cfg["sl_mode"]).upper() == "4H_ORIGIN" else 0
+        diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(runtime_cfg["short_range_relaxed"]) else 0
+        diagnostics["V11_MAX_ENTRY_EXTENSION_ATR_X100"] = int(round(float(runtime_cfg["max_entry_extension_atr"]) * 100))
+        diagnostics["V11_MAX_TARGET_R_X100"] = int(round(float(runtime_cfg["max_target_r"]) * 100))
+        diagnostics["V11_REQUIRE_BREAKOUT_QUALITY"] = 1 if bool(runtime_cfg["require_breakout_quality"]) else 0
+        diagnostics["V11_MIN_BREAKOUT_BODY_RATIO_X100"] = int(round(float(runtime_cfg["min_breakout_body_ratio"]) * 100))
+        diagnostics["V11_MIN_BREAKOUT_RANGE_ATR_X100"] = int(round(float(runtime_cfg["min_breakout_range_atr"]) * 100))
+        diagnostics["V11_MAX_RETEST_DEPTH_X100"] = int(round(float(runtime_cfg["max_retest_depth"]) * 100))
+        LOGGER.info(
+            "BACKTEST V11 RUNTIME CONFIG | fingerprint=%s config=%s",
+            v11_runtime_config_fingerprint(runtime_cfg),
+            runtime_cfg,
+        )
 
         reject_items = [
             (key, int(value))

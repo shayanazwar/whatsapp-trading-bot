@@ -59,7 +59,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V11-value-pullback-liquidity-reclaim"
+ENGINE_VERSION = "V11-balanced-value-pullback-liquidity-reclaim"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -426,15 +426,52 @@ def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
 
 
 def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
+    """Build a directional 1D permission from independent macro votes.
+
+    The original V11 implementation required every bullish/bearish component
+    to agree (EMA placement + price location + exact HH/HL or LH/LL). That made
+    the macro layer behave like a hard all-or-nothing structure gate and produced
+    large neutral regions even when the broader trend evidence was aligned.
+
+    V11.2 keeps the 1D layer directional and causal, but uses the proven V10-style
+    3-of-5 macro vote model: price vs EMA200, EMA50 vs EMA200, confirmed structure,
+    EMA50 slope, and ADX. Structure remains visible in diagnostics but is no longer
+    required to be the sole deciding vote. The 4H setup still supplies the strict
+    trend-continuation structure requirement.
+    """
     closes = [float(c["close"]) for c in candles]
     e21 = _safe_ema(closes, 21)
     e50 = _safe_ema(closes, 50)
     e200 = _safe_ema(closes, 200)
     slope = _ema_slope(closes, 50, lookback=5)
+    adx = _adx(candles)
     structure = _v11_structure(candles, 3, 3)
     price = closes[-1]
-    bull = bool(e50 and e200 and price > e200 and e50 > e200 and structure == "HH/HL")
-    bear = bool(e50 and e200 and price < e200 and e50 < e200 and structure == "LH/LL")
+
+    if e50 is None or e200 is None:
+        return {
+            "regime": "NEUTRAL", "bull": False, "bear": False,
+            "e21": e21, "e50": e50, "e200": e200, "slope": slope,
+            "adx": adx, "structure": structure, "price": price,
+            "bull_votes": 0, "bear_votes": 0,
+        }
+
+    bull_votes = sum((
+        price > e200,
+        e50 > e200,
+        structure == "HH/HL",
+        slope > 0,
+        adx >= ADX_TREND_MIN,
+    ))
+    bear_votes = sum((
+        price < e200,
+        e50 < e200,
+        structure == "LH/LL",
+        slope < 0,
+        adx >= ADX_TREND_MIN,
+    ))
+    bull = bull_votes >= 3 and bull_votes > bear_votes
+    bear = bear_votes >= 3 and bear_votes > bull_votes
     return {
         "regime": "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
         "bull": bull,
@@ -443,8 +480,11 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
         "e50": e50,
         "e200": e200,
         "slope": slope,
+        "adx": adx,
         "structure": structure,
         "price": price,
+        "bull_votes": bull_votes,
+        "bear_votes": bear_votes,
     }
 
 
@@ -627,7 +667,10 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
             swept = float(c["high"]) > level
         if not swept:
             continue
-        for j in range(i + 1, min(end, i + 2) + 1):
+        # Reclaim may occur on any subsequent candle within the full V11.2
+        # trigger window. The previous implementation unintentionally limited
+        # this to only the next 1–2 candles despite max_bars=6.
+        for j in range(i + 1, end + 1):
             r = candles[j]
             ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
             rrng = max(rhigh - rlow, 1e-12)
@@ -776,7 +819,7 @@ def _v11_analyze_side(
 
     if not direction_ok:
         return reject(
-            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'})"
+            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
         )
     if context.get("hostile"):
         return reject(
@@ -817,12 +860,10 @@ def _v11_analyze_side(
             last_reason = f"{side}: no 1H candles after impulse endpoint"
             continue
 
-        if side == "LONG" and min(float(c["low"]) for c in post_impulse) <= float(impulse["low"]):
-            last_reason = f"{side}: 1H pullback erased 4H impulse origin"
-            continue
-        if side == "SHORT" and max(float(c["high"]) for c in post_impulse) >= float(impulse["high"]):
-            last_reason = f"{side}: 1H pullback erased 4H impulse origin"
-            continue
+        # Structural invalidation is defined on the 4H setup timeframe. A 1H
+        # wick may probe the origin without erasing a completed 4H structure,
+        # so do not reject the setup merely because an intrabar 1H low/high
+        # touches the origin. The completed 4H close test above is authoritative.
 
         zlow, zhigh = _num(zone.get("low")), _num(zone.get("high"))
         trigger = None
@@ -957,7 +998,7 @@ def _v11_empty(
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
-        "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11 Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
+        "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
         "technical_gate_failures": list(side_failures or [reason]),
@@ -1082,7 +1123,7 @@ def analyze_candles(
         "estimated_round_trip_cost_pct": cost_pct, "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
         "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
         "signal_engine_version": ENGINE_VERSION,
-        "signal_basis": "1D trend → 12H health → 4H impulse/pullback into value → 1H liquidity sweep/reclaim → next 1H open",
+        "signal_basis": "1D macro vote → 12H health → 4H impulse/pullback into value → 1H liquidity sweep/reclaim → next 1H open",
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
         "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),

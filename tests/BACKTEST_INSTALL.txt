@@ -1,33 +1,19 @@
-MEXC SWING ENGINE V11 — BACKTEST / DEPLOYMENT NOTES
+V11 FIXED BACKTEST
 
-Authoritative strategy timeframes:
-- 1D
-- 12H
-- 4H
-- 1H
+The paper backtester uses only completed 1D / 12H / 4H / 1H candles.
+12H is synthesized causally from three contiguous completed 4H candles.
+Each decision is made at a completed 1H close and paper execution uses the next 1H open.
 
-12H is causally synthesized from three contiguous completed 4H candles.
-The only execution baseline is market entry at the next 1H open after the completed reclaim candle.
+Supported windows:
+BACKTEST 1D
+BACKTEST 7D
+BACKTEST 30D
+BACKTEST 60D
+BACKTEST 90D
+BACKTEST 180D
+BACKTEST 365D
 
-Supported paper backtests:
-- 1D
-- 7D
-- 30D
-- 60D
-- 90D
-- 180D
-- 365D
+For strategy evaluation, compare LONG/SHORT balance, TP/SL outcomes, total R,
+expectancy, profit factor, drawdown, signal RR, and actual-fill RR across multiple windows.
 
-Use 1D/7D for smoke tests, 30D/90D+ for statistical evaluation, and 180D/365D for robustness. A true walk-forward study still requires explicit train/test segmentation outside this simple fixed-window runner.
-
-The backtest never calls the live executor and never places a real order. Historical execution uses the next 1H open with fee/slippage modeling plus the same fixed funding allowance used by live signal validation.
-
-Important research limitation: the universe is the current eligible MEXC universe, not a survivorship-bias-free historical universe. Live order-book, spread, freshness, and funding history cannot be reconstructed exactly from ordinary OHLCV; V11 therefore uses a conservative fixed cost/funding allowance for historical acceptance.
-
-Deployment safety:
-- SCANNER_ENABLED=false by default
-- AUTO_SIGNAL_ENABLED=false by default
-- AUTO_TRADE_ENABLED=false by default
-- ALLOW_LIVE_EXECUTION=false by default
-
-Do not enable live trading until the V11 execution adapter has been separately validated against real MEXC responses and actual-fill reconciliation.
+This is a paper simulator. No real orders are executed by the supplied release.

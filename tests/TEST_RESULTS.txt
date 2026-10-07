@@ -1,22 +1,17 @@
-V11 LOCAL TEST VERIFICATION
-Date: 2026-10-07
+V11 FIXED LOCAL TEST RESULTS
 
-pytest -q: 84 passed, 2 skipped
+pytest -q: 75 passed, 0 failed, 0 skipped
 python -m compileall -q app tests: PASS
-FastAPI import: PASS
+import app.main: PASS
+health route: PASS
 
-Skipped tests are explicitly legacy V10-only compatibility fixtures and are outside the V11 pytest release path.
-
-V11 regression coverage includes:
-- strict 1D / 12H / 4H / 1H timeframe contract
-- causal 12H synthesis from completed 4H candles
-- strict 1H sweep -> subsequent reclaim for LONG and SHORT
-- strict HH/HL and LH/LL 4H continuation sequencing
-- real target-path blocker detection
-- nearest structural target symmetry, including SHORT
-- next-1H-open market execution model
-- shared fee/slippage/funding cost model
-- actual fill RR reporting separate from signal-close RR
-- live signal freshness boundary
-- no lower-timeframe support in active app code
-- duplicate/legacy V10 strategy helper removal
+Validated areas include:
+- 1D / 12H / 4H / 1H-only strategy surface
+- causal 12H aggregation
+- strict separate-candle sweep/reclaim
+- LONG + SHORT structural symmetry
+- next-1H-open MARKET execution semantics
+- stale live-signal rejection
+- nearest structural target + truthful target-path diagnostic
+- signal RR vs actual fill RR reporting
+- default live-trading safety switches

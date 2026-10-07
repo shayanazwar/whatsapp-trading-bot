@@ -2,13 +2,14 @@ from app.bot import TIMEFRAME_ALIASES, fmt_price
 
 
 def test_timeframes():
+    assert set(TIMEFRAME_ALIASES) == {
+        "1H", "1HR", "1HOUR", "4H", "4HR", "4HOUR",
+        "12H", "12HR", "12HOUR", "1D", "1DAY",
+    }
     assert TIMEFRAME_ALIASES["1H"] == "1h"
     assert TIMEFRAME_ALIASES["4H"] == "4h"
     assert TIMEFRAME_ALIASES["12H"] == "12h"
     assert TIMEFRAME_ALIASES["1D"] == "1d"
-    assert "5M" not in TIMEFRAME_ALIASES
-    assert "15M" not in TIMEFRAME_ALIASES
-    assert "30M" not in TIMEFRAME_ALIASES
 
 
 def test_price_format():

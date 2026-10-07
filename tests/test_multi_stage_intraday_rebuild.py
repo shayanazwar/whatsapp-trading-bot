@@ -37,7 +37,7 @@ def valid_analysis():
         "trade_geometry_ok": True, "risk_ok": True, "primary_entry_timeframe": "1H",
         "signal_candle_timeframe": "1H", "entry": 110.0, "stop_loss": 105.0, "tp": 128.0,
         "rr": 3.6, "atr": 4.0, "sl_atr": 1.2, "tp_distance_atr": 4.5, "mexc_spread_pct": 0.01,
-        "max_allowed_spread_pct": 0.50, "max_signal_age_seconds": 5400,
+        "max_allowed_spread_pct": 0.50, "max_signal_age_seconds": 300,
     }
 
 
@@ -50,7 +50,7 @@ def test_signal_validator_requires_1h_entry_and_structural_geometry():
 
 def test_signal_validator_rejects_non_1h_entry_timeframe():
     data = valid_analysis()
-    data["primary_entry_timeframe"] = "15M"
+    data["primary_entry_timeframe"] = "4H"
     signal, reasons = validate_signal(data, min_confluence=65, min_rr=2.0)
     assert signal is None
     assert any("Primary entry timeframe" in r for r in reasons)

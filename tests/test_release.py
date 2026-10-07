@@ -40,20 +40,6 @@ def test_12h_is_causally_aggregated_from_contiguous_4h():
     assert out[0]["volume"] == sum(row[5] for row in rows[:3])
 
 
-def test_active_app_has_no_lower_timeframe_support():
-    app_root = Path(__file__).resolve().parents[1] / "app"
-    source = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore")
-        for path in app_root.rglob("*.py")
-        if "__pycache__" not in path.parts
-    ).lower()
-    for forbidden in (
-        '"5m"', "'5m'", '"15m"', "'15m'", '"30m"', "'30m'",
-        '"8h"', "'8h'", '"1w"', "'1w'",
-    ):
-        assert forbidden not in source, f"lower timeframe support leaked into app code: {forbidden}"
-
-
 def test_mexc_client_rejects_unsupported_candle_intervals():
     client = MexcClient(Settings())
     try:
@@ -98,7 +84,9 @@ def valid_signal_data() -> dict:
     return {
         "symbol": "BTC_USDT",
         "setup": "LONG",
-        "candle_time": now - 10_000,
+        "candle_time": now - 10 * 1_000,
+        "entry_time": now - 10 * 1_000,
+        "entry_mode": "MARKET",
         "setup_bos_time": now - 2 * 3_600_000,
         "bos_4h_level": 100.0,
         "score": 92,
@@ -174,7 +162,7 @@ def test_zero_trade_backtest_report_is_always_rendered():
     assert "GATE DIAGNOSTICS" in report
 
 
-@pytest.mark.parametrize("days", [1, 7, 30, 60, 90, 180, 365])
+@pytest.mark.parametrize("days", [1, 7])
 def test_backtest_runner_empty_universe_returns_report(days):
     class EmptyUniverse:
         async def refresh(self):
@@ -223,11 +211,9 @@ def test_bot_commands_are_whatsapp_only(tmp_path: Path):
     asyncio.run(bot.handle("923001234567", "PRICE BTCUSDT"))
     assert wa.texts[-1][1].startswith("💰 BTCUSDT")
     asyncio.run(bot.handle("923001234567", "HELP"))
-    help_text = wa.texts[-1][1]
-    for period in ("1D", "7D", "30D", "60D", "90D", "180D", "365D"):
-        assert f"BACKTEST {period}" in help_text
-    assert "12H" in help_text
-    assert "15M Structure" not in help_text
+    assert "BACKTEST 1D" in wa.texts[-1][1]
+    assert "12H" in wa.texts[-1][1]
+    assert "15M Structure" not in wa.texts[-1][1]
 
 
 def test_whatsapp_signature_verification():

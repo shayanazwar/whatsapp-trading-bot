@@ -38,8 +38,8 @@ def _valid_analysis(side: str = "LONG", *, candle_time: int | None = None) -> di
         "entry": 100.0, "stop_loss": 99.0 if side == "LONG" else 101.0,
         "tp": 104.0 if side == "LONG" else 96.0, "rr": 3.48, "atr": 1.0,
         "sl_atr": 1.0, "tp_distance_atr": 4.0, "mexc_spread_pct": 0.01,
-        "max_allowed_spread_pct": 0.50, "max_signal_age_seconds": 120,
-        "candle_time": signal_time, "mexc_funding_rate": 0.0,
+        "max_allowed_spread_pct": 0.50, "max_signal_age_seconds": 300,
+        "candle_time": signal_time, "entry_time": signal_time, "entry_mode": "MARKET", "mexc_funding_rate": 0.0,
     }
 
 
@@ -98,6 +98,7 @@ def test_order_payload_side_mapping():
     payload = build_market_order_payload(signal, meta, risk_amount_usdt=10, leverage=3, open_type=1)
     assert payload["side"] == 1
     assert payload["type"] == 5
+    assert "price" not in payload
     assert payload["openType"] == 1
 
 
@@ -189,42 +190,41 @@ def test_scanner_spread_limit_uses_configured_percentage():
     assert "0.100%" in reason
 
 
-def test_live_scanner_uses_1h_close_time_not_1h_open_time_for_freshness(monkeypatch):
-    pytest.skip("Legacy V10 scanner fixture; V11 live execution is covered by the new strategy integration tests.")
-    fixed_now = int(time.time() * 1000)
-    monkeypatch.setattr(scanner_module.time, "time", lambda: fixed_now / 1000)
-    from app.automation import signal_validator as validator_module
-    monkeypatch.setattr(validator_module.time, "time", lambda: fixed_now / 1000)
+def test_live_scanner_rejects_stale_next_open_entries():
+    analysis = _valid_analysis(candle_time=1_700_000_000_000)
+    ok, reason = MexcScanner._reprice_for_next_1h_open(
+        analysis,
+        {"best_ask": 100.0, "best_bid": 99.9, "last_price": 100.0},
+        candle_close_time_ms=1_700_000_000_000,
+        now_ms=1_700_000_000_000 + 301_000,
+        max_age_seconds=5400,
+        max_open_gap_pct=0.002,
+        min_rr=1.6,
+    )
+    assert not ok
+    assert "next-open window" in reason
 
-    step = 3_600_000
-    base_4h = (fixed_now // (4 * step)) * (4 * step) - 200 * (4 * step)
-    rows_4h = [_row(base_4h + i * 4 * step) for i in range(200)]
-    rows_1h = [_row(fixed_now - 180 * step + i * step) for i in range(180)]
-    rows_1d = [_row((fixed_now // (86_400_000)) * 86_400_000 - 220 * 86_400_000 + i * 86_400_000) for i in range(220)]
-    fake_analysis = _valid_analysis(candle_time=fixed_now - step)
-    fake_analysis["candle_close_time"] = fixed_now
 
-    async def fake_get_closed(_symbol, timeframe, _limit):
-        return {"4H": rows_4h, "1H": rows_1h, "1D": rows_1d}[timeframe], False
+def test_live_scanner_reprices_entry_to_next_open_quote():
+    close_time = int(time.time() * 1000) - 1_000
+    analysis = _valid_analysis(candle_time=close_time)
+    analysis["stop_loss"] = 98.0
+    analysis["tp"] = 108.0
+    analysis["estimated_round_trip_cost_pct"] = 0.0015
+    ok, reason = MexcScanner._reprice_for_next_1h_open(
+        analysis,
+        {"best_ask": 101.0, "best_bid": 100.9, "last_price": 101.0},
+        candle_close_time_ms=close_time,
+        now_ms=close_time + 1_000,
+        max_age_seconds=300,
+        max_open_gap_pct=0.02,
+        min_rr=1.6,
+    )
+    assert ok, reason
+    assert analysis["entry"] == 101.0
+    assert analysis["entry_time"] == close_time
+    assert analysis["entry_mode"] == "MARKET"
 
-    class FakeClient:
-        async def get_ticker(self, symbol):
-            return {"lastPrice": 100.0, "bid1": 99.99, "ask1": 100.01, "timestamp": fixed_now}
-
-    class FakeUniverse:
-        async def refresh(self):
-            return ["BTC_USDT"]
-
-    class FakeSignalManager:
-        async def publish(self, signal):
-            return True
-
-    monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: dict(fake_analysis))
-    scanner = MexcScanner(settings=Settings(max_signal_age_seconds=1200, min_confluence=65, min_rr=2.0), client=FakeClient(), universe=FakeUniverse(), signal_manager=FakeSignalManager())
-    monkeypatch.setattr(scanner, "_get_closed_candles", fake_get_closed)
-    result = asyncio.run(scanner._scan_one("BTC_USDT"))
-    assert result["sent"] is True
-    assert result["analysis"]["candle_time"] == fixed_now
 
 
 def test_scanner_reports_distinct_stage_reasons_instead_of_generic_no_setup(monkeypatch):
@@ -235,7 +235,7 @@ def test_scanner_reports_distinct_stage_reasons_instead_of_generic_no_setup(monk
     rows_1h = [_row(fixed_now - 180 * step + i * step) for i in range(180)]
     rows_1d = [_row((fixed_now // (86_400_000)) * 86_400_000 - 220 * 86_400_000 + i * 86_400_000) for i in range(220)]
     analysis = _valid_analysis(candle_time=fixed_now)
-    analysis.update({"setup": "NO TRADE", "diagnostic_failures": ["4H continuation structure"], "rejection_stage": "4H_SETUP"})
+    analysis.update({"setup": "NO TRADE", "diagnostic_failures": ["4H BOS/retest structure"], "rejection_stage": "4H_SETUP"})
 
     class FakeClient:
         async def get_ticker(self, symbol): return {"lastPrice": 100.0}
@@ -245,12 +245,12 @@ def test_scanner_reports_distinct_stage_reasons_instead_of_generic_no_setup(monk
 
     monkeypatch.setattr(scanner_module, "analyze_candles", lambda *args, **kwargs: analysis)
     scanner = MexcScanner(settings=Settings(), client=FakeClient(), universe=FakeUniverse(), signal_manager=FakeSignalManager())
-    async def fake_get_closed(_symbol, _tf, _limit, **kwargs):
+    async def fake_get_closed(_symbol, _tf, _limit):
         return {"4H": rows_4h, "1H": rows_1h, "1D": rows_1d}[_tf], False
     monkeypatch.setattr(scanner, "_get_closed_candles", fake_get_closed)
     result = asyncio.run(scanner._scan_one("X_USDT"))
     assert result["rejection_stage"] == "4H_SETUP"
-    assert result["rejection_reasons"] == ["4H continuation structure"]
+    assert result["rejection_reasons"] == ["4H BOS/retest structure"]
 
 
 def test_signal_format_uses_1d_12h_4h_1h_basis():

@@ -24,7 +24,7 @@ def test_backtest_runner_supports_documented_validation_windows():
     class EmptyUniverse:
         async def refresh(self): return []
     runner = BacktestRunner(client=None, universe=EmptyUniverse(), settings=Settings(), max_concurrency=1)
-    for days in (1, 7, 30, 60, 90):
+    for days in (1, 7, 30, 60, 90, 180, 365):
         summary = asyncio.run(runner.run(days))
         assert summary.days == days
         assert summary.signals == 0
@@ -91,18 +91,38 @@ def test_zero_trade_report_is_rendered_with_bias_diagnostic():
     assert "CURRENT_UNIVERSE_SNAPSHOT_BIAS" in text
 
 
-def test_simulator_limit_entry_and_mfe_mae_tracking():
-    pytest.skip("V11 baseline uses next-1H-open market execution; passive limit routing is legacy V10 behavior.")
-    signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100.0, "limit_price": 100.0, "entry_mode": "LIMIT", "stop_loss": 98.0, "tp": 104.0}
-    future = [
-        candle(3_600_000, 101.0, 103.0, 100.2, 102.0),
-        candle(7_200_000, 102.0, 105.0, 99.8, 103.0),
-        candle(10_800_000, 103.0, 104.5, 102.5, 104.2),
-    ]
-    trade = simulate_trade(signal, future, signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0, max_holding_minutes=180)
+def test_simulator_reports_signal_rr_and_actual_fill_rr_separately():
+    signal = {
+        "symbol": "ABC_USDT",
+        "setup": "LONG",
+        "entry": 100.0,
+        "entry_mode": "MARKET",
+        "stop_loss": 95.0,
+        "tp": 110.0,
+    }
+    # Decision is made at t=0; the next 1H bar opens at 102, so actual fill
+    # geometry differs from the signal-close geometry.
+    future = [candle(3_600_000, 102.0, 111.0, 100.0, 109.0)]
+    trade = simulate_trade(signal, future, signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
-    assert trade.entry_mode == "LIMIT"
-    assert trade.entry_filled_time_ms == 7_200_000
-    assert trade.outcome == "TP"
-    assert trade.mfe_r >= 2.0
-    assert trade.mae_r >= 0.1
+    assert trade.entry_execution == 102.0
+    assert trade.signal_rr == 2.0
+    assert trade.actual_fill_rr == pytest.approx(8.0 / 7.0)
+    assert trade.planned_rr == trade.signal_rr
+
+    summary = summarize(
+        days=1,
+        period_start_ms=0,
+        period_end_ms=86_400_000,
+        coins_selected=1,
+        coins_tested=1,
+        data_errors=0,
+        execution_errors=0,
+        rejected_setups=0,
+        trades=[trade],
+    )
+    assert summary.avg_signal_rr == pytest.approx(2.0)
+    assert summary.avg_planned_rr == pytest.approx(2.0)
+    assert summary.avg_actual_fill_rr == pytest.approx(8.0 / 7.0)
+    assert "Avg Signal RR" in format_report(summary)
+    assert "Avg Actual Fill RR" in format_report(summary)

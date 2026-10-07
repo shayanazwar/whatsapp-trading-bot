@@ -50,9 +50,9 @@ class FakeWhatsApp:
 def signal():
     analysis = {
         "symbol": "BNB_USDT", "setup": "LONG", "score": 85,
-        "setup_bos_time": 1234567890000, "bos_15m_level": 770.0,
-        "rsi": 54.0, "rvol_15m": 1.2, "trend_4h": "BULLISH",
-        "structure_1h": "HH/HL", "target_timeframe": "1H",
+        "candle_time": 1234567890000, "entry_time": 1234567890000, "entry_mode": "MARKET",
+        "rsi": 54.0, "rvol_1h": 1.2, "regime_1d": "BULLISH",
+        "structure_4h": "HH/HL", "target_timeframe": "4H",
     }
     return ValidatedSignal(
         key="same-key", symbol="BNB_USDT", side="LONG", candle_time=1234567890000,

@@ -221,36 +221,47 @@ class MexcScanner:
             payload["regime_pass"] = int(bool(stages.get("1D_REGIME")))
             payload["bias_pass"] = int(bool(stages.get("12H_BIAS")))
             payload["setup_pass"] = int(bool(analysis.get("structure_ok") and analysis.get("setup_ok")))
+            payload["direction_pass"] = int(bool(analysis.get("direction_ok")))
             payload["trigger_pass"] = int(bool(stages.get("1H_TRIGGER")))
+            payload["entry_distance_pass"] = int(bool(stages.get("ENTRY_DISTANCE", analysis.get("entry_distance_ok", False))))
             payload["quality_pass"] = int(bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))))
             payload["risk_pass"] = int(bool(stages.get("RISK", analysis.get("risk_ok", False))))
             payload["rr_pass"] = int(bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))))
 
             side = str(analysis.get("setup") or "").upper()
             failures = analysis.get("diagnostic_failures") or ["No actionable setup"]
-            if side not in {"LONG", "SHORT"}:
-                stage = str(analysis.get("rejection_stage") or "SETUP")
-                return self._reject(symbol, failures, stage, payload)
 
-            # Check all strategy stages for diagnostics; reject at the first failed gate.
-            # Reject at the first failed strategy gate while retaining all stage counters.
+            # The Engine is authoritative for technical-stage ordering. Supporting
+            # confirmation families are deliberately not a hard veto.
             ordered = [
+                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H protected BOS/departure setup"),
                 ("DIRECTION", bool(analysis.get("direction_ok")), "1D/12H/4H direction"),
-                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H BOS/departure setup"),
                 ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H retest confirmation"),
+                ("ENTRY_DISTANCE", bool(stages.get("ENTRY_DISTANCE", analysis.get("entry_distance_ok", False))), "1H entry distance"),
                 ("VOLATILITY", bool(analysis.get("volatility_ok")), "ATR volatility regime"),
-                ("CONFIRMATION_FAMILIES", bool(analysis.get("confirmation_family_diversity_ok")), "Confirmation-family diversity"),
-                ("TARGET_PATH", bool(analysis.get("location_ok") and analysis.get("target_path_structural") and analysis.get("target_path_clear")), "Clear HTF target path"),
+                ("TARGET_PATH", bool(analysis.get("target_path_ok") and analysis.get("target_path_structural")), "HTF target availability"),
+                ("PATH_FRICTION", bool(analysis.get("target_path_clear")), "Meaningful target-path friction"),
                 ("RISK", bool(stages.get("RISK", analysis.get("risk_ok", False))), "Structural risk model"),
-                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))), f"Post-cost RR {float(analysis.get('rr', 0) or 0):.2f} < {float(getattr(self.settings, "min_rr", 2.0)):.2f}"),
+                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))), "Post-cost RR"),
+                ("SHOCK", bool(stages.get("SHOCK", analysis.get("shock_veto_ok", True))), str(analysis.get("shock_veto_reason") or "Shock veto")),
                 ("BTC", bool(analysis.get("btc_filter_ok")), str(analysis.get("btc_filter_reason") or "BTC filter")),
-                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), f"Quality score {analysis.get('score', 0)} < {int(getattr(self.settings, "min_confluence", 65))}"),
+                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), "Quality score"),
                 ("TECHNICAL_CANDIDATE", bool(analysis.get("technical_candidate")), "Engine technical candidate gate"),
             ]
+            if side not in {"LONG", "SHORT"} or not analysis.get("technical_candidate"):
+                stage = str(analysis.get("first_failure") or analysis.get("rejection_stage") or next((name for name, passed, _ in ordered if not passed), "TECHNICAL_CANDIDATE"))
+                reasons = (analysis.get("stage_failures") or {}).get(stage) or failures or [stage]
+                payload["first_failure"] = stage
+                payload["first_failure_reason"] = reasons
+                return self._reject(symbol, reasons, stage, payload)
             for stage, passed, fallback in ordered:
                 if not passed:
                     reasons = (analysis.get("stage_failures") or {}).get(stage) or [fallback]
+                    payload["first_failure"] = stage
+                    payload["first_failure_reason"] = reasons
                     return self._reject(symbol, reasons, stage, payload)
+            payload["first_failure"] = None
+            payload["first_failure_reason"] = None
 
             btc_ok, btc_reason = btc_filter_ok(side, self._btc_context, is_btc=symbol.upper().startswith("BTC"))
             payload["btc_would_block"] = int(not btc_ok)

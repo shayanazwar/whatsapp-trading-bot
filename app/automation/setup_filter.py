@@ -4,8 +4,10 @@ from typing import Any
 
 MIN_SCORE = 65
 MIN_RR = 2.00
-MIN_CONFIRMATION_FAMILIES = 4
-MIN_AVAILABLE_CONFIRMATION_FAMILIES = 4
+# Confirmation families are supporting evidence, not a hard wall.  The Engine
+# scores them, while core setup/structure/risk gates decide technical validity.
+MIN_CONFIRMATION_FAMILIES = 0
+MIN_AVAILABLE_CONFIRMATION_FAMILIES = 0
 MIN_ATR_PERCENTILE = 5.0
 MAX_ATR_PERCENTILE = 98.0
 MIN_SL_ATR = 0.50
@@ -51,7 +53,6 @@ def validate_analysis(
         ("shock_veto_ok", "1H shock/liquidity veto failed"),
         ("btc_filter_ok", "BTC directional filter failed"),
         ("volatility_ok", "ATR volatility percentile gate failed"),
-        ("confirmation_family_diversity_ok", "Confirmation-family diversity gate failed"),
         ("technical_candidate", "Engine did not mark this as a technical candidate"),
         ("trade_geometry_ok", "Single-TP structural geometry failed"),
         ("risk_ok", "Risk/RR validation failed"),
@@ -100,13 +101,8 @@ def validate_analysis(
     if "target_path_clear" in data and data.get("target_path_clear") is not True:
         reasons.append("4H/1H target path is not clear")
 
-    families_passed = data.get("confirmation_families_passed")
-    families_available = data.get("confirmation_families_available")
-    if families_passed is not None and int(_f(families_passed, 0)) < MIN_CONFIRMATION_FAMILIES:
-        reasons.append(f"Confirmation families {int(_f(families_passed, 0))} < required {MIN_CONFIRMATION_FAMILIES}")
-    if families_available is not None and int(_f(families_available, 0)) < MIN_AVAILABLE_CONFIRMATION_FAMILIES:
-        reasons.append(f"Available confirmation families {int(_f(families_available, 0))} < required {MIN_AVAILABLE_CONFIRMATION_FAMILIES}")
-
+    # Supporting confirmation-family counts are informational only.  Do not
+    # reintroduce a hidden 4-of-N hard gate at final validation.
     atr_percentile = data.get("atr_percentile")
     if atr_percentile is not None:
         atr_rank = _f(atr_percentile, -1.0)

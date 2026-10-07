@@ -50,9 +50,14 @@ SEARCH PEPE
 🧪 BACKTEST
 BACKTEST 1D
 BACKTEST 7D
+BACKTEST 30D
+BACKTEST 60D
+BACKTEST 90D
+BACKTEST 180D
+BACKTEST 365D
 
 ⏱ SIGNAL: 1D • 12H • 4H • 1H
-CHART: MEXC-supported timeframes
+CHART: 1H / 4H / 12H / 1D only
 """
 
 COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
@@ -291,17 +296,17 @@ class Bot:
                 return "N/A"
 
         body = (
-            f"🧠 {data.get('symbol', normalize_symbol_token(raw_symbol))} ANALYSIS\n\n"
-            f"4H Trend: {data.get('trend_4h', 'N/A')}\n"
-            f"1H Structure: {data.get('structure_1h', 'N/A')}\n"
-            f"4H BOS: {data.get('bos_4h', 'N/A')}\n"
-            f"EMA 21/50: {data.get('ema_direction', 'N/A')}\n"
+            f"🧠 {data.get('symbol', normalize_symbol_token(raw_symbol))} V11 ANALYSIS\n\n"
+            f"1D Regime: {data.get('regime_1d', 'N/A')}\n"
+            f"12H Context: {data.get('bias_12h', 'N/A')}\n"
+            f"4H Structure: {data.get('trend_4h', 'N/A')}\n"
+            f"Value Zone: {fmt_optional(data.get('value_zone_low'))} → {fmt_optional(data.get('value_zone_high'))}\n"
+            f"1H Trigger: {data.get('trigger_type', 'N/A')}\n"
+            f"Sweep Level: {fmt_optional(data.get('swept_level_1h'))}\n"
+            f"RVOL: {fmt_number(data.get('rvol_1h'))}\n"
             f"RSI: {fmt_number(data.get('rsi'))}\n"
             f"Volume: {data.get('volume', 'N/A')}\n"
-            f"Support: {fmt_optional(data.get('support'))}\n"
-            f"Resistance: {fmt_optional(data.get('resistance'))}\n"
-            f"Score: {data.get('score', 'N/A')}/100\n"
-            f"Families: {data.get('confirmation_families_passed', data.get('confirmation_family_count', 0))}/{data.get('confirmation_families_available', 8)}\n\n"
+            f"Diagnostic Score: {data.get('score', 'N/A')}/100\n\n"
             f"Potential Setup: {data.get('setup', 'NO TRADE')}\n"
         )
 
@@ -332,7 +337,7 @@ class Bot:
 
         tf = TIMEFRAME_ALIASES.get(raw_tf.upper())
         if not tf:
-            raise ValueError("Supported chart timeframes: 5M, 15M, 1H, 4H, 1D")
+            raise ValueError("Supported chart timeframes: 1H, 4H, 12H, 1D")
 
         ref = await self.market.resolve(raw_symbol)
         rows = await self.market.ohlcv(
@@ -609,11 +614,16 @@ class Bot:
         periods = {
             "1D": 1,
             "7D": 7,
+            "30D": 30,
+            "60D": 60,
+            "90D": 90,
+            "180D": 180,
+            "365D": 365,
         }
 
         if period not in periods:
             raise ValueError(
-                "Usage: BACKTEST 1D or BACKTEST 7D"
+                "Usage: BACKTEST 1D, 7D, 30D, 60D, 90D, 180D, or 365D"
             )
 
         if self.backtest_runner.is_running:

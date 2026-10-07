@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     mexc_access_key: str = Field(default="", alias="MEXC_ACCESS_KEY")
     mexc_secret_key: str = Field(default="", alias="MEXC_SECRET_KEY")
     mexc_recv_window: int = Field(default=10, alias="MEXC_RECV_WINDOW")
-    mexc_order_type: int = Field(default=1, alias="MEXC_ORDER_TYPE")
+    mexc_order_type: int = Field(default=5, alias="MEXC_ORDER_TYPE")
     mexc_open_type: int = Field(default=1, alias="MEXC_OPEN_TYPE")
     mexc_default_leverage: int = Field(default=3, alias="MEXC_DEFAULT_LEVERAGE")
     max_risk_per_trade: float = Field(default=1.0, alias="MAX_RISK_PER_TRADE")
@@ -59,10 +59,11 @@ class Settings(BaseSettings):
     mexc_rate_limit_backoff_cap_seconds: float = Field(default=20.0, alias="MEXC_RATE_LIMIT_BACKOFF_CAP_SECONDS")
     mexc_rate_limit_jitter_seconds: float = Field(default=0.25, alias="MEXC_RATE_LIMIT_JITTER_SECONDS")
     candle_limit: int = Field(default=250, alias="CANDLE_LIMIT")
-    min_confluence: int = Field(default=65, alias="MIN_CONFLUENCE")
-    min_rr: float = Field(default=2.0, alias="MIN_RR")
+    min_confluence: int = Field(default=0, alias="MIN_CONFLUENCE")
+    min_rr: float = Field(default=1.6, alias="MIN_RR")
     max_entry_drift_pct: float = Field(default=0.002, alias="MAX_ENTRY_DRIFT_PCT")
-    estimated_round_trip_cost_pct: float = Field(default=0.0015, alias="ESTIMATED_ROUND_TRIP_COST_PCT")
+    estimated_round_trip_cost_pct: float = Field(default=0.0012, alias="ESTIMATED_ROUND_TRIP_COST_PCT")
+    estimated_funding_cost_pct: float = Field(default=0.0002, alias="ESTIMATED_FUNDING_COST_PCT")
     max_mexc_spread_pct: float = Field(default=0.001, alias="MAX_MEXC_SPREAD_PCT")
     max_index_dislocation_pct: float = Field(default=0.002, alias="MAX_INDEX_DISLOCATION_PCT")
     max_data_age_seconds: float = Field(default=5.0, alias="MAX_DATA_AGE_SECONDS")
@@ -71,7 +72,7 @@ class Settings(BaseSettings):
     require_increasing_volume: bool = Field(default=False, alias="REQUIRE_INCREASING_VOLUME")
     signal_expiry_minutes: int = Field(default=30, alias="SIGNAL_EXPIRY_MINUTES")
     # Signal freshness is measured from the CLOSE of the completed 1H entry candle.
-    max_signal_age_seconds: float = Field(default=5400.0, alias="MAX_SIGNAL_AGE_SECONDS")
+    max_signal_age_seconds: float = Field(default=120.0, alias="MAX_SIGNAL_AGE_SECONDS")
     auto_signal_recipients: str = Field(default="", alias="AUTO_SIGNAL_RECIPIENTS")
     auto_signal_telegram_recipients: str = Field(
         default="",
@@ -88,6 +89,8 @@ class Settings(BaseSettings):
     backtest_max_open_positions: int = Field(default=4, alias="BACKTEST_MAX_OPEN_POSITIONS")
     backtest_max_same_direction: int = Field(default=2, alias="BACKTEST_MAX_SAME_DIRECTION")
     backtest_total_open_risk_r: float = Field(default=3.0, alias="BACKTEST_TOTAL_OPEN_RISK_R")
+    backtest_fee_rate: float = Field(default=0.0006, alias="BACKTEST_FEE_RATE")
+    backtest_slippage_bps: float = Field(default=2.0, alias="BACKTEST_SLIPPAGE_BPS")
 
     # Additional live-trading kill switch
     allow_live_execution: bool = Field(default=False, alias="ALLOW_LIVE_EXECUTION")
@@ -99,6 +102,21 @@ class Settings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    @property
+    def backtest_execution_cost_pct(self) -> float:
+        """Round-trip fee + adverse slippage allowance used by the paper simulator."""
+        fee = max(0.0, float(self.backtest_fee_rate)) * 2.0
+        slippage = max(0.0, float(self.backtest_slippage_bps)) / 10_000.0 * 2.0
+        return fee + slippage
+
+    @property
+    def effective_round_trip_cost_pct(self) -> float:
+        """One conservative cost model shared by live validation and backtests."""
+        execution_cost = self.backtest_execution_cost_pct
+        configured_cost = max(0.0, float(self.estimated_round_trip_cost_pct))
+        funding = max(0.0, float(self.estimated_funding_cost_pct))
+        return max(configured_cost, execution_cost) + funding
 
     @property
     def allowed_user_set(self) -> set[str]:

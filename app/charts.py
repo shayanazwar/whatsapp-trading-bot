@@ -28,6 +28,9 @@ class ChartRenderer:
         rows: Iterable,
         title: str | None = None,
     ) -> Path:
+        allowed = {"1H", "4H", "12H", "1D"}
+        if str(timeframe or "").upper() not in allowed:
+            raise ValueError("Supported chart timeframes: 1H, 4H, 12H, 1D")
         return await asyncio.to_thread(
             self._render_sync,
             ref,

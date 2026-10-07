@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -16,27 +17,16 @@ LOGGER = logging.getLogger(__name__)
 # candle intervals.  The trading exchange is MEXC; there is no alternate
 # exchange fallback in this market layer.
 TIMEFRAME_ALIASES = {
-    "1M": "1m", "1MIN": "1m",
-    "5M": "5m", "5MIN": "5m",
-    "15M": "15m", "15MIN": "15m",
-    "30M": "30m", "30MIN": "30m",
     "1H": "1h", "1HR": "1h", "1HOUR": "1h",
     "4H": "4h", "4HR": "4h", "4HOUR": "4h",
-    "8H": "8h", "8HR": "8h", "8HOUR": "8h",
+    "12H": "12h", "12HR": "12h", "12HOUR": "12h",
     "1D": "1d", "1DAY": "1d",
-    "1W": "1w", "1WEEK": "1w",
 }
 
 _MEXC_INTERVALS = {
-    "1m": "Min1",
-    "5m": "Min5",
-    "15m": "Min15",
-    "30m": "Min30",
     "1h": "Min60",
     "4h": "Hour4",
-    "8h": "Hour8",
     "1d": "Day1",
-    "1w": "Week1",
 }
 
 
@@ -171,13 +161,15 @@ class MarketData:
     async def ohlcv(self, ref: MarketRef, timeframe: str, limit: int):
         if ref.exchange.lower() != "mexc":
             raise ValueError("Only MEXC Futures market data is supported.")
-        tf = TIMEFRAME_ALIASES.get(timeframe.upper(), timeframe.lower())
+        raw_tf = str(timeframe or "").strip().upper()
+        tf = TIMEFRAME_ALIASES.get(raw_tf)
+        if tf is None:
+            raise ValueError("Supported analysis/chart timeframes: 1H, 4H, 12H, 1D")
         if tf == "12h":
             raw = await self.mexc.get_klines(ref.symbol, "Hour4", max(9, int(limit) * 3 + 6))
-            return synthesize_12h_from_4h(raw)[: int(limit)]
-        interval = _MEXC_INTERVALS.get(tf)
-        if interval is None:
-            raise ValueError("Unsupported market timeframe: 12H is synthesized from completed 4H candles; otherwise use a MEXC-supported interval.")
+            now_ms = int(time.time() * 1000)
+            return synthesize_12h_from_4h(raw, now_ms=now_ms)[-int(limit):]
+        interval = _MEXC_INTERVALS[tf]
         return await self.mexc.get_klines(ref.symbol, interval, limit)
 
     async def executable_price(self, ref: MarketRef, side: str) -> float:

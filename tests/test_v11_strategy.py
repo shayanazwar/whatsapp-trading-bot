@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path
+from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, convert_candles
 
 DAY = 86_400_000
 HOUR = 3_600_000
@@ -155,3 +155,33 @@ def test_v11_liquidity_trigger_accepts_wick_sweep_before_later_reclaim():
     assert out["ready"] is True
     assert out["sweep_idx"] == 216
     assert out["reclaim_idx"] == 217
+
+
+def test_v11_balanced_1d_macro_permission_uses_three_of_five_votes(monkeypatch):
+    rows = [{"time": i * DAY, "open": 109.5, "high": 110.5, "low": 108.5, "close": 110.0, "volume": 1000.0} for i in range(220)]
+
+    def fake_ema(values, period):
+        return {21: 108.0, 50: 105.0, 200: 100.0}[period]
+
+    monkeypatch.setattr("app.analysis.engine._safe_ema", fake_ema)
+    monkeypatch.setattr("app.analysis.engine._ema_slope", lambda *args, **kwargs: 0.01)
+    monkeypatch.setattr("app.analysis.engine._adx", lambda *args, **kwargs: 20.0)
+    monkeypatch.setattr("app.analysis.engine._v11_structure", lambda *args, **kwargs: "RANGE")
+    out = _v11_regime_1d(convert_candles(rows))
+    assert out["bull"] is True
+    assert out["bear"] is False
+    assert out["bull_votes"] == 4
+
+
+def test_v11_liquidity_trigger_reclaim_can_occur_four_bars_after_sweep():
+    rows = []
+    base = 1_800_000_000_000
+    for i in range(10):
+        rows.append({"time": base + i * HOUR, "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.0, "volume": 1000.0})
+    rows[3] = {"time": base + 3 * HOUR, "open": 100.0, "high": 100.5, "low": 98.0, "close": 99.0, "volume": 1200.0}
+    rows[7] = {"time": base + 7 * HOUR, "open": 99.0, "high": 102.0, "low": 98.8, "close": 101.5, "volume": 1500.0}
+    candles = convert_candles(rows)
+    out = _v11_liquidity_trigger(candles, 3, "LONG", max_bars=6)
+    assert out["ready"] is True
+    assert out["sweep_idx"] == 3
+    assert out["reclaim_idx"] == 7

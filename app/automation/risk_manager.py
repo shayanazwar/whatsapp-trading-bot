@@ -9,7 +9,7 @@ MIN_RR = 1.60
 MIN_SL_ATR = 0.20
 MAX_SL_ATR = 3.00
 MIN_TP_ATR = 0.50
-DEFAULT_COST_BUFFER_PCT = 0.0018  # V11 shared conservative round-trip cost
+DEFAULT_COST_BUFFER_PCT = 0.0015  # configurable conservative round-trip buffer
 
 
 @dataclass(frozen=True)

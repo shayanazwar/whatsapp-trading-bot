@@ -57,7 +57,9 @@ class ScannerScheduler:
             pass
 
     async def _run(self) -> None:
-        await self.scan_now()
+        # V11 decisions are tied to completed 1H candles. Never perform an
+        # unaligned startup scan that could discover an already-stale signal;
+        # first scan occurs just after the next hourly boundary.
         while not self._stopping.is_set():
             await self._sleep_until_next_boundary()
             if not self._stopping.is_set():

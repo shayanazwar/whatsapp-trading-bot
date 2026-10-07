@@ -39,49 +39,38 @@ def build_market_order_payload(
     risk_amount_usdt: float,
     leverage: int,
     open_type: int,
-    cost_buffer_pct: float = 0.0018,
 ) -> dict[str, Any]:
-    """Build the V11 MEXC Futures market-opening order payload.
-
-    MEXC uses ``type=5`` for market orders. The API still accepts a ``price``
-    reference field; it is the executable quote captured by the scanner and is
-    not used as a passive limit price.
-    """
+    """Build the V11 next-1H-open MEXC Futures MARKET opening order."""
     if risk_amount_usdt <= 0:
         raise ValueError("Risk amount must be greater than zero")
     if leverage <= 0:
         raise ValueError("Leverage must be greater than zero")
-    if str(signal.analysis.get("entry_mode") or "MARKET").upper() != "MARKET":
-        raise ValueError("V11 execution requires MARKET entry mode")
-
-    execution_price = float(signal.analysis.get("market_execution_price") or signal.plan.entry)
-    if execution_price <= 0:
-        raise ValueError("Executable market-entry reference price must be positive")
 
     quantity = calculate_contract_quantity(
         risk_amount_usdt=risk_amount_usdt,
-        entry=execution_price,
+        entry=signal.plan.entry,
         stop_loss=signal.plan.stop_loss,
         contract_size=meta.contract_size,
         vol_unit=meta.vol_unit,
         min_vol=meta.min_vol,
         max_vol=meta.max_vol,
-        cost_buffer_pct=cost_buffer_pct,
     )
     if quantity <= 0:
         raise ValueError("Calculated order quantity is zero")
 
     return {
         "symbol": signal.symbol,
-        "price": execution_price,
         "vol": quantity,
         "leverage": int(leverage),
+        # MEXC Futures: 1 = open long, 3 = open short.
         "side": 1 if signal.side == "LONG" else 3,
+        # MEXC Futures: 5 = MARKET.
         "type": 5,
         "openType": int(open_type),
         "externalOid": signal.key[:32],
         "positionMode": 1,
     }
+
 
 
 class MexcExecutor:
@@ -99,7 +88,7 @@ class MexcExecutor:
       5. Order submitted.
       6. Actual fill reconciled.
       7. Protective SL installed and verified.
-      8. TP1/TP2 installed and verified.
+      8. Single structural TP installed and verified.
       9. Position monitored.
      10. Emergency recovery available.
 
@@ -178,9 +167,6 @@ class MexcExecutor:
                 None,
                 "Execution rejected: invalid trade side",
             )
-
-        if str(signal.analysis.get("entry_mode") or "MARKET").upper() != "MARKET":
-            return ExecutionResult(False, None, "Execution rejected: V11 requires MARKET entry mode")
 
         # ==============================================================
         # FUTURES EQUITY
@@ -266,7 +252,6 @@ class MexcExecutor:
                 vol_unit=meta.vol_unit,
                 min_vol=meta.min_vol,
                 max_vol=meta.max_vol,
-                cost_buffer_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", 0.0018)),
             )
 
         except Exception as exc:
@@ -374,7 +359,6 @@ class MexcExecutor:
                 risk_amount_usdt=risk_amount,
                 leverage=self.settings.mexc_default_leverage,
                 open_type=self.settings.mexc_open_type,
-                cost_buffer_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", 0.0018)),
             )
 
         except Exception as exc:
@@ -422,7 +406,7 @@ class MexcExecutor:
         #
         #   order fill reconciliation
         #   protective SL installation
-        #   TP1/TP2 installation
+        #   single-TP installation
         #   protection verification
         #
         # before the position is considered ACTIVE.

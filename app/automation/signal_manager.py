@@ -19,7 +19,7 @@ def format_signal(signal: ValidatedSignal) -> str:
     return (
         "🚨 MEXC FUTURES TRADE SIGNAL\n\n"
         f"{signal.symbol} — {signal.side}\n\n"
-        f"📍 Entry ({str(d.get('entry_mode') or 'MARKET').upper()}): ${fmt_price(signal.plan.entry)}\n"
+        f"📍 Entry (NEXT 1H OPEN MARKET): ${fmt_price(signal.plan.entry)}\n"
         f"🛑 SL: ${fmt_price(signal.plan.stop_loss)}\n"
         f"🎯 TP: ${fmt_price(signal.plan.tp)} ({target_tf})\n"
         f"📊 RR: 1:{signal.plan.rr:.2f}\n\n"

@@ -10,7 +10,7 @@ from .risk_manager import MIN_RR, MIN_SL_ATR, MAX_SL_ATR, MIN_TP_ATR, TradePlan,
 from .setup_filter import validate_analysis
 
 ONE_HOUR_MS = 3_600_000
-DEFAULT_MAX_SIGNAL_AGE_MS = 120 * 1000
+DEFAULT_MAX_SIGNAL_AGE_MS = 5 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -30,22 +30,14 @@ def make_signal_key(
     *,
     setup_bos_time: int | None = None,
     bos_level: float | None = None,
-    setup_identity: str | None = None,
 ) -> str:
-    """Build a deterministic signal key.
-
-    V11 setup identity is based on the actual impulse/sweep/reclaim event.
-    Legacy BOS fields remain supported for older callers and tests.
-    """
-    if setup_identity:
-        raw = f"mexc|{symbol.upper()}|{side.upper()}|V11SETUP:{setup_identity}"
-    else:
-        bos_time = setup_bos_time if setup_bos_time is not None else candle_time
-        try:
-            level_key = f"{float(bos_level):.12g}" if bos_level is not None else "NA"
-        except (TypeError, ValueError):
-            level_key = "NA"
-        raw = f"mexc|{symbol.upper()}|{side.upper()}|SETUP:{bos_time}|LEVEL:{level_key}"
+    """Stable setup identity for V11; legacy BOS fields remain optional for compatibility."""
+    bos_time = setup_bos_time if setup_bos_time is not None else candle_time
+    try:
+        level_key = f"{float(bos_level):.12g}" if bos_level is not None else "NA"
+    except (TypeError, ValueError):
+        level_key = "NA"
+    raw = f"mexc|{symbol.upper()}|{side.upper()}|SETUP:{bos_time}|LEVEL:{level_key}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
@@ -102,14 +94,17 @@ def validate_signal(
 
     try:
         configured_age = data.get("max_signal_age_seconds")
-        max_age_ms = (
-            int(float(configured_age) * 1000)
-            if configured_age is not None
-            else DEFAULT_MAX_SIGNAL_AGE_MS
-        )
-        max_age_ms = max(5_000, max_age_ms)
+        requested_ms = int(float(configured_age) * 1000) if configured_age is not None else DEFAULT_MAX_SIGNAL_AGE_MS
+        max_age_ms = max(1_000, min(requested_ms, DEFAULT_MAX_SIGNAL_AGE_MS))
     except (TypeError, ValueError):
         max_age_ms = DEFAULT_MAX_SIGNAL_AGE_MS
+
+    entry_mode = str(data.get("entry_mode") or "MARKET").upper()
+    if entry_mode != "MARKET":
+        return None, ["V11 execution mode must be MARKET at the next 1H open"]
+    entry_time = _ms(data.get("entry_time")) if data.get("entry_time") is not None else candle_time
+    if entry_time != candle_time:
+        return None, ["V11 entry_time must equal the next 1H open / signal close timestamp"]
 
     signal_age_ms = now_ms - candle_time
     if signal_age_ms > max_age_ms:
@@ -134,21 +129,9 @@ def validate_signal(
         return None, ["SHORT geometry must satisfy TP < Entry < SL"]
 
     required_rr = max(MIN_RR, float(min_rr or 0.0))
-    # Live and backtest use the same fixed conservative allowance. Do not
-    # mutate RR based on the instantaneous funding quote, because that would
-    # make acceptance rules differ between historical and live execution.
-    try:
-        round_trip_cost_pct = data.get("effective_round_trip_cost_pct")
-        if round_trip_cost_pct is None:
-            base_cost = float(data.get("estimated_round_trip_cost_pct", 0.0012) or 0.0012)
-            funding_allowance = float(data.get("estimated_funding_cost_pct", 0.0002) or 0.0002)
-            # Keep the fallback identical to Settings.effective_round_trip_cost_pct:
-            # two fee legs + two adverse-slippage legs, plus one fixed funding allowance.
-            backtest_execution_cost = (2.0 * 0.0006) + (2.0 * 2.0 / 10_000.0)
-            round_trip_cost_pct = max(0.0, base_cost, backtest_execution_cost) + max(0.0, funding_allowance)
-        round_trip_cost_pct = max(0.0, float(round_trip_cost_pct))
-    except (TypeError, ValueError):
-        return None, ["Invalid shared round-trip cost model"]
+    round_trip_cost_pct = float(data.get("estimated_round_trip_cost_pct", 0.0015) or 0.0015)
+    # Funding remains informational execution context. Acceptance uses the
+    # same deterministic round-trip cost model as the paper backtester.
 
     try:
         rr_gross = abs(tp - entry) / abs(entry - stop_loss)
@@ -167,14 +150,9 @@ def validate_signal(
             f"Post-cost RR {rr_net:.2f} < required {required_rr:.2f} (gross {rr_gross:.2f})"
         ]
 
-    try:
-        atr = float(data.get("atr_4h") or data.get("atr") or 0.0)
-    except (TypeError, ValueError):
-        atr = 0.0
-    if not math.isfinite(atr) or atr <= 0:
+    atr = float(data.get("atr_4h") or data.get("atr") or 0.0)
+    if atr <= 0:
         return None, ["ATR is missing or non-positive"]
-    # Recompute geometry from the actual validated levels so stale cached
-    # diagnostics can never override the authoritative Entry/SL/TP values.
     sl_atr = abs(entry - stop_loss) / atr
     tp_atr = abs(tp - entry) / atr
     if sl_atr < MIN_SL_ATR or sl_atr > MAX_SL_ATR:
@@ -191,14 +169,7 @@ def validate_signal(
     bos_level = data.get("bos_4h_level")
     if bos_level is None:
         bos_level = data.get("long_bos_level") if side == "LONG" else data.get("short_bos_level")
-    key = make_signal_key(
-        symbol,
-        side,
-        candle_time,
-        setup_bos_time=setup_bos_time,
-        bos_level=bos_level,
-        setup_identity=str(data.get("setup_identity") or "").strip() or None,
-    )
+    key = make_signal_key(symbol, side, candle_time, setup_bos_time=setup_bos_time, bos_level=bos_level)
 
     analysis = dict(data)
     analysis.update(

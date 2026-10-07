@@ -42,12 +42,12 @@ def validate_analysis(
 
     hard_flags = (
         ("direction_ok", "1D macro directional boundary failed"),
-        ("structure_ok", "4H continuation structure failed"),
-        ("setup_ok", "4H value pullback failed"),
+        ("structure_ok", "4H impulse/value structure failed"),
+        ("setup_ok", "1H value-pullback setup failed"),
         ("confirmation_ok", "1H confirmation failed"),
         ("location_ok", "Higher-timeframe target path failed"),
         ("target_path_structural", "Target is not a confirmed higher-timeframe structure level"),
-        ("structure_quality_ok", "4H continuation quality failed"),
+        ("structure_quality_ok", "4H HH/HL or LH/LL structure quality failed"),
         ("shock_veto_ok", "1H shock/liquidity veto failed"),
         ("btc_filter_ok", "BTC directional filter failed"),
         ("volatility_ok", "ATR volatility percentile gate failed"),
@@ -78,33 +78,29 @@ def validate_analysis(
     if signal_tf != "1H":
         reasons.append("Signal candle timeframe must be 1H")
 
+    entry_mode = str(data.get("entry_mode") or "MARKET").upper()
+    if entry_mode != "MARKET":
+        reasons.append("V11 execution mode must be MARKET")
+    candle_time = data.get("candle_time")
+    entry_time = data.get("entry_time", candle_time)
+    try:
+        if candle_time is not None and entry_time is not None and int(float(candle_time)) != int(float(entry_time)):
+            reasons.append("V11 entry_time must equal the next 1H open / signal close timestamp")
+    except (TypeError, ValueError):
+        reasons.append("V11 entry timestamp is invalid")
+
     rr = _f(data.get("rr"), 0.0)
     required_rr = max(MIN_RR, float(min_rr or 0.0))
     if rr + 1e-12 < required_rr:
         reasons.append(f"RR {rr:.2f} < required {required_rr:.2f}")
 
-    atr_for_geometry = _f(data.get("atr_4h", data.get("atr")), 0.0)
-    if atr_for_geometry > 0:
-        try:
-            entry_for_sl = float(data.get("entry"))
-            stop_for_sl = float(data.get("stop_loss"))
-            sl_atr = abs(entry_for_sl - stop_for_sl) / atr_for_geometry
-        except (TypeError, ValueError):
-            sl_atr = 999.0
-    else:
-        sl_atr = 999.0
+    sl_atr = _f(data.get("sl_atr_4h", data.get("sl_atr")), 999.0)
     if sl_atr < MIN_SL_ATR:
         reasons.append(f"SL distance {sl_atr:.2f} ATR < minimum {MIN_SL_ATR:.2f}")
     elif sl_atr > MAX_SL_ATR:
         reasons.append(f"SL distance {sl_atr:.2f} ATR > maximum {MAX_SL_ATR:.2f}")
 
-    if atr_for_geometry > 0:
-        try:
-            tp_distance_atr = abs(float(data.get("tp")) - float(data.get("entry"))) / atr_for_geometry
-        except (TypeError, ValueError):
-            tp_distance_atr = 0.0
-    else:
-        tp_distance_atr = 0.0
+    tp_distance_atr = _f(data.get("tp_distance_atr"), 0.0)
     if tp_distance_atr < MIN_TP_ATR:
         reasons.append(f"TP distance {tp_distance_atr:.2f} ATR < minimum {MIN_TP_ATR:.2f}")
 
@@ -113,7 +109,7 @@ def validate_analysis(
     if "futures_execution_ok" in data and data.get("futures_execution_ok") is not True:
         reasons.append("Futures execution quality could not be verified")
     if "target_path_clear" in data and data.get("target_path_clear") is not True:
-        reasons.append("4H/1H target path is not clear")
+        reasons.append("4H/12H/1D target path is not clear")
 
     families_passed = data.get("confirmation_families_passed")
     families_available = data.get("confirmation_families_available")

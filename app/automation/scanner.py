@@ -25,18 +25,8 @@ LOGGER = logging.getLogger(__name__)
 
 MEXC_INTERVALS = {"1D": "Day1", "12H": None, "4H": "Hour4", "1H": "Min60"}
 TIMEFRAME_MS = {"1D": 86_400_000, "12H": 43_200_000, "4H": 14_400_000, "1H": 3_600_000}
+MAX_LIVE_SIGNAL_AGE_SECONDS = 300.0  # V11 next-1H-open execution grace window
 CANDLE_LIMITS = {"1D": 220, "12H": 220, "4H": 650, "1H": 250}
-
-
-def get_decision_close_ms(now_ms: int) -> int:
-    """Return the most recent completed 1H boundary used by V11 decisions."""
-    return (int(now_ms) // TIMEFRAME_MS["1H"]) * TIMEFRAME_MS["1H"]
-
-
-def signal_fresh_enough(decision_ms: int, actual_now_ms: int, max_age_seconds: float) -> bool:
-    """Require live discovery to happen shortly after the completed 1H close."""
-    age_ms = int(actual_now_ms) - int(decision_ms)
-    return 0 <= age_ms <= max(5_000, int(float(max_age_seconds) * 1000))
 
 
 class MexcScanner:
@@ -61,12 +51,103 @@ class MexcScanner:
         self._candle_fetch_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._cache_limit = max(180, int(getattr(settings, "candle_limit", 650)))
 
+    @staticmethod
+    def _reprice_for_next_1h_open(
+        analysis: dict[str, Any],
+        futures_context: dict[str, Any],
+        *,
+        candle_close_time_ms: int,
+        now_ms: int,
+        max_age_seconds: float,
+        max_open_gap_pct: float,
+        min_rr: float,
+    ) -> tuple[bool, str]:
+        """Move a technical V11 signal from signal-close reference to next-open execution.
+
+        V11 analysis is decided on the completed 1H close. Live execution is a
+        MARKET order at the next 1H open, represented here by the executable
+        top-of-book quote observed immediately after the boundary. A stale scan
+        is rejected rather than executing an old close as if it were the new open.
+        """
+        age_seconds = max(0.0, (int(now_ms) - int(candle_close_time_ms)) / 1000.0)
+        hard_max_age = min(max(float(max_age_seconds), 0.0), MAX_LIVE_SIGNAL_AGE_SECONDS)
+        if age_seconds > hard_max_age:
+            return False, f"1H setup age {age_seconds:.1f}s exceeds live next-open window {hard_max_age:.1f}s"
+        if int(now_ms) < int(candle_close_time_ms):
+            return False, "Next 1H open has not occurred yet"
+
+        side = str(analysis.get("setup") or "").upper()
+        reference_entry = float(analysis.get("entry") or 0.0)
+        if reference_entry <= 0 or side not in {"LONG", "SHORT"}:
+            return False, "Invalid signal-close entry reference"
+        executable_entry = futures_context.get("best_ask" if side == "LONG" else "best_bid")
+        if executable_entry is None:
+            executable_entry = futures_context.get("last_price")
+        try:
+            executable_entry = float(executable_entry)
+        except (TypeError, ValueError):
+            return False, "Executable next-open quote is unavailable"
+        if executable_entry <= 0:
+            return False, "Executable next-open quote is invalid"
+
+        gap_pct = abs(executable_entry - reference_entry) / reference_entry * 100.0
+        configured = max(0.0, float(max_open_gap_pct))
+        if configured <= 1.0:
+            configured *= 100.0
+        if gap_pct > configured:
+            return False, f"Next-open gap {gap_pct:.3f}% exceeds {configured:.3f}%"
+
+        stop = float(analysis.get("stop_loss") or 0.0)
+        target = float(analysis.get("tp") or 0.0)
+        if side == "LONG":
+            geometry_ok = stop < executable_entry < target
+        else:
+            geometry_ok = target < executable_entry < stop
+        if not geometry_ok:
+            return False, "Next-open market price breaks structural SL/TP geometry"
+
+        risk = abs(executable_entry - stop)
+        reward = abs(target - executable_entry)
+        if risk <= 0:
+            return False, "Next-open structural risk is zero"
+        signal_cost = max(0.0, float(analysis.get("estimated_round_trip_cost_pct", 0.0015) or 0.0015))
+        cost_price = executable_entry * signal_cost
+        rr_gross = reward / risk
+        rr_net = (reward - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
+        if rr_net + 1e-12 < float(min_rr):
+            return False, f"Next-open post-cost RR {rr_net:.2f} < {float(min_rr):.2f}"
+
+        atr4 = float(analysis.get("atr_4h") or analysis.get("atr") or 0.0)
+        atr1 = float(analysis.get("atr_1h") or analysis.get("atr") or 0.0)
+        sl_atr4 = risk / atr4 if atr4 > 0 else 0.0
+        sl_atr1 = risk / atr1 if atr1 > 0 else 0.0
+        analysis.update({
+            "signal_close_entry": reference_entry,
+            "entry": executable_entry,
+            "entry_time": int(candle_close_time_ms),
+            "entry_reference_time": int(candle_close_time_ms),
+            "entry_reference_price": executable_entry,
+            "next_1h_open_reference": executable_entry,
+            "opening_gap_pct": gap_pct,
+            "entry_drift_pct": gap_pct,
+            "rr_gross": rr_gross,
+            "rr": rr_net,
+            "rr_net": rr_net,
+            "sl_atr": sl_atr4,
+            "sl_atr_4h": sl_atr4,
+            "sl_atr_1h": sl_atr1,
+            "stop_distance_pct": risk / executable_entry,
+            "tp_distance_atr": reward / atr4 if atr4 > 0 else 0.0,
+            "tp_distance_atr_1h": reward / atr1 if atr1 > 0 else 0.0,
+            "tp_distance_pct": reward / executable_entry,
+            "trade_geometry_ok": True,
+            "risk_ok": True,
+            "rr_ok": rr_net >= float(min_rr),
+            "entry_distance_ok": True,
+        })
+        return True, "OK"
+
     async def scan_once(self) -> dict[str, int]:
-        scan_now_ms = int(time.time() * 1000)
-        # V11 decisions occur exactly at completed 1H closes. One snapshot is
-        # shared across the whole scan so symbols cannot be analyzed against
-        # different hours as the scan runs.
-        decision_close_ms = get_decision_close_ms(scan_now_ms)
         symbols = await self.universe.refresh()
         stats = self._empty_stats(len(symbols))
         if not symbols:
@@ -74,7 +155,7 @@ class MexcScanner:
             self._log_stats(stats)
             return stats
 
-        await self._refresh_btc_context(decision_close_ms=decision_close_ms)
+        await self._refresh_btc_context()
         configured = int(getattr(self.settings, "scan_concurrency", 4))
         concurrency = max(1, min(4, configured))
         queue: asyncio.Queue[str] = asyncio.Queue()
@@ -91,7 +172,7 @@ class MexcScanner:
                 except asyncio.QueueEmpty:
                     return
                 try:
-                    results.append(await self._scan_one(symbol, decision_close_ms=decision_close_ms))
+                    results.append(await self._scan_one(symbol))
                 except Exception as exc:
                     LOGGER.exception("Scanner worker %s crashed on %s", worker_id, symbol)
                     results.append(self._error(symbol, f"worker exception: {exc}"))
@@ -168,13 +249,13 @@ class MexcScanner:
             top = reasons.most_common(8) if hasattr(reasons, "most_common") else sorted(reasons.items(), key=lambda x: (-x[1], x[0]))[:8]
             LOGGER.info("MEXC REJECTION REASONS | %s", " | ".join(f"{reason}={count}" for reason, count in top))
 
-    async def _get_closed_candles(self, symbol: str, timeframe: str, limit: int, *, now_ms: int | None = None) -> tuple[list[Any], bool]:
+    async def _get_closed_candles(self, symbol: str, timeframe: str, limit: int) -> tuple[list[Any], bool]:
         tf = timeframe.upper()
         if tf not in APPROVED_TIMEFRAMES:
             raise ValueError(f"Unsupported analysis timeframe: {timeframe}")
         key = (symbol.upper(), tf)
-        decision_now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-        expected_open = (decision_now_ms // TIMEFRAME_MS[tf]) * TIMEFRAME_MS[tf] - TIMEFRAME_MS[tf]
+        now_ms = int(time.time() * 1000)
+        expected_open = (now_ms // TIMEFRAME_MS[tf]) * TIMEFRAME_MS[tf] - TIMEFRAME_MS[tf]
         cached = self._candle_cache.get(key)
         minimum_cached = min(int(limit), 180)
         if cached and cached[0] >= expected_open and len(cached[1]) >= minimum_cached:
@@ -186,22 +267,21 @@ class MexcScanner:
                 return cached[1], True
             if tf == "12H":
                 raw = await self.client.get_klines(symbol, "Hour4", min(2000, int(limit) * 3 + 6))
-                rows = synthesize_12h_from_4h(closed_candle_rows(raw, "4H", decision_now_ms), now_ms=decision_now_ms)
+                rows = synthesize_12h_from_4h(closed_candle_rows(raw, "4H", now_ms), now_ms=now_ms)
             else:
                 raw = await self.client.get_klines(symbol, MEXC_INTERVALS[tf], limit)
-                rows = closed_candle_rows(raw, tf, decision_now_ms)
+                rows = closed_candle_rows(raw, tf, now_ms)
             rows = rows[-int(limit):]
             if rows:
                 self._candle_cache[key] = (int(rows[-1]["time"]), rows)
             return rows, False
 
-    async def _refresh_btc_context(self, *, decision_close_ms: int | None = None) -> None:
+    async def _refresh_btc_context(self) -> None:
         try:
-            snapshot = decision_close_ms if decision_close_ms is not None else int(time.time() * 1000)
-            c1d, _ = await self._get_closed_candles("BTC_USDT", "1D", 220, now_ms=snapshot)
-            c4, _ = await self._get_closed_candles("BTC_USDT", "4H", 650, now_ms=snapshot)
-            c1, _ = await self._get_closed_candles("BTC_USDT", "1H", 250, now_ms=snapshot)
-            c12 = synthesize_12h_from_4h(c4, now_ms=snapshot)
+            c1d, _ = await self._get_closed_candles("BTC_USDT", "1D", 220)
+            c4, _ = await self._get_closed_candles("BTC_USDT", "4H", 650)
+            c1, _ = await self._get_closed_candles("BTC_USDT", "1H", 250)
+            c12 = synthesize_12h_from_4h(c4)
             if len(c1d) < 210 or len(c12) < 60 or len(c4) < 180 or len(c1) < 180:
                 self._btc_context = {"ok": False, "reason": "insufficient BTC history"}
                 return
@@ -211,20 +291,14 @@ class MexcScanner:
             LOGGER.warning("BTC market context unavailable; filter will abstain: %s", exc)
             self._btc_context = {"ok": False, "reason": str(exc)}
 
-    async def _scan_one(self, symbol: str, *, decision_close_ms: int | None = None, now_ms: int | None = None) -> dict[str, Any]:
+    async def _scan_one(self, symbol: str) -> dict[str, Any]:
         cache_hits = 0
         try:
-            # Candle inputs stay on the single scan decision snapshot, while
-            # freshness/quote/execution checks use the actual time this symbol
-            # reaches the execution stage. This prevents a long scan cycle from
-            # treating a late symbol as if it were still at the hour boundary.
-            actual_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
-            decision_ms = int(decision_close_ms if decision_close_ms is not None else get_decision_close_ms(actual_now_ms))
-            c4, hit4 = await self._get_closed_candles(symbol, "4H", 650, now_ms=decision_ms)
-            c1, hit1 = await self._get_closed_candles(symbol, "1H", 250, now_ms=decision_ms)
-            c1d, hitd = await self._get_closed_candles(symbol, "1D", 220, now_ms=decision_ms)
+            c4, hit4 = await self._get_closed_candles(symbol, "4H", 650)
+            c1, hit1 = await self._get_closed_candles(symbol, "1H", 250)
+            c1d, hitd = await self._get_closed_candles(symbol, "1D", 220)
             cache_hits += int(hit4) + int(hit1) + int(hitd)
-            c12 = synthesize_12h_from_4h(c4, now_ms=decision_ms)
+            c12 = synthesize_12h_from_4h(c4)
 
             mins = {"1D": 210, "12H": 60, "4H": 180, "1H": 180}
             payload: dict[str, Any] = {"candle_cache_hits": cache_hits}
@@ -236,9 +310,8 @@ class MexcScanner:
 
             analysis = analyze_candles(
                 symbol, c1d, c12, c4, c1,
-                now_ms=decision_ms,
                 btc_context=self._btc_context,
-                estimated_round_trip_cost_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", getattr(self.settings, "estimated_round_trip_cost_pct", 0.0018))),
+                estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
             )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
@@ -294,7 +367,6 @@ class MexcScanner:
                 ticker,
                 float(getattr(self.settings, "max_data_age_seconds", 15.0)),
                 max_spread_pct=max_spread_pct,
-                now_ms=actual_now_ms,
             )
             analysis["mexc_spread_pct"] = spread_pct
             analysis["max_allowed_spread_pct"] = max_spread_pct
@@ -303,7 +375,7 @@ class MexcScanner:
                 return self._reject(symbol, quote_reason, "EXECUTION", payload)
 
             futures_context = await self._get_futures_execution_context(
-                symbol, ticker, spread_pct=spread_pct, now_ms=actual_now_ms
+                symbol, ticker, spread_pct=spread_pct
             )
             analysis["futures_context"] = futures_context
             analysis["mexc_funding_rate"] = futures_context.get("funding_rate")
@@ -320,100 +392,26 @@ class MexcScanner:
                     payload,
                 )
 
-            # A V11 live signal is actionable only for the just-completed 1H
-            # candle. Older completed-hour setups must never be executed late.
+            # MEXC kline timestamps are candle-open timestamps. V11 decision time is
+            # the CLOSE of the completed 1H candle. The next 1H open is the only live
+            # entry point; stale discoveries are rejected rather than back-filled.
             candle_close_time = int(analysis.get("candle_close_time") or (int(c1[-1]["time"]) + TIMEFRAME_MS["1H"]))
             analysis["candle_time"] = candle_close_time
-            analysis["strategy_entry_time_ms"] = candle_close_time
-            analysis["next_1h_open_time_ms"] = candle_close_time
-            max_age_seconds = max(5.0, float(getattr(self.settings, "max_signal_age_seconds", 120.0)))
-            analysis["max_signal_age_seconds"] = max_age_seconds
+            configured_age = float(getattr(self.settings, "max_signal_age_seconds", MAX_LIVE_SIGNAL_AGE_SECONDS) or MAX_LIVE_SIGNAL_AGE_SECONDS)
+            analysis["max_signal_age_seconds"] = min(configured_age, MAX_LIVE_SIGNAL_AGE_SECONDS)
+            ok_open, open_reason = self._reprice_for_next_1h_open(
+                analysis,
+                futures_context,
+                candle_close_time_ms=candle_close_time,
+                now_ms=int(time.time() * 1000),
+                max_age_seconds=configured_age,
+                max_open_gap_pct=float(getattr(self.settings, "max_entry_drift_pct", 0.002)),
+                min_rr=float(getattr(self.settings, "min_rr", 1.6)),
+            )
+            if not ok_open:
+                payload["rejected_execution"] = 1
+                return self._reject(symbol, open_reason, "EXECUTION", payload)
 
-            if candle_close_time != decision_ms:
-                payload["rejected_execution"] = 1
-                return self._reject(
-                    symbol,
-                    f"Latest completed 1H close is {candle_close_time}; scan decision snapshot is {decision_ms}",
-                    "EXECUTION",
-                    payload,
-                )
-            signal_age_seconds = max(0.0, (actual_now_ms - decision_ms) / 1000.0)
-            analysis["signal_age_seconds"] = signal_age_seconds
-            if not signal_fresh_enough(decision_ms, actual_now_ms, max_age_seconds):
-                payload["rejected_execution"] = 1
-                return self._reject(
-                    symbol,
-                    f"1H signal freshness {signal_age_seconds:.1f}s exceeds {max_age_seconds:.1f}s",
-                    "EXECUTION",
-                    payload,
-                )
-
-            # Execute at the current executable side of the book. This is the
-            # live implementation of V11's "next 1H open" market-entry intent.
-            # The engine's candle-close entry is preserved for auditability.
-            reference_entry = float(analysis.get("entry") or 0.0)
-            analysis["signal_reference_entry"] = reference_entry
-            best_bid = futures_context.get("best_bid")
-            best_ask = futures_context.get("best_ask")
-            executable_entry = best_ask if side == "LONG" else best_bid
-            try:
-                executable_entry = float(executable_entry)
-            except (TypeError, ValueError):
-                executable_entry = 0.0
-            if executable_entry <= 0:
-                payload["rejected_execution"] = 1
-                return self._reject(symbol, "Executable order-book quote unavailable", "EXECUTION", payload)
-
-            configured_drift = float(getattr(self.settings, "max_entry_drift_pct", 0.002))
-            max_drift_pct = configured_drift * 100.0 if 0.0 < configured_drift <= 1.0 else configured_drift
-            drift_pct = abs(executable_entry - reference_entry) / reference_entry * 100.0 if reference_entry > 0 else float("inf")
-            analysis["entry_drift_pct"] = drift_pct
-            analysis["max_entry_drift_pct"] = max_drift_pct
-            if drift_pct > max_drift_pct:
-                payload["rejected_execution"] = 1
-                return self._reject(symbol, f"Market entry drift {drift_pct:.3f}% exceeds {max_drift_pct:.3f}%", "EXECUTION", payload)
-
-            effective_cost_pct = float(getattr(self.settings, "effective_round_trip_cost_pct", 0.0018))
-            risk = abs(executable_entry - float(analysis.get("stop_loss") or 0.0))
-            tp_value = float(analysis.get("tp") or 0.0)
-            if risk <= 0 or tp_value <= 0:
-                payload["rejected_execution"] = 1
-                return self._reject(symbol, "Invalid live entry/SL/TP geometry", "EXECUTION", payload)
-            if side == "LONG" and not (float(analysis["stop_loss"]) < executable_entry < tp_value):
-                return self._reject(symbol, "LONG live quote breaks SL < Entry < TP", "EXECUTION", payload)
-            if side == "SHORT" and not (tp_value < executable_entry < float(analysis["stop_loss"])):
-                return self._reject(symbol, "SHORT live quote breaks TP < Entry < SL", "EXECUTION", payload)
-            cost_price = executable_entry * max(0.0, effective_cost_pct)
-            reward = abs(tp_value - executable_entry)
-            rr_gross = reward / risk
-            rr_net = (reward - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
-            if rr_net < float(getattr(self.settings, "min_rr", 1.6)):
-                payload["rejected_execution"] = 1
-                return self._reject(symbol, f"Post-cost RR at executable quote {rr_net:.2f} < {float(getattr(self.settings, 'min_rr', 1.6)):.2f}", "RR", payload)
-
-            analysis["entry"] = executable_entry
-            analysis["market_execution_price"] = executable_entry
-            analysis["entry_quote_time_ms"] = actual_now_ms
-            analysis["entry_time_ms"] = actual_now_ms
-            analysis["entry_mode"] = "MARKET"
-            analysis["rr_gross"] = rr_gross
-            analysis["rr"] = rr_net
-            analysis["rr_net"] = rr_net
-            analysis["estimated_round_trip_cost_pct"] = effective_cost_pct
-            analysis["sl_atr"] = risk / float(analysis.get("atr_4h") or 1.0)
-            analysis["sl_atr_4h"] = analysis["sl_atr"]
-            analysis["sl_atr_1h"] = risk / float(analysis.get("atr_1h") or 1.0)
-            analysis["stop_distance_pct"] = risk / executable_entry
-            analysis["tp_distance_atr"] = reward / float(analysis.get("atr_4h") or 1.0)
-            analysis["tp_distance_atr_1h"] = reward / float(analysis.get("atr_1h") or 1.0)
-            analysis["tp_distance_pct"] = reward / executable_entry
-            analysis["risk_ok"] = bool(0.20 <= analysis["sl_atr_4h"] <= 3.00)
-            analysis["trade_geometry_ok"] = True
-            analysis["rr_ok"] = bool(rr_net >= float(getattr(self.settings, "min_rr", 1.6)))
-            analysis["technical_candidate"] = bool(analysis.get("technical_candidate") and analysis["risk_ok"] and analysis["rr_ok"] and analysis.get("target_path_clear") is True)
-            analysis.setdefault("stage_status", {})["RISK"] = analysis["risk_ok"]
-            analysis.setdefault("stage_status", {})["RR"] = analysis["rr_ok"]
-            analysis["signal_entry_execution_model"] = "MARKET_AT_NEXT_1H_OPEN"
             signal, reasons = validate_signal(
                 analysis,
                 min_confluence=int(getattr(self.settings, "min_confluence", 65)),
@@ -469,7 +467,6 @@ class MexcScanner:
         max_age_seconds: float = 15.0,
         *,
         max_spread_pct: float = 0.50,
-        now_ms: int | None = None,
     ) -> tuple[bool, str, float]:
         def number(key: str) -> float | None:
             try:
@@ -497,7 +494,7 @@ class MexcScanner:
             try:
                 ts = int(float(raw_ts))
                 ts = ts if ts >= 10**12 else ts * 1000
-                age = abs(int(now_ms if now_ms is not None else time.time() * 1000) - ts) / 1000.0
+                age = abs(int(time.time() * 1000) - ts) / 1000.0
                 if age > float(max_age_seconds):
                     return False, f"Ticker timestamp is stale by {age:.1f}s", spread_pct
             except (TypeError, ValueError):
@@ -552,7 +549,6 @@ class MexcScanner:
         ticker: dict[str, Any],
         *,
         spread_pct: float,
-        now_ms: int | None = None,
     ) -> dict[str, Any]:
         """Build truthful live futures execution context after technical gates."""
         tasks = await asyncio.gather(
@@ -598,7 +594,7 @@ class MexcScanner:
             try:
                 ts = int(float(raw_ts))
                 ts = ts if ts >= 10**12 else ts * 1000
-                age = max(0.0, (int(now_ms if now_ms is not None else time.time() * 1000) - ts) / 1000.0)
+                age = max(0.0, (int(time.time() * 1000) - ts) / 1000.0)
                 context["ticker_timestamp_ms"] = ts
                 context["ticker_age_seconds"] = age
             except (TypeError, ValueError):

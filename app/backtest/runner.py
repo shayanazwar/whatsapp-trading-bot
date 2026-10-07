@@ -23,6 +23,7 @@ The runner is designed to match V11 value-pullback engine:
 import asyncio
 import inspect
 import logging
+import os
 import time
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -219,7 +220,33 @@ def _utc_hour(timestamp_ms: int) -> int:
 
 
 def _period(days: int) -> tuple[int, int]:
-    """Calculate a causal historical window with a 72h future tail."""
+    """Calculate a causal historical window, optionally frozen by environment.
+
+    Default behavior is unchanged. For controlled A/B tests, set
+    V11_BACKTEST_END_MS, or set both V11_BACKTEST_START_MS and
+    V11_BACKTEST_END_MS. This lets two strategy variants use the exact same
+    historical window without changing the WhatsApp command interface.
+    """
+    raw_start = os.getenv("V11_BACKTEST_START_MS")
+    raw_end = os.getenv("V11_BACKTEST_END_MS")
+
+    if raw_start or raw_end:
+        if not raw_end:
+            raise ValueError("V11_BACKTEST_END_MS is required when freezing a backtest period")
+        try:
+            end_ms = int(raw_end)
+        except ValueError as exc:
+            raise ValueError("V11_BACKTEST_END_MS must be an integer Unix timestamp in milliseconds") from exc
+        if raw_start:
+            try:
+                start_ms = int(raw_start)
+            except ValueError as exc:
+                raise ValueError("V11_BACKTEST_START_MS must be an integer Unix timestamp in milliseconds") from exc
+        else:
+            start_ms = end_ms - int(days) * ONE_DAY_MS
+        if start_ms >= end_ms:
+            raise ValueError("V11_BACKTEST_START_MS must be earlier than V11_BACKTEST_END_MS")
+        return start_ms, end_ms
 
     end_dt = datetime.now(timezone.utc).replace(
         minute=0,
@@ -650,6 +677,25 @@ class BacktestRunner:
 
             if not analysis.get("technical_candidate"):
                 inc("TECHNICAL_REJECT")
+                side_diags = analysis.get("side_diagnostics") or []
+                for side_diag in side_diags:
+                    side_name = str(side_diag.get("side") or "UNKNOWN").upper()
+                    if side_name not in {"LONG", "SHORT"}:
+                        continue
+                    inc(f"SIDE_EVALUATIONS_{side_name}")
+                    if side_diag.get("candidate"):
+                        inc(f"SIDE_CANDIDATE_{side_name}")
+                        continue
+                    inc(f"FIRST_FAILURE_{side_name}_TOTAL")
+                    reason = str(side_diag.get("primary_failure") or "rejected")
+                    normalized_first = (
+                        reason.upper()
+                        .replace(" ", "_")
+                        .replace(":", "")
+                        .replace("/", "_")
+                    )[:160]
+                    inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
+
                 failures = analysis.get("technical_gate_failures") or [
                     analysis.get("rejection_stage") or "technical_candidate"
                 ]
@@ -666,6 +712,17 @@ class BacktestRunner:
                 continue
 
             inc("TECHNICAL_ACCEPT")
+            for side_diag in (analysis.get("side_diagnostics") or []):
+                side_name = str(side_diag.get("side") or "UNKNOWN").upper()
+                if side_name in {"LONG", "SHORT"}:
+                    inc(f"SIDE_EVALUATIONS_{side_name}")
+                    if side_diag.get("candidate"):
+                        inc(f"SIDE_CANDIDATE_{side_name}")
+                    else:
+                        inc(f"FIRST_FAILURE_{side_name}_TOTAL")
+                        reason = str(side_diag.get("primary_failure") or "rejected")
+                        normalized_first = (reason.upper().replace(" ", "_").replace(":", "").replace("/", "_"))[:160]
+                        inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
 
             side = str(
                 analysis.get("setup")

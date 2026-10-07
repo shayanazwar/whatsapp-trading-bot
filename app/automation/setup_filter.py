@@ -4,8 +4,10 @@ from typing import Any
 
 MIN_SCORE = 65
 MIN_RR = 2.00
-MIN_CONFIRMATION_FAMILIES = 0
-MIN_AVAILABLE_CONFIRMATION_FAMILIES = 0
+MIN_CONFIRMATION_FAMILIES = 4
+MIN_AVAILABLE_CONFIRMATION_FAMILIES = 4
+MIN_ATR_PERCENTILE = 5.0
+MAX_ATR_PERCENTILE = 98.0
 MIN_SL_ATR = 0.50
 MAX_SL_ATR = 1.25
 MIN_TP_ATR = 1.00
@@ -47,11 +49,24 @@ def validate_analysis(
         ("target_path_structural", "Target is not a confirmed higher-timeframe structure level"),
         ("structure_quality_ok", "4H BOS/retest quality failed"),
         ("shock_veto_ok", "1H shock/liquidity veto failed"),
+        ("btc_filter_ok", "BTC directional filter failed"),
+        ("volatility_ok", "ATR volatility percentile gate failed"),
+        ("confirmation_family_diversity_ok", "Confirmation-family diversity gate failed"),
         ("technical_candidate", "Engine did not mark this as a technical candidate"),
         ("trade_geometry_ok", "Single-TP structural geometry failed"),
         ("risk_ok", "Risk/RR validation failed"),
     )
+    conditional_hard_flags = {
+        "btc_filter_ok",
+        "volatility_ok",
+        "confirmation_family_diversity_ok",
+    }
     for key, message in hard_flags:
+        # These newer diagnostics are enforced whenever the Engine supplies them.
+        # Missing fields remain backward-compatible for legacy callers/fixtures;
+        # the live Engine always supplies them.
+        if key in conditional_hard_flags and key not in data:
+            continue
         if data.get(key) is not True:
             reasons.append(message)
 
@@ -78,7 +93,27 @@ def validate_analysis(
     if tp_distance_atr < MIN_TP_ATR:
         reasons.append(f"TP distance {tp_distance_atr:.2f} ATR < minimum {MIN_TP_ATR:.2f}")
 
-    if require_increasing_volume and str(data.get("volume_status") or "").upper() != "INCREASING":
+    if "data_fresh" in data and data.get("data_fresh") is not True:
+        reasons.append("Market data freshness could not be verified")
+    if "futures_execution_ok" in data and data.get("futures_execution_ok") is not True:
+        reasons.append("Futures execution quality could not be verified")
+    if "target_path_clear" in data and data.get("target_path_clear") is not True:
+        reasons.append("4H/1H target path is not clear")
+
+    families_passed = data.get("confirmation_families_passed")
+    families_available = data.get("confirmation_families_available")
+    if families_passed is not None and int(_f(families_passed, 0)) < MIN_CONFIRMATION_FAMILIES:
+        reasons.append(f"Confirmation families {int(_f(families_passed, 0))} < required {MIN_CONFIRMATION_FAMILIES}")
+    if families_available is not None and int(_f(families_available, 0)) < MIN_AVAILABLE_CONFIRMATION_FAMILIES:
+        reasons.append(f"Available confirmation families {int(_f(families_available, 0))} < required {MIN_AVAILABLE_CONFIRMATION_FAMILIES}")
+
+    atr_percentile = data.get("atr_percentile")
+    if atr_percentile is not None:
+        atr_rank = _f(atr_percentile, -1.0)
+        if not (MIN_ATR_PERCENTILE <= atr_rank <= MAX_ATR_PERCENTILE):
+            reasons.append(f"ATR percentile {atr_rank:.1f} outside {MIN_ATR_PERCENTILE:.1f}-{MAX_ATR_PERCENTILE:.1f}")
+
+    if require_increasing_volume and str(data.get("volume_status") or data.get("volume") or "").upper() != "INCREASING":
         reasons.append("Volume is not increasing")
 
     spread = _f(data.get("mexc_spread_pct"), 0.0)

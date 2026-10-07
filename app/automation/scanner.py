@@ -185,7 +185,7 @@ class MexcScanner:
             c4, _ = await self._get_closed_candles("BTC_USDT", "4H", 650)
             c1, _ = await self._get_closed_candles("BTC_USDT", "1H", 250)
             c12 = synthesize_12h_from_4h(c4)
-            if len(c1d) < 120 or len(c12) < 60 or len(c4) < 180 or len(c1) < 180:
+            if len(c1d) < 210 or len(c12) < 60 or len(c4) < 180 or len(c1) < 180:
                 self._btc_context = {"ok": False, "reason": "insufficient BTC history"}
                 return
             self._btc_context = build_btc_context(c1d, c12, c4, c1)
@@ -203,7 +203,7 @@ class MexcScanner:
             cache_hits += int(hit4) + int(hit1) + int(hitd)
             c12 = synthesize_12h_from_4h(c4)
 
-            mins = {"1D": 120, "12H": 60, "4H": 180, "1H": 180}
+            mins = {"1D": 210, "12H": 60, "4H": 180, "1H": 180}
             payload: dict[str, Any] = {"candle_cache_hits": cache_hits}
             for tf, rows in (("1D", c1d), ("12H", c12), ("4H", c4), ("1H", c1)):
                 if len(rows) < mins[tf]:
@@ -211,7 +211,11 @@ class MexcScanner:
                 payload[f"pass_{tf.lower()}"] = 1
             payload["data_valid"] = 1
 
-            analysis = analyze_candles(symbol, c1d, c12, c4, c1, btc_context=self._btc_context)
+            analysis = analyze_candles(
+                symbol, c1d, c12, c4, c1,
+                btc_context=self._btc_context,
+                estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+            )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
             payload["regime_pass"] = int(bool(stages.get("1D_REGIME")))
@@ -232,23 +236,27 @@ class MexcScanner:
             # Reject at the first failed strategy gate while retaining all stage counters.
             ordered = [
                 ("DIRECTION", bool(analysis.get("direction_ok")), "1D/12H/4H direction"),
-                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H BOS/retest setup"),
-                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H execution trigger"),
-                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), f"Quality score {analysis.get('score', 0)} < {int(getattr(self.settings, "min_confluence", 65))}"),
+                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H BOS/departure setup"),
+                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H retest confirmation"),
+                ("VOLATILITY", bool(analysis.get("volatility_ok")), "ATR volatility regime"),
+                ("CONFIRMATION_FAMILIES", bool(analysis.get("confirmation_family_diversity_ok")), "Confirmation-family diversity"),
+                ("TARGET_PATH", bool(analysis.get("location_ok") and analysis.get("target_path_structural") and analysis.get("target_path_clear")), "Clear HTF target path"),
                 ("RISK", bool(stages.get("RISK", analysis.get("risk_ok", False))), "Structural risk model"),
                 ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))), f"Post-cost RR {float(analysis.get('rr', 0) or 0):.2f} < {float(getattr(self.settings, "min_rr", 2.0)):.2f}"),
+                ("BTC", bool(analysis.get("btc_filter_ok")), str(analysis.get("btc_filter_reason") or "BTC filter")),
+                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), f"Quality score {analysis.get('score', 0)} < {int(getattr(self.settings, "min_confluence", 65))}"),
+                ("TECHNICAL_CANDIDATE", bool(analysis.get("technical_candidate")), "Engine technical candidate gate"),
             ]
             for stage, passed, fallback in ordered:
                 if not passed:
                     reasons = (analysis.get("stage_failures") or {}).get(stage) or [fallback]
                     return self._reject(symbol, reasons, stage, payload)
 
-            # BTC regime is observational at setup-generation time. The portfolio
-            # layer can use it for sizing/concurrency without suppressing valid
-            # structural coin setups here.
             btc_ok, btc_reason = btc_filter_ok(side, self._btc_context, is_btc=symbol.upper().startswith("BTC"))
             payload["btc_would_block"] = int(not btc_ok)
             payload["btc_filter_reason"] = btc_reason
+            if not btc_ok:
+                return self._reject(symbol, btc_reason, "BTC", payload)
 
             try:
                 ticker = await self.client.get_ticker(symbol)
@@ -269,12 +277,48 @@ class MexcScanner:
                 payload["rejected_execution"] = 1
                 return self._reject(symbol, quote_reason, "EXECUTION", payload)
 
+            futures_context = await self._get_futures_execution_context(
+                symbol, ticker, spread_pct=spread_pct
+            )
+            analysis["futures_context"] = futures_context
+            analysis["mexc_funding_rate"] = futures_context.get("funding_rate")
+            analysis["futures_ok"] = bool(futures_context.get("execution_ok"))
+            analysis["futures_execution_ok"] = bool(futures_context.get("execution_ok"))
+            analysis["futures_context_checked"] = True
+            analysis["data_fresh"] = bool(quote_ok)
+            if not futures_context.get("execution_ok"):
+                payload["rejected_execution"] = 1
+                return self._reject(
+                    symbol,
+                    futures_context.get("errors") or ["Futures execution quality check failed"],
+                    "EXECUTION",
+                    payload,
+                )
+
             # MEXC kline timestamps are candle-open timestamps. Decision time is the
             # close of the completed 1H candle; use that consistently for freshness
             # validation and signal identity.
             candle_close_time = int(analysis.get("candle_close_time") or (int(c1[-1]["time"]) + TIMEFRAME_MS["1H"]))
             analysis["candle_time"] = candle_close_time
             analysis["max_signal_age_seconds"] = int(getattr(self.settings, "max_signal_age_seconds", 5400))
+
+            signal_age_seconds = max(0.0, (int(time.time() * 1000) - candle_close_time) / 1000.0)
+            if signal_age_seconds > float(getattr(self.settings, "max_signal_age_seconds", 5400)):
+                payload["rejected_execution"] = 1
+                return self._reject(symbol, f"1H setup age {signal_age_seconds:.0f}s exceeds configured maximum", "EXECUTION", payload)
+
+            live_last = futures_context.get("last_price")
+            planned_entry = analysis.get("entry")
+            entry_mode = str(analysis.get("entry_mode") or "MARKET").upper()
+            if live_last and planned_entry and entry_mode == "MARKET":
+                drift_pct = abs(float(live_last) - float(planned_entry)) / float(planned_entry) * 100.0
+                configured_drift = float(getattr(self.settings, "max_entry_drift_pct", 0.002))
+                max_drift_pct = configured_drift * 100.0 if 0.0 < configured_drift <= 1.0 else configured_drift
+                analysis["entry_drift_pct"] = drift_pct
+                analysis["max_entry_drift_pct"] = max_drift_pct
+                if drift_pct > max_drift_pct:
+                    payload["rejected_execution"] = 1
+                    return self._reject(symbol, f"Market entry drift {drift_pct:.3f}% exceeds {max_drift_pct:.3f}%", "EXECUTION", payload)
 
             signal, reasons = validate_signal(
                 analysis,
@@ -364,6 +408,155 @@ class MexcScanner:
             except (TypeError, ValueError):
                 return False, "Ticker timestamp is malformed", spread_pct
         return True, "OK", spread_pct
+
+    @staticmethod
+    def _number_from_payload(
+        payload: Any,
+        *keys: str,
+        positive_only: bool = False,
+    ) -> float | None:
+        if isinstance(payload, dict):
+            for key in keys:
+                try:
+                    value = float(payload.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value == value and value not in (float("inf"), -float("inf")):
+                    if positive_only and value <= 0:
+                        continue
+                    return value
+        return None
+
+    @classmethod
+    def _price_from_payload(cls, payload: Any, *keys: str) -> float | None:
+        return cls._number_from_payload(payload, *keys, positive_only=True)
+
+    @staticmethod
+    def _book_levels(payload: Any, side: str, limit: int) -> list[tuple[float, float]]:
+        if not isinstance(payload, dict):
+            return []
+        raw = payload.get(side) or payload.get(side.lower()) or []
+        levels: list[tuple[float, float]] = []
+        for item in list(raw)[:max(1, int(limit))]:
+            try:
+                if isinstance(item, dict):
+                    price = float(item.get("price", item.get("p")))
+                    qty = float(item.get("vol", item.get("quantity", item.get("qty", item.get("v")))))
+                else:
+                    price = float(item[0])
+                    qty = float(item[1])
+                if price > 0 and qty > 0:
+                    levels.append((price, qty))
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+        return levels
+
+    async def _get_futures_execution_context(
+        self,
+        symbol: str,
+        ticker: dict[str, Any],
+        *,
+        spread_pct: float,
+    ) -> dict[str, Any]:
+        """Build truthful live futures execution context after technical gates."""
+        tasks = await asyncio.gather(
+            self.client.get_depth(symbol, int(getattr(self.settings, "orderbook_levels", 10))),
+            self.client.get_index_price(symbol),
+            self.client.get_fair_price(symbol),
+            self.client.get_funding_rate(symbol),
+            return_exceptions=True,
+        )
+        depth, index_payload, fair_payload, funding_payload = tasks
+
+        context: dict[str, Any] = {
+            "status": "PARTIAL",
+            "execution_ok": False,
+            "spread_pct": float(spread_pct),
+            "ticker_timestamp_ms": None,
+            "ticker_age_seconds": None,
+            "last_price": self._price_from_payload(ticker, "lastPrice", "last", "fairPrice"),
+            "best_bid": None,
+            "best_ask": None,
+            "top_bid_qty": 0.0,
+            "top_ask_qty": 0.0,
+            "top_bid_notional": 0.0,
+            "top_ask_notional": 0.0,
+            "orderbook_levels": int(getattr(self.settings, "orderbook_levels", 10)),
+            "orderbook_checked": False,
+            "index_price": self._price_from_payload(index_payload, "indexPrice", "index_price", "price") if not isinstance(index_payload, Exception) else None,
+            "fair_price": self._price_from_payload(fair_payload, "fairPrice", "fair_price", "price") if not isinstance(fair_payload, Exception) else None,
+            "funding_rate": self._number_from_payload(funding_payload, "fundingRate", "funding_rate", "funding") if not isinstance(funding_payload, Exception) else None,
+            "index_dislocation_pct": None,
+            "fair_dislocation_pct": None,
+            "index_dislocation_checked": False,
+            "funding_checked": not isinstance(funding_payload, Exception),
+            "errors": [],
+        }
+
+        for label, payload_value in (("depth", depth), ("index", index_payload), ("fair", fair_payload), ("funding", funding_payload)):
+            if isinstance(payload_value, Exception):
+                context["errors"].append(f"{label}: {payload_value}")
+
+        raw_ts = ticker.get("timestamp")
+        if raw_ts is not None:
+            try:
+                ts = int(float(raw_ts))
+                ts = ts if ts >= 10**12 else ts * 1000
+                age = max(0.0, (int(time.time() * 1000) - ts) / 1000.0)
+                context["ticker_timestamp_ms"] = ts
+                context["ticker_age_seconds"] = age
+            except (TypeError, ValueError):
+                context["errors"].append("ticker timestamp malformed")
+        else:
+            context["errors"].append("ticker timestamp missing")
+
+        bids = self._book_levels(depth, "bids", context["orderbook_levels"]) if not isinstance(depth, Exception) else []
+        asks = self._book_levels(depth, "asks", context["orderbook_levels"]) if not isinstance(depth, Exception) else []
+        if bids and asks:
+            context["orderbook_checked"] = True
+            context["best_bid"] = bids[0][0]
+            context["best_ask"] = asks[0][0]
+            context["top_bid_qty"] = sum(q for _, q in bids)
+            context["top_ask_qty"] = sum(q for _, q in asks)
+            context["top_bid_notional"] = sum(p * q for p, q in bids)
+            context["top_ask_notional"] = sum(p * q for p, q in asks)
+            if context["last_price"] and context["spread_pct"] <= 0:
+                context["spread_pct"] = (context["best_ask"] - context["best_bid"]) / context["last_price"] * 100.0
+        else:
+            context["errors"].append("order book bids/asks unavailable")
+
+        last = context["last_price"]
+        index_price = context["index_price"]
+        fair_price = context["fair_price"]
+        max_dislocation_cfg = float(getattr(self.settings, "max_index_dislocation_pct", 0.002))
+        max_dislocation_pct = max_dislocation_cfg * 100.0 if 0.0 < max_dislocation_cfg <= 1.0 else max_dislocation_cfg
+        if last and index_price:
+            context["index_dislocation_pct"] = abs(last - index_price) / index_price * 100.0
+            context["index_dislocation_checked"] = True
+        if last and fair_price:
+            context["fair_dislocation_pct"] = abs(last - fair_price) / fair_price * 100.0
+            context["fair_dislocation_checked"] = True
+
+        quote_ok = context["ticker_timestamp_ms"] is not None and context["ticker_age_seconds"] is not None and context["ticker_age_seconds"] <= float(getattr(self.settings, "max_data_age_seconds", 5.0))
+        book_ok = bool(context["orderbook_checked"])
+        configured_spread = float(getattr(self.settings, "max_mexc_spread_pct", 0.001))
+        max_spread_pct = configured_spread * 100.0 if 0.0 < configured_spread <= 1.0 else configured_spread
+        spread_known_bad = context.get("spread_pct", 0.0) > max_spread_pct
+        index_known_bad = (
+            context.get("index_dislocation_pct") is not None
+            and context["index_dislocation_pct"] > max_dislocation_pct
+        ) or (
+            context.get("fair_dislocation_pct") is not None
+            and context["fair_dislocation_pct"] > max_dislocation_pct
+        )
+        context["max_index_dislocation_pct"] = max_dislocation_pct
+        context["index_ok"] = not index_known_bad
+        if spread_known_bad:
+            context["errors"].append(f"Order-book spread {context.get('spread_pct',0.0):.3f}% exceeds configured maximum")
+        context["execution_ok"] = bool(quote_ok and book_ok and not index_known_bad and not spread_known_bad)
+        if context["execution_ok"] and quote_ok and book_ok:
+            context["status"] = "VERIFIED" if context.get("index_dislocation_checked") else "PARTIAL"
+        return context
 
     async def _execute_signal(self, signal):
         if self.executor is None:

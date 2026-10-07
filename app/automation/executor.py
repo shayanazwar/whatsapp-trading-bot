@@ -32,72 +32,54 @@ class ExecutionResult:
     message: str
 
 
-def build_limit_order_payload(
+def build_market_order_payload(
     signal: ValidatedSignal,
     meta: ContractMeta,
     *,
     risk_amount_usdt: float,
     leverage: int,
     open_type: int,
+    cost_buffer_pct: float = 0.0018,
 ) -> dict[str, Any]:
+    """Build the V11 MEXC Futures market-opening order payload.
+
+    MEXC uses ``type=5`` for market orders. The API still accepts a ``price``
+    reference field; it is the executable quote captured by the scanner and is
+    not used as a passive limit price.
     """
-    Build a MEXC Futures opening limit order.
-
-    Position size is calculated from:
-        allowed risk / SL distance
-
-    Leverage does NOT increase the allowed risk.
-    """
-
     if risk_amount_usdt <= 0:
-        raise ValueError(
-            "Risk amount must be greater than zero"
-        )
-
+        raise ValueError("Risk amount must be greater than zero")
     if leverage <= 0:
-        raise ValueError(
-            "Leverage must be greater than zero"
-        )
+        raise ValueError("Leverage must be greater than zero")
+    if str(signal.analysis.get("entry_mode") or "MARKET").upper() != "MARKET":
+        raise ValueError("V11 execution requires MARKET entry mode")
+
+    execution_price = float(signal.analysis.get("market_execution_price") or signal.plan.entry)
+    if execution_price <= 0:
+        raise ValueError("Executable market-entry reference price must be positive")
 
     quantity = calculate_contract_quantity(
         risk_amount_usdt=risk_amount_usdt,
-        entry=signal.plan.entry,
+        entry=execution_price,
         stop_loss=signal.plan.stop_loss,
         contract_size=meta.contract_size,
         vol_unit=meta.vol_unit,
         min_vol=meta.min_vol,
         max_vol=meta.max_vol,
+        cost_buffer_pct=cost_buffer_pct,
     )
-
     if quantity <= 0:
-        raise ValueError(
-            "Calculated order quantity is zero"
-        )
+        raise ValueError("Calculated order quantity is zero")
 
     return {
         "symbol": signal.symbol,
-        "price": signal.plan.entry,
+        "price": execution_price,
         "vol": quantity,
         "leverage": int(leverage),
-
-        # MEXC Futures:
-        # 1 = open long
-        # 3 = open short
-        "side": (
-            1
-            if signal.side == "LONG"
-            else 3
-        ),
-
-        # 1 = limit order
-        "type": 1,
-
+        "side": 1 if signal.side == "LONG" else 3,
+        "type": 5,
         "openType": int(open_type),
-
-        # Unique client-side identifier.
         "externalOid": signal.key[:32],
-
-        # Existing project uses position mode 1.
         "positionMode": 1,
     }
 
@@ -177,7 +159,7 @@ class MexcExecutor:
 
         valid, reason = validate_levels(
             signal.plan,
-            min_rr=2.0,
+            min_rr=float(getattr(self.settings, "min_rr", 1.6)),
         )
 
         if not valid:
@@ -196,6 +178,9 @@ class MexcExecutor:
                 None,
                 "Execution rejected: invalid trade side",
             )
+
+        if str(signal.analysis.get("entry_mode") or "MARKET").upper() != "MARKET":
+            return ExecutionResult(False, None, "Execution rejected: V11 requires MARKET entry mode")
 
         # ==============================================================
         # FUTURES EQUITY
@@ -281,6 +266,7 @@ class MexcExecutor:
                 vol_unit=meta.vol_unit,
                 min_vol=meta.min_vol,
                 max_vol=meta.max_vol,
+                cost_buffer_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", 0.0018)),
             )
 
         except Exception as exc:
@@ -382,12 +368,13 @@ class MexcExecutor:
         # ==============================================================
 
         try:
-            payload = build_limit_order_payload(
+            payload = build_market_order_payload(
                 signal,
                 meta,
                 risk_amount_usdt=risk_amount,
                 leverage=self.settings.mexc_default_leverage,
                 open_type=self.settings.mexc_open_type,
+                cost_buffer_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", 0.0018)),
             )
 
         except Exception as exc:

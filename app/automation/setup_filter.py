@@ -2,17 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-MIN_SCORE = 65
-MIN_RR = 2.00
-# Confirmation families are supporting evidence, not a hard wall.  The Engine
-# scores them, while core setup/structure/risk gates decide technical validity.
+MIN_SCORE = 0  # V11 score is diagnostic only
+MIN_RR = 1.60
 MIN_CONFIRMATION_FAMILIES = 0
 MIN_AVAILABLE_CONFIRMATION_FAMILIES = 0
-MIN_ATR_PERCENTILE = 5.0
-MAX_ATR_PERCENTILE = 98.0
-MIN_SL_ATR = 0.50
-MAX_SL_ATR = 1.25
-MIN_TP_ATR = 1.00
+MIN_ATR_PERCENTILE = 0.0
+MAX_ATR_PERCENTILE = 100.0
+MIN_SL_ATR = 0.20
+MAX_SL_ATR = 3.00
+MIN_TP_ATR = 0.50
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -34,7 +32,7 @@ def validate_analysis(
     reasons: list[str] = []
     score = int(_f(data.get("score"), 0))
     required_score = max(MIN_SCORE, int(min_confluence))
-    if score < required_score:
+    if bool(data.get("score_hard_gate", False)) and score < required_score:
         reasons.append(f"Score {score} < required {required_score}")
 
     side = str(data.get("setup") or "").upper()
@@ -44,15 +42,16 @@ def validate_analysis(
 
     hard_flags = (
         ("direction_ok", "1D macro directional boundary failed"),
-        ("structure_ok", "4H BOS/retest structure failed"),
-        ("setup_ok", "1H setup failed"),
+        ("structure_ok", "4H continuation structure failed"),
+        ("setup_ok", "4H value pullback failed"),
         ("confirmation_ok", "1H confirmation failed"),
         ("location_ok", "Higher-timeframe target path failed"),
         ("target_path_structural", "Target is not a confirmed higher-timeframe structure level"),
-        ("structure_quality_ok", "4H BOS/retest quality failed"),
+        ("structure_quality_ok", "4H continuation quality failed"),
         ("shock_veto_ok", "1H shock/liquidity veto failed"),
         ("btc_filter_ok", "BTC directional filter failed"),
         ("volatility_ok", "ATR volatility percentile gate failed"),
+        ("confirmation_family_diversity_ok", "Confirmation-family diversity gate failed"),
         ("technical_candidate", "Engine did not mark this as a technical candidate"),
         ("trade_geometry_ok", "Single-TP structural geometry failed"),
         ("risk_ok", "Risk/RR validation failed"),
@@ -84,13 +83,28 @@ def validate_analysis(
     if rr + 1e-12 < required_rr:
         reasons.append(f"RR {rr:.2f} < required {required_rr:.2f}")
 
-    sl_atr = _f(data.get("sl_atr_4h", data.get("sl_atr")), 999.0)
+    atr_for_geometry = _f(data.get("atr_4h", data.get("atr")), 0.0)
+    if atr_for_geometry > 0:
+        try:
+            entry_for_sl = float(data.get("entry"))
+            stop_for_sl = float(data.get("stop_loss"))
+            sl_atr = abs(entry_for_sl - stop_for_sl) / atr_for_geometry
+        except (TypeError, ValueError):
+            sl_atr = 999.0
+    else:
+        sl_atr = 999.0
     if sl_atr < MIN_SL_ATR:
         reasons.append(f"SL distance {sl_atr:.2f} ATR < minimum {MIN_SL_ATR:.2f}")
     elif sl_atr > MAX_SL_ATR:
         reasons.append(f"SL distance {sl_atr:.2f} ATR > maximum {MAX_SL_ATR:.2f}")
 
-    tp_distance_atr = _f(data.get("tp_distance_atr"), 0.0)
+    if atr_for_geometry > 0:
+        try:
+            tp_distance_atr = abs(float(data.get("tp")) - float(data.get("entry"))) / atr_for_geometry
+        except (TypeError, ValueError):
+            tp_distance_atr = 0.0
+    else:
+        tp_distance_atr = 0.0
     if tp_distance_atr < MIN_TP_ATR:
         reasons.append(f"TP distance {tp_distance_atr:.2f} ATR < minimum {MIN_TP_ATR:.2f}")
 
@@ -101,8 +115,13 @@ def validate_analysis(
     if "target_path_clear" in data and data.get("target_path_clear") is not True:
         reasons.append("4H/1H target path is not clear")
 
-    # Supporting confirmation-family counts are informational only.  Do not
-    # reintroduce a hidden 4-of-N hard gate at final validation.
+    families_passed = data.get("confirmation_families_passed")
+    families_available = data.get("confirmation_families_available")
+    if families_passed is not None and int(_f(families_passed, 0)) < MIN_CONFIRMATION_FAMILIES:
+        reasons.append(f"Confirmation families {int(_f(families_passed, 0))} < required {MIN_CONFIRMATION_FAMILIES}")
+    if families_available is not None and int(_f(families_available, 0)) < MIN_AVAILABLE_CONFIRMATION_FAMILIES:
+        reasons.append(f"Available confirmation families {int(_f(families_available, 0))} < required {MIN_AVAILABLE_CONFIRMATION_FAMILIES}")
+
     atr_percentile = data.get("atr_percentile")
     if atr_percentile is not None:
         atr_rank = _f(atr_percentile, -1.0)

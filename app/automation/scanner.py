@@ -28,6 +28,17 @@ TIMEFRAME_MS = {"1D": 86_400_000, "12H": 43_200_000, "4H": 14_400_000, "1H": 3_6
 CANDLE_LIMITS = {"1D": 220, "12H": 220, "4H": 650, "1H": 250}
 
 
+def get_decision_close_ms(now_ms: int) -> int:
+    """Return the most recent completed 1H boundary used by V11 decisions."""
+    return (int(now_ms) // TIMEFRAME_MS["1H"]) * TIMEFRAME_MS["1H"]
+
+
+def signal_fresh_enough(decision_ms: int, actual_now_ms: int, max_age_seconds: float) -> bool:
+    """Require live discovery to happen shortly after the completed 1H close."""
+    age_ms = int(actual_now_ms) - int(decision_ms)
+    return 0 <= age_ms <= max(5_000, int(float(max_age_seconds) * 1000))
+
+
 class MexcScanner:
     """Closed-candle MEXC Futures scanner using only 1D/12H/4H/1H."""
 
@@ -51,6 +62,11 @@ class MexcScanner:
         self._cache_limit = max(180, int(getattr(settings, "candle_limit", 650)))
 
     async def scan_once(self) -> dict[str, int]:
+        scan_now_ms = int(time.time() * 1000)
+        # V11 decisions occur exactly at completed 1H closes. One snapshot is
+        # shared across the whole scan so symbols cannot be analyzed against
+        # different hours as the scan runs.
+        decision_close_ms = get_decision_close_ms(scan_now_ms)
         symbols = await self.universe.refresh()
         stats = self._empty_stats(len(symbols))
         if not symbols:
@@ -58,7 +74,7 @@ class MexcScanner:
             self._log_stats(stats)
             return stats
 
-        await self._refresh_btc_context()
+        await self._refresh_btc_context(decision_close_ms=decision_close_ms)
         configured = int(getattr(self.settings, "scan_concurrency", 4))
         concurrency = max(1, min(4, configured))
         queue: asyncio.Queue[str] = asyncio.Queue()
@@ -75,7 +91,7 @@ class MexcScanner:
                 except asyncio.QueueEmpty:
                     return
                 try:
-                    results.append(await self._scan_one(symbol))
+                    results.append(await self._scan_one(symbol, decision_close_ms=decision_close_ms))
                 except Exception as exc:
                     LOGGER.exception("Scanner worker %s crashed on %s", worker_id, symbol)
                     results.append(self._error(symbol, f"worker exception: {exc}"))
@@ -152,13 +168,13 @@ class MexcScanner:
             top = reasons.most_common(8) if hasattr(reasons, "most_common") else sorted(reasons.items(), key=lambda x: (-x[1], x[0]))[:8]
             LOGGER.info("MEXC REJECTION REASONS | %s", " | ".join(f"{reason}={count}" for reason, count in top))
 
-    async def _get_closed_candles(self, symbol: str, timeframe: str, limit: int) -> tuple[list[Any], bool]:
+    async def _get_closed_candles(self, symbol: str, timeframe: str, limit: int, *, now_ms: int | None = None) -> tuple[list[Any], bool]:
         tf = timeframe.upper()
         if tf not in APPROVED_TIMEFRAMES:
             raise ValueError(f"Unsupported analysis timeframe: {timeframe}")
         key = (symbol.upper(), tf)
-        now_ms = int(time.time() * 1000)
-        expected_open = (now_ms // TIMEFRAME_MS[tf]) * TIMEFRAME_MS[tf] - TIMEFRAME_MS[tf]
+        decision_now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        expected_open = (decision_now_ms // TIMEFRAME_MS[tf]) * TIMEFRAME_MS[tf] - TIMEFRAME_MS[tf]
         cached = self._candle_cache.get(key)
         minimum_cached = min(int(limit), 180)
         if cached and cached[0] >= expected_open and len(cached[1]) >= minimum_cached:
@@ -170,21 +186,22 @@ class MexcScanner:
                 return cached[1], True
             if tf == "12H":
                 raw = await self.client.get_klines(symbol, "Hour4", min(2000, int(limit) * 3 + 6))
-                rows = synthesize_12h_from_4h(closed_candle_rows(raw, "4H", now_ms), now_ms=now_ms)
+                rows = synthesize_12h_from_4h(closed_candle_rows(raw, "4H", decision_now_ms), now_ms=decision_now_ms)
             else:
                 raw = await self.client.get_klines(symbol, MEXC_INTERVALS[tf], limit)
-                rows = closed_candle_rows(raw, tf, now_ms)
+                rows = closed_candle_rows(raw, tf, decision_now_ms)
             rows = rows[-int(limit):]
             if rows:
                 self._candle_cache[key] = (int(rows[-1]["time"]), rows)
             return rows, False
 
-    async def _refresh_btc_context(self) -> None:
+    async def _refresh_btc_context(self, *, decision_close_ms: int | None = None) -> None:
         try:
-            c1d, _ = await self._get_closed_candles("BTC_USDT", "1D", 220)
-            c4, _ = await self._get_closed_candles("BTC_USDT", "4H", 650)
-            c1, _ = await self._get_closed_candles("BTC_USDT", "1H", 250)
-            c12 = synthesize_12h_from_4h(c4)
+            snapshot = decision_close_ms if decision_close_ms is not None else int(time.time() * 1000)
+            c1d, _ = await self._get_closed_candles("BTC_USDT", "1D", 220, now_ms=snapshot)
+            c4, _ = await self._get_closed_candles("BTC_USDT", "4H", 650, now_ms=snapshot)
+            c1, _ = await self._get_closed_candles("BTC_USDT", "1H", 250, now_ms=snapshot)
+            c12 = synthesize_12h_from_4h(c4, now_ms=snapshot)
             if len(c1d) < 210 or len(c12) < 60 or len(c4) < 180 or len(c1) < 180:
                 self._btc_context = {"ok": False, "reason": "insufficient BTC history"}
                 return
@@ -194,14 +211,20 @@ class MexcScanner:
             LOGGER.warning("BTC market context unavailable; filter will abstain: %s", exc)
             self._btc_context = {"ok": False, "reason": str(exc)}
 
-    async def _scan_one(self, symbol: str) -> dict[str, Any]:
+    async def _scan_one(self, symbol: str, *, decision_close_ms: int | None = None, now_ms: int | None = None) -> dict[str, Any]:
         cache_hits = 0
         try:
-            c4, hit4 = await self._get_closed_candles(symbol, "4H", 650)
-            c1, hit1 = await self._get_closed_candles(symbol, "1H", 250)
-            c1d, hitd = await self._get_closed_candles(symbol, "1D", 220)
+            # Candle inputs stay on the single scan decision snapshot, while
+            # freshness/quote/execution checks use the actual time this symbol
+            # reaches the execution stage. This prevents a long scan cycle from
+            # treating a late symbol as if it were still at the hour boundary.
+            actual_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+            decision_ms = int(decision_close_ms if decision_close_ms is not None else get_decision_close_ms(actual_now_ms))
+            c4, hit4 = await self._get_closed_candles(symbol, "4H", 650, now_ms=decision_ms)
+            c1, hit1 = await self._get_closed_candles(symbol, "1H", 250, now_ms=decision_ms)
+            c1d, hitd = await self._get_closed_candles(symbol, "1D", 220, now_ms=decision_ms)
             cache_hits += int(hit4) + int(hit1) + int(hitd)
-            c12 = synthesize_12h_from_4h(c4)
+            c12 = synthesize_12h_from_4h(c4, now_ms=decision_ms)
 
             mins = {"1D": 210, "12H": 60, "4H": 180, "1H": 180}
             payload: dict[str, Any] = {"candle_cache_hits": cache_hits}
@@ -213,55 +236,45 @@ class MexcScanner:
 
             analysis = analyze_candles(
                 symbol, c1d, c12, c4, c1,
+                now_ms=decision_ms,
                 btc_context=self._btc_context,
-                estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+                estimated_round_trip_cost_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", getattr(self.settings, "estimated_round_trip_cost_pct", 0.0018))),
             )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
             payload["regime_pass"] = int(bool(stages.get("1D_REGIME")))
             payload["bias_pass"] = int(bool(stages.get("12H_BIAS")))
             payload["setup_pass"] = int(bool(analysis.get("structure_ok") and analysis.get("setup_ok")))
-            payload["direction_pass"] = int(bool(analysis.get("direction_ok")))
             payload["trigger_pass"] = int(bool(stages.get("1H_TRIGGER")))
-            payload["entry_distance_pass"] = int(bool(stages.get("ENTRY_DISTANCE", analysis.get("entry_distance_ok", False))))
             payload["quality_pass"] = int(bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))))
             payload["risk_pass"] = int(bool(stages.get("RISK", analysis.get("risk_ok", False))))
-            payload["rr_pass"] = int(bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))))
+            payload["rr_pass"] = int(bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 1.6)))))
 
             side = str(analysis.get("setup") or "").upper()
             failures = analysis.get("diagnostic_failures") or ["No actionable setup"]
+            if side not in {"LONG", "SHORT"}:
+                stage = str(analysis.get("rejection_stage") or "SETUP")
+                return self._reject(symbol, failures, stage, payload)
 
-            # The Engine is authoritative for technical-stage ordering. Supporting
-            # confirmation families are deliberately not a hard veto.
+            # Check all strategy stages for diagnostics; reject at the first failed gate.
+            # Reject at the first failed strategy gate while retaining all stage counters.
             ordered = [
-                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H protected BOS/departure setup"),
                 ("DIRECTION", bool(analysis.get("direction_ok")), "1D/12H/4H direction"),
-                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H retest confirmation"),
-                ("ENTRY_DISTANCE", bool(stages.get("ENTRY_DISTANCE", analysis.get("entry_distance_ok", False))), "1H entry distance"),
-                ("VOLATILITY", bool(analysis.get("volatility_ok")), "ATR volatility regime"),
-                ("TARGET_PATH", bool(analysis.get("target_path_ok") and analysis.get("target_path_structural")), "HTF target availability"),
-                ("PATH_FRICTION", bool(analysis.get("target_path_clear")), "Meaningful target-path friction"),
+                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H impulse/value setup"),
+                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H liquidity sweep/reclaim"),
+                ("VOLATILITY", bool(analysis.get("volatility_ok")), "volatility sanity"),
+                ("CONFIRMATION_FAMILIES", bool(analysis.get("confirmation_family_diversity_ok")), "supporting evidence"),
+                ("TARGET_PATH", bool(analysis.get("location_ok") and analysis.get("target_path_structural") and analysis.get("target_path_clear")), "Clear HTF target path"),
                 ("RISK", bool(stages.get("RISK", analysis.get("risk_ok", False))), "Structural risk model"),
-                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 2.0)))), "Post-cost RR"),
-                ("SHOCK", bool(stages.get("SHOCK", analysis.get("shock_veto_ok", True))), str(analysis.get("shock_veto_reason") or "Shock veto")),
+                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 1.6)))), f"Post-cost RR {float(analysis.get('rr', 0) or 0):.2f} < {float(getattr(self.settings, "min_rr", 1.6)):.2f}"),
                 ("BTC", bool(analysis.get("btc_filter_ok")), str(analysis.get("btc_filter_reason") or "BTC filter")),
-                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), "Quality score"),
+                ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), f"V11 score gate"),
                 ("TECHNICAL_CANDIDATE", bool(analysis.get("technical_candidate")), "Engine technical candidate gate"),
             ]
-            if side not in {"LONG", "SHORT"} or not analysis.get("technical_candidate"):
-                stage = str(analysis.get("first_failure") or analysis.get("rejection_stage") or next((name for name, passed, _ in ordered if not passed), "TECHNICAL_CANDIDATE"))
-                reasons = (analysis.get("stage_failures") or {}).get(stage) or failures or [stage]
-                payload["first_failure"] = stage
-                payload["first_failure_reason"] = reasons
-                return self._reject(symbol, reasons, stage, payload)
             for stage, passed, fallback in ordered:
                 if not passed:
                     reasons = (analysis.get("stage_failures") or {}).get(stage) or [fallback]
-                    payload["first_failure"] = stage
-                    payload["first_failure_reason"] = reasons
                     return self._reject(symbol, reasons, stage, payload)
-            payload["first_failure"] = None
-            payload["first_failure_reason"] = None
 
             btc_ok, btc_reason = btc_filter_ok(side, self._btc_context, is_btc=symbol.upper().startswith("BTC"))
             payload["btc_would_block"] = int(not btc_ok)
@@ -281,6 +294,7 @@ class MexcScanner:
                 ticker,
                 float(getattr(self.settings, "max_data_age_seconds", 15.0)),
                 max_spread_pct=max_spread_pct,
+                now_ms=actual_now_ms,
             )
             analysis["mexc_spread_pct"] = spread_pct
             analysis["max_allowed_spread_pct"] = max_spread_pct
@@ -289,7 +303,7 @@ class MexcScanner:
                 return self._reject(symbol, quote_reason, "EXECUTION", payload)
 
             futures_context = await self._get_futures_execution_context(
-                symbol, ticker, spread_pct=spread_pct
+                symbol, ticker, spread_pct=spread_pct, now_ms=actual_now_ms
             )
             analysis["futures_context"] = futures_context
             analysis["mexc_funding_rate"] = futures_context.get("funding_rate")
@@ -306,35 +320,104 @@ class MexcScanner:
                     payload,
                 )
 
-            # MEXC kline timestamps are candle-open timestamps. Decision time is the
-            # close of the completed 1H candle; use that consistently for freshness
-            # validation and signal identity.
+            # A V11 live signal is actionable only for the just-completed 1H
+            # candle. Older completed-hour setups must never be executed late.
             candle_close_time = int(analysis.get("candle_close_time") or (int(c1[-1]["time"]) + TIMEFRAME_MS["1H"]))
             analysis["candle_time"] = candle_close_time
-            analysis["max_signal_age_seconds"] = int(getattr(self.settings, "max_signal_age_seconds", 5400))
+            analysis["strategy_entry_time_ms"] = candle_close_time
+            analysis["next_1h_open_time_ms"] = candle_close_time
+            max_age_seconds = max(5.0, float(getattr(self.settings, "max_signal_age_seconds", 120.0)))
+            analysis["max_signal_age_seconds"] = max_age_seconds
 
-            signal_age_seconds = max(0.0, (int(time.time() * 1000) - candle_close_time) / 1000.0)
-            if signal_age_seconds > float(getattr(self.settings, "max_signal_age_seconds", 5400)):
+            if candle_close_time != decision_ms:
                 payload["rejected_execution"] = 1
-                return self._reject(symbol, f"1H setup age {signal_age_seconds:.0f}s exceeds configured maximum", "EXECUTION", payload)
+                return self._reject(
+                    symbol,
+                    f"Latest completed 1H close is {candle_close_time}; scan decision snapshot is {decision_ms}",
+                    "EXECUTION",
+                    payload,
+                )
+            signal_age_seconds = max(0.0, (actual_now_ms - decision_ms) / 1000.0)
+            analysis["signal_age_seconds"] = signal_age_seconds
+            if not signal_fresh_enough(decision_ms, actual_now_ms, max_age_seconds):
+                payload["rejected_execution"] = 1
+                return self._reject(
+                    symbol,
+                    f"1H signal freshness {signal_age_seconds:.1f}s exceeds {max_age_seconds:.1f}s",
+                    "EXECUTION",
+                    payload,
+                )
 
-            live_last = futures_context.get("last_price")
-            planned_entry = analysis.get("entry")
-            entry_mode = str(analysis.get("entry_mode") or "MARKET").upper()
-            if live_last and planned_entry and entry_mode == "MARKET":
-                drift_pct = abs(float(live_last) - float(planned_entry)) / float(planned_entry) * 100.0
-                configured_drift = float(getattr(self.settings, "max_entry_drift_pct", 0.002))
-                max_drift_pct = configured_drift * 100.0 if 0.0 < configured_drift <= 1.0 else configured_drift
-                analysis["entry_drift_pct"] = drift_pct
-                analysis["max_entry_drift_pct"] = max_drift_pct
-                if drift_pct > max_drift_pct:
-                    payload["rejected_execution"] = 1
-                    return self._reject(symbol, f"Market entry drift {drift_pct:.3f}% exceeds {max_drift_pct:.3f}%", "EXECUTION", payload)
+            # Execute at the current executable side of the book. This is the
+            # live implementation of V11's "next 1H open" market-entry intent.
+            # The engine's candle-close entry is preserved for auditability.
+            reference_entry = float(analysis.get("entry") or 0.0)
+            analysis["signal_reference_entry"] = reference_entry
+            best_bid = futures_context.get("best_bid")
+            best_ask = futures_context.get("best_ask")
+            executable_entry = best_ask if side == "LONG" else best_bid
+            try:
+                executable_entry = float(executable_entry)
+            except (TypeError, ValueError):
+                executable_entry = 0.0
+            if executable_entry <= 0:
+                payload["rejected_execution"] = 1
+                return self._reject(symbol, "Executable order-book quote unavailable", "EXECUTION", payload)
 
+            configured_drift = float(getattr(self.settings, "max_entry_drift_pct", 0.002))
+            max_drift_pct = configured_drift * 100.0 if 0.0 < configured_drift <= 1.0 else configured_drift
+            drift_pct = abs(executable_entry - reference_entry) / reference_entry * 100.0 if reference_entry > 0 else float("inf")
+            analysis["entry_drift_pct"] = drift_pct
+            analysis["max_entry_drift_pct"] = max_drift_pct
+            if drift_pct > max_drift_pct:
+                payload["rejected_execution"] = 1
+                return self._reject(symbol, f"Market entry drift {drift_pct:.3f}% exceeds {max_drift_pct:.3f}%", "EXECUTION", payload)
+
+            effective_cost_pct = float(getattr(self.settings, "effective_round_trip_cost_pct", 0.0018))
+            risk = abs(executable_entry - float(analysis.get("stop_loss") or 0.0))
+            tp_value = float(analysis.get("tp") or 0.0)
+            if risk <= 0 or tp_value <= 0:
+                payload["rejected_execution"] = 1
+                return self._reject(symbol, "Invalid live entry/SL/TP geometry", "EXECUTION", payload)
+            if side == "LONG" and not (float(analysis["stop_loss"]) < executable_entry < tp_value):
+                return self._reject(symbol, "LONG live quote breaks SL < Entry < TP", "EXECUTION", payload)
+            if side == "SHORT" and not (tp_value < executable_entry < float(analysis["stop_loss"])):
+                return self._reject(symbol, "SHORT live quote breaks TP < Entry < SL", "EXECUTION", payload)
+            cost_price = executable_entry * max(0.0, effective_cost_pct)
+            reward = abs(tp_value - executable_entry)
+            rr_gross = reward / risk
+            rr_net = (reward - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
+            if rr_net < float(getattr(self.settings, "min_rr", 1.6)):
+                payload["rejected_execution"] = 1
+                return self._reject(symbol, f"Post-cost RR at executable quote {rr_net:.2f} < {float(getattr(self.settings, 'min_rr', 1.6)):.2f}", "RR", payload)
+
+            analysis["entry"] = executable_entry
+            analysis["market_execution_price"] = executable_entry
+            analysis["entry_quote_time_ms"] = actual_now_ms
+            analysis["entry_time_ms"] = actual_now_ms
+            analysis["entry_mode"] = "MARKET"
+            analysis["rr_gross"] = rr_gross
+            analysis["rr"] = rr_net
+            analysis["rr_net"] = rr_net
+            analysis["estimated_round_trip_cost_pct"] = effective_cost_pct
+            analysis["sl_atr"] = risk / float(analysis.get("atr_4h") or 1.0)
+            analysis["sl_atr_4h"] = analysis["sl_atr"]
+            analysis["sl_atr_1h"] = risk / float(analysis.get("atr_1h") or 1.0)
+            analysis["stop_distance_pct"] = risk / executable_entry
+            analysis["tp_distance_atr"] = reward / float(analysis.get("atr_4h") or 1.0)
+            analysis["tp_distance_atr_1h"] = reward / float(analysis.get("atr_1h") or 1.0)
+            analysis["tp_distance_pct"] = reward / executable_entry
+            analysis["risk_ok"] = bool(0.20 <= analysis["sl_atr_4h"] <= 3.00)
+            analysis["trade_geometry_ok"] = True
+            analysis["rr_ok"] = bool(rr_net >= float(getattr(self.settings, "min_rr", 1.6)))
+            analysis["technical_candidate"] = bool(analysis.get("technical_candidate") and analysis["risk_ok"] and analysis["rr_ok"] and analysis.get("target_path_clear") is True)
+            analysis.setdefault("stage_status", {})["RISK"] = analysis["risk_ok"]
+            analysis.setdefault("stage_status", {})["RR"] = analysis["rr_ok"]
+            analysis["signal_entry_execution_model"] = "MARKET_AT_NEXT_1H_OPEN"
             signal, reasons = validate_signal(
                 analysis,
                 min_confluence=int(getattr(self.settings, "min_confluence", 65)),
-                min_rr=float(getattr(self.settings, "min_rr", 2.0)),
+                min_rr=float(getattr(self.settings, "min_rr", 1.6)),
                 require_increasing_volume=bool(getattr(self.settings, "require_increasing_volume", False)),
             )
             if signal is None:
@@ -386,6 +469,7 @@ class MexcScanner:
         max_age_seconds: float = 15.0,
         *,
         max_spread_pct: float = 0.50,
+        now_ms: int | None = None,
     ) -> tuple[bool, str, float]:
         def number(key: str) -> float | None:
             try:
@@ -413,7 +497,7 @@ class MexcScanner:
             try:
                 ts = int(float(raw_ts))
                 ts = ts if ts >= 10**12 else ts * 1000
-                age = abs(int(time.time() * 1000) - ts) / 1000.0
+                age = abs(int(now_ms if now_ms is not None else time.time() * 1000) - ts) / 1000.0
                 if age > float(max_age_seconds):
                     return False, f"Ticker timestamp is stale by {age:.1f}s", spread_pct
             except (TypeError, ValueError):
@@ -468,6 +552,7 @@ class MexcScanner:
         ticker: dict[str, Any],
         *,
         spread_pct: float,
+        now_ms: int | None = None,
     ) -> dict[str, Any]:
         """Build truthful live futures execution context after technical gates."""
         tasks = await asyncio.gather(
@@ -513,7 +598,7 @@ class MexcScanner:
             try:
                 ts = int(float(raw_ts))
                 ts = ts if ts >= 10**12 else ts * 1000
-                age = max(0.0, (int(time.time() * 1000) - ts) / 1000.0)
+                age = max(0.0, (int(now_ms if now_ms is not None else time.time() * 1000) - ts) / 1000.0)
                 context["ticker_timestamp_ms"] = ts
                 context["ticker_age_seconds"] = age
             except (TypeError, ValueError):

@@ -334,7 +334,7 @@ def simulate_trade(
         # the requested limit. If not filled within the expiry window, the order dies.
         if entry_exec is None:
             if entry_mode == "LIMIT":
-                if timestamp > limit_expiry_ts:
+                if timestamp >= limit_expiry_ts:
                     return None
                 if limit_price is None or not isfinite(limit_price) or limit_price <= 0:
                     return None
@@ -364,8 +364,13 @@ def simulate_trade(
             entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
             realized_pnl = -entry_fee
             slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
-            # A limit order can fill inside this candle; without intrabar sequencing,
-            # the same deterministic SL_FIRST/TP_FIRST rule is used after the fill.
+            # A passive limit can fill at an unknown point inside the candle.
+            # Do not evaluate that same candle's full high/low after the fill,
+            # because its pre-fill movement is unknowable without tick data.
+            if entry_mode == "LIMIT" and fill_ts == timestamp:
+                previous_close = close
+                previous_close_time = close_time
+                continue
 
         if close_time > expiry_ts:
             if previous_close is None or previous_close_time is None:

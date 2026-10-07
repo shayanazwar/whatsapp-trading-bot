@@ -44,6 +44,7 @@ from .simulator import (
     DEFAULT_MAX_HOLDING_MINUTES,
     DEFAULT_SLIPPAGE_BPS,
     SimulatedTrade,
+    simulate_trade,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ WARMUP_1H = 20 * ONE_DAY_MS
 FETCH_TIMEOUT_SECONDS = 180
 HEARTBEAT_INTERVAL_SECONDS = 30
 
-SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 90}
+SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 60, 90}
 
 
 # ============================================================
@@ -354,75 +355,12 @@ async def _fetch_symbol_history(
 # 1H-BASED PAPER EXECUTION
 # ============================================================
 
-def _safe_number(value: Any) -> float | None:
+def _safe_number(value: Any, default: float | None = None) -> float | None:
     try:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
-        return None
-    return result if result == result and result not in (float("inf"), -float("inf")) else None
-
-
-def _adverse_slippage(
-    price: float,
-    side: str,
-    *,
-    is_entry: bool,
-    slippage_bps: float,
-) -> float:
-    slip = max(0.0, float(slippage_bps)) / 10_000.0
-    if side == "LONG":
-        return price * (1.0 + slip) if is_entry else price * (1.0 - slip)
-    return price * (1.0 - slip) if is_entry else price * (1.0 + slip)
-
-
-def _hold_minutes(signal_time_ms: int, timestamp_ms: int) -> float:
-    return max(0.0, (timestamp_ms - signal_time_ms) / 60_000.0)
-
-
-def _candle_hl(candle: Any) -> tuple[int, float, float] | None:
-    try:
-        timestamp = _candle_time(candle)
-        if isinstance(candle, dict):
-            high = float(candle["high"])
-            low = float(candle["low"])
-        else:
-            high = float(candle[2])
-            low = float(candle[3])
-    except (KeyError, TypeError, ValueError, IndexError):
-        return None
-    if timestamp <= 0 or low > high:
-        return None
-    return timestamp, high, low
-
-
-def _quality_snapshot(signal: dict[str, Any]) -> dict[str, float]:
-    """Extract numeric engine diagnostics for SimulatedTrade.quality."""
-
-    keys = (
-        "score",
-        "atr_percentile",
-        "sl_atr",
-        "stop_distance_pct",
-        "rsi",
-        "rvol_1h",
-        "macd_hist_delta",
-        "momentum_quality",
-        "volume_quality",
-        "volatility_quality",
-        "entry_efficiency",
-        "twelve_h_context_quality",
-        "trigger_quality",
-    )
-    out: dict[str, float] = {}
-    for key in keys:
-        value = _safe_number(signal.get(key))
-        if value is not None:
-            out[key] = value
-    retest = signal.get("retest") or {}
-    retest_quality = _safe_number(retest.get("quality"))
-    if retest_quality is not None:
-        out["retest_quality"] = retest_quality
-    return out
+        return default
+    return result if result == result and result not in (float("inf"), -float("inf")) else default
 
 
 def simulate_trade_1h(
@@ -434,243 +372,14 @@ def simulate_trade_1h(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
 ) -> SimulatedTrade | None:
-    """Causal trade simulation using ONLY future 1H candles.
-
-    ENGINE_FIXED.py intentionally exposes one structural target in ``tp``.
-    For reporting compatibility with the existing BacktestSummary, TP1 is a
-    1R milestone and TP2 is the engine's structural target.
-
-    Market entries use adverse entry slippage. Limit entries are filled at the
-    limit price when touched within the engine's three-1H-bar limit expiry.
-    Exits use adverse slippage and include fees in realized R.
-    """
-
-    symbol = str(signal.get("symbol") or "UNKNOWN")
-    side = str(signal.get("setup") or "").upper()
-    entry = _safe_number(signal.get("entry"))
-    stop = _safe_number(signal.get("stop_loss"))
-    tp2 = _safe_number(signal.get("tp"))
-
-    if side not in {"LONG", "SHORT"} or None in (entry, stop, tp2):
-        return None
-    assert entry is not None and stop is not None and tp2 is not None
-
-    risk_planned = abs(entry - stop)
-    if risk_planned <= 0:
-        return None
-
-    if side == "LONG" and not (stop < entry < tp2):
-        return None
-    if side == "SHORT" and not (tp2 < entry < stop):
-        return None
-
-    tp1 = entry + risk_planned if side == "LONG" else entry - risk_planned
-    if side == "LONG" and tp1 >= tp2:
-        tp1 = entry + 0.5 * abs(tp2 - entry)
-    elif side == "SHORT" and tp1 <= tp2:
-        tp1 = entry - 0.5 * abs(tp2 - entry)
-
-    max_hold = float(
-        max_holding_minutes
-        if max_holding_minutes is not None
-        else signal.get("intraday_max_hold_minutes") or DEFAULT_MAX_HOLDING_MINUTES
-    )
-    if max_hold <= 0:
-        max_hold = DEFAULT_MAX_HOLDING_MINUTES
-
-    fee_rate = max(0.0, float(fee_rate))
-    slippage_bps = max(0.0, float(slippage_bps))
-    signal_time = int(signal_close_time_ms)
-    expiry_time = signal_time + int(max_hold * 60_000)
-
-    future = []
-    for candle in future_candles:
-        parsed = _candle_hl(candle)
-        if parsed is None:
-            continue
-        timestamp, high, low = parsed
-        if timestamp < signal_time:
-            continue
-        future.append((timestamp, high, low))
-    future.sort(key=lambda item: item[0])
-
-    if not future:
-        return None
-
-    entry_mode = str(signal.get("entry_mode") or "MARKET").upper()
-    limit_price = _safe_number(
-        signal.get("entry_limit_price", signal.get("limit_price"))
-    )
-    limit_expiry_bars = int(
-        _safe_number(signal.get("limit_entry_expiry_bars")) or 3
-    )
-
-    entry_exec: float | None = None
-    filled_timestamp: int | None = None
-    start_index = 0
-
-    if entry_mode == "LIMIT" and limit_price is not None:
-        limit_deadline = signal_time + limit_expiry_bars * ONE_HOUR_MS
-        for index, (timestamp, high, low) in enumerate(future):
-            if timestamp >= limit_deadline:
-                break
-            if high < low:
-                continue
-            touched = low <= limit_price <= high
-            if not touched:
-                continue
-            entry_exec = limit_price
-            filled_timestamp = timestamp
-            start_index = index
-            break
-        if entry_exec is None:
-            return None
-    else:
-        entry_exec = _adverse_slippage(
-            entry,
-            side,
-            is_entry=True,
-            slippage_bps=slippage_bps,
-        )
-        filled_timestamp = signal_time
-
-    if side == "LONG" and entry_exec <= stop:
-        return None
-    if side == "SHORT" and entry_exec >= stop:
-        return None
-
-    risk_exec = abs(entry_exec - stop)
-    if risk_exec <= 0:
-        return None
-
-    planned_rr = abs(tp2 - entry) / risk_planned
-    tp1_hit = False
-    last_valid_close = signal_time
-
-    quality = _quality_snapshot(signal)
-    regime = str(signal.get("regime_1d") or signal.get("trend_4h") or "UNKNOWN")
-
-    def make_trade(
-        outcome: str,
-        timestamp_ms: int | None,
-        *,
-        tp2_hit: bool = False,
-        sl_hit: bool = False,
-        exit_price: float | None = None,
-        expired: bool = False,
-    ) -> SimulatedTrade:
-        hold = None if timestamp_ms is None else _hold_minutes(signal_time, timestamp_ms)
-        exit_exec = None
-        r_value = None
-        fees_r = 0.0
-        slippage_r = 0.0
-
-        if exit_price is not None:
-            exit_exec = _adverse_slippage(
-                exit_price,
-                side,
-                is_entry=False,
-                slippage_bps=slippage_bps,
-            )
-            reward_or_loss = (
-                exit_exec - entry_exec
-                if side == "LONG"
-                else entry_exec - exit_exec
-            )
-            gross_r = reward_or_loss / risk_exec
-            notional = abs(entry_exec) + abs(exit_exec)
-            fees_r = notional * fee_rate / risk_exec
-            r_value = gross_r - fees_r
-            slippage_r = (
-                abs(entry_exec - entry)
-                + abs(exit_exec - exit_price)
-            ) / risk_exec
-
-        return SimulatedTrade(
-            symbol=symbol,
-            side=side,
-            signal_time_ms=signal_time,
-            entry=entry,
-            stop_loss=stop,
-            tp1=tp1,
-            tp2=tp2,
-            planned_rr=planned_rr,
-            tp1_hit=bool(tp1_hit),
-            tp2_hit=bool(tp2_hit),
-            sl_hit=bool(sl_hit),
-            outcome=outcome,
-            r_multiple=r_value,
-            exit_time_ms=timestamp_ms,
-            hold_minutes=hold,
-            fees_r=fees_r,
-            slippage_r=slippage_r,
-            entry_execution=entry_exec,
-            exit_execution=exit_exec,
-            expired=expired,
-            regime=regime,
-            quality=quality,
-        )
-
-    for index in range(start_index, len(future)):
-        timestamp, high, low = future[index]
-        close_time = timestamp + ONE_HOUR_MS
-
-        if close_time <= signal_time:
-            continue
-        if timestamp > expiry_time:
-            break
-
-        last_valid_close = min(close_time, expiry_time)
-
-        if side == "LONG":
-            sl_touched = low <= stop
-            tp2_touched = high >= tp2
-            tp1_touched = high >= tp1
-        else:
-            sl_touched = high >= stop
-            tp2_touched = low <= tp2
-            tp1_touched = low <= tp1
-
-        # Conservative same-candle ordering: SL wins when both SL and target
-        # levels are touched and there is no intrabar sequencing information.
-        if sl_touched and (tp1_touched or tp2_touched):
-            return make_trade(
-                "SL",
-                close_time,
-                sl_hit=True,
-                exit_price=stop,
-            )
-        if tp2_touched:
-            tp1_hit = True
-            return make_trade(
-                "TP2",
-                close_time,
-                tp2_hit=True,
-                exit_price=tp2,
-            )
-        if tp1_touched:
-            tp1_hit = True
-        if sl_touched:
-            return make_trade(
-                "SL",
-                close_time,
-                sl_hit=True,
-                exit_price=stop,
-            )
-
-        if close_time >= expiry_time:
-            return make_trade(
-                "EXPIRED",
-                expiry_time,
-                expired=True,
-            )
-
-    if last_valid_close <= signal_time:
-        return None
-    return make_trade(
-        "EXPIRED",
-        min(last_valid_close, expiry_time),
-        expired=True,
+    """Single authoritative 1H paper simulator used by the V9.2 Runner."""
+    return simulate_trade(
+        signal,
+        future_candles,
+        signal_close_time_ms=int(signal_close_time_ms),
+        fee_rate=float(fee_rate),
+        slippage_bps=float(slippage_bps),
+        max_holding_minutes=max_holding_minutes,
     )
 
 
@@ -897,6 +606,7 @@ class BacktestRunner:
                     c1,
                     now_ms=signal_close_ms,
                     btc_context=btc_context,
+                    estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -968,10 +678,16 @@ class BacktestRunner:
 
             inc(f"FULL_ENGINE_ACCEPT_{side}")
 
+            bos_level = (
+                analysis.get("long_bos_level")
+                if side == "LONG"
+                else analysis.get("short_bos_level")
+            )
             structure_key = (
                 side,
                 analysis.get("setup_bos_time"),
-                analysis.get("setup_retest_time"),
+                bos_level,
+                analysis.get("setup_retest_1h_time") or analysis.get("setup_retest_time"),
             )
             if structure_key in seen_structures:
                 inc("DUPLICATE_STRUCTURE_SKIPPED")
@@ -1129,7 +845,7 @@ class BacktestRunner:
             LOGGER.info(
                 "BACKTEST HEARTBEAT | days=%d phase=%s processed=%d/%d "
                 "tested=%d signals=%d data_errors=%d engine_errors=%d "
-                "simulation_errors=%d elapsed=%.1fs symbol=%s",
+                "simulation_errors=%d analysis_errors=%d elapsed=%.1fs symbol=%s",
                 days,
                 state.get("phase", "UNKNOWN"),
                 processed,
@@ -1139,20 +855,21 @@ class BacktestRunner:
                 int(state.get("data_errors", 0)),
                 int(state.get("engine_errors", 0)),
                 int(state.get("simulation_errors", 0)),
+                int(state.get("analysis_errors", 0)),
                 elapsed,
                 state.get("symbol", "-"),
             )
 
     async def run(self, days: int) -> BacktestSummary:
-        """Run a complete 1D/7D/30D/90D causal paper backtest."""
+        """Run a complete 1D/7D/30D/60D/90D causal paper backtest."""
 
         days = int(days)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
-                "Supported backtests: 1D, 7D, 30D, 90D"
+                "Supported backtests: 1D, 7D, 30D, 60D, 90D"
             )
 
-        if self._run_lock.locked():
+        if self._running or self._run_lock.locked():
             raise BacktestAlreadyRunning(
                 "A backtest is already running. Please wait for it to finish."
             )
@@ -1171,6 +888,7 @@ class BacktestRunner:
                         "data_errors": 0,
                         "engine_errors": 0,
                         "simulation_errors": 0,
+                        "analysis_errors": 0,
                         "signals": 0,
                         "symbol": "-",
                     },
@@ -1197,16 +915,39 @@ class BacktestRunner:
                         timeout=FETCH_TIMEOUT_SECONDS,
                     )
                 )
-                symbols = [
-                    str(symbol).upper()
-                    for symbol in all_symbols
-                    if str(symbol).strip()
-                ][:MAX_BACKTEST_SYMBOLS]
+                max_symbols = max(1, min(
+                    int(getattr(self.settings, "backtest_max_symbols", MAX_BACKTEST_SYMBOLS)),
+                    MAX_BACKTEST_SYMBOLS,
+                ))
+                symbols = []
+                seen_symbols: set[str] = set()
+                for raw_symbol in all_symbols:
+                    symbol = str(raw_symbol).strip().upper()
+                    if not symbol or symbol in seen_symbols:
+                        continue
+                    seen_symbols.add(symbol)
+                    symbols.append(symbol)
+                    if len(symbols) >= max_symbols:
+                        break
 
                 if not symbols:
-                    raise RuntimeError(
-                        "No eligible MEXC Futures symbols are available for backtesting."
-                    )
+                    LOGGER.warning("BACKTEST EMPTY UNIVERSE | days=%d", days)
+                    summary_payload = {
+                        "days": days,
+                        "period_start_ms": int(start_ms),
+                        "period_end_ms": int(end_ms),
+                        "coins_selected": 0,
+                        "coins_tested": 0,
+                        "data_errors": 0,
+                        "execution_errors": 0,
+                        "rejected_setups": 0,
+                        "trades": [],
+                        "diagnostics": {"NO_ELIGIBLE_SYMBOLS": 1, "CURRENT_UNIVERSE_SNAPSHOT_BIAS": 1},
+                    }
+                    params = inspect.signature(summarize).parameters
+                    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                        summary_payload = {k: v for k, v in summary_payload.items() if k in params}
+                    return summarize(**summary_payload)
 
                 state["total"] = len(symbols)
                 inc_global("SYMBOLS_DISCOVERED", len(all_symbols))
@@ -1291,6 +1032,7 @@ class BacktestRunner:
                                 )
                                 async with state_lock:
                                     inc_global("SYMBOLS_DATA_READY")
+                                    state["tested"] += 1
                             except asyncio.CancelledError:
                                 raise
                             except Exception as exc:
@@ -1321,12 +1063,15 @@ class BacktestRunner:
                                     symbol_data_errors,
                                     symbol_simulation_errors,
                                     symbol_engine_errors,
-                                ) = await asyncio.to_thread(
-                                    self._simulate_symbol,
-                                    history,
-                                    start_ms,
-                                    end_ms,
-                                    btc_context_cache,
+                                ) = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        self._simulate_symbol,
+                                        history,
+                                        start_ms,
+                                        end_ms,
+                                        btc_context_cache,
+                                    ),
+                                    timeout=max(1.0, float(getattr(self.settings, "backtest_analysis_timeout_seconds", 120.0))),
                                 )
                             except asyncio.CancelledError:
                                 raise
@@ -1360,7 +1105,6 @@ class BacktestRunner:
                                 state["data_errors"] += int(symbol_data_errors)
                                 state["engine_errors"] += int(symbol_engine_errors)
                                 state["simulation_errors"] += int(symbol_simulation_errors)
-                                state["tested"] += 1
                                 trades.extend(symbol_trades)
                                 state["signals"] = len(trades)
 
@@ -1421,6 +1165,7 @@ class BacktestRunner:
                 execution_errors = int(
                     state.get("engine_errors", 0)
                     + state.get("simulation_errors", 0)
+                    + state.get("analysis_errors", 0)
                 )
 
                 summary_payload = {
@@ -1459,7 +1204,7 @@ class BacktestRunner:
 
                 LOGGER.info(
                     "BACKTEST COMPLETE | days=%d tested=%d/%d signals=%d "
-                    "data_errors=%d engine_errors=%d simulation_errors=%d "
+                    "data_errors=%d engine_errors=%d simulation_errors=%d analysis_errors=%d "
                     "duration=%.2fs",
                     days,
                     state["tested"],
@@ -1468,6 +1213,7 @@ class BacktestRunner:
                     state["data_errors"],
                     state["engine_errors"],
                     state["simulation_errors"],
+                    state.get("analysis_errors", 0),
                     time.monotonic() - started,
                 )
 

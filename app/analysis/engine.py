@@ -10,6 +10,7 @@ causally synthesized from three completed 4H candles.
 """
 
 import math
+import os
 import time
 from bisect import bisect_right
 from typing import Any, Iterable, List, Optional, Tuple
@@ -406,6 +407,11 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
 # V11 strategy constants. Score is diagnostic only; it is never an acceptance gate.
 V11_MIN_RR = 1.60
 V11_MIN_IMPULSE_ATR = 2.50
+# Controlled A/B experiment switch. Default preserves the frozen V11 control.
+# SWEEP = current V11 stop; 4H_ORIGIN = experimental HTF structural stop.
+V11_SL_MODE = str(os.getenv("V11_SL_MODE", "SWEEP")).strip().upper() or "SWEEP"
+if V11_SL_MODE not in {"SWEEP", "4H_ORIGIN"}:
+    V11_SL_MODE = "SWEEP"
 V11_SETUP_MAX_4H_BARS = 30
 V11_MAX_TRIGGER_BARS = 6
 V11_STOP_BUFFER_ATR_4H = 0.20
@@ -815,6 +821,7 @@ def _v11_analyze_side(
             "reason": str(reason),
             "technical_gate_failures": [f"{side}: {reason}"],
             "rejection_stage": "SETUP",
+            "primary_rejection_reason": f"{side}: {reason}",
         }
 
     if not direction_ok:
@@ -885,19 +892,23 @@ def _v11_analyze_side(
         entry = float(c1[-1]["close"])
         atr4 = max(_safe_atr(c4), float(impulse["atr"]))
         atr1 = _safe_atr(c1)
-        # SL geometry fix:
-        # The trade thesis is a 4H impulse/value-pullback. The old implementation
-        # anchored the stop to the local 1H sweep wick, which can be taken out by
-        # normal 4H retracement noise while the 4H structure remains valid.
-        # Keep the existing volatility buffer unchanged so this experiment isolates
-        # the anchor change only.
+        sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
+        sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
-        if side == "LONG":
-            # 4H bullish impulse becomes structurally invalid only below its origin.
-            stop = float(impulse["low"]) - buffer
-        else:
-            # 4H bearish impulse becomes structurally invalid only above its origin.
-            stop = float(impulse["high"]) + buffer
+        if V11_SL_MODE == "4H_ORIGIN":
+            # Controlled experiment only: invalidate the completed 4H impulse,
+            # rather than placing the stop inside the 1H sweep noise.
+            if side == "LONG":
+                stop = float(impulse["low"]) - buffer
+            else:
+                stop = float(impulse["high"]) + buffer
+        elif side == "SWEEP":
+            if side == "LONG":
+                stop = sweep_low - buffer
+            else:
+                stop = sweep_high + buffer
+        else:  # Defensive fallback; V11_SL_MODE is normalized above.
+            stop = sweep_low - buffer if side == "LONG" else sweep_high + buffer
         risk = abs(entry - stop)
         if risk <= 0 or not math.isfinite(risk):
             last_reason = f"{side}: invalid structural stop/risk"
@@ -1005,6 +1016,7 @@ def _v11_empty(
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
         "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
+        "sl_mode": V11_SL_MODE,
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
         "technical_gate_failures": list(side_failures or [reason]),
@@ -1057,16 +1069,22 @@ def analyze_candles(
     cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
+    side_diagnostics: list[dict[str, Any]] = []
     for side in ("LONG", "SHORT"):
         result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
         if result.get("candidate"):
             candidates.append(result)
+            side_diagnostics.append({"side": side, "candidate": True, "primary_failure": None})
         else:
-            failures = result.get("technical_gate_failures") or [result.get("reason") or f"{side}: rejected"]
-            side_failures.extend(str(x) for x in failures[:2])
+            primary = str(result.get("primary_rejection_reason") or result.get("reason") or f"{side}: rejected")
+            side_failures.extend([primary])
+            side_diagnostics.append({"side": side, "candidate": False, "primary_failure": primary})
     if not candidates:
         reasons = side_failures or ["no active V11 value-pullback trigger"]
-        return _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context, side_failures=reasons)
+        result = _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context, side_failures=reasons)
+        result["side_diagnostics"] = side_diagnostics
+        result["primary_rejection_reason"] = side_diagnostics[0]["primary_failure"] if side_diagnostics else reasons[0]
+        return result
     # If both sides somehow qualify, rank by structural setup quality only; this is
     # not an accuracy score and is not used as a threshold.
     chosen = max(candidates, key=lambda x: (float(x["score"]), int(x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"])))
@@ -1149,6 +1167,7 @@ def analyze_candles(
         "risk_ok": geometry_ok, "rr_ok": rr >= V11_MIN_RR, "entry_distance_ok": True,
         "stage_status": stage_status, "stage_failures": stage_failures, "technical_candidate": bool(geometry_ok and rr >= V11_MIN_RR and btc_ok),
         "signal_blocked": False, "rejection_stage": None, "technical_gate_failures": [], "diagnostic_failures": [],
+        "side_diagnostics": side_diagnostics, "primary_rejection_reason": None,
         "reasons": reasons,
         "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr, "rr_gross": rr_gross,
         "sl_atr": risk / float(chosen["atr_4h"]) if chosen["atr_4h"] > 0 else 0.0,
@@ -1164,7 +1183,13 @@ def analyze_candles(
         "target_path_reason": (chosen.get("target_path") or {}).get("reason") or target_reason,
         "target_path_obstacles": (chosen.get("target_path") or {}).get("obstacles") or [],
         "target_timeframe": target_tf, "target_levels": [chosen["target"]],
-        "blocking_level": None, "stop_source": "4H-impulse-origin structural invalidation + volatility buffer",
+        "blocking_level": None,
+        "stop_source": (
+            "4H impulse-origin structural invalidation + volatility buffer"
+            if V11_SL_MODE == "4H_ORIGIN"
+            else "liquidity-sweep structural invalidation + volatility buffer"
+        ),
+        "sl_mode": V11_SL_MODE,
         "geometry_reason": "OK", "entry_limit_price": None, "limit_entry_expiry_minutes": 0,
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],

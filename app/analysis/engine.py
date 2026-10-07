@@ -885,13 +885,19 @@ def _v11_analyze_side(
         entry = float(c1[-1]["close"])
         atr4 = max(_safe_atr(c4), float(impulse["atr"]))
         atr1 = _safe_atr(c1)
-        sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
-        sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
+        # SL geometry fix:
+        # The trade thesis is a 4H impulse/value-pullback. The old implementation
+        # anchored the stop to the local 1H sweep wick, which can be taken out by
+        # normal 4H retracement noise while the 4H structure remains valid.
+        # Keep the existing volatility buffer unchanged so this experiment isolates
+        # the anchor change only.
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
         if side == "LONG":
-            stop = sweep_low - buffer
+            # 4H bullish impulse becomes structurally invalid only below its origin.
+            stop = float(impulse["low"]) - buffer
         else:
-            stop = sweep_high + buffer
+            # 4H bearish impulse becomes structurally invalid only above its origin.
+            stop = float(impulse["high"]) + buffer
         risk = abs(entry - stop)
         if risk <= 0 or not math.isfinite(risk):
             last_reason = f"{side}: invalid structural stop/risk"
@@ -1158,7 +1164,7 @@ def analyze_candles(
         "target_path_reason": (chosen.get("target_path") or {}).get("reason") or target_reason,
         "target_path_obstacles": (chosen.get("target_path") or {}).get("obstacles") or [],
         "target_timeframe": target_tf, "target_levels": [chosen["target"]],
-        "blocking_level": None, "stop_source": "liquidity-sweep structural invalidation + volatility buffer",
+        "blocking_level": None, "stop_source": "4H-impulse-origin structural invalidation + volatility buffer",
         "geometry_reason": "OK", "entry_limit_price": None, "limit_entry_expiry_minutes": 0,
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],

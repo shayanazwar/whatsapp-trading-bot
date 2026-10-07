@@ -29,6 +29,8 @@ class BacktestSummary:
     expired: int
     win_rate: float | None
     avg_planned_rr: float | None
+    avg_signal_rr: float | None
+    avg_actual_fill_rr: float | None
     avg_realized_r: float | None
     total_r: float
     expectancy_r: float | None
@@ -69,7 +71,17 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
     positive = sum(v for v in values if v > 0)
     negative = abs(sum(v for v in values if v < 0))
     pf = positive / negative if negative > 0 else (float("inf") if positive > 0 else None)
-    planned = [abs(float(t.tp1) - float(t.entry)) / abs(float(t.entry) - float(t.stop_loss)) for t in ordered if abs(float(t.entry) - float(t.stop_loss)) > 0]
+    signal_rr = [
+        abs(float(t.tp1) - float(getattr(t, "signal_entry", t.entry)))
+        / abs(float(getattr(t, "signal_entry", t.entry)) - float(t.stop_loss))
+        for t in ordered
+        if abs(float(getattr(t, "signal_entry", t.entry)) - float(t.stop_loss)) > 0
+    ]
+    actual_fill_rr = [
+        float(getattr(t, "actual_fill_rr", t.planned_rr))
+        for t in ordered
+        if math.isfinite(float(getattr(t, "actual_fill_rr", t.planned_rr)))
+    ]
     diagnostics_out = dict(diagnostics or {})
     diagnostics_out.setdefault("SIGNALS", len(ordered))
     diagnostics_out.setdefault("RESOLVED", len(resolved))
@@ -98,7 +110,9 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         sl_hits=losses,
         expired=expired,
         win_rate=(100.0 * wins / (wins + losses)) if wins + losses else None,
-        avg_planned_rr=mean(planned) if planned else None,
+        avg_planned_rr=mean(actual_fill_rr) if actual_fill_rr else None,
+        avg_signal_rr=mean(signal_rr) if signal_rr else None,
+        avg_actual_fill_rr=mean(actual_fill_rr) if actual_fill_rr else None,
         avg_realized_r=mean(values) if values else None,
         total_r=sum(values),
         expectancy_r=mean(values) if values else None,
@@ -138,7 +152,8 @@ def format_report(summary: BacktestSummary) -> str:
         f"⌛ Expired: {summary.expired}",
         "",
         f"📈 Win Rate: {_fmt(summary.win_rate, 1, '%')}",
-        f"⚖️ Avg Planned RR: {_fmt(summary.avg_planned_rr)}",
+        f"⚖️ Avg Signal RR (close): {_fmt(summary.avg_signal_rr)}",
+        f"⚖️ Avg Fill RR (gross): {_fmt(summary.avg_actual_fill_rr or summary.avg_planned_rr)}",
         f"💰 Avg Realized R: {_fmt(summary.avg_realized_r)}R",
         f"💰 Total R: {summary.total_r:+.2f}R",
         f"📊 Expectancy: {_fmt(summary.expectancy_r)}R/trade",

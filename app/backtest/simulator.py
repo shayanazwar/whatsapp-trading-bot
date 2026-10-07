@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping
 
 
 ONE_HOUR_MS = 3_600_000
-DEFAULT_FEE_RATE = 0.0004
+DEFAULT_FEE_RATE = 0.0006
 DEFAULT_SLIPPAGE_BPS = 2.0
 DEFAULT_MAX_HOLDING_MINUTES = 72 * 60
 DEFAULT_SAME_BAR_RULE = "SL_FIRST"
@@ -24,12 +24,15 @@ class SimulatedTrade:
     tp1: float
     tp2: float
     planned_rr: float
+    signal_entry: float
+    actual_fill_rr: float
     tp1_hit: bool
     tp2_hit: bool
     sl_hit: bool
     outcome: str
     r_multiple: float | None
     exit_time_ms: int | None
+    funding_cost: float = 0.0
     hold_minutes: float | None = None
     fees_r: float = 0.0
     slippage_r: float = 0.0
@@ -189,6 +192,7 @@ def simulate_trade(
     signal_close_time_ms: int,
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    funding_cost_pct: float = 0.0,
     max_holding_minutes: float | None = None,
     same_bar_rule: str | None = None,
 ) -> SimulatedTrade | None:
@@ -238,6 +242,7 @@ def simulate_trade(
         )
         fee_rate = max(0.0, float(fee_rate))
         slippage_bps = max(0.0, float(slippage_bps))
+        funding_cost_pct = max(0.0, float(funding_cost_pct))
     except (TypeError, ValueError, OverflowError):
         return None
     if not isfinite(max_hold) or max_hold <= 0:
@@ -258,6 +263,7 @@ def simulate_trade(
     realized_pnl = 0.0
     gross_pnl = 0.0
     exit_fees = 0.0
+    funding_cost = 0.0
     slippage_cash = 0.0
     tp_hit = sl_hit = False
     final_exec: float | None = None
@@ -294,13 +300,19 @@ def simulate_trade(
         if net_r is not None and not isfinite(net_r):
             net_r = None
         denominator = initial_risk_cash if initial_risk_cash > 0 else 0.0
-        fees_r = (entry_fee + exit_fees) / denominator if denominator else 0.0
+        fees_r = (entry_fee + exit_fees + funding_cost) / denominator if denominator else 0.0
         slip_r = slippage_cash / denominator if denominator else 0.0
-        planned_rr = abs(tp - entry) / planned_risk if planned_risk > 0 else 0.0
+        signal_rr = abs(tp - entry) / planned_risk if planned_risk > 0 else 0.0
+        actual_fill_rr = (
+            abs(tp - entry_exec) / abs(entry_exec - stop)
+            if entry_exec is not None and abs(entry_exec - stop) > 0
+            else 0.0
+        )
         return SimulatedTrade(
             symbol=symbol, side=side, signal_time_ms=signal_time, entry=entry,
-            stop_loss=stop, tp1=tp, tp2=tp, planned_rr=planned_rr,
-            tp1_hit=tp_hit, tp2_hit=tp_hit, sl_hit=sl_hit, outcome=outcome,
+            stop_loss=stop, tp1=tp, tp2=tp, planned_rr=actual_fill_rr,
+            signal_entry=entry, actual_fill_rr=actual_fill_rr,
+            funding_cost=funding_cost, tp1_hit=tp_hit, tp2_hit=tp_hit, sl_hit=sl_hit, outcome=outcome,
             r_multiple=net_r, exit_time_ms=ts, hold_minutes=hold, fees_r=fees_r,
             slippage_r=slip_r, entry_execution=entry_exec, exit_execution=final_exec,
             expired=expired, regime=str(signal.get("regime") or signal.get("trend_4h") or "UNKNOWN"),
@@ -334,7 +346,7 @@ def simulate_trade(
         # the requested limit. If not filled within the expiry window, the order dies.
         if entry_exec is None:
             if entry_mode == "LIMIT":
-                if timestamp > limit_expiry_ts:
+                if timestamp >= limit_expiry_ts:
                     return None
                 if limit_price is None or not isfinite(limit_price) or limit_price <= 0:
                     return None
@@ -362,7 +374,8 @@ def simulate_trade(
             if risk_exec <= 0 or initial_risk_cash <= 0 or not isfinite(initial_risk_cash):
                 return None
             entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
-            realized_pnl = -entry_fee
+            funding_cost = abs(entry_exec) * initial_size * contract_size * funding_cost_pct
+            realized_pnl = -entry_fee - funding_cost
             slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
             # A passive limit can fill at an unknown point inside the candle.
             # Do not evaluate that same candle's full high/low after the fill,
@@ -372,7 +385,7 @@ def simulate_trade(
                 previous_close_time = close_time
                 continue
 
-        if entry_exec is None and close_time > expiry_ts:
+        if close_time > expiry_ts:
             if previous_close is None or previous_close_time is None:
                 previous_close = close
                 previous_close_time = close_time

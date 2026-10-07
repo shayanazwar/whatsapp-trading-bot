@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Causal MEXC Futures backtest runner for the V10 Breakout + Retest swing engine.
+"""Causal MEXC Futures backtest runner for the V11 swing engine.
 
 Authoritative analysis timeframes:
     1D -> 12H -> 4H -> 1H
@@ -8,7 +8,7 @@ Authoritative analysis timeframes:
 This runner deliberately does not fetch, build, analyze, or simulate with:
     any lower timeframe beyond the four authoritative frames.
 
-The runner is designed to match app/analysis/engine.py / gold-v10-breakout-retest-architecture:
+The runner is designed to match V11 value-pullback engine:
 - 12H is synthesized once from completed 4H candles using the engine helper.
 - MEXC timestamps are canonicalized to milliseconds at ingestion.
 - 1H candle closes are the only decision points.
@@ -18,8 +18,8 @@ The runner is designed to match app/analysis/engine.py / gold-v10-breakout-retes
   engine itself decides whether BTC would block a side.
 - Backtest execution is simulated on 1H candles because the authoritative
   strategy no longer uses any lower-timeframe execution data.
-- Technical rejection accounting records exactly one FIRST_FAILURE stage while
-  retaining the complete list of technical gate failures for forensic analysis.
+- Historical acceptance uses the same fixed conservative round-trip cost
+  allowance as live validation; instantaneous funding quotes never mutate RR.
 """
 
 import asyncio
@@ -73,7 +73,7 @@ WARMUP_1H = 20 * ONE_DAY_MS
 FETCH_TIMEOUT_SECONDS = 180
 HEARTBEAT_INTERVAL_SECONDS = 30
 
-SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 60, 90}
+SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 60, 90, 180, 365}
 
 
 # ============================================================
@@ -374,7 +374,7 @@ def simulate_trade_1h(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
 ) -> SimulatedTrade | None:
-    """Single authoritative 1H paper simulator used by the V9.2 Runner."""
+    """Single authoritative 1H paper simulator used by the V11 Runner."""
     return simulate_trade(
         signal,
         future_candles,
@@ -390,7 +390,7 @@ def simulate_trade_1h(
 # ============================================================
 
 class BacktestRunner:
-    """Causal paper backtester for the V9.2 1D/12H/4H/1H engine."""
+    """Causal paper backtester for the V11 1D/12H/4H/1H engine."""
 
     def __init__(
         self,
@@ -491,22 +491,6 @@ class BacktestRunner:
                     btc4,
                     btc1,
                 )
-            except TypeError:
-                # Compatibility with an older deployed helper. The V9.2
-                # engine does not use this branch.
-                try:
-                    cache[signal_close_ms] = build_btc_context(
-                        btc1d,
-                        None,
-                        btc4,
-                        btc1,
-                    )
-                except Exception:
-                    LOGGER.exception(
-                        "BACKTEST BTC_CONTEXT_ERROR | signal_close_ms=%s",
-                        signal_close_ms,
-                    )
-                    cache[signal_close_ms] = None
             except Exception:
                 LOGGER.exception(
                     "BACKTEST BTC_CONTEXT_ERROR | signal_close_ms=%s",
@@ -608,7 +592,7 @@ class BacktestRunner:
                     c1,
                     now_ms=signal_close_ms,
                     btc_context=btc_context,
-                    estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+                    estimated_round_trip_cost_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", getattr(self.settings, "estimated_round_trip_cost_pct", 0.0018))),
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -652,14 +636,10 @@ class BacktestRunner:
 
             if not analysis.get("technical_candidate"):
                 inc("TECHNICAL_REJECT")
-                failures = list(analysis.get("technical_gate_failures") or [])
-                first_failure = str(
-                    analysis.get("first_failure")
-                    or analysis.get("rejection_stage")
-                    or (failures[0] if failures else "TECHNICAL_CANDIDATE")
-                )
-                inc(f"FIRST_FAILURE_{first_failure.upper().replace(' ', '_').replace(':', '').replace('/', '_').replace('-', '_')}")
-                for failure in failures:
+                failures = analysis.get("technical_gate_failures") or [
+                    analysis.get("rejection_stage") or "technical_candidate"
+                ]
+                for failure in failures[:8]:
                     key = (
                         "REJECT_"
                         + str(failure)
@@ -667,13 +647,11 @@ class BacktestRunner:
                         .replace(" ", "_")
                         .replace(":", "")
                         .replace("/", "_")
-                        .replace("-", "_")
                     )
                     inc(key)
                 continue
 
             inc("TECHNICAL_ACCEPT")
-            inc("FIRST_FAILURE_NONE")
 
             side = str(
                 analysis.get("setup")
@@ -686,16 +664,12 @@ class BacktestRunner:
 
             inc(f"FULL_ENGINE_ACCEPT_{side}")
 
-            bos_level = (
-                analysis.get("long_bos_level")
-                if side == "LONG"
-                else analysis.get("short_bos_level")
-            )
             structure_key = (
                 side,
-                analysis.get("setup_bos_time"),
-                bos_level,
-                analysis.get("setup_retest_1h_time") or analysis.get("setup_retest_time"),
+                analysis.get("setup_impulse_high_time"),
+                analysis.get("setup_impulse_low_time"),
+                analysis.get("swept_level_1h"),
+                analysis.get("reclaim_time_1h") or analysis.get("setup_retest_1h_time"),
             )
             if structure_key in seen_structures:
                 inc("DUPLICATE_STRUCTURE_SKIPPED")
@@ -753,6 +727,7 @@ class BacktestRunner:
                     signal_close_time_ms=signal_close_ms,
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
+                    funding_cost_pct=float(getattr(self.settings, "estimated_funding_cost_pct", 0.0002)),
                     max_holding_minutes=max_hold,
                 )
             except Exception as exc:
@@ -869,12 +844,12 @@ class BacktestRunner:
             )
 
     async def run(self, days: int) -> BacktestSummary:
-        """Run a complete 1D/7D/30D/60D/90D causal paper backtest."""
+        """Run a complete 1D/7D/30D/60D/90D/180D/365D causal paper backtest."""
 
         days = int(days)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
-                "Supported backtests: 1D, 7D, 30D, 60D, 90D"
+                "Supported backtests: 1D, 7D, 30D, 60D, 90D, 180D, 365D"
             )
 
         if self._running or self._run_lock.locked():

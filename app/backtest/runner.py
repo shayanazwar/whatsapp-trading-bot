@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Causal MEXC Futures backtest runner for the V9.2 swing engine.
+"""Causal MEXC Futures backtest runner for the V10 Breakout + Retest swing engine.
 
 Authoritative analysis timeframes:
     1D -> 12H -> 4H -> 1H
@@ -8,7 +8,7 @@ Authoritative analysis timeframes:
 This runner deliberately does not fetch, build, analyze, or simulate with:
     any lower timeframe beyond the four authoritative frames.
 
-The runner is designed to match ENGINE_FIXED.py / gold-v9.2-accuracy-geometry:
+The runner is designed to match app/analysis/engine.py / gold-v10-breakout-retest-architecture:
 - 12H is synthesized once from completed 4H candles using the engine helper.
 - MEXC timestamps are canonicalized to milliseconds at ingestion.
 - 1H candle closes are the only decision points.
@@ -18,6 +18,8 @@ The runner is designed to match ENGINE_FIXED.py / gold-v9.2-accuracy-geometry:
   engine itself decides whether BTC would block a side.
 - Backtest execution is simulated on 1H candles because the authoritative
   strategy no longer uses any lower-timeframe execution data.
+- Technical rejection accounting records exactly one FIRST_FAILURE stage while
+  retaining the complete list of technical gate failures for forensic analysis.
 """
 
 import asyncio
@@ -650,10 +652,14 @@ class BacktestRunner:
 
             if not analysis.get("technical_candidate"):
                 inc("TECHNICAL_REJECT")
-                failures = analysis.get("technical_gate_failures") or [
-                    analysis.get("rejection_stage") or "technical_candidate"
-                ]
-                for failure in failures[:8]:
+                failures = list(analysis.get("technical_gate_failures") or [])
+                first_failure = str(
+                    analysis.get("first_failure")
+                    or analysis.get("rejection_stage")
+                    or (failures[0] if failures else "TECHNICAL_CANDIDATE")
+                )
+                inc(f"FIRST_FAILURE_{first_failure.upper().replace(' ', '_').replace(':', '').replace('/', '_').replace('-', '_')}")
+                for failure in failures:
                     key = (
                         "REJECT_"
                         + str(failure)
@@ -661,11 +667,13 @@ class BacktestRunner:
                         .replace(" ", "_")
                         .replace(":", "")
                         .replace("/", "_")
+                        .replace("-", "_")
                     )
                     inc(key)
                 continue
 
             inc("TECHNICAL_ACCEPT")
+            inc("FIRST_FAILURE_NONE")
 
             side = str(
                 analysis.get("setup")

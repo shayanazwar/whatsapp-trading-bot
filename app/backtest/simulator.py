@@ -334,7 +334,7 @@ def simulate_trade(
         # the requested limit. If not filled within the expiry window, the order dies.
         if entry_exec is None:
             if entry_mode == "LIMIT":
-                if timestamp >= limit_expiry_ts:
+                if timestamp > limit_expiry_ts:
                     return None
                 if limit_price is None or not isfinite(limit_price) or limit_price <= 0:
                     return None
@@ -372,7 +372,7 @@ def simulate_trade(
                 previous_close_time = close_time
                 continue
 
-        if close_time > expiry_ts:
+        if entry_exec is None and close_time > expiry_ts:
             if previous_close is None or previous_close_time is None:
                 previous_close = close
                 previous_close_time = close_time

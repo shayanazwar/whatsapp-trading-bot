@@ -1,14 +1,22 @@
-TEST VERIFICATION
-Date: 2026-09-28
+V11 LOCAL TEST VERIFICATION
+Date: 2026-10-07
 
-pytest -q: 38 passed
-python -m compileall -q app tests: OK
+pytest -q: 84 passed, 2 skipped
+python -m compileall -q app tests: PASS
+FastAPI import: PASS
 
-Included regression coverage:
-- MEXC client parsing/signing
-- bounded MEXC rate-limit retry/backoff
-- scanner concurrency cap
-- live scanner staged 4H/1H/15M -> 5M/1D fetching
-- backtest closed-candle look-ahead protection
-- backtest feature/integration behavior
-- signal/risk/execution gates
+Skipped tests are explicitly legacy V10-only compatibility fixtures and are outside the V11 pytest release path.
+
+V11 regression coverage includes:
+- strict 1D / 12H / 4H / 1H timeframe contract
+- causal 12H synthesis from completed 4H candles
+- strict 1H sweep -> subsequent reclaim for LONG and SHORT
+- strict HH/HL and LH/LL 4H continuation sequencing
+- real target-path blocker detection
+- nearest structural target symmetry, including SHORT
+- next-1H-open market execution model
+- shared fee/slippage/funding cost model
+- actual fill RR reporting separate from signal-close RR
+- live signal freshness boundary
+- no lower-timeframe support in active app code
+- duplicate/legacy V10 strategy helper removal

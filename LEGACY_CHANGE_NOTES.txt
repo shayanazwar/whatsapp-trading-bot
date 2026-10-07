@@ -1,0 +1,23 @@
+MEXC ENGINE V8.1 — OVER-FILTERING CORRECTION
+
+This patch corrects the V8 over-tightening that produced zero signals.
+
+Changed in app/analysis/engine.py:
+- 4H BOS strength floor restored from 0.60 to 0.50.
+- 4H retest quality restored to the prior non-zero base scoring while keeping BOS invalidation.
+- Retest invalidation tolerance widened to 0.35 ATR(4H).
+- 1H trigger remains tied to the latest closed 1H candle, but confirms the already-established 4H retest instead of requiring a second 1H touch + wick rejection.
+- Added a modest post-retest continuation confirmation path.
+- 1H trigger body minimum reduced to 0.25 (from V8's 0.40) to avoid eliminating ordinary confirmation candles.
+- Entry-distance cap relaxed from 0.60 ATR(4H) to 1.25 ATR(4H).
+- Target-path selection restored to the prior 1D/12H/4H structural target logic so V8 does not reject nearly every setup because the nearest HTF level is below 2R.
+- Score threshold, MIN_RR=2.0, HTF direction hierarchy, timeframes, causal 12H aggregation, simulator, and integrations are unchanged.
+
+Validation:
+- 73/73 tests passed.
+- Python compile check passed.
+
+Important: The purpose of this patch is to remove the accidental V8 over-filtering. It does not claim profitability. Run the next 7D backtest and compare TP/SL/expiry, Total R, Expectancy and Profit Factor.
+
+
+> **LEGACY / HISTORICAL DOCUMENT** — This file describes an earlier V8 patch and is not authoritative for V11. See `V11_STRATEGY_SPEC.md`.

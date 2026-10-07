@@ -1,0 +1,71 @@
+Pak Trading Academy — MEXC Gold v1.3 replacement manifest
+
+REPLACE THESE FILES:
+app/analysis/engine.py
+app/automation/scanner.py
+app/automation/setup_filter.py
+app/automation/signal_validator.py
+app/automation/signal_manager.py
+app/automation/scheduler.py
+app/automation/mexc_client.py
+app/automation/executor.py
+app/automation/universe.py
+app/config.py
+app/database.py
+app/bot.py
+app/main.py
+.env.example
+tests/test_automation.py
+
+OPTIONAL DOCS INCLUDED:
+FINAL_CODE_AUDIT.md
+PROJECT_STATE.md
+REPLACEMENT_MANIFEST.txt
+
+VERIFICATION:
+pytest -q -> 17 passed
+python -m compileall -q app tests -> OK
+
+LIVE TRADING:
+AUTO_TRADE_ENABLED=false
+ALLOW_LIVE_EXECUTION=false
+LIVE_IMPLEMENTED=false
+
+
+FINALIZED PERFORMANCE REPLACEMENTS — 2026-09-28
+
+REPLACE:
+app/backtest/runner.py
+app/analysis/engine.py
+tests/test_backtest_feature.py
+PROJECT_STATE.md
+FINAL_CODE_AUDIT.md
+REPLACEMENT_MANIFEST.txt
+
+KEY FIXES:
+- Backtest concurrency cap 4.
+- Closed-candle look-ahead correction.
+- Efficient 15M candidate indexing.
+- LONG/SHORT candidate preservation.
+- Cached 4H/1H prefilter.
+- Exact 15M entry-confirmation prefilter.
+- Single BOS computation per side per full analysis.
+- Backtest timing instrumentation.
+
+VERIFICATION:
+pytest -q -> 35 passed
+python -m compileall -q app tests -> OK
+
+IMPORTANT:
+4_USDT is a legitimate MEXC Futures contract and is intentionally NOT blacklisted.
+Live trading remains disabled.
+
+Final combined hardening package (2026-09-28):
+- app/automation/mexc_client.py — shared MEXC public REST throttle, bounded backoff/retry, jitter, Retry-After support.
+- app/automation/scanner.py — concurrency cap 4 + staged 4H/1H/15M technical prefilter before 5M/1D fetches.
+- app/config.py — configurable rate-limit controls, scan concurrency default 4.
+- tests/test_automation.py — rate-limit retry regression coverage.
+- .env.example — rate-limit environment controls.
+
+
+> **LEGACY / HISTORICAL DOCUMENT** — This file is retained for history only and is **not authoritative for V11**. The active V11 strategy uses only 1D / 12H / 4H / 1H and the current implementation is defined by `V11_STRATEGY_SPEC.md`.

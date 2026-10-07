@@ -1,0 +1,40 @@
+Pak Trading Academy — MEXC public API rate-limit replacement
+Date: 2026-09-28
+
+REPLACE THESE PATHS FROM THE REPOSITORY ROOT
+
+app/automation/mexc_client.py
+app/automation/scanner.py
+app/config.py
+tests/test_automation.py
+.env.example
+PROJECT_STATE.md
+FINAL_CODE_AUDIT.md
+
+WHAT THIS FIX DOES
+
+1. Paces every public MEXC REST request through one shared limiter.
+2. Defaults to 0.20 seconds between request starts and 8 requests per 2 seconds.
+3. Detects HTTP 418/429/503 and MEXC JSON rate-limit responses.
+4. Uses bounded exponential backoff, Retry-After when provided, and jitter.
+5. Shares the backoff pause across concurrent tasks so retries do not stampede.
+6. Caps scanner symbol concurrency at 4 even when an older SCAN_CONCURRENCY is higher.
+
+IMPORTANT
+
+Do not change these strategy rules for this problem:
+- 4H regime
+- 1H alignment
+- 15M setup/confirmation
+- minimum score 82
+- minimum RR 2.0
+
+Live trading remains disabled.
+
+VERIFICATION
+
+pytest -q -> 37 passed
+python -m compileall -q app tests -> OK
+
+
+> **LEGACY / HISTORICAL DOCUMENT** — This file is retained for history only and is **not authoritative for V11**. The active V11 strategy uses only 1D / 12H / 4H / 1H and the current implementation is defined by `V11_STRATEGY_SPEC.md`.

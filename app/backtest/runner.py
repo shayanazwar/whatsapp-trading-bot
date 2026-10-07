@@ -31,9 +31,13 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from ..analysis.engine import (
+    V11_MAX_TRIGGER_BARS,
+    V11_MIN_IMPULSE_ATR,
+    V11_SHORT_RANGE_RELAXED,
+    V11_SL_MODE,
+    analyze_candles,
     build_btc_context,
     convert_candles,
-    analyze_candles,
     synthesize_12h_from_4h,
 )
 from ..automation.mexc_client import MexcAPIError, MexcClient
@@ -236,12 +240,16 @@ def _period(days: int) -> tuple[int, int]:
         try:
             end_ms = int(raw_end)
         except ValueError as exc:
-            raise ValueError("V11_BACKTEST_END_MS must be an integer Unix timestamp in milliseconds") from exc
+            raise ValueError("V11_BACKTEST_END_MS must be an integer Unix timestamp in seconds or milliseconds") from exc
+        if abs(end_ms) < 100_000_000_000:
+            end_ms *= 1000
         if raw_start:
             try:
                 start_ms = int(raw_start)
             except ValueError as exc:
-                raise ValueError("V11_BACKTEST_START_MS must be an integer Unix timestamp in milliseconds") from exc
+                raise ValueError("V11_BACKTEST_START_MS must be an integer Unix timestamp in seconds or milliseconds") from exc
+            if abs(start_ms) < 100_000_000_000:
+                start_ms *= 1000
         else:
             start_ms = end_ms - int(days) * ONE_DAY_MS
         if start_ms >= end_ms:
@@ -398,6 +406,7 @@ def simulate_trade_1h(
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
+    counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
     """Single authoritative 1H paper simulator used by the V11 Runner."""
     return simulate_trade(
@@ -407,6 +416,7 @@ def simulate_trade_1h(
         fee_rate=float(fee_rate),
         slippage_bps=float(slippage_bps),
         max_holding_minutes=max_holding_minutes,
+        counterfactual_tp_r=counterfactual_tp_r,
     )
 
 
@@ -564,10 +574,20 @@ class BacktestRunner:
         engine_errors = 0
 
         seen_structures: set[tuple[Any, ...]] = set()
+        seen_first_failures: set[tuple[str, str, str]] = set()
         active_until_ms = 0
 
         def inc(key: str, amount: int = 1) -> None:
             diagnostics[key] = diagnostics.get(key, 0) + int(amount)
+
+        counterfactual_tp_r = _safe_number(os.getenv("V11_COUNTERFACTUAL_TP_R"))
+        if counterfactual_tp_r is not None and counterfactual_tp_r <= 0:
+            counterfactual_tp_r = None
+        if counterfactual_tp_r is not None:
+            inc("TP_COUNTERFACTUAL_ENABLED")
+            inc("TP_COUNTERFACTUAL_R_X100", int(round(counterfactual_tp_r * 100)))
+        else:
+            inc("TP_COUNTERFACTUAL_CONTROL")
 
         # Only 1H bars create decisions.
         for row in history.candles_1h:
@@ -695,6 +715,11 @@ class BacktestRunner:
                         .replace("/", "_")
                     )[:160]
                     inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
+                    diag_key = str(side_diag.get("diagnostic_key") or "")
+                    unique_key = (side_name, normalized_first, diag_key)
+                    if unique_key not in seen_first_failures:
+                        seen_first_failures.add(unique_key)
+                        inc(f"UNIQUE_FIRST_FAILURE_{side_name}_{normalized_first}")
 
                 failures = analysis.get("technical_gate_failures") or [
                     analysis.get("rejection_stage") or "technical_candidate"
@@ -723,6 +748,11 @@ class BacktestRunner:
                         reason = str(side_diag.get("primary_failure") or "rejected")
                         normalized_first = (reason.upper().replace(" ", "_").replace(":", "").replace("/", "_"))[:160]
                         inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
+                        diag_key = str(side_diag.get("diagnostic_key") or "")
+                        unique_key = (side_name, normalized_first, diag_key)
+                        if unique_key not in seen_first_failures:
+                            seen_first_failures.add(unique_key)
+                            inc(f"UNIQUE_FIRST_FAILURE_{side_name}_{normalized_first}")
 
             side = str(
                 analysis.get("setup")
@@ -799,6 +829,7 @@ class BacktestRunner:
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
                     max_holding_minutes=max_hold,
+                    counterfactual_tp_r=counterfactual_tp_r,
                 )
             except Exception as exc:
                 simulation_errors += 1
@@ -850,6 +881,10 @@ class BacktestRunner:
         diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int(
             (time.monotonic() - symbol_started) * 1000
         )
+        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
+        diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
+        diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
+        diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
 
         reject_items = [
             (key, int(value))

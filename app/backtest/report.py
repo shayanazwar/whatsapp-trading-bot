@@ -166,7 +166,25 @@ def format_report(summary: BacktestSummary) -> str:
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
     ]
+    cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
+    if cf is not None:
+        lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
     if summary.diagnostics:
+        active_experiments = []
+        sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))
+        impulse_x100 = int(summary.diagnostics.get("V11_MIN_IMPULSE_ATR_X100", 250))
+        trigger_bars = int(summary.diagnostics.get("V11_MAX_TRIGGER_BARS", 6))
+        short_relaxed = int(summary.diagnostics.get("V11_SHORT_RANGE_RELAXED", 0))
+        if sl_origin:
+            active_experiments.append("SL=4H_ORIGIN")
+        if impulse_x100 != 250:
+            active_experiments.append(f"4H_IMPULSE={impulse_x100 / 100.0:.2f}ATR")
+        if trigger_bars != 6:
+            active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
+        if short_relaxed:
+            active_experiments.append("SHORT_RANGE_RELAXED=ON")
+        if active_experiments:
+            lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
         lines.extend(("", "GATE DIAGNOSTICS"))
         important = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))
         lines.extend(f"{key}: {value}" for key, value in important[:20])

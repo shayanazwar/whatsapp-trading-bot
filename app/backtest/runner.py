@@ -21,6 +21,7 @@ The runner is designed to match ENGINE_FIXED.py / gold-v9.2-accuracy-geometry:
 """
 
 import asyncio
+import inspect
 import logging
 import time
 from bisect import bisect_left, bisect_right
@@ -1408,14 +1409,53 @@ class BacktestRunner:
                 state["phase"] = "FINALIZING"
                 trades.sort(key=lambda trade: trade.signal_time_ms)
 
-                summary = summarize(
-                    days=days,
-                    coins_selected=len(symbols),
-                    coins_tested=int(state["tested"]),
-                    data_errors=int(state["data_errors"]),
-                    trades=trades,
-                    diagnostics=diagnostics,
+                # Build the complete current summary payload.  The deployed
+                # report.py may be one of two compatible schema generations:
+                # older builds do not have the four forensic keyword fields,
+                # while newer builds require them.  Detect the active callable
+                # signature rather than allowing an avoidable TypeError to abort
+                # an otherwise completed backtest.
+                rejected_setups = int(
+                    diagnostics.get("TECHNICAL_REJECT", 0)
                 )
+                execution_errors = int(
+                    state.get("engine_errors", 0)
+                    + state.get("simulation_errors", 0)
+                )
+
+                summary_payload = {
+                    "days": days,
+                    "coins_selected": len(symbols),
+                    "coins_tested": int(state["tested"]),
+                    "data_errors": int(state["data_errors"]),
+                    "period_start_ms": int(start_ms),
+                    "period_end_ms": int(end_ms),
+                    "execution_errors": execution_errors,
+                    "rejected_setups": rejected_setups,
+                    "trades": trades,
+                    "diagnostics": diagnostics,
+                }
+
+                try:
+                    summarize_parameters = inspect.signature(summarize).parameters
+                    accepts_kwargs = any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in summarize_parameters.values()
+                    )
+                    if not accepts_kwargs:
+                        summary_payload = {
+                            key: value
+                            for key, value in summary_payload.items()
+                            if key in summarize_parameters
+                        }
+
+                    summary = summarize(**summary_payload)
+                except (TypeError, ValueError) as exc:
+                    LOGGER.exception(
+                        "BACKTEST SUMMARY ERROR | summarize() schema mismatch | reason=%s",
+                        exc,
+                    )
+                    raise
 
                 LOGGER.info(
                     "BACKTEST COMPLETE | days=%d tested=%d/%d signals=%d "

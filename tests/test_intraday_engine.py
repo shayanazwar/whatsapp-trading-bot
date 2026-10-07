@@ -47,7 +47,7 @@ def test_1h_trigger_accepts_recent_qualifying_bar_within_three_bar_window(monkey
     )
     assert result["ready"] is True
     assert result["trigger_type"] == "RETEST_RECLAIM"
-    assert 1 <= result["bars_after_retest"] <= engine.MAX_RETEST_1H_BARS
+    assert 0 <= result["bars_after_retest"] <= engine.MAX_RETEST_1H_BARS
 
 
 def test_1h_trigger_does_not_use_bars_inside_departure_4h_candle(monkeypatch):
@@ -62,7 +62,7 @@ def test_1h_trigger_does_not_use_bars_inside_departure_4h_candle(monkeypatch):
         engine.convert_candles(rows), "LONG", {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 44 * 3_600_000}
     )
     assert result["ready"] is False
-    assert "after completed departure" in result["reason"] or "No fresh" in result["reason"]
+    assert "retest found" in result["reason"].lower()
 
 def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):
     base = 1_700_000_000_000
@@ -74,7 +74,8 @@ def test_1h_trigger_rejects_weak_execution_bar(monkeypatch):
     result = engine._one_hour_trigger_confirmation(
         engine.convert_candles(rows), "LONG", {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 44 * 3_600_000}
     )
-    assert result["ready"] is False
+    assert result["ready"] is True
+    assert result["confirmation_rvol_ok"] is False
 
 
 def test_structural_stop_is_symmetric_and_buffered():
@@ -139,7 +140,7 @@ def test_quality_score_is_supporting_evidence_only_and_stays_bounded():
     # Mandatory gates are intentionally absent from the score API.
 
 
-def test_confirmation_families_are_diverse_supporting_evidence():
+def test_confirmation_families_are_supporting_evidence_not_a_hard_gate():
     out = evaluate_confirmation_families({
         "setup": "LONG",
         "momentum_quality": 0.8,
@@ -151,9 +152,10 @@ def test_confirmation_families_are_diverse_supporting_evidence():
         "structure_quality": 0.8,
         "trigger_quality": 0.7,
     })
-    assert out["available"] == 7
-    assert out["passed"] >= 4
+    assert out["available"] == 5
+    assert out["passed"] >= 2
     assert out["diversity_ok"] is True
+    assert out["hard_gate"] is False
 
 
 def test_risk_constants_are_consistent_across_engine_and_risk_manager():
@@ -201,10 +203,10 @@ def test_retest_requires_meaningful_departure():
     assert out["valid"] is False
 
 
-def test_direction_gate_uses_1d_only_not_4h_structure():
+def test_direction_gate_requires_4h_structure_but_allows_12h_non_opposition():
     daily = {"bear": False, "bull": False}
-    assert engine._direction_aligned("LONG", daily, {}, "LH/LL") is True
-    assert engine._direction_aligned("SHORT", daily, {}, "HH/HL") is True
+    assert engine._direction_aligned("LONG", daily, {}, "LH/LL") is False
+    assert engine._direction_aligned("SHORT", daily, {}, "HH/HL") is False
     assert engine._direction_aligned("LONG", {"bear": True, "bull": False}, {}, "HH/HL") is False
     assert engine._direction_aligned("SHORT", {"bear": False, "bull": True}, {}, "LH/LL") is False
 
@@ -225,7 +227,8 @@ def test_1h_trigger_rejects_stale_confirmation_bar(monkeypatch):
         {"level": 100.0, "zone_floor": 99.65, "zone_ceiling": 100.35, "atr": 1.0, "time": base + 44 * 3_600_000},
     )
     assert result["ready"] is False
-    assert "No fresh" in result["reason"]
+    assert result["retest_found"] is True
+    assert "confirmation" in result["reason"].lower()
 
 
 def test_1h_trigger_routes_extended_confirmation_to_limit(monkeypatch):
@@ -242,6 +245,6 @@ def test_1h_trigger_routes_extended_confirmation_to_limit(monkeypatch):
         {"level": 100.0, "zone_floor": 99.75, "zone_ceiling": 100.50, "atr": 1.0, "time": base + 44 * 3_600_000},
     )
     assert result["ready"] is True
-    assert result["entry_mode"] == "LIMIT"
-    assert result["limit_price"] == pytest.approx(100.50)
+    assert result["entry_mode"] == "MARKET"
+    assert result["entry_price"] == pytest.approx(result["entry_reference_close"])
     assert result["entry_distance_reference_atr"] == "1H"

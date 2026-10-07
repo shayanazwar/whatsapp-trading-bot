@@ -96,6 +96,8 @@ def test_simulator_limit_entry_and_mfe_mae_tracking():
     future = [
         candle(3_600_000, 101.0, 103.0, 100.2, 102.0),
         candle(7_200_000, 102.0, 105.0, 99.8, 103.0),
+        candle(10_800_000, 103.0, 103.5, 99.8, 103.0),
+        candle(14_400_000, 103.0, 104.5, 102.5, 104.5),
     ]
     trade = simulate_trade(signal, future, signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0, max_holding_minutes=180)
     assert trade is not None

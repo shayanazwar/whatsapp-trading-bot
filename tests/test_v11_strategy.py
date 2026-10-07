@@ -1,6 +1,22 @@
 from __future__ import annotations
 
-from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, convert_candles
+import pytest
+
+from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, convert_candles, get_v11_runtime_config
+
+
+@pytest.fixture(autouse=True)
+def _legacy_control_mode(monkeypatch):
+    """Existing fixture tests validate the original V11 control behavior."""
+    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
+    monkeypatch.delenv("V11_SL_MODE", raising=False)
+    monkeypatch.delenv("V11_MAX_TRIGGER_BARS", raising=False)
+    monkeypatch.delenv("V11_MAX_RECLAIM_RECENCY_BARS", raising=False)
+    monkeypatch.delenv("V11_MAX_ENTRY_EXTENSION_ATR", raising=False)
+    monkeypatch.delenv("V11_MAX_TARGET_R", raising=False)
+    monkeypatch.delenv("V11_MAX_RETEST_DEPTH", raising=False)
+    monkeypatch.delenv("V11_REQUIRE_BREAKOUT_QUALITY", raising=False)
+
 
 DAY = 86_400_000
 HOUR = 3_600_000
@@ -185,3 +201,20 @@ def test_v11_liquidity_trigger_reclaim_can_occur_four_bars_after_sweep():
     assert out["ready"] is True
     assert out["sweep_idx"] == 3
     assert out["reclaim_idx"] == 7
+
+
+def test_v11_accuracy_profile_reads_runtime_env(monkeypatch):
+    monkeypatch.setenv("V11_ACCURACY_MODE", "true")
+    monkeypatch.setenv("V11_MIN_IMPULSE_ATR", "500")
+    monkeypatch.setenv("V11_SL_MODE", "4H_ORIGIN")
+    monkeypatch.setenv("V11_MAX_TRIGGER_BARS", "3")
+    monkeypatch.setenv("V11_MAX_RECLAIM_RECENCY_BARS", "2")
+    monkeypatch.setenv("V11_MAX_ENTRY_EXTENSION_ATR", "0.75")
+    monkeypatch.setenv("V11_MAX_TARGET_R", "2.50")
+    cfg = get_v11_runtime_config()
+    assert cfg["min_impulse_atr"] == 500.0
+    assert cfg["sl_mode"] == "4H_ORIGIN"
+    assert cfg["reclaim_max_bars"] == 3
+    assert cfg["reclaim_recency_bars"] == 2
+    assert cfg["max_entry_extension_atr"] == 0.75
+    assert cfg["max_target_r"] == 2.50

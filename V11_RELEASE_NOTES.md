@@ -1,10 +1,10 @@
-# V11 FIXED RELEASE NOTES
+# V11 BALANCED FIXED RELEASE NOTES
 
 ## Build
-`PAK TRADING ACADEMY — MEXC SWING ENGINE V11 FIXED`
+`PAK TRADING ACADEMY — MEXC SWING ENGINE V11 BALANCED FIXED`
 
 ## Strategy
-Trend Pullback / Value Re-entry with 1H Liquidity Sweep → later Reclaim.
+Trend Pullback / Value Re-entry with 1H Liquidity Sweep → later Reclaim, with a balanced 1D macro permission model.
 
 ## Timeframes
 **1D / 12H / 4H / 1H only.** 12H is causally synthesized from three completed 4H candles.
@@ -13,6 +13,11 @@ Trend Pullback / Value Re-entry with 1H Liquidity Sweep → later Reclaim.
 Decision = completed 1H close. Paper fill = next 1H open. Live path = MARKET order reference at the next hourly boundary.
 
 ## Applied forensic fixes
+### V11-balanced over-filtering corrections
+- 1D macro permission uses a directional 3-of-5 vote model (price/EMA200, EMA50/EMA200, 3/3 structure, EMA50 slope, ADX) instead of an all-component hard gate.
+- 1H wick probes no longer invalidate a 4H impulse; only completed 4H closes through the impulse origin invalidate it.
+- 1H reclaim can occur anywhere within the full six-candle window after the sweep.
+
 - Live signal age hard-capped at 5 minutes; stale discoveries are rejected.
 - Scanner reprices the trade to the executable next-open quote and revalidates SL/TP geometry and post-cost RR.
 - Executor order payload is MEXC Futures MARKET (`type=5`) with no `price` field.
@@ -31,7 +36,7 @@ Decision = completed 1H close. Paper fill = next 1H open. Live path = MARKET ord
 `SCANNER_ENABLED=false`, `AUTO_SIGNAL_ENABLED=false`, `AUTO_TRADE_ENABLED=false`, `ALLOW_LIVE_EXECUTION=false`, and `LIVE_IMPLEMENTED=false` remain the safe defaults.
 
 ## Local verification
-- **75 tests passed**
+- **78 tests passed**
 - **0 failed / 0 skipped**
 - Python compilation: PASS
 - FastAPI import: PASS

@@ -1,4 +1,4 @@
-# MEXC SWING ENGINE V11 — STRATEGY SPECIFICATION
+# MEXC SWING ENGINE V11-balanced — STRATEGY SPECIFICATION
 
 ## 1. Purpose
 
@@ -33,18 +33,26 @@ No 5M, 15M, 30M, or hidden lower-timeframe aggregation.
 Multiple candidate 4H impulses may remain eligible. The engine does not rely on V10's latest-only BOS selection.
 
 ## 5. 1D regime
+V11-balanced uses a directional 3-of-5 macro vote rather than an all-components
+hard gate. This restores the more practical V10 macro permission model without
+restoring V10's late BOS/departure/retest entry state machine.
 
-LONG permission:
+LONG permission requires at least 3 bullish votes:
 - close > EMA200
 - EMA50 > EMA200
 - confirmed 3/3 swing structure = HH/HL
+- EMA50 slope > 0
+- ADX >= 14
 
-SHORT permission is the exact inverse:
+SHORT permission requires at least 3 bearish votes:
 - close < EMA200
 - EMA50 < EMA200
-- structure = LH/LL
+- confirmed 3/3 swing structure = LH/LL
+- EMA50 slope < 0
+- ADX >= 14
 
-EMA50 slope is recorded as supporting evidence, not an additional hard gate.
+The selected side must have more macro votes than the opposite side. Exact HH/HL
+or LH/LL structure remains mandatory for the 4H trend-continuation impulse.
 
 ## 6. 12H context
 
@@ -85,7 +93,7 @@ If the corridor and retracement band do not overlap, the retracement band remain
 LONG:
 - price enters value after the impulse high;
 - no completed 4H close below the impulse origin;
-- pullback does not erase the impulse structure.
+- 1H wick probes of the origin are allowed; only completed 4H closes invalidate the impulse.
 
 SHORT is the exact inverse.
 

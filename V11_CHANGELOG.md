@@ -44,3 +44,10 @@ The Claude/GPT/Gemini accuracy, PF and expectancy figures were research projecti
 - Live and backtest post-cost RR use the same deterministic round-trip cost model.
 - Removed obsolete duplicate V10 strategy definitions from the V11 engine.
 - Added 180D and 365D paper-backtest windows.
+
+## V11-balanced over-filtering corrections
+
+- Replaced the all-components 1D macro hard gate with a directional 3-of-5 macro vote model using price vs EMA200, EMA50 vs EMA200, 3/3 structure, EMA50 slope and ADX.
+- Corrected pullback invalidation to rely on completed 4H closes against the 4H impulse origin; 1H wick probes no longer falsely erase the setup.
+- Corrected the liquidity trigger so the reclaim can occur on any subsequent 1H candle within the full six-candle window.
+- Preserved the 1D/12H/4H/1H-only architecture, strict 4H HH/HL or LH/LL impulse structure, structural stop, structural-first target selection, post-cost RR, and next-1H-open MARKET execution.

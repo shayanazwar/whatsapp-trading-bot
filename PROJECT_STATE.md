@@ -1,53 +1,39 @@
-# Project State — Pak Trading Academy WhatsApp Trading Bot
+# PROJECT STATE — V11
 
-## Current architecture
+## Current engine
+**PAK TRADING ACADEMY — MEXC SWING ENGINE V11**
 
-```text
-MEXC Futures Data
-      ↓
-Universe Filter
-      ↓
-1D  → Macro Regime
-      ↓
-12H → Intermediate Bias (causally aggregated from completed 4H candles)
-      ↓
-4H  → Primary Structure / BOS / Retest / S&R
-      ↓
-1H  → Setup / Confirmation / Entry
-      ↓
-Risk → SL / TP / RR
-      ↓
-Final Validator
-      ↓
-Duplicate / Cooldown
-      ↓
-WhatsApp Dispatch
-```
+## Strategy
+Trend Pullback / Value Re-entry with 1H Liquidity Sweep + Reclaim.
 
-## Supported analysis timeframes
+## Timeframes
+**1D / 12H / 4H / 1H only.**
 
-Only `1D`, `12H`, `4H`, and `1H` are valid analysis timeframes. The 12H series is built locally from exactly three contiguous completed 4H candles so no unsupported exchange interval is required.
+No 5M, 15M, 30M or hidden lower-timeframe aggregation.
 
-## Messaging
+## V11 flow
+1. 1D macro trend permission
+2. 12H health / veto
+3. 4H impulse detection
+4. 4H controlled pullback into value
+5. 1H causal liquidity sweep
+6. 1H reclaim
+7. Next 1H open execution
+8. Structural sweep-based SL + ATR buffer
+9. Nearest confirmed HTF structural TP
+10. Post-cost RR >= 1.60
+11. Signal
 
-WhatsApp is the only supported messaging interface. The inbound path is:
+## What changed from V10
+V10's breakout → mandatory departure → retest → reclaim architecture is no longer the production strategy layer. V10 remains the conceptual control/baseline for future comparisons.
 
-`Meta Cloud API → FastAPI webhook → signature check → message extraction → command router → handler → WhatsApp send API`.
+## Research policy
+AI-projected win-rate/PF/expectancy ranges are not treated as expected results. V11 must prove itself with 30D/90D+ and then longer walk-forward tests.
 
-Webhook retries remain retryable when processing fails, while successfully processed message IDs are persisted for idempotency.
-
-## Backtesting
-
-The paper backtester supports `1D` and `7D` runs and uses only completed 1D/12H/4H/1H data. Historical decisions are evaluated at completed 1H closes, and future trade resolution is performed only on later 1H candles. Every run returns a report, including zero-signal runs.
-
-## Risk model
-
-Trade geometry is structural and higher-timeframe oriented. Stops are placed beyond invalidating structure with an ATR-based buffer, targets are anchored to higher-timeframe path/liquidity, and minimum post-cost RR is enforced.
-
-## Operational diagnostics
-
-Scanner logs include aggregate counts for universe, data validation, each approved timeframe, structure, setup, momentum, volume, risk, RR, final signals, duplicates, and errors. WhatsApp dispatch logs include outbound acceptance IDs when Meta accepts a message.
-
-## Deployment
-
-The production container starts `uvicorn app.main:app`. Runtime secrets remain environment variables and are never stored in replacement artifacts.
+## Validation
+- Local active test suite: **75 passed, 0 failed, 0 skipped**.
+- Python compilation: PASS.
+- `app.main` import: PASS.
+- `/health`: PASS.
+- Supported paper-backtest windows: **1D / 7D / 30D / 60D / 90D / 180D / 365D**.
+- Live execution remains disabled until post-fill reconciliation and protective-order verification are implemented.

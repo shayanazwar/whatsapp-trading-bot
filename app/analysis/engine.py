@@ -405,15 +405,59 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
 
 
 # V11 strategy constants. Score is diagnostic only; it is never an acceptance gate.
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        return float(default)
+    return float(value)
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return int(default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+    return value if minimum <= value <= maximum else int(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 V11_MIN_RR = 1.60
-V11_MIN_IMPULSE_ATR = 2.50
+# Controlled threshold experiment. Default preserves the frozen V11 control.
+V11_MIN_IMPULSE_ATR = _env_float(
+    "V11_MIN_IMPULSE_ATR", 2.50, minimum=0.50, maximum=8.00
+)
 # Controlled A/B experiment switch. Default preserves the frozen V11 control.
 # SWEEP = current V11 stop; 4H_ORIGIN = experimental HTF structural stop.
 V11_SL_MODE = str(os.getenv("V11_SL_MODE", "SWEEP")).strip().upper() or "SWEEP"
 if V11_SL_MODE not in {"SWEEP", "4H_ORIGIN"}:
     V11_SL_MODE = "SWEEP"
+# Controlled sweep -> current-reclaim search-window experiment. The final
+# reclaim must still be on the current 1H decision candle; this parameter only
+# controls how far back the causal sweep may be relative to that reclaim.
+V11_MAX_TRIGGER_BARS = _env_int(
+    "V11_MAX_TRIGGER_BARS", 6, minimum=1, maximum=24
+)
+# Controlled SHORT experiment. When enabled, only 1D RANGE structure may
+# bypass the normal daily short permission, and the normal 12H/4H/1H gates
+# remain mandatory. Default is OFF.
+V11_SHORT_RANGE_RELAXED = _env_bool("V11_SHORT_RANGE_RELAXED", False)
+
 V11_SETUP_MAX_4H_BARS = 30
-V11_MAX_TRIGGER_BARS = 6
 V11_STOP_BUFFER_ATR_4H = 0.20
 V11_STOP_BUFFER_ATR_1H = 0.15
 V11_MIN_SL_ATR_SANITY = 0.20
@@ -810,9 +854,20 @@ def _v11_analyze_side(
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
     context = _v11_context_12h(c12, side)
-    direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+    short_range_exception = bool(
+        side == "SHORT"
+        and V11_SHORT_RANGE_RELAXED
+        and str(daily.get("structure") or "").upper() == "RANGE"
+        and str(context.get("structure") or "").upper() == "LH/LL"
+        and not bool(context.get("hostile"))
+    )
+    direction_ok = (
+        bool(daily.get("bull"))
+        if side == "LONG"
+        else bool(daily.get("bear")) or short_range_exception
+    )
 
-    def reject(reason: str) -> dict[str, Any]:
+    def reject(reason: str, diagnostic_key: str | None = None) -> dict[str, Any]:
         return {
             "side": side,
             "direction_ok": direction_ok,
@@ -822,26 +877,34 @@ def _v11_analyze_side(
             "technical_gate_failures": [f"{side}: {reason}"],
             "rejection_stage": "SETUP",
             "primary_rejection_reason": f"{side}: {reason}",
+            "diagnostic_key": diagnostic_key,
         }
 
+    daily_key = f"1D:{int(c1d[-1]['time'])}"
     if not direction_ok:
         return reject(
-            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
+            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})",
+            diagnostic_key=daily_key,
         )
     if context.get("hostile"):
         return reject(
-            f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})"
+            f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})",
+            diagnostic_key=f"12H:{int(c12[-1]['time'])}",
         )
 
     e21_4 = _safe_ema([float(c["close"]) for c in c4], 21)
     e50_4 = _safe_ema([float(c["close"]) for c in c4], 50)
     impulses = _v11_find_impulses(c4, side)
     if not impulses:
-        return reject(f"{side}: no completed 4H HH/HL or LH/LL impulse >= {V11_MIN_IMPULSE_ATR:.2f} ATR")
+        return reject(
+            f"{side}: no completed 4H HH/HL or LH/LL impulse >= {V11_MIN_IMPULSE_ATR:.2f} ATR",
+            diagnostic_key=f"4H:{int(c4[-1]['time'])}",
+        )
 
     last_reason = f"{side}: no active value-pullback trigger"
     for impulse in reversed(impulses):
         impulse_end_idx = int(impulse["high_idx"]) if side == "LONG" else int(impulse["low_idx"])
+        impulse_diag_key = f"IMPULSE:{int(impulse['low_time'])}:{int(impulse['high_time'])}"
         setup_age = len(c4) - 1 - impulse_end_idx
         if setup_age > V11_SETUP_MAX_4H_BARS:
             last_reason = f"{side}: 4H impulse expired ({setup_age} bars > {V11_SETUP_MAX_4H_BARS})"
@@ -988,6 +1051,7 @@ def _v11_analyze_side(
             "value_deep": deep, "value_quality": value_quality, "shock_ok": shock_ok,
             "setup_state": "TRIGGERED", "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
             "technical_gate_failures": [], "rejection_stage": None,
+            "diagnostic_key": impulse_diag_key + f":TRIGGER:{int(trigger.get('trigger_time') or 0)}",
         }
     return {
         "side": side,
@@ -997,6 +1061,7 @@ def _v11_analyze_side(
         "reason": last_reason,
         "technical_gate_failures": [last_reason],
         "rejection_stage": "SETUP",
+        "diagnostic_key": locals().get("impulse_diag_key"),
     }
 
 def _v11_empty(
@@ -1074,11 +1139,11 @@ def analyze_candles(
         result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
         if result.get("candidate"):
             candidates.append(result)
-            side_diagnostics.append({"side": side, "candidate": True, "primary_failure": None})
+            side_diagnostics.append({"side": side, "candidate": True, "primary_failure": None, "diagnostic_key": result.get("diagnostic_key")})
         else:
             primary = str(result.get("primary_rejection_reason") or result.get("reason") or f"{side}: rejected")
             side_failures.extend([primary])
-            side_diagnostics.append({"side": side, "candidate": False, "primary_failure": primary})
+            side_diagnostics.append({"side": side, "candidate": False, "primary_failure": primary, "diagnostic_key": result.get("diagnostic_key")})
     if not candidates:
         reasons = side_failures or ["no active V11 value-pullback trigger"]
         result = _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context, side_failures=reasons)

@@ -132,6 +132,8 @@ def convert_candles(rows: Iterable[Any] | None) -> List[Candle]:
                 continue
             if min(candle["open"], candle["high"], candle["low"], candle["close"]) <= 0:
                 continue
+            if candle["volume"] < 0:
+                continue
             if candle["low"] > candle["high"] or not (candle["low"] <= candle["close"] <= candle["high"]):
                 continue
             output.append(candle)
@@ -143,10 +145,17 @@ def convert_candles(rows: Iterable[Any] | None) -> List[Candle]:
     return [dedup[k] for k in sorted(dedup)]
 
 
+def _coerce_candles(rows: Iterable[Any] | None) -> List[Candle]:
+    """Return normalized Candle objects without reprocessing an already-normalized list."""
+    if isinstance(rows, list) and (not rows or isinstance(rows[0], Candle)):
+        return rows
+    return convert_candles(rows)
+
+
 def closed_candle_rows(candles: Iterable[Any] | None, timeframe_ms: Any, now_ms: Optional[int] = None) -> List[Candle]:
     interval = _timeframe_ms(timeframe_ms)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    source = candles if isinstance(candles, list) and (not candles or isinstance(candles[0], Candle)) else convert_candles(candles)
+    source = _coerce_candles(candles)
     return [c for c in source if int(c["time"]) + interval <= now]
 
 
@@ -592,26 +601,59 @@ def _one_hour_trigger_confirmation(
         # Do not reuse a confirmation if a newer bar invalidated the zone.
         if any((side=="LONG" and float(candles[j]["close"])<zone_floor) or (side=="SHORT" and float(candles[j]["close"])>zone_ceiling) for j in range(conf_idx+1,latest+1)):
             continue
-        confirmation=candles[conf_idx]; close=float(confirmation["close"])
-        if side=="LONG": extension=max(0.0,close-zone_ceiling); zone_edge=zone_ceiling
-        else: extension=max(0.0,zone_floor-close); zone_edge=zone_floor
+        confirmation=candles[conf_idx]
+        confirmation_close=float(confirmation["close"])
+        decision_candle=candles[latest]
+        decision_close=float(decision_candle["close"])
+
+        # A historical confirmation may remain usable for up to
+        # MAX_TRIGGER_BARS_1H, but execution must occur at the current decision
+        # timestamp. Never backtest a later decision using the old confirmation
+        # candle's market price.
+        if conf_idx < latest:
+            current_threshold = 0.10 * atr1
+            if (
+                (side == "LONG" and decision_close < level - current_threshold)
+                or (side == "SHORT" and decision_close > level + current_threshold)
+            ):
+                continue
+            entry_reference_close = decision_close
+        else:
+            entry_reference_close = confirmation_close
+
+        if side=="LONG":
+            extension=max(0.0,entry_reference_close-zone_ceiling)
+            zone_edge=zone_ceiling
+        else:
+            extension=max(0.0,zone_floor-entry_reference_close)
+            zone_edge=zone_floor
+
         distance_atr=extension/atr1 if atr1>0 else float("inf")
         if extension<=1e-12 or distance_atr<=MAX_ENTRY_DISTANCE_ATR:
-            entry_price=close; entry_mode="MARKET"; limit_price=None
+            entry_price=entry_reference_close; entry_mode="MARKET"; limit_price=None
         elif distance_atr<=MAX_LIMIT_ENTRY_DISTANCE_ATR:
             entry_price=zone_edge; entry_mode="LIMIT"; limit_price=zone_edge
-        else: continue
-        closes=[float(c["close"]) for c in candles[:conf_idx+1]]; r=_safe_rsi(closes); rv=_relative_volume(candles[:conf_idx+1])
-        o,h,l=map(float,(confirmation["open"],confirmation["high"],confirmation["low"])); rng=max(h-l,1e-12); body=abs(close-o)/rng
-        loc=(close-l)/rng if side=="LONG" else (h-close)/rng; mom=_clamp(((r-50)/20) if side=="LONG" else ((50-r)/20),0,1)
+        else:
+            continue
+
+        closes=[float(c["close"]) for c in candles[:conf_idx+1]]
+        r=_safe_rsi(closes)
+        rv=_relative_volume(candles[:conf_idx+1])
+        o,h,l=map(float,(confirmation["open"],confirmation["high"],confirmation["low"]))
+        rng=max(h-l,1e-12)
+        body=abs(confirmation_close-o)/rng
+        loc=(confirmation_close-l)/rng if side=="LONG" else (h-confirmation_close)/rng
+        mom=_clamp(((r-50)/20) if side=="LONG" else ((50-r)/20),0,1)
         quality=_clamp(0.40*_clamp(wick_ratio/0.60,0,1)+0.35*_clamp(loc,0,1)+0.15*_clamp(body/0.70,0,1)+0.10*mom,0,1)
         return {"index":conf_idx,"ready":True,"quality":quality,"rsi":r,"rvol":rv,"atr":atr1,"body_ratio":body,"close_location":loc,
-                "candle_time":int(confirmation["time"]),"trigger_type":"RETEST_RECLAIM","reason":"fresh 1H retest zone hold confirmed",
+                "candle_time":int(confirmation["time"]),"decision_candle_time":int(decision_candle["time"]),
+                "trigger_type":"RETEST_RECLAIM","reason":"fresh 1H retest zone hold confirmed",
                 "bars_after_retest":conf_idx-touch_idx,"touched_level":True,"rejection_wick_ratio":wick_ratio,
                 "previous_high":float(candles[max(0,conf_idx-1)]["high"]),"previous_low":float(candles[max(0,conf_idx-1)]["low"]),
                 "entry_price":entry_price,"entry_mode":entry_mode,"limit_price":limit_price,"zone_floor":zone_floor,"zone_ceiling":zone_ceiling,
-                "retest_low_1h":low,"retest_high_1h":high,"confirmation_index":conf_idx,"entry_reference_close":close,
+                "retest_low_1h":low,"retest_high_1h":high,"confirmation_index":conf_idx,"entry_reference_close":entry_reference_close,
                 "entry_distance_atr":distance_atr,"entry_distance_reference_atr":"1H"}
+
     empty["reason"]="No fresh 1H retest confirmation within window"; return empty
 
 
@@ -697,16 +739,13 @@ def _target_path(frames: Iterable[tuple[str, list[Candle]]], side: str, entry: f
     out["target_levels"] = major_1d + major_12h
     out["friction_levels"] = friction_4h
 
-    # Treat 12H/1D as major targets and 4H/1H as friction. Prefer the nearest
-    # fresh major level that naturally provides the required RR. This allows a
-    # nearer 12H structure to be the terminal target when it is viable, while a
-    # farther 1D level may legitimately become terminal when the 12H level is too
-    # close to provide the required geometry.
-    major_candidates = []
-    if major_12h:
-        major_candidates.append(major_12h[0])
-    if major_1d:
-        major_candidates.append(major_1d[0])
+    # Treat 12H/1D as major targets and 4H/1H as friction. Evaluate all
+    # fresh major candidates in nearest-first order. A farther structurally
+    # justified target is allowed when nearer major structure cannot satisfy
+    # post-cost RR; RR is never manufactured by jumping directly to the furthest
+    # level.
+    major_candidates = list(major_12h) + list(major_1d)
+
     if not major_candidates:
         out["reason"] = "no fresh major 1D/12H opposing structure"
         return out
@@ -716,20 +755,22 @@ def _target_path(frames: Iterable[tuple[str, list[Candle]]], side: str, entry: f
         return (lp - entry) if side == "LONG" else (entry - lp)
 
     major_candidates.sort(key=target_distance)
+    cost_pct = 0.0015
+    cost = entry * cost_pct
+
     for candidate_index, terminal in enumerate(major_candidates):
         level_price = _num(terminal.get("price"))
         tp = level_price - 0.15 * atr_value if side == "LONG" else level_price + 0.15 * atr_value
         reward = (tp - entry) if side == "LONG" else (entry - tp)
         if reward <= 0:
             continue
-        cost_pct = 0.0015
-        cost = entry * cost_pct
+
         gross_rr = reward / risk
         net_rr = max(0.0, reward - cost) / (risk + cost)
         if net_rr + 1e-12 < MIN_RR:
             continue
-        other_major = [x for x in major_candidates if x is not terminal]
-        intermediates = other_major + major_1d[1:] + major_12h[1:]
+
+        intermediates = major_candidates[:candidate_index]
         out.update({
             "ok": True,
             "structural": True,
@@ -737,7 +778,7 @@ def _target_path(frames: Iterable[tuple[str, list[Candle]]], side: str, entry: f
             "target_timeframe": terminal.get("timeframe"),
             "target_level": terminal,
             "intermediate_major_levels": intermediates[:20],
-            "blocking_level": other_major[0] if other_major else (friction_4h[0] if friction_4h else None),
+            "blocking_level": intermediates[0] if intermediates else (friction_4h[0] if friction_4h else None),
             "natural_rr": net_rr,
             "gross_rr": gross_rr,
             "reason": f"fresh {terminal.get('timeframe')} terminal target satisfies post-cost RR",
@@ -748,7 +789,7 @@ def _target_path(frames: Iterable[tuple[str, list[Candle]]], side: str, entry: f
     lp = _num(nearest.get("price"))
     tp = lp - 0.15 * atr_value if side == "LONG" else lp + 0.15 * atr_value
     reward = (tp - entry) if side == "LONG" else (entry - tp)
-    net_rr = max(0.0, reward - entry * 0.0015) / (risk + entry * 0.0015)
+    net_rr = max(0.0, reward - cost) / (risk + cost)
     out.update({
         "target_timeframe": nearest.get("timeframe"),
         "target_level": nearest,
@@ -807,11 +848,11 @@ def calculate_trade_levels(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _direction_aligned(side: str, daily: dict[str, Any], bias: dict[str, Any], primary_structure: str, bos: Optional[dict[str, Any]] = None) -> bool:
-    """Use 1D only as the macro permission boundary; 4H BOS defines setup side."""
+    """Require 1D and 12H to be non-opposing; the 4H BOS defines setup side."""
     if side == "LONG":
-        return not bool(daily.get("bear"))
+        return not bool(daily.get("bear")) and not bool(bias.get("bear"))
     if side == "SHORT":
-        return not bool(daily.get("bull"))
+        return not bool(daily.get("bull")) and not bool(bias.get("bull"))
     return False
 
 def _shock_veto(candles: list[Candle], side: str, atr_value: float) -> tuple[bool, str]:
@@ -881,8 +922,8 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
 
 def build_btc_context(candles_1d: list, candles_12h: list | None, candles_4h: list, candles_1h: list | None = None) -> dict[str, Any]:
     try:
-        daily = _macro_regime(convert_candles(candles_1d))
-        c4 = convert_candles(candles_4h)
+        daily = _macro_regime(_coerce_candles(candles_1d))
+        c4 = _coerce_candles(candles_4h)
         a4 = _safe_atr(c4)
         structure_4h = _structure_from_swings(*_swing_points(c4))
         e50_4h = _safe_ema([float(c["close"]) for c in c4], 50)
@@ -891,7 +932,7 @@ def build_btc_context(candles_1d: list, candles_12h: list | None, candles_4h: li
         bear_4h = bool(e50_4h is not None and last_close < e50_4h and structure_4h != "HH/HL")
         move4 = (last_close - float(c4[-2]["close"])) / a4 if len(c4) >= 2 and a4 > 0 else 0.0
         move1 = 0.0
-        c1 = convert_candles(candles_1h or [])
+        c1 = _coerce_candles(candles_1h or [])
         if len(c1) >= 2:
             a1 = _safe_atr(c1)
             move1 = (float(c1[-1]["close"]) - float(c1[-2]["close"])) / a1 if a1 > 0 else 0.0

@@ -18,8 +18,6 @@ The runner is designed to match V11 value-pullback engine:
   engine itself decides whether BTC would block a side.
 - Backtest execution is simulated on 1H candles because the authoritative
   strategy no longer uses any lower-timeframe execution data.
-- Historical acceptance uses the same fixed conservative round-trip cost
-  allowance as live validation; instantaneous funding quotes never mutate RR.
 """
 
 import asyncio
@@ -491,6 +489,22 @@ class BacktestRunner:
                     btc4,
                     btc1,
                 )
+            except TypeError:
+                # Compatibility with an older deployed helper. The V9.2
+                # engine does not use this branch.
+                try:
+                    cache[signal_close_ms] = build_btc_context(
+                        btc1d,
+                        None,
+                        btc4,
+                        btc1,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "BACKTEST BTC_CONTEXT_ERROR | signal_close_ms=%s",
+                        signal_close_ms,
+                    )
+                    cache[signal_close_ms] = None
             except Exception:
                 LOGGER.exception(
                     "BACKTEST BTC_CONTEXT_ERROR | signal_close_ms=%s",
@@ -592,7 +606,7 @@ class BacktestRunner:
                     c1,
                     now_ms=signal_close_ms,
                     btc_context=btc_context,
-                    estimated_round_trip_cost_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", getattr(self.settings, "estimated_round_trip_cost_pct", 0.0018))),
+                    estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -727,7 +741,6 @@ class BacktestRunner:
                     signal_close_time_ms=signal_close_ms,
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
-                    funding_cost_pct=float(getattr(self.settings, "estimated_funding_cost_pct", 0.0002)),
                     max_holding_minutes=max_hold,
                 )
             except Exception as exc:
@@ -781,15 +794,22 @@ class BacktestRunner:
             (time.monotonic() - symbol_started) * 1000
         )
 
+        reject_items = [
+            (key, int(value))
+            for key, value in diagnostics.items()
+            if key.startswith("REJECT_") and int(value) > 0
+        ]
+        top_reject = max(reject_items, key=lambda item: item[1])[0] if reject_items else "NONE"
         LOGGER.info(
             "BACKTEST SYMBOL COMPLETE | "
             "symbol=%s engine_calls=%d technical_accept=%d technical_reject=%d "
-            "trades=%d data_errors=%d engine_errors=%d simulation_errors=%d "
+            "top_reject=%s trades=%d data_errors=%d engine_errors=%d simulation_errors=%d "
             "seconds=%.2f",
             history.symbol,
             diagnostics.get("ENGINE_CALLS", 0),
             diagnostics.get("TECHNICAL_ACCEPT", 0),
             diagnostics.get("TECHNICAL_REJECT", 0),
+            top_reject,
             len(trades),
             data_errors,
             engine_errors,

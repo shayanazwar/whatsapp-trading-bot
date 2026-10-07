@@ -30,25 +30,46 @@ TIMEFRAME_ALIASES = {
 }
 APPROVED_TIMEFRAMES = ("1D", "12H", "4H", "1H")
 
+MIN_SCORE = 0
+MIN_RR = 1.60
+MIN_SL_ATR = 0.50
+MAX_SL_ATR = 1.25
+MIN_TP_ATR = 0.50
+MIN_ATR_PERCENTILE = 5.0
+MAX_ATR_PERCENTILE = 98.0
+BOS_BUFFER_ATR = 0.10
+RETEST_TOLERANCE_ATR = 0.25
+RETEST_PENETRATION_ATR = 0.75
+RETEST_INVALIDATION_ATR = 0.25
+MAX_SETUP_AGE_4H = 18  # 72h
+MAX_RETEST_BARS_4H = 18
+MAX_ENTRY_DISTANCE_ATR = 0.35  # signed extension measured in 1H ATR
+MAX_LIMIT_ENTRY_DISTANCE_ATR = 0.85
+MIN_DEPARTURE_ATR = 0.60
+MAX_DEPARTURE_BARS_4H = 6
+MAX_RETEST_1H_BARS = 12
+RETEST_ZONE_FLOOR_ATR = 0.35
+RETEST_ZONE_CEILING_ATR = 0.35
+RETEST_WICK_MIN = 0.30
+LIMIT_ENTRY_EXPIRY_BARS = 3
 BTC_SHOCK_ATR = 2.0
+ADX_TREND_MIN = 14.0
+MIN_TRIGGER_BODY = 0.25
+MIN_TRIGGER_CLOSE_LOCATION = 0.58
+MIN_TRIGGER_RVOL = 0.70
+MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
+ENGINE_VERSION = "V11-value-pullback-liquidity-reclaim"
 
-# V11 strategy controls. These are the only strategy thresholds used by the
-# authoritative 1D -> 12H -> 4H -> 1H engine.
-V11_MIN_RR = 1.60
-V11_MIN_IMPULSE_ATR = 2.50
-V11_SETUP_MAX_4H_BARS = 30
-V11_MAX_TRIGGER_BARS = 6
-V11_STOP_BUFFER_ATR_4H = 0.20
-V11_STOP_BUFFER_ATR_1H = 0.15
-V11_MIN_SL_ATR_SANITY = 0.20
-V11_MAX_SL_ATR_SANITY = 3.00
-V11_SHOCK_RANGE_ATR = 4.50
-V11_TRIGGER_MIN_BODY_RATIO = 0.25
-V11_TRIGGER_MIN_CLOSE_LOCATION = 0.58
-V11_TARGET_LEVEL_TOLERANCE_ATR = 0.10
-V11_ENGINE_RR_EPSILON = 1e-9
-ENGINE_VERSION = "V11-value-pullback-liquidity-reclaim-fixed"
+CONFIRMATION_FAMILY_NAMES = (
+    "momentum",
+    "relative_volume",
+    "volatility_regime",
+    "target_path",
+    "vwap_location",
+    "structure_quality",
+    "entry_quality",
+)
 
 
 class Candle(dict):
@@ -335,29 +356,63 @@ def _structure_from_swings(highs: list[tuple[int, float]], lows: list[tuple[int,
 
 
 
-# ============================================================
-# V11 — TREND PULLBACK / VALUE RE-ENTRY / LIQUIDITY SWEEP
-# Authoritative timeframes: 1D / 12H / 4H / 1H only.
-# ============================================================
 
-CONFIRMATION_FAMILY_NAMES = (
-    "trend_context",
-    "value_location",
-    "liquidity_reclaim",
-    "relative_volume",
-    "volatility",
-    "target_geometry",
-)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[bool, str]:
     if len(candles) < minimum:
-        return False, f"Insufficient {timeframe} candles: {len(candles)}<{minimum}"
-    times = [int(c["time"]) for c in candles]
-    if times != sorted(set(times)):
-        return False, f"{timeframe} candle timestamps are not strictly increasing"
+        return False, f"{timeframe}: not enough closed candles ({len(candles)}<{minimum})"
+    interval = TIMEFRAME_MS[timeframe.lower()]
+    times = [int(c["time"]) for c in candles[-minimum:]]
+    if any(b <= a for a, b in zip(times, times[1:])):
+        return False, f"{timeframe}: non-monotonic timestamps"
+    if any(b - a > interval for a, b in zip(times, times[1:])):
+        return False, f"{timeframe}: candle gap inside analysis window"
     return True, "OK"
 
+
+
+
+
+
+
+
+# V11 strategy constants. Score is diagnostic only; it is never an acceptance gate.
+V11_MIN_RR = 1.60
+V11_MIN_IMPULSE_ATR = 2.50
+V11_SETUP_MAX_4H_BARS = 30
+V11_MAX_TRIGGER_BARS = 6
+V11_STOP_BUFFER_ATR_4H = 0.20
+V11_STOP_BUFFER_ATR_1H = 0.15
+V11_MIN_SL_ATR_SANITY = 0.20
+V11_MAX_SL_ATR_SANITY = 3.00
+V11_SHOCK_RANGE_ATR = 4.50
 
 def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
     highs, lows = _swing_points(candles, left=left, right=right)
@@ -378,8 +433,8 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
     slope = _ema_slope(closes, 50, lookback=5)
     structure = _v11_structure(candles, 3, 3)
     price = closes[-1]
-    bull = bool(e50 and e200 and price > e200 and e50 > e200 and slope > 0 and structure == "HH/HL")
-    bear = bool(e50 and e200 and price < e200 and e50 < e200 and slope < 0 and structure == "LH/LL")
+    bull = bool(e50 and e200 and price > e200 and e50 > e200 and structure == "HH/HL")
+    bear = bool(e50 and e200 and price < e200 and e50 < e200 and structure == "LH/LL")
     return {
         "regime": "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
         "bull": bull,
@@ -400,7 +455,7 @@ def _v11_context_12h(candles: list[Candle], side: str) -> dict[str, Any]:
     slope = _ema_slope(closes, 50, lookback=5)
     structure = _v11_structure(candles, 3, 3)
     if e21 is None or e50 is None:
-        return {"status": "NEUTRAL", "hostile": False, "healthy": False, "structure": structure, "e21": e21, "e50": e50, "slope": slope, "price": closes[-1] if closes else 0.0}
+        return {"status": "NEUTRAL", "hostile": False, "structure": structure, "e21": e21, "e50": e50, "slope": slope}
     price = closes[-1]
     if side == "LONG":
         hostile = bool(structure == "LH/LL" and price < e50 and slope < 0)
@@ -420,107 +475,71 @@ def _v11_context_12h(candles: list[Candle], side: str) -> dict[str, Any]:
     }
 
 
-def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = V11_SETUP_MAX_4H_BARS) -> list[dict[str, Any]]:
-    """Find completed 4H continuation impulses with strict HH/HL or LH/LL sequencing.
+def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> list[dict[str, Any]]:
+    """Find completed 4H impulse legs without future leakage.
 
-    LONG sequence: confirmed lower-low reference -> prior high -> higher-low -> higher-high.
-    SHORT sequence: confirmed higher-high reference -> prior low -> lower-high -> lower-low.
-    Only centered pivots that are fully confirmed by their right-side candles are used.
+    Pivots are 3/3, so a pivot is only used after its three right-side candles
+    are closed. Multiple active candidates are returned; the caller may select
+    the newest still-valid setup rather than forcing a single latest-only setup.
     """
-    if side not in {"LONG", "SHORT"} or len(candles) < 40:
+    if side not in {"LONG", "SHORT"} or len(candles) < 30:
         return []
     highs, lows = _swing_points(candles, left=3, right=3)
     atrs = _atr_series(candles, 14)
-    out: list[dict[str, Any]] = []
-
+    events: list[dict[str, Any]] = []
     if side == "LONG":
-        for hi_pos in range(len(highs)):
-            hi_idx, hi_price = highs[hi_pos]
-            if len(candles) - 1 - hi_idx > max_age:
+        for hi_pos, (hi_idx, hi_price) in enumerate(highs):
+            if hi_idx < 7 or len(candles) - 1 - hi_idx > max_age:
                 continue
-            lows_before = [x for x in lows if x[0] < hi_idx]
-            if not lows_before:
+            prior_high = highs[hi_pos - 1][1] if hi_pos > 0 else None
+            if prior_high is None or hi_price <= prior_high:
                 continue
-            lo_idx, lo_price = lows_before[-1]
-            highs_before_lo = [x for x in highs[:hi_pos] if x[0] < lo_idx]
-            if not highs_before_lo:
+            eligible_lows = [(idx, price) for idx, price in lows if idx < hi_idx]
+            if len(eligible_lows) < 2:
                 continue
-            prior_hi_idx, prior_hi_price = highs_before_lo[-1]
-            lows_before_prior_hi = [x for x in lows if x[0] < prior_hi_idx]
-            if not lows_before_prior_hi:
+            lo_idx, lo_price = eligible_lows[-1]
+            prev_lo_idx, prev_lo_price = eligible_lows[-2]
+            if lo_idx < 3 or lo_price <= prev_lo_price or prev_lo_idx >= lo_idx:
                 continue
-            prior_lo_idx, prior_lo_price = lows_before_prior_hi[-1]
-            if not (prior_lo_idx < prior_hi_idx < lo_idx < hi_idx):
-                continue
-            if not (lo_price > prior_lo_price and hi_price > prior_hi_price):
-                continue
-            atr4 = _num(atrs[hi_idx] if hi_idx < len(atrs) else 0.0)
             leg = hi_price - lo_price
+            atr4 = _num(atrs[hi_idx] if hi_idx < len(atrs) else 0.0)
             if atr4 <= 0 or leg < V11_MIN_IMPULSE_ATR * atr4:
                 continue
-            out.append({
-                "side": side,
-                "low_idx": lo_idx,
-                "high_idx": hi_idx,
-                "low": float(lo_price),
-                "high": float(hi_price),
-                "prior_low": float(prior_lo_price),
-                "prior_high": float(prior_hi_price),
-                "prior_low_idx": prior_lo_idx,
-                "prior_high_idx": prior_hi_idx,
-                "atr": atr4,
-                "leg": leg,
-                "leg_atr": leg / atr4,
+            events.append({
+                "side": side, "low_idx": lo_idx, "high_idx": hi_idx,
+                "low": float(lo_price), "high": float(hi_price),
+                "atr": atr4, "leg": leg, "leg_atr": leg / atr4,
+                "structure_label": "HH/HL",
                 "high_time": int(candles[hi_idx]["time"]),
                 "low_time": int(candles[lo_idx]["time"]),
             })
     else:
-        for lo_pos in range(len(lows)):
-            lo_idx, lo_price = lows[lo_pos]
-            if len(candles) - 1 - lo_idx > max_age:
+        for lo_pos, (lo_idx, lo_price) in enumerate(lows):
+            if lo_idx < 7 or len(candles) - 1 - lo_idx > max_age:
                 continue
-            highs_before = [x for x in highs if x[0] < lo_idx]
-            if not highs_before:
+            prior_low = lows[lo_pos - 1][1] if lo_pos > 0 else None
+            if prior_low is None or lo_price >= prior_low:
                 continue
-            hi_idx, hi_price = highs_before[-1]
-            lows_before_hi = [x for x in lows[:lo_pos] if x[0] < hi_idx]
-            if not lows_before_hi:
+            eligible_highs = [(idx, price) for idx, price in highs if idx < lo_idx]
+            if len(eligible_highs) < 2:
                 continue
-            prior_lo_idx, prior_lo_price = lows_before_hi[-1]
-            highs_before_prior_lo = [x for x in highs if x[0] < prior_lo_idx]
-            if not highs_before_prior_lo:
+            hi_idx, hi_price = eligible_highs[-1]
+            prev_hi_idx, prev_hi_price = eligible_highs[-2]
+            if hi_idx < 3 or hi_price >= prev_hi_price or prev_hi_idx >= hi_idx:
                 continue
-            prior_hi_idx, prior_hi_price = highs_before_prior_lo[-1]
-            if not (prior_hi_idx < prior_lo_idx < hi_idx < lo_idx):
-                continue
-            if not (hi_price < prior_hi_price and lo_price < prior_lo_price):
-                continue
-            atr4 = _num(atrs[lo_idx] if lo_idx < len(atrs) else 0.0)
             leg = hi_price - lo_price
+            atr4 = _num(atrs[lo_idx] if lo_idx < len(atrs) else 0.0)
             if atr4 <= 0 or leg < V11_MIN_IMPULSE_ATR * atr4:
                 continue
-            out.append({
-                "side": side,
-                "low_idx": lo_idx,
-                "high_idx": hi_idx,
-                "low": float(lo_price),
-                "high": float(hi_price),
-                "prior_low": float(prior_lo_price),
-                "prior_high": float(prior_hi_price),
-                "prior_low_idx": prior_lo_idx,
-                "prior_high_idx": prior_hi_idx,
-                "atr": atr4,
-                "leg": leg,
-                "leg_atr": leg / atr4,
+            events.append({
+                "side": side, "low_idx": lo_idx, "high_idx": hi_idx,
+                "low": float(lo_price), "high": float(hi_price),
+                "atr": atr4, "leg": leg, "leg_atr": leg / atr4,
+                "structure_label": "LH/LL",
                 "high_time": int(candles[hi_idx]["time"]),
                 "low_time": int(candles[lo_idx]["time"]),
             })
-
-    unique: dict[tuple[int, int, str], dict[str, Any]] = {}
-    for item in out:
-        key = (int(item["low_idx"]), int(item["high_idx"]), side)
-        unique[key] = item
-    return sorted(unique.values(), key=lambda x: int(x["high_idx"] if side == "LONG" else x["low_idx"]))
+    return sorted(events, key=lambda x: int(x["high_idx"] if side == "LONG" else x["low_idx"]))
 
 
 def _v11_value_zone(leg: dict[str, Any], ema21: float | None, ema50: float | None) -> dict[str, float | bool]:
@@ -533,198 +552,191 @@ def _v11_value_zone(leg: dict[str, Any], ema21: float | None, ema50: float | Non
     if side == "LONG":
         retrace_low = high - 0.786 * rng
         retrace_high = high - 0.382 * rng
-        deep_low = high - 0.786 * rng
-        deep_high = high - 0.50 * rng
     else:
         retrace_low = low + 0.382 * rng
         retrace_high = low + 0.786 * rng
-        deep_low = low + 0.50 * rng
-        deep_high = low + 0.786 * rng
     if ema21 is None or ema50 is None:
-        return {"ok": retrace_low < retrace_high, "low": retrace_low, "high": retrace_high, "deep_low": min(deep_low, deep_high), "deep_high": max(deep_low, deep_high), "retracement_mid": (retrace_low + retrace_high) / 2.0, "retracement_low": retrace_low, "retracement_high": retrace_high}
+        return {"ok": True, "low": retrace_low, "high": retrace_high, "deep_low": retrace_low, "deep_high": retrace_high, "retracement_mid": (retrace_low + retrace_high) / 2.0}
     corridor_low = min(ema21, ema50) - 0.15 * float(leg["atr"])
     corridor_high = max(ema21, ema50) + 0.15 * float(leg["atr"])
     zone_low = max(retrace_low, corridor_low)
     zone_high = min(retrace_high, corridor_high)
-    # A no-overlap EMA corridor must not silently invent another value zone;
-    # the Fibonacci pullback remains the deterministic fallback.
     if zone_low >= zone_high:
         zone_low, zone_high = retrace_low, retrace_high
-    return {"ok": zone_low < zone_high, "low": zone_low, "high": zone_high, "deep_low": min(deep_low, deep_high), "deep_high": max(deep_low, deep_high), "retracement_mid": (retrace_low + retrace_high) / 2.0, "retracement_low": retrace_low, "retracement_high": retrace_high}
+    if side == "LONG":
+        deep_low = high - 0.786 * rng
+        deep_high = high - 0.50 * rng
+    else:
+        deep_low = low + 0.50 * rng
+        deep_high = low + 0.786 * rng
+    return {
+        "ok": zone_low < zone_high,
+        "low": zone_low,
+        "high": zone_high,
+        "deep_low": min(deep_low, deep_high),
+        "deep_high": max(deep_low, deep_high),
+        "retracement_mid": (retrace_low + retrace_high) / 2.0,
+        "retracement_low": retrace_low,
+        "retracement_high": retrace_high,
+    }
 
 
-def _v11_value_touched(candles_1h: list[Candle], start_time: int, zone: dict[str, Any]) -> list[int]:
+def _v11_value_touched(candles_1h: list[Candle], start_time: int, zone: dict[str, Any], side: str) -> tuple[bool, int | None, float | None, float | None]:
     zlow, zhigh = _num(zone.get("low")), _num(zone.get("high"))
-    if zlow <= 0 or zhigh <= 0 or zlow >= zhigh:
-        return []
-    return [i for i, c in enumerate(candles_1h) if int(c["time"]) > start_time and float(c["low"]) <= zhigh and float(c["high"]) >= zlow]
+    if zlow <= 0 or zhigh <= 0:
+        return False, None, None, None
+    for i, c in enumerate(candles_1h):
+        if int(c["time"]) <= start_time:
+            continue
+        h, l = float(c["high"]), float(c["low"])
+        if l <= zhigh and h >= zlow:
+            return True, i, l, h
+    return False, None, None, None
 
 
 def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max_bars: int = V11_MAX_TRIGGER_BARS) -> dict[str, Any]:
-    """Strict two-candle liquidity event: sweep first, reclaim on a later candle."""
+    """Causal sweep + reclaim trigger.
+
+    The swept level is derived only from the three candles immediately before
+    the sweep candle. The reclaim candle must close back through that level.
+    No centered pivot is used for the trigger.
+    """
     empty = {
-        "ready": False,
-        "sweep_idx": None,
-        "reclaim_idx": None,
-        "swept_level": None,
-        "rvol": 0.0,
-        "body_ratio": 0.0,
-        "close_location": 0.0,
-        "quality": 0.0,
-        "reason": "no strict sweep → subsequent reclaim",
+        "ready": False, "sweep_idx": None, "reclaim_idx": None, "swept_level": None,
+        "rvol": 0.0, "body_ratio": 0.0, "close_location": 0.0,
+        "quality": 0.0, "reason": "no causal liquidity sweep + reclaim",
     }
-    if side not in {"LONG", "SHORT"} or start_idx < 3 or start_idx >= len(candles):
+    if start_idx < 3 or start_idx >= len(candles):
         return empty
     end = min(len(candles) - 1, start_idx + max_bars)
-    for i in range(start_idx, end):
-        prior = candles[i - 3:i]
-        if len(prior) != 3:
+    for i in range(start_idx, end + 1):
+        prior = candles[max(0, i - 3):i]
+        if len(prior) < 3:
             continue
         c = candles[i]
         if side == "LONG":
             level = min(float(x["low"]) for x in prior)
-            swept = float(c["low"]) < level and float(c["close"]) <= level
+            # A liquidity sweep is a wick through the prior liquidity pool.
+            # The documented V11 sequence is sweep -> subsequent reclaim, so
+            # the sweep candle must breach the level but does not need to close
+            # beyond it. Requiring a close below/above the level turns many
+            # ordinary stop-runs into breakouts and suppresses valid setups.
+            swept = float(c["low"]) < level
         else:
             level = max(float(x["high"]) for x in prior)
-            swept = float(c["high"]) > level and float(c["close"]) >= level
+            swept = float(c["high"]) > level
         if not swept:
             continue
-        for j in range(i + 1, end + 1):
+        for j in range(i + 1, min(end, i + 2) + 1):
             r = candles[j]
             ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
             rrng = max(rhigh - rlow, 1e-12)
-            body_ratio = abs(rclose - ropen) / rrng
-            raw_loc = (rclose - rlow) / rrng
-            close_loc = raw_loc if side == "LONG" else 1.0 - raw_loc
-            reclaimed = (rclose > level and rclose > ropen) if side == "LONG" else (rclose < level and rclose < ropen)
+            body = abs(rclose - ropen) / rrng
+            loc = (rclose - rlow) / rrng
+            if side == "LONG":
+                reclaimed = rclose > level and rclose > ropen
+                close_loc = loc
+            else:
+                reclaimed = rclose < level and rclose < ropen
+                close_loc = 1.0 - loc
             if not reclaimed:
                 continue
-            if body_ratio + 1e-12 < V11_TRIGGER_MIN_BODY_RATIO or close_loc + 1e-12 < V11_TRIGGER_MIN_CLOSE_LOCATION:
-                continue
             rvol = _relative_volume(candles[:j + 1], 20)
-            quality = _clamp(
-                0.45
-                + 0.20 * _clamp(body_ratio / 0.50, 0, 1)
-                + 0.20 * _clamp(rvol / 1.20, 0, 1)
-                + 0.15 * _clamp(close_loc / 0.70, 0, 1),
-                0,
-                1,
-            )
+            quality = _clamp(0.45 + 0.20 * _clamp(body / 0.50, 0, 1) + 0.20 * _clamp(rvol / 1.20, 0, 1) + 0.15 * _clamp(close_loc / 0.70, 0, 1), 0, 1)
             return {
-                "ready": True,
-                "sweep_idx": i,
-                "reclaim_idx": j,
-                "swept_level": float(level),
-                "rvol": rvol,
-                "body_ratio": body_ratio,
-                "close_location": close_loc,
-                "quality": quality,
-                "reason": "strict liquidity sweep followed by later reclaim",
-                "trigger_time": int(r["time"]),
-                "sweep_time": int(c["time"]),
+                "ready": True, "sweep_idx": i, "reclaim_idx": j, "swept_level": level,
+                "rvol": rvol, "body_ratio": body, "close_location": close_loc,
+                "quality": quality, "reason": "liquidity sweep absorbed and reclaimed",
+                "trigger_time": int(r["time"]), "sweep_time": int(c["time"]),
             }
     return empty
 
 
-def _fresh_structural_levels(candles: list[Candle], timeframe: str, side: str, entry: float) -> list[dict[str, Any]]:
-    highs, lows = _swing_points(candles, 3, 3)
-    levels: list[dict[str, Any]] = []
+def _v11_target(c4: list[Candle], c12: list[Candle], c1d: list[Candle], entry: float, side: str, impulse: dict[str, Any]) -> dict[str, Any]:
+    """Select the nearest meaningful structural target before applying RR.
+
+    Target selection is structural-first. If the nearest valid magnet does not
+    clear the post-cost RR floor, the setup is rejected rather than choosing a
+    farther level solely to manufacture RR.
+    """
+    levels: list[tuple[float, str, int]] = []
+    for candles, tf, left, right in ((c4, "4H", 3, 3), (c12, "12H", 3, 3), (c1d, "1D", 3, 3)):
+        highs, lows = _swing_points(candles, left, right)
+        if side == "LONG":
+            for idx, price in highs:
+                if price > entry:
+                    levels.append((float(price), tf, int(candles[idx]["time"])))
+        else:
+            for idx, price in lows:
+                if price < entry:
+                    levels.append((float(price), tf, int(candles[idx]["time"])))
+    # The impulse extreme is always a legitimate first structural magnet.
+    impulse_target = float(impulse["high"] if side == "LONG" else impulse["low"])
+    if (side == "LONG" and impulse_target > entry) or (side == "SHORT" and impulse_target < entry):
+        levels.append((impulse_target, "4H_IMPULSE", int(impulse["high_time"] if side == "LONG" else impulse["low_time"])))
+    if not levels:
+        return {"ok": False, "reason": "no structural target beyond entry"}
     if side == "LONG":
-        for idx, price in highs:
-            price = float(price)
-            if price <= entry:
-                continue
-            # A resistance pivot is "fresh" until a later candle has already traded
-            # through it. This is evaluated using only completed candles.
-            if any(float(c["high"]) >= price for c in candles[idx + 1:]):
-                continue
-            levels.append({"price": price, "timeframe": timeframe, "index": int(idx), "time": int(candles[idx]["time"]), "kind": "RESISTANCE"})
+        price, tf, ts = min(levels, key=lambda x: x[0] - entry)
     else:
-        for idx, price in lows:
-            price = float(price)
-            if price >= entry:
-                continue
-            if any(float(c["low"]) <= price for c in candles[idx + 1:]):
-                continue
-            levels.append({"price": price, "timeframe": timeframe, "index": int(idx), "time": int(candles[idx]["time"]), "kind": "SUPPORT"})
-    return levels
+        # For SHORTs, the closest lower structural level is the smallest
+        # positive distance below entry. Using max(distance) would select the
+        # farthest downside target and could manufacture a blocked path.
+        price, tf, ts = min(levels, key=lambda x: entry - x[0])
+    return {"ok": True, "price": price, "timeframe": tf, "time": ts, "reason": "nearest structural target"}
 
 
-def _v11_target(
+def _v11_target_path(
     c4: list[Candle],
     c12: list[Candle],
     c1d: list[Candle],
-    c1: list[Candle],
     entry: float,
+    target: float,
     side: str,
-    impulse: dict[str, Any],
-    atr4: float,
+    target_time: int | None = None,
 ) -> dict[str, Any]:
-    """Choose the nearest fresh HTF target, then independently validate its path.
+    """Validate that no nearer confirmed HTF obstacle blocks the target.
 
-    A farther target is never selected merely to manufacture RR. If the nearest
-    structurally valid target has a real intervening structural blocker, the setup fails.
+    This is intentionally limited to completed 4H/12H/1D structure. It does
+    not inspect any future candle after the 1H decision close. The target is
+    structural-first; this function verifies the path diagnostic independently
+    instead of equating “a target exists” with “the path is clear”.
     """
-    levels: list[dict[str, Any]] = []
-    for candles, tf in ((c4, "4H"), (c12, "12H"), (c1d, "1D")):
-        levels.extend(_fresh_structural_levels(candles, tf, side, entry))
+    side = str(side).upper()
+    if side not in {"LONG", "SHORT"} or entry <= 0 or target <= 0:
+        return {"clear": False, "obstacles": [], "reason": "invalid target-path inputs"}
 
-    impulse_price = float(impulse["high"] if side == "LONG" else impulse["low"])
-    impulse_time = int(impulse["high_time"] if side == "LONG" else impulse["low_time"])
-    if (side == "LONG" and impulse_price > entry) or (side == "SHORT" and impulse_price < entry):
-        consumed = any((float(c["high"]) >= impulse_price if side == "LONG" else float(c["low"]) <= impulse_price) for c in c4[int(impulse["high_idx"] if side == "LONG" else impulse["low_idx"]) + 1:])
-        if not consumed:
-            levels.append({"price": impulse_price, "timeframe": "4H_IMPULSE", "index": int(impulse["high_idx"] if side == "LONG" else impulse["low_idx"]), "time": impulse_time, "kind": "IMPULSE_TARGET"})
+    obstacles: list[dict[str, Any]] = []
+    frames = ((c4, "4H", 3, 3), (c12, "12H", 3, 3), (c1d, "1D", 3, 3))
+    for candles, tf, left, right in frames:
+        highs, lows = _swing_points(candles, left, right)
+        points = highs if side == "LONG" else lows
+        for idx, price in points:
+            price = float(price)
+            ts = int(candles[idx]["time"])
+            if target_time is not None and ts == int(target_time):
+                continue
+            between = entry < price < target if side == "LONG" else target < price < entry
+            if between:
+                obstacles.append({"price": price, "timeframe": tf, "time": ts})
 
-    if not levels:
-        return {"ok": False, "structural": False, "path_clear": False, "reason": "no fresh structural target beyond entry", "target_levels": [], "blocking_levels": []}
-
-    # Choose the nearest valid structural level on either side. A farther
-    # short target must never win merely because ``entry - price`` is larger.
-    target = min(levels, key=lambda x: abs(float(x["price"]) - entry))
-    if side == "LONG":
-        between = lambda p: entry < p < target["price"]
-    else:
-        between = lambda p: target["price"] < p < entry
-
-    tolerance = max(abs(atr4) * V11_TARGET_LEVEL_TOLERANCE_ATR, abs(entry) * 0.0005)
-    blockers: list[dict[str, Any]] = []
-    # The higher-timeframe candidate set is already nearest-first. The real path
-    # test therefore focuses on completed 1H structural levels that price must cross.
-    blockers.extend(
-        level
-        for level in _fresh_structural_levels(c1, "1H", side, entry)
-        if between(float(level["price"])) and abs(float(level["price"]) - float(target["price"])) > tolerance
-    )
-    # Also catch current 4H/12H/1D structural levels between entry and target,
-    # even when the selected target comes from another timeframe.
-    for level in levels:
-        p = float(level["price"])
-        if between(p) and abs(p - float(target["price"])) > tolerance:
-            blockers.append(level)
-
-    # Deduplicate blockers by approximate level/timeframe.
-    dedup: dict[tuple[str, int, float], dict[str, Any]] = {}
-    for item in blockers:
-        dedup[(str(item["timeframe"]), int(item["time"]), round(float(item["price"]), 10))] = item
-    blockers = sorted(dedup.values(), key=lambda x: abs(float(x["price"]) - entry))
-    return {
-        "ok": not blockers,
-        "structural": True,
-        "path_clear": not blockers,
-        "price": float(target["price"]),
-        "timeframe": str(target["timeframe"]),
-        "time": int(target["time"]),
-        "target": target,
-        "target_levels": levels,
-        "blocking_levels": blockers,
-        "blocking_level": blockers[0] if blockers else None,
-        "reason": "nearest fresh structural target with no intervening completed structural blocker" if not blockers else "nearest target path blocked by an intervening structural level",
-    }
+    # Collapse duplicate price levels across timeframes while retaining all source evidence.
+    obstacles.sort(key=lambda x: x["price"], reverse=(side == "SHORT"))
+    deduped: list[dict[str, Any]] = []
+    for obstacle in obstacles:
+        if not deduped or abs(float(obstacle["price"]) - float(deduped[-1]["price"])) > max(abs(entry) * 1e-6, 1e-12):
+            deduped.append(obstacle)
+    if deduped:
+        return {
+            "clear": False,
+            "obstacles": deduped,
+            "reason": f"{len(deduped)} confirmed HTF obstacle(s) between entry and target",
+        }
+    return {"clear": True, "obstacles": [], "reason": "no confirmed HTF structural obstacle before target"}
 
 
 def _v11_score(features: dict[str, float]) -> tuple[int, dict[str, int]]:
-    """Diagnostic score only. It is never an acceptance gate."""
+    """Diagnostic score only. It is deliberately not an acceptance threshold."""
     groups = {
         "impulse_structure": int(round(25 * _clamp(features.get("impulse", 0), 0, 1))),
         "value_location": int(round(25 * _clamp(features.get("value", 0), 0, 1))),
@@ -736,30 +748,461 @@ def _v11_score(features: dict[str, float]) -> tuple[int, dict[str, int]]:
     return sum(groups.values()), groups
 
 
-def build_btc_context(candles_1d: list, candles_12h: list | None, candles_4h: list, candles_1h: list | None = None) -> dict[str, Any]:
+def _v11_analyze_side(
+    symbol: str,
+    side: str,
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+    daily: dict[str, Any],
+    cost_pct: float,
+    btc_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Evaluate one V11 side and retain the first failing gate for diagnostics."""
+    context = _v11_context_12h(c12, side)
+    direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+
+    def reject(reason: str) -> dict[str, Any]:
+        return {
+            "side": side,
+            "direction_ok": direction_ok,
+            "context": context,
+            "candidate": False,
+            "reason": str(reason),
+            "technical_gate_failures": [f"{side}: {reason}"],
+            "rejection_stage": "SETUP",
+        }
+
+    if not direction_ok:
+        return reject(
+            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'})"
+        )
+    if context.get("hostile"):
+        return reject(
+            f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})"
+        )
+
+    e21_4 = _safe_ema([float(c["close"]) for c in c4], 21)
+    e50_4 = _safe_ema([float(c["close"]) for c in c4], 50)
+    impulses = _v11_find_impulses(c4, side)
+    if not impulses:
+        return reject(f"{side}: no completed 4H HH/HL or LH/LL impulse >= {V11_MIN_IMPULSE_ATR:.2f} ATR")
+
+    last_reason = f"{side}: no active value-pullback trigger"
+    for impulse in reversed(impulses):
+        impulse_end_idx = int(impulse["high_idx"]) if side == "LONG" else int(impulse["low_idx"])
+        setup_age = len(c4) - 1 - impulse_end_idx
+        if setup_age > V11_SETUP_MAX_4H_BARS:
+            last_reason = f"{side}: 4H impulse expired ({setup_age} bars > {V11_SETUP_MAX_4H_BARS})"
+            continue
+
+        if side == "LONG":
+            if any(float(c["close"]) < float(impulse["low"]) for c in c4[impulse_end_idx + 1:]):
+                last_reason = f"{side}: 4H impulse invalidated below origin {float(impulse['low']):.8g}"
+                continue
+        else:
+            if any(float(c["close"]) > float(impulse["high"]) for c in c4[impulse_end_idx + 1:]):
+                last_reason = f"{side}: 4H impulse invalidated above origin {float(impulse['high']):.8g}"
+                continue
+
+        zone = _v11_value_zone(impulse, e21_4, e50_4)
+        if not zone.get("ok"):
+            last_reason = f"{side}: value zone invalid/non-overlapping"
+            continue
+
+        start_time = int(c4[impulse_end_idx]["time"])
+        post_impulse = [c for c in c1 if int(c["time"]) > start_time]
+        if not post_impulse:
+            last_reason = f"{side}: no 1H candles after impulse endpoint"
+            continue
+
+        if side == "LONG" and min(float(c["low"]) for c in post_impulse) <= float(impulse["low"]):
+            last_reason = f"{side}: 1H pullback erased 4H impulse origin"
+            continue
+        if side == "SHORT" and max(float(c["high"]) for c in post_impulse) >= float(impulse["high"]):
+            last_reason = f"{side}: 1H pullback erased 4H impulse origin"
+            continue
+
+        zlow, zhigh = _num(zone.get("low")), _num(zone.get("high"))
+        trigger = None
+        touched_value = False
+        for touch_idx, touch_candle in enumerate(c1):
+            if int(touch_candle["time"]) <= start_time:
+                continue
+            if float(touch_candle["low"]) <= zhigh and float(touch_candle["high"]) >= zlow:
+                touched_value = True
+                candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side)
+                if candidate_trigger.get("ready") and int(candidate_trigger.get("reclaim_idx", -1)) == len(c1) - 1:
+                    trigger = candidate_trigger
+                    break
+        if not trigger:
+            last_reason = f"{side}: value zone touched={touched_value}, but no 1H sweep -> later reclaim completed on current candle"
+            continue
+
+        trigger_idx = int(trigger["reclaim_idx"])
+        entry = float(c1[-1]["close"])
+        atr4 = max(_safe_atr(c4), float(impulse["atr"]))
+        atr1 = _safe_atr(c1)
+        sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
+        sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
+        buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
+        if side == "LONG":
+            stop = sweep_low - buffer
+        else:
+            stop = sweep_high + buffer
+        risk = abs(entry - stop)
+        if risk <= 0 or not math.isfinite(risk):
+            last_reason = f"{side}: invalid structural stop/risk"
+            continue
+        sl_atr = risk / atr4 if atr4 > 0 else 999.0
+        if sl_atr < V11_MIN_SL_ATR_SANITY or sl_atr > V11_MAX_SL_ATR_SANITY:
+            last_reason = f"{side}: SL distance {sl_atr:.2f} ATR outside {V11_MIN_SL_ATR_SANITY:.2f}-{V11_MAX_SL_ATR_SANITY:.2f} safety bounds"
+            continue
+
+        target = _v11_target(c4, c12, c1d, entry, side, impulse)
+        if not target.get("ok"):
+            last_reason = f"{side}: no structural target beyond entry"
+            continue
+        tp = float(target["price"])
+        target_path = _v11_target_path(
+            c4, c12, c1d, entry, tp, side,
+            target_time=int(target.get("time")) if target.get("time") is not None else None,
+        )
+        if not target_path.get("clear"):
+            last_reason = f"{side}: target path blocked ({target_path.get('reason') or 'HTF obstacle'})"
+            continue
+        if side == "LONG" and not (stop < entry < tp):
+            last_reason = f"{side}: invalid geometry SL < Entry < TP"
+            continue
+        if side == "SHORT" and not (tp < entry < stop):
+            last_reason = f"{side}: invalid geometry TP < Entry < SL"
+            continue
+
+        rr_gross = abs(tp - entry) / risk
+        cost_price = entry * max(0.0, cost_pct)
+        rr_net = (abs(tp - entry) - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
+        if rr_net < V11_MIN_RR:
+            last_reason = f"{side}: post-cost RR {rr_net:.2f} < required {V11_MIN_RR:.2f} (gross {rr_gross:.2f})"
+            continue
+
+        atr_rank = _atr_percentile(c4)
+        last = c1[-1]
+        range1 = float(last["high"]) - float(last["low"])
+        shock_ok = not (atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1)
+        if not shock_ok:
+            last_reason = f"{side}: 1H shock candle exceeds {V11_SHOCK_RANGE_ATR:.2f} ATR"
+            continue
+
+        value_mid = (float(zone["low"]) + float(zone["high"])) / 2.0
+        value_quality = 1.0 - min(1.0, abs(entry - value_mid) / max(0.5 * atr4, 1e-9))
+        deep = float(zone.get("deep_low", zone["low"])) <= entry <= float(zone.get("deep_high", zone["high"]))
+        trigger_quality = float(trigger["quality"])
+        target_quality = _clamp(rr_gross / 2.5, 0, 1)
+        context_quality = 1.0 if context.get("healthy") else 0.6
+        impulse_quality = _clamp(float(impulse["leg_atr"]) / 4.0, 0, 1)
+        volatility_quality = 1.0 if 5 <= atr_rank <= 98 else 0.5
+        score, score_groups = _v11_score({
+            "impulse": impulse_quality, "value": max(value_quality, 0.85 if deep else 0.0),
+            "trigger": trigger_quality, "target": target_quality,
+            "context": context_quality, "volatility": volatility_quality,
+        })
+        btc_ok, btc_reason = btc_filter_ok(side, btc_context or {}, is_btc=symbol.upper().startswith("BTC"))
+        if not btc_ok:
+            return {
+                "side": side,
+                "direction_ok": direction_ok,
+                "context": context,
+                "candidate": False,
+                "reason": f"{side}: BTC context veto ({btc_reason})",
+                "technical_gate_failures": [f"{side}: BTC context veto ({btc_reason})"],
+                "rejection_stage": "BTC",
+                "btc_filter_ok": False,
+            }
+        return {
+            "side": side, "candidate": True, "direction_ok": True, "context": context,
+            "impulse": impulse, "value_zone": zone, "trigger": trigger,
+            "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr_net, "rr_gross": rr_gross,
+            "atr_4h": atr4, "atr_1h": atr1, "sl_atr": sl_atr,
+            "tp_distance_atr": abs(tp - entry) / atr4 if atr4 > 0 else 0.0,
+            "target": target, "target_path": target_path, "score": score, "score_groups": score_groups,
+            "atr_percentile": atr_rank, "btc_filter_ok": True, "btc_filter_reason": btc_reason,
+            "value_deep": deep, "value_quality": value_quality, "shock_ok": shock_ok,
+            "setup_state": "TRIGGERED", "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+            "technical_gate_failures": [], "rejection_stage": None,
+        }
+    return {
+        "side": side,
+        "direction_ok": direction_ok,
+        "context": context,
+        "candidate": False,
+        "reason": last_reason,
+        "technical_gate_failures": [last_reason],
+        "rejection_stage": "SETUP",
+    }
+
+def _v11_empty(
+    symbol: str,
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+    reason: str,
+    daily: dict[str, Any],
+    btc_context: dict[str, Any] | None = None,
+    *,
+    side_failures: list[str] | None = None,
+) -> dict[str, Any]:
+    price = float(c1[-1]["close"])
+    return {
+        "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
+        "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
+        "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11 Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
+        "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
+        "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
+        "technical_gate_failures": list(side_failures or [reason]),
+        "diagnostic_failures": list(side_failures or [reason]),
+        "reasons": list(side_failures or [reason]),
+        "direction_ok": False, "structure_ok": False, "setup_ok": False, "confirmation_ok": False,
+        "entry_distance_ok": False, "volatility_ok": True, "confirmation_family_diversity_ok": True,
+        "location_ok": False, "target_path_ok": False, "target_path_structural": False, "target_path_clear": False,
+        "risk_ok": False, "trade_geometry_ok": False, "rr_ok": False, "shock_veto_ok": True,
+        "btc_filter_ok": True, "btc_filter_reason": "not evaluated", "score": 0, "score_groups": {},
+        "stage_status": {"1D_REGIME": False, "12H_BIAS": False, "4H_SETUP": False, "1H_TRIGGER": False, "RISK": False, "RR": False, "QUALITY": True, "BTC": True, "SHOCK": True},
+        "stage_failures": {"SETUP": [reason]}, "entry": None, "stop_loss": None, "tp": None, "rr": None,
+        "atr_4h": _safe_atr(c4), "atr_1h": _safe_atr(c1), "atr": _safe_atr(c1),
+        "atr_percentile": _atr_percentile(c4), "rvol_1h": _relative_volume(c1, 20),
+        "entry_mode": "MARKET", "limit_price": None, "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES,
+        "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "btc_context": btc_context or {"ok": False},
+    }
+
+
+def analyze_candles(
+    symbol: str,
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list,
+    *,
+    now_ms: Optional[int] = None,
+    cache: Optional[dict[str, Any]] = None,
+    btc_context: Optional[dict[str, Any]] = None,
+    estimated_round_trip_cost_pct: float = 0.0015,
+) -> dict[str, Any]:
+    """V11 deterministic Trend Pullback / Value Re-entry engine.
+
+    Decision point: completed 1H candle close.
+    Execution baseline: next 1H open.
+    Authoritative timeframes: 1D / 12H / 4H / 1H only.
+    """
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    c1d = closed_candle_rows(candles_1d or [], "1D", now)
+    c4 = closed_candle_rows(candles_4h or [], "4H", now)
+    c1 = closed_candle_rows(candles_1h or [], "1H", now)
+    c12 = closed_candle_rows(candles_12h, "12H", now) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now)
+    for c, tf, minimum in ((c1d, "1d", 210), (c12, "12h", 60), (c4, "4h", 180), (c1, "1h", 180)):
+        ok, reason = _data_quality(c, tf, minimum)
+        if not ok:
+            raise ValueError(f"{symbol}: {reason}")
+    daily = _v11_regime_1d(c1d)
+    cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
+    candidates: list[dict[str, Any]] = []
+    side_failures: list[str] = []
+    for side in ("LONG", "SHORT"):
+        result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
+        if result.get("candidate"):
+            candidates.append(result)
+        else:
+            failures = result.get("technical_gate_failures") or [result.get("reason") or f"{side}: rejected"]
+            side_failures.extend(str(x) for x in failures[:2])
+    if not candidates:
+        reasons = side_failures or ["no active V11 value-pullback trigger"]
+        return _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context, side_failures=reasons)
+    # If both sides somehow qualify, rank by structural setup quality only; this is
+    # not an accuracy score and is not used as a threshold.
+    chosen = max(candidates, key=lambda x: (float(x["score"]), int(x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"])))
+    side = str(chosen["side"])
+    trigger = chosen["trigger"]
+    impulse = chosen["impulse"]
+    context = chosen["context"]
+    entry = float(chosen["entry"]); stop = float(chosen["stop_loss"]); tp = float(chosen["tp"])
+    rr = float(chosen["rr"]); rr_gross = float(chosen["rr_gross"])
+    risk = abs(entry - stop)
+    target_ok = bool(chosen.get("target", {}).get("ok"))
+    target_clear = bool((chosen.get("target_path") or {}).get("clear"))
+    geometry_ok = bool((stop < entry < tp) if side == "LONG" else (tp < entry < stop))
+    btc_ok = bool(chosen.get("btc_filter_ok", True))
+    stage_status = {
+        "1D_REGIME": True, "12H_BIAS": not bool(context.get("hostile")), "4H_SETUP": True,
+        "1H_TRIGGER": True, "ENTRY_DISTANCE": True, "VOLATILITY": True,
+        "CONFIRMATION_FAMILIES": True, "TARGET_PATH": target_ok and target_clear,
+        "RISK": geometry_ok, "RR": rr >= V11_MIN_RR, "QUALITY": True,
+        "BTC": btc_ok, "SHOCK": bool(chosen.get("shock_ok", True)),
+    }
+    stage_failures = {k: [] for k in stage_status}
+    direction_ok = True
+    confirmation_ok = True
+    structure_ok = True
+    setup_ok = True
+    families = {
+        "trend_context": "PASS" if context.get("healthy") else "SUPPORT",
+        "value_location": "PASS" if chosen.get("value_deep") else "SUPPORT",
+        "liquidity_reclaim": "PASS",
+        "relative_volume": "PASS" if _num(trigger.get("rvol")) >= 1.20 else "SUPPORT",
+        "volatility": "PASS" if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else "SUPPORT",
+        "target_geometry": "PASS",
+    }
+    passed = sum(v == "PASS" for v in families.values())
+    score = int(chosen["score"])
+    target_tf = str(chosen["target"].get("timeframe") or "4H")
+    target_reason = "nearest structural target; RR applied after target selection"
+    reasons = [
+        f"1D {daily.get('regime')} permission",
+        f"4H impulse {float(impulse['leg_atr']):.2f} ATR",
+        f"Value zone {float(chosen['value_zone']['low']):.6g}-{float(chosen['value_zone']['high']):.6g}",
+        "1H liquidity sweep + reclaim",
+        f"Structural TP {target_tf}; post-cost RR {rr:.2f}",
+    ]
+    return {
+        "symbol": symbol.upper(), "price": float(c1[-1]["close"]), "setup": side, "setup_candidate": side,
+        "regime_1d": daily.get("regime"), "trend_4h": "HH/HL" if side == "LONG" else "LH/LL",
+        "bias_12h": context.get("status"), "daily_structure_1d": daily.get("structure"),
+        "structure_12h": context.get("structure"), "structure_4h": impulse.get("structure_label", "HH/HL" if side == "LONG" else "LH/LL"),
+        "protected_structure_4h": "BULLISH" if side == "LONG" else "BEARISH",
+        "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"),
+        "ema21_12h": context.get("e21"), "ema50_12h": context.get("e50"),
+        "ema21_4h": _safe_ema([float(c["close"]) for c in c4], 21), "ema50_4h": _safe_ema([float(c["close"]) for c in c4], 50),
+        "ema21_1h": _safe_ema([float(c["close"]) for c in c1], 21), "ema50_1h": _safe_ema([float(c["close"]) for c in c1], 50),
+        "rsi": _safe_rsi([float(c["close"]) for c in c1]), "rsi_1h_entry": _safe_rsi([float(c["close"]) for c in c1]),
+        "atr": float(chosen["atr_1h"]), "atr_1h": float(chosen["atr_1h"]), "atr_4h": float(chosen["atr_4h"]),
+        "atr_percentile": float(chosen["atr_percentile"]), "rvol": _relative_volume(c1, 20), "rvol_1h": float(trigger.get("rvol", 0.0)),
+        "volume": volume_status(c1), "adx_1d": _adx(c1d), "ema50_slope_1d": daily.get("slope"),
+        "estimated_round_trip_cost_pct": cost_pct, "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
+        "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
+        "signal_engine_version": ENGINE_VERSION,
+        "signal_basis": "1D trend → 12H health → 4H impulse/pullback into value → 1H liquidity sweep/reclaim → next 1H open",
+        "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
+        "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
+        "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),
+        "trigger_type": "LIQUIDITY_SWEEP_RECLAIM", "trigger_reason": trigger.get("reason"),
+        "trigger_close_location": float(trigger.get("close_location", 0.0)),
+        "structure_quality_ok": True, "trade_geometry_ok": geometry_ok,
+        "momentum_quality": 0.5, "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
+        "volatility_quality": 1.0 if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else 0.5,
+        "entry_efficiency": 1.0, "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
+        "entry_mode": "MARKET", "limit_price": None, "entry_1h_ready": True,
+        "shock_veto_ok": bool(chosen.get("shock_ok", True)), "shock_veto_reason": "OK",
+        "score": score, "score_groups": chosen["score_groups"],
+        "confirmation_families": families, "confirmation_families_passed": passed, "confirmation_families_available": len(families),
+        "confirmation_family_diversity_ok": True,
+        "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok,
+        "momentum_ok": True, "volume_ok": True, "location_ok": bool(target_ok and target_clear), "volatility_ok": True,
+        "risk_ok": geometry_ok, "rr_ok": rr >= V11_MIN_RR, "entry_distance_ok": True,
+        "stage_status": stage_status, "stage_failures": stage_failures, "technical_candidate": bool(geometry_ok and rr >= V11_MIN_RR and btc_ok),
+        "signal_blocked": False, "rejection_stage": None, "technical_gate_failures": [], "diagnostic_failures": [],
+        "reasons": reasons,
+        "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr, "rr_gross": rr_gross,
+        "sl_atr": risk / float(chosen["atr_4h"]) if chosen["atr_4h"] > 0 else 0.0,
+        "sl_atr_1h": risk / float(chosen["atr_1h"]) if chosen["atr_1h"] > 0 else 0.0,
+        "sl_atr_4h": risk / float(chosen["atr_4h"]) if chosen["atr_4h"] > 0 else 0.0,
+        "stop_distance_pct": risk / entry if entry > 0 else 0.0,
+        "tp_distance_atr": abs(tp - entry) / float(chosen["atr_4h"]) if chosen["atr_4h"] > 0 else 0.0,
+        "tp_distance_atr_1h": abs(tp - entry) / float(chosen["atr_1h"]) if chosen["atr_1h"] > 0 else 0.0,
+        "tp_distance_pct": abs(tp - entry) / entry if entry > 0 else 0.0,
+        "target_path_ok": bool(target_ok and target_clear),
+        "target_path_structural": bool(target_ok),
+        "target_path_clear": bool(target_clear),
+        "target_path_reason": (chosen.get("target_path") or {}).get("reason") or target_reason,
+        "target_path_obstacles": (chosen.get("target_path") or {}).get("obstacles") or [],
+        "target_timeframe": target_tf, "target_levels": [chosen["target"]],
+        "blocking_level": None, "stop_source": "liquidity-sweep structural invalidation + volatility buffer",
+        "geometry_reason": "OK", "entry_limit_price": None, "limit_entry_expiry_minutes": 0,
+        "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "trigger_candle_open_time": trigger.get("trigger_time"),
+        "setup_impulse_high_time": impulse.get("high_time"), "setup_impulse_low_time": impulse.get("low_time"),
+        "setup_pullback_touch_time": int(c1[int(trigger["sweep_idx"])]["time"]),
+        "setup_retest_time": trigger.get("trigger_time"), "setup_retest_1h_time": trigger.get("trigger_time"),
+        "setup_bos_time": None, "setup_departure_time": None,
+        "value_zone_low": float(chosen["value_zone"]["low"]), "value_zone_high": float(chosen["value_zone"]["high"]),
+        "value_deep": bool(chosen.get("value_deep")), "swept_level_1h": float(trigger["swept_level"]),
+        "sweep_time_1h": trigger.get("sweep_time"), "reclaim_time_1h": trigger.get("trigger_time"),
+        "rolling_vwap_12h": None, "flow_proxy_ratio": None,
+        "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
+        "btc_filter_ok": btc_ok, "btc_filter_reason": chosen.get("btc_filter_reason", "OK"), "btc_would_block": not btc_ok,
+        "btc_risk_mode": "OBSERVE", "btc_context": btc_context or {"ok": False},
+    }
+
+
+
+
+
+
+def _backtest_flow_proxy(candles: list[Candle], window: int = 12) -> float | None:
+    rows = candles[-window:] if len(candles) > window else candles
+    buy = sell = 0.0
+    for c in rows:
+        vol = _num(c.get("volume"))
+        if _num(c.get("close")) > _num(c.get("open")):
+            buy += vol
+        elif _num(c.get("close")) < _num(c.get("open")):
+            sell += vol
+    total = buy + sell
+    return (buy - sell) / total if total > 0 else None
+
+
+def _rolling_vwap(candles: list[Candle], window: int = 48) -> float | None:
+    rows = candles[-window:] if len(candles) > window else candles
+    total = 0.0
+    weighted = 0.0
+    for c in rows:
+        vol = _num(c.get("volume"))
+        if vol <= 0:
+            continue
+        typical = (_num(c.get("high")) + _num(c.get("low")) + _num(c.get("close"))) / 3.0
+        total += vol
+        weighted += typical * vol
+    return weighted / total if total > 0 else None
+
+
+
+
+
+
+def build_btc_context(
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list | None = None,
+) -> dict[str, Any]:
+    """Build causal BTC context using only the approved V11 timeframes."""
     try:
         c1d = _coerce_candles(candles_1d)
         c12 = _coerce_candles(candles_12h or [])
         c4 = _coerce_candles(candles_4h)
         c1 = _coerce_candles(candles_1h or [])
         daily = _v11_regime_1d(c1d)
+        structure_12h = _v11_structure(c12, 3, 3) if c12 else "UNKNOWN"
+        structure_4h = _v11_structure(c4, 3, 3) if c4 else "UNKNOWN"
         a4 = _safe_atr(c4)
-        a1 = _safe_atr(c1) if c1 else 0.0
-        close4 = float(c4[-1]["close"]) if c4 else 0.0
-        move4 = (close4 - float(c4[-2]["close"])) / a4 if len(c4) >= 2 and a4 > 0 else 0.0
+        a1 = _safe_atr(c1)
+        move4 = (float(c4[-1]["close"]) - float(c4[-2]["close"])) / a4 if len(c4) >= 2 and a4 > 0 else 0.0
         move1 = (float(c1[-1]["close"]) - float(c1[-2]["close"])) / a1 if len(c1) >= 2 and a1 > 0 else 0.0
         return {
             "ok": True,
             "bull_1d": bool(daily.get("bull")),
             "bear_1d": bool(daily.get("bear")),
-            "structure_4h": _v11_structure(c4, 3, 3),
-            "bull_4h": _v11_structure(c4, 3, 3) == "HH/HL",
-            "bear_4h": _v11_structure(c4, 3, 3) == "LH/LL",
+            "bull_4h": structure_4h == "HH/HL",
+            "bear_4h": structure_4h == "LH/LL",
+            "structure_12h": structure_12h,
+            "structure_4h": structure_4h,
             "move_4h_atr": move4,
             "move_1h_atr": move1,
             "candle_time_4h": int(c4[-1]["time"]) if c4 else 0,
             "candle_time_1h": int(c1[-1]["time"]) if c1 else 0,
-            "candle_time_12h": int(c12[-1]["time"]) if c12 else 0,
         }
     except Exception as exc:
         return {"ok": False, "reason": str(exc)}
@@ -787,483 +1230,10 @@ def btc_filter_ok(side: str, context: dict[str, Any], *, is_btc: bool = False) -
     return True, "OK"
 
 
-def _v11_analyze_side(
-    symbol: str,
-    side: str,
-    c1d: list[Candle],
-    c12: list[Candle],
-    c4: list[Candle],
-    c1: list[Candle],
-    daily: dict[str, Any],
-    cost_pct: float,
-    btc_context: dict[str, Any] | None,
-) -> dict[str, Any]:
-    context = _v11_context_12h(c12, side)
-    direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
-    if not direction_ok or context.get("hostile"):
-        return {"side": side, "direction_ok": direction_ok, "context": context, "candidate": False, "reason": "macro direction or hostile 12H context"}
-
-    e21_4 = _safe_ema([float(c["close"]) for c in c4], 21)
-    e50_4 = _safe_ema([float(c["close"]) for c in c4], 50)
-    impulses = _v11_find_impulses(c4, side)
-    atr_rank = _atr_percentile(c4)
-    btc_ok, btc_reason = btc_filter_ok(side, btc_context or {}, is_btc=symbol.upper().startswith("BTC"))
-    if not btc_ok:
-        return {"side": side, "direction_ok": direction_ok, "context": context, "candidate": False, "reason": btc_reason, "btc_filter_ok": False, "btc_filter_reason": btc_reason}
-
-    for impulse in reversed(impulses):
-        extreme_idx = int(impulse["high_idx"] if side == "LONG" else impulse["low_idx"])
-        if len(c4) - 1 - extreme_idx > V11_SETUP_MAX_4H_BARS:
-            continue
-        # The completed 4H continuation structure must remain intact.
-        if side == "LONG":
-            if any(float(c["close"]) < float(impulse["low"]) for c in c4[extreme_idx + 1:]):
-                continue
-        else:
-            if any(float(c["close"]) > float(impulse["high"]) for c in c4[extreme_idx + 1:]):
-                continue
-
-        zone = _v11_value_zone(impulse, e21_4, e50_4)
-        if not zone.get("ok"):
-            continue
-        start_time = int(c4[extreme_idx]["time"])
-        touched = _v11_value_touched(c1, start_time, zone)
-        if not touched:
-            continue
-
-        for touch_idx in touched:
-            trigger = _v11_liquidity_trigger(c1, touch_idx, side)
-            if not trigger.get("ready") or int(trigger.get("reclaim_idx", -1)) != len(c1) - 1:
-                continue
-
-            entry = float(c1[-1]["close"])
-            atr4 = max(_safe_atr(c4), float(impulse["atr"]))
-            atr1 = _safe_atr(c1)
-            if atr4 <= 0 or atr1 <= 0:
-                continue
-            sweep_start = int(trigger["sweep_idx"])
-            reclaim_idx = int(trigger["reclaim_idx"])
-            sweep_low = min(float(c["low"]) for c in c1[sweep_start:reclaim_idx + 1])
-            sweep_high = max(float(c["high"]) for c in c1[sweep_start:reclaim_idx + 1])
-            buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
-            stop = sweep_low - buffer if side == "LONG" else sweep_high + buffer
-            risk = abs(entry - stop)
-            if risk <= 0 or not math.isfinite(risk):
-                continue
-            sl_atr = risk / atr4
-            if sl_atr < V11_MIN_SL_ATR_SANITY or sl_atr > V11_MAX_SL_ATR_SANITY:
-                continue
-
-            target = _v11_target(c4, c12, c1d, c1, entry, side, impulse, atr4)
-            if not target.get("ok"):
-                continue
-            tp = float(target["price"])
-            if side == "LONG" and not (stop < entry < tp):
-                continue
-            if side == "SHORT" and not (tp < entry < stop):
-                continue
-            rr_gross = abs(tp - entry) / risk
-            cost_price = entry * max(0.0, cost_pct)
-            rr_net = (abs(tp - entry) - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
-            if rr_net + V11_ENGINE_RR_EPSILON < V11_MIN_RR:
-                continue
-
-            last = c1[-1]
-            range1 = float(last["high"]) - float(last["low"])
-            shock_ok = not (atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1)
-            if not shock_ok:
-                continue
-
-            value_mid = (float(zone["low"]) + float(zone["high"])) / 2.0
-            value_quality = 1.0 - min(1.0, abs(entry - value_mid) / max(0.5 * atr4, 1e-9))
-            deep = float(zone.get("deep_low", zone["low"])) <= entry <= float(zone.get("deep_high", zone["high"]))
-            trigger_quality = float(trigger["quality"])
-            target_quality = _clamp(rr_gross / 2.5, 0, 1)
-            context_quality = 1.0 if context.get("healthy") else 0.6
-            impulse_quality = _clamp(float(impulse["leg_atr"]) / 4.0, 0, 1)
-            volatility_quality = 1.0 if 5 <= atr_rank <= 98 else 0.5
-            score, score_groups = _v11_score({
-                "impulse": impulse_quality,
-                "value": max(value_quality, 0.85 if deep else 0.0),
-                "trigger": trigger_quality,
-                "target": target_quality,
-                "context": context_quality,
-                "volatility": volatility_quality,
-            })
-            setup_identity = f"{side}|IMP:{int(impulse['low_time'])}:{int(impulse['high_time'])}|SWEEP:{int(trigger['sweep_time'])}|RECLAIM:{int(trigger['trigger_time'])}|LEVEL:{float(trigger['swept_level']):.12g}"
-            return {
-                "side": side,
-                "candidate": True,
-                "direction_ok": True,
-                "context": context,
-                "impulse": impulse,
-                "value_zone": zone,
-                "trigger": trigger,
-                "entry": entry,
-                "signal_reference_entry": entry,
-                "stop_loss": stop,
-                "tp": tp,
-                "rr": rr_net,
-                "rr_gross": rr_gross,
-                "atr_4h": atr4,
-                "atr_1h": atr1,
-                "sl_atr": sl_atr,
-                "tp_distance_atr": abs(tp - entry) / atr4,
-                "target": target,
-                "target_path_ok": bool(target.get("ok")),
-                "target_path_structural": bool(target.get("structural")),
-                "target_path_clear": bool(target.get("path_clear")),
-                "target_path_reason": target.get("reason"),
-                "blocking_levels": target.get("blocking_levels") or [],
-                "blocking_level": target.get("blocking_level"),
-                "score": score,
-                "score_groups": score_groups,
-                "atr_percentile": atr_rank,
-                "btc_filter_ok": True,
-                "btc_filter_reason": btc_reason,
-                "value_deep": deep,
-                "value_quality": value_quality,
-                "shock_ok": shock_ok,
-                "setup_state": "TRIGGERED",
-                "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
-                "setup_identity": setup_identity,
-            }
-    return {"side": side, "direction_ok": direction_ok, "context": context, "candidate": False, "reason": "no active value-pullback setup"}
-
-
-def _v11_empty(
-    symbol: str,
-    c1d: list[Candle],
-    c12: list[Candle],
-    c4: list[Candle],
-    c1: list[Candle],
-    reason: str,
-    daily: dict[str, Any],
-    btc_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    price = float(c1[-1]["close"])
-    close_time = int(c1[-1]["time"]) + TIMEFRAME_MS["1h"]
-    return {
-        "symbol": symbol.upper(),
-        "price": price,
-        "setup": "NONE",
-        "setup_candidate": "NONE",
-        "regime_1d": daily.get("regime"),
-        "daily_structure_1d": daily.get("structure"),
-        "signal_engine_version": ENGINE_VERSION,
-        "signal_basis": "1D trend → 12H health → 4H impulse/pullback into value → 1H strict liquidity sweep/reclaim → next 1H market execution",
-        "primary_entry_timeframe": "1H",
-        "setup_timeframe": "4H",
-        "signal_candle_timeframe": "1H",
-        "entry_mode": "MARKET",
-        "entry_1h_ready": False,
-        "direction_ok": False,
-        "structure_ok": False,
-        "setup_ok": False,
-        "confirmation_ok": False,
-        "location_ok": False,
-        "target_path_ok": False,
-        "target_path_structural": False,
-        "target_path_clear": False,
-        "structure_quality_ok": False,
-        "trade_geometry_ok": False,
-        "shock_veto_ok": False,
-        "technical_candidate": False,
-        "risk_ok": False,
-        "rr_ok": False,
-        "volatility_ok": False,
-        "confirmation_family_diversity_ok": True,
-        "score": 0,
-        "score_groups": {},
-        "confirmation_families": {},
-        "confirmation_families_passed": 0,
-        "confirmation_families_available": len(CONFIRMATION_FAMILY_NAMES),
-        "reasons": [reason],
-        "diagnostic_failures": [reason],
-        "technical_gate_failures": [reason],
-        "rejection_stage": "DIRECTION" if not daily.get("bull") and not daily.get("bear") else "SETUP",
-        "candle_open_time": int(c1[-1]["time"]),
-        "candle_close_time": close_time,
-        "candle_time": close_time,
-        "closed_1d_candles": len(c1d),
-        "closed_12h_candles": len(c12),
-        "closed_4h_candles": len(c4),
-        "closed_1h_candles": len(c1),
-        "btc_filter_ok": True if not btc_context else bool(btc_context.get("ok", True)),
-        "btc_filter_reason": "No actionable setup",
-        "btc_context": btc_context or {"ok": False},
-    }
-
-
-def _v11_diagnostic_failures(data: dict[str, Any]) -> list[str]:
-    checks = [
-        (not bool(data.get("direction_ok")), "1D directional permission failed"),
-        (not bool(data.get("structure_ok")), "4H continuation structure failed"),
-        (not bool(data.get("setup_ok")), "4H value pullback failed"),
-        (not bool(data.get("confirmation_ok")), "1H strict sweep/reclaim failed"),
-        (not bool(data.get("target_path_ok")), "No valid structural target/path"),
-        (not bool(data.get("risk_ok")), "Structural risk model failed"),
-        (not bool(data.get("rr_ok")), f"Post-cost RR < {V11_MIN_RR:.2f}"),
-        (not bool(data.get("shock_veto_ok")), "1H shock veto failed"),
-        (not bool(data.get("btc_filter_ok")), "BTC regime filter failed"),
-    ]
-    return [label for failed, label in checks if failed]
-
-
-def calculate_confluence(data: dict[str, Any]) -> dict[str, Any]:
-    """Compatibility identity function; V11 score is diagnostic, not a gate."""
-    return dict(data)
-
-
-def _diagnostic_failures(data: dict[str, Any]) -> list[str]:
-    return _v11_diagnostic_failures(data)
-
-
-def _backtest_flow_proxy(candles: list[Candle], window: int = 12) -> float | None:
-    rows = candles[-window:] if len(candles) > window else candles
-    buy = sell = 0.0
-    for c in rows:
-        vol = _num(c.get("volume"))
-        if _num(c.get("close")) > _num(c.get("open")):
-            buy += vol
-        elif _num(c.get("close")) < _num(c.get("open")):
-            sell += vol
-    total = buy + sell
-    return (buy - sell) / total if total > 0 else None
-
-
-def _rolling_vwap(candles: list[Candle], window: int = 48) -> float | None:
-    rows = candles[-window:] if len(candles) > window else candles
-    total = weighted = 0.0
-    for c in rows:
-        vol = _num(c.get("volume"))
-        if vol <= 0:
-            continue
-        typical = (_num(c.get("high")) + _num(c.get("low")) + _num(c.get("close"))) / 3.0
-        total += vol
-        weighted += typical * vol
-    return weighted / total if total > 0 else None
-
-
-def analyze_candles(
-    symbol: str,
-    candles_1d: list[Any],
-    candles_12h: list[Any] | None,
-    candles_4h: list[Any],
-    candles_1h: list[Any],
-    *,
-    now_ms: int | None = None,
-    btc_context: dict[str, Any] | None = None,
-    estimated_round_trip_cost_pct: float = 0.0018,
-) -> dict[str, Any]:
-    """Authoritative V11 analysis using only completed 1D/12H/4H/1H candles."""
-    now = int(now_ms if now_ms is not None else time.time() * 1000)
-    c1d = closed_candle_rows(candles_1d or [], "1D", now)
-    c4 = closed_candle_rows(candles_4h or [], "4H", now)
-    c1 = closed_candle_rows(candles_1h or [], "1H", now)
-    c12 = closed_candle_rows(candles_12h, "12H", now) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now)
-    for c, tf, minimum in ((c1d, "1D", 210), (c12, "12H", 60), (c4, "4H", 180), (c1, "1H", 180)):
-        ok, reason = _data_quality(c, tf, minimum)
-        if not ok:
-            raise ValueError(f"{symbol}: {reason}")
-
-    daily = _v11_regime_1d(c1d)
-    cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0018))
-    candidates = []
-    for side in ("LONG", "SHORT"):
-        result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
-        if result.get("candidate"):
-            candidates.append(result)
-    if not candidates:
-        return _v11_empty(
-            symbol, c1d, c12, c4, c1,
-            "1D trend permission is neutral" if daily.get("regime") == "NEUTRAL" else "no active V11 value-pullback trigger",
-            daily,
-            btc_context,
-        )
-
-    # Deterministic ranking when both sides qualify. Score is only a ranking aid.
-    chosen = max(
-        candidates,
-        key=lambda x: (
-            int(x.get("score", 0)),
-            int(x["trigger"].get("reclaim_idx", -1)),
-            int(x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"]),
-        ),
-    )
-    side = str(chosen["side"])
-    context = chosen["context"]
-    trigger = chosen["trigger"]
-    impulse = chosen["impulse"]
-    target = chosen["target"]
-    entry = float(chosen["entry"])
-    stop = float(chosen["stop_loss"])
-    tp = float(chosen["tp"])
-    rr = float(chosen["rr"])
-    rr_gross = float(chosen["rr_gross"])
-    risk = abs(entry - stop)
-    geometry_ok = bool((stop < entry < tp) if side == "LONG" else (tp < entry < stop))
-    target_ok = bool(chosen.get("target_path_ok"))
-    target_clear = bool(chosen.get("target_path_clear"))
-    shock_ok = bool(chosen.get("shock_ok"))
-    btc_ok = bool(chosen.get("btc_filter_ok", True))
-    rr_ok = bool(rr + V11_ENGINE_RR_EPSILON >= V11_MIN_RR)
-    atr4 = float(chosen["atr_4h"])
-    atr1 = float(chosen["atr_1h"])
-    atr_rank = float(chosen["atr_percentile"])
-
-    direction_ok = True
-    structure_ok = True
-    setup_ok = True
-    confirmation_ok = True
-    volatility_ok = bool(5 <= atr_rank <= 98)
-    families = {
-        "trend_context": "PASS" if context.get("healthy") else "SUPPORT",
-        "value_location": "PASS" if chosen.get("value_deep") else "SUPPORT",
-        "liquidity_reclaim": "PASS",
-        "relative_volume": "PASS" if _num(trigger.get("rvol")) >= 1.20 else "SUPPORT",
-        "volatility": "PASS" if volatility_ok else "SUPPORT",
-        "target_geometry": "PASS" if target_ok and target_clear else "SUPPORT",
-    }
-    passed = sum(value == "PASS" for value in families.values())
-    score = int(chosen["score"])
-    stage_status = {
-        "1D_REGIME": direction_ok,
-        "12H_BIAS": not bool(context.get("hostile")),
-        "4H_SETUP": structure_ok and setup_ok,
-        "1H_TRIGGER": confirmation_ok,
-        "ENTRY_DISTANCE": True,
-        "VOLATILITY": volatility_ok,
-        "CONFIRMATION_FAMILIES": True,
-        "TARGET_PATH": target_ok and target_clear,
-        "RISK": geometry_ok,
-        "RR": rr_ok,
-        "QUALITY": True,
-        "BTC": btc_ok,
-        "SHOCK": shock_ok,
-    }
-    stage_failures = {key: [] for key in stage_status}
-    if not target_clear:
-        stage_failures["TARGET_PATH"] = [str(chosen.get("target_path_reason") or "target path is blocked")]
-    if not rr_ok:
-        stage_failures["RR"] = [f"Post-cost RR {rr:.2f} < {V11_MIN_RR:.2f}"]
-    if not geometry_ok:
-        stage_failures["RISK"] = ["SL < entry < TP geometry failed for selected side"]
-    technical_candidate = bool(direction_ok and structure_ok and setup_ok and confirmation_ok and target_ok and target_clear and geometry_ok and rr_ok and volatility_ok and shock_ok and btc_ok)
-
-    reasons = [
-        f"1D {daily.get('regime')} permission",
-        f"4H continuation impulse {float(impulse['leg_atr']):.2f} ATR",
-        f"Value zone {float(chosen['value_zone']['low']):.6g}-{float(chosen['value_zone']['high']):.6g}",
-        "1H strict liquidity sweep → subsequent reclaim",
-        f"Structural TP {target.get('timeframe', 'HTF')}; post-cost RR {rr:.2f}",
-    ]
-    analysis = {
-        "symbol": symbol.upper(),
-        "price": entry,
-        "setup": side,
-        "setup_candidate": side,
-        "regime_1d": daily.get("regime"),
-        "trend_4h": "HH/HL" if side == "LONG" else "LH/LL",
-        "bias_12h": context.get("status"),
-        "daily_structure_1d": daily.get("structure"),
-        "structure_12h": context.get("structure"),
-        "structure_4h": "HH/HL" if side == "LONG" else "LH/LL",
-        "protected_structure_4h": "BULLISH" if side == "LONG" else "BEARISH",
-        "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"),
-        "ema21_12h": context.get("e21"), "ema50_12h": context.get("e50"),
-        "ema21_4h": _safe_ema([float(c["close"]) for c in c4], 21), "ema50_4h": _safe_ema([float(c["close"]) for c in c4], 50),
-        "ema21_1h": _safe_ema([float(c["close"]) for c in c1], 21), "ema50_1h": _safe_ema([float(c["close"]) for c in c1], 50),
-        "rsi": _safe_rsi([float(c["close"]) for c in c1]), "rsi_1h_entry": _safe_rsi([float(c["close"]) for c in c1]),
-        "atr": atr1, "atr_1h": atr1, "atr_4h": atr4, "atr_percentile": atr_rank,
-        "rvol": _relative_volume(c1, 20), "rvol_1h": float(trigger.get("rvol", 0.0)),
-        "volume": volume_status(c1), "volume_status": volume_status(c1), "adx_1d": _adx(c1d), "ema50_slope_1d": daily.get("slope"),
-        "estimated_round_trip_cost_pct": cost_pct,
-        "effective_round_trip_cost_pct": cost_pct,
-        "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
-        "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
-        "signal_engine_version": ENGINE_VERSION,
-        "signal_basis": "1D trend → 12H health → 4H continuation impulse/pullback into value → 1H strict liquidity sweep/reclaim → next 1H market execution",
-        "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
-        "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES,
-        "trigger_side": side,
-        "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),
-        "trigger_type": "LIQUIDITY_SWEEP_THEN_RECLAIM", "trigger_reason": trigger.get("reason"),
-        "trigger_close_location": float(trigger.get("close_location", 0.0)),
-        "structure_quality_ok": structure_ok, "trade_geometry_ok": geometry_ok,
-        "momentum_quality": 0.5, "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
-        "volatility_quality": 1.0 if volatility_ok else 0.5,
-        "entry_efficiency": 1.0, "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
-        "entry_mode": "MARKET", "limit_price": None, "entry_1h_ready": True,
-        "shock_veto_ok": shock_ok, "shock_veto_reason": "OK" if shock_ok else "1H trigger candle range exceeded shock threshold",
-        "score": score, "score_groups": chosen["score_groups"],
-        "confirmation_families": families, "confirmation_families_passed": passed, "confirmation_families_available": len(families),
-        "confirmation_family_diversity_ok": True,
-        "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok,
-        "momentum_ok": True, "volume_ok": True, "location_ok": target_ok and target_clear, "volatility_ok": volatility_ok,
-        "risk_ok": geometry_ok, "rr_ok": rr_ok, "entry_distance_ok": True,
-        "stage_status": stage_status, "stage_failures": stage_failures,
-        "technical_candidate": technical_candidate,
-        "signal_blocked": False, "rejection_stage": None,
-        "technical_gate_failures": _v11_diagnostic_failures({
-            "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok,
-            "confirmation_ok": confirmation_ok, "target_path_ok": target_ok and target_clear,
-            "risk_ok": geometry_ok, "rr_ok": rr_ok, "shock_veto_ok": shock_ok, "btc_filter_ok": btc_ok,
-        }),
-        "diagnostic_failures": [], "reasons": reasons,
-        "entry": entry, "signal_reference_entry": entry,
-        "stop_loss": stop, "tp": tp, "rr": rr, "rr_gross": rr_gross,
-        "sl_atr": risk / atr4 if atr4 > 0 else 0.0,
-        "sl_atr_1h": risk / atr1 if atr1 > 0 else 0.0, "sl_atr_4h": risk / atr4 if atr4 > 0 else 0.0,
-        "stop_distance_pct": risk / entry if entry > 0 else 0.0,
-        "tp_distance_atr": abs(tp - entry) / atr4 if atr4 > 0 else 0.0,
-        "tp_distance_atr_1h": abs(tp - entry) / atr1 if atr1 > 0 else 0.0,
-        "tp_distance_pct": abs(tp - entry) / entry if entry > 0 else 0.0,
-        "target_path_ok": target_ok,
-        "target_path_structural": bool(target.get("structural")),
-        "target_path_clear": target_clear,
-        "target_path_reason": target.get("reason"),
-        "target_timeframe": target.get("timeframe"),
-        "target_levels": target.get("target_levels") or [],
-        "blocking_levels": target.get("blocking_levels") or [],
-        "blocking_level": target.get("blocking_level"),
-        "stop_source": "1H sweep extreme + structural volatility buffer",
-        "geometry_reason": "OK" if geometry_ok else "invalid side geometry",
-        "entry_limit_price": None, "limit_entry_expiry_minutes": 0,
-        "candle_open_time": int(c1[-1]["time"]),
-        "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
-        "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
-        "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
-        "trigger_candle_open_time": trigger.get("trigger_time"),
-        "setup_impulse_high_time": impulse.get("high_time"), "setup_impulse_low_time": impulse.get("low_time"),
-        "setup_pullback_touch_time": int(c1[int(trigger["sweep_idx"])]["time"]),
-        "sweep_time_1h": trigger.get("sweep_time"), "reclaim_time_1h": trigger.get("trigger_time"),
-        "setup_identity": chosen.get("setup_identity"),
-        "setup_bos_time": None, "setup_departure_time": None,
-        "value_zone_low": float(chosen["value_zone"]["low"]), "value_zone_high": float(chosen["value_zone"]["high"]),
-        "value_deep": bool(chosen.get("value_deep")), "swept_level_1h": float(trigger["swept_level"]),
-        "rolling_vwap_12h": _rolling_vwap(c12, 48), "flow_proxy_ratio": _backtest_flow_proxy(c1, 12),
-        "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
-        "btc_filter_ok": btc_ok, "btc_filter_reason": chosen.get("btc_filter_reason", "OK"),
-        "btc_would_block": not btc_ok, "btc_risk_mode": "OBSERVE", "btc_context": btc_context or {"ok": False},
-    }
-    return analysis
-
-
 async def analyze_symbol(market, symbol: str) -> dict[str, Any]:
     ref = await market.resolve(symbol)
     c1d = await market.ohlcv(ref, "1D", 250)
     c4 = await market.ohlcv(ref, "4H", 650)
     c1 = await market.ohlcv(ref, "1H", 250)
     c12 = synthesize_12h_from_4h(c4)
-    btc = None
-    if str(symbol).upper() != "BTC_USDT":
-        try:
-            btc_c1d = await market.ohlcv(await market.resolve("BTC_USDT"), "1D", 250)
-            btc_c4 = await market.ohlcv(await market.resolve("BTC_USDT"), "4H", 650)
-            btc_c1 = await market.ohlcv(await market.resolve("BTC_USDT"), "1H", 250)
-            btc_c12 = synthesize_12h_from_4h(btc_c4)
-            btc = build_btc_context(btc_c1d, btc_c12, btc_c4, btc_c1)
-        except Exception:
-            btc = None
-    return analyze_candles(symbol, c1d, c12, c4, c1, btc_context=btc)
+    return analyze_candles(ref.symbol, c1d, c12, c4, c1)

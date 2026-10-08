@@ -60,7 +60,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V11-balanced-value-pullback-liquidity-reclaim"
+ENGINE_VERSION = "V11-A-accuracy-research-variant"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -1172,7 +1172,7 @@ def _v11_empty(
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
-        "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
+        "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim", "strategy_variant": "CONTROL",
         "sl_mode": V11_SL_MODE,
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
@@ -1195,7 +1195,7 @@ def _v11_empty(
     }
 
 
-def analyze_candles(
+def _analyze_v11_control_candles(
     symbol: str,
     candles_1d: list,
     candles_12h: list | None,
@@ -1337,6 +1337,7 @@ def analyze_candles(
         "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
         "signal_engine_version": ENGINE_VERSION,
         "signal_basis": "1D macro vote → 12H health → 4H impulse/pullback into value → 1H liquidity sweep/reclaim → next 1H open",
+        "strategy_variant": "CONTROL",
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
         "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),
@@ -1432,6 +1433,948 @@ def _rolling_vwap(candles: list[Candle], window: int = 48) -> float | None:
 
 
 
+
+
+# ============================================================================
+# V11 EXPERIMENTAL STRATEGY VARIANTS
+# ============================================================================
+# The common V11 control engine remains intact above. Experimental variants are
+# deliberately implemented as a thin strategy layer so data, candle handling,
+# timeframes, cost model, and existing infrastructure remain reusable.
+
+V11_DEFAULT_STRATEGY = os.getenv("V11_DEFAULT_STRATEGY", "A").strip().upper() or "A"
+if V11_DEFAULT_STRATEGY not in {"CONTROL", "A", "B", "C"}:
+    V11_DEFAULT_STRATEGY = "CONTROL"
+V11_STRATEGY_VARIANT = os.getenv("V11_STRATEGY_VARIANT", V11_DEFAULT_STRATEGY).strip().upper() or V11_DEFAULT_STRATEGY
+if V11_STRATEGY_VARIANT not in {"CONTROL", "A", "B", "C"}:
+    V11_STRATEGY_VARIANT = V11_DEFAULT_STRATEGY
+
+# Strategy A — V11-QG (Quality Gate). The research recommendation is to test
+# one gate at a time. Default is the first recommended test (room-to-target),
+# while the other gates remain opt-in for controlled ablations.
+QG_ENABLE_G1 = _env_bool("V11_QG_ENABLE_ROOM", True)
+QG_ENABLE_G2 = _env_bool("V11_QG_ENABLE_RECLAIM", False)
+QG_ENABLE_G3 = _env_bool("V11_QG_ENABLE_EXTENSION", False)
+QG_ROOM_MIN_R = _env_float("V11_QG_ROOM_MIN_R", 1.50, minimum=0.50, maximum=5.00)
+QG_RQ_MIN = _env_float("V11_QG_RQ_MIN", 0.60, minimum=0.30, maximum=0.95)
+QG_RANGE_CAP_ATR1 = _env_float("V11_QG_RANGE_CAP_ATR1", 2.00, minimum=0.50, maximum=5.00)
+QG_EXT_MAX_ATR4 = _env_float("V11_QG_EXT_MAX_ATR4", 2.00, minimum=0.50, maximum=6.00)
+
+# Strategy B — BRT-4H (Breakout + Retest Hold). Values are pre-registered
+# baselines from the research report, not optimized here.
+BRT_LOOKBACK_4H = _env_int("V11_BRT_LOOKBACK_4H", 12, minimum=8, maximum=16)
+BRT_BREAKOUT_BUFFER_ATR4 = _env_float("V11_BRT_BREAKOUT_BUFFER_ATR4", 0.20, minimum=0.05, maximum=0.50)
+BRT_BODY_MIN = _env_float("V11_BRT_BODY_MIN", 0.60, minimum=0.30, maximum=0.90)
+BRT_RETEST_BARS_1H = _env_int("V11_BRT_RETEST_BARS_1H", 12, minimum=4, maximum=24)
+BRT_RETEST_ZONE_ATR4 = _env_float("V11_BRT_RETEST_ZONE_ATR4", 0.35, minimum=0.10, maximum=0.75)
+BRT_RETEST_INVALIDATION_ATR1 = _env_float("V11_BRT_RETEST_INVALIDATION_ATR1", 0.25, minimum=0.05, maximum=0.75)
+BRT_MIN_RR = _env_float("V11_BRT_MIN_RR", 2.00, minimum=1.20, maximum=4.00)
+BRT_MIN_BREAKOUT_ATR4 = _env_float("V11_BRT_MIN_BREAKOUT_ATR4", 1.20, minimum=0.50, maximum=4.00)
+BRT_MAX_BREAKOUT_ATR4 = _env_float("V11_BRT_MAX_BREAKOUT_ATR4", 3.50, minimum=1.00, maximum=6.00)
+
+# Strategy C — LDR (Liquidity-Displacement Reversion). Base test is restricted
+# to a genuine 1D neutral regime; counter-trend permissions are intentionally
+# not enabled in the base implementation.
+LDR_RANGE_LOOKBACK_4H = _env_int("V11_LDR_RANGE_LOOKBACK_4H", 18, minimum=12, maximum=24)
+LDR_DISP_LOOKBACK_4H = _env_int("V11_LDR_DISP_LOOKBACK_4H", 6, minimum=3, maximum=12)
+LDR_DISP_ATR4 = _env_float("V11_LDR_DISP_ATR4", 2.50, minimum=1.00, maximum=5.00)
+LDR_SWEEP_MIN_ATR1 = _env_float("V11_LDR_SWEEP_MIN_ATR1", 0.10, minimum=0.02, maximum=0.75)
+LDR_RECLAIM_BARS_1H = _env_int("V11_LDR_RECLAIM_BARS_1H", 6, minimum=1, maximum=12)
+LDR_MIN_RR = _env_float("V11_LDR_MIN_RR", 1.50, minimum=1.00, maximum=3.00)
+LDR_TIME_STOP_BARS_1H = _env_int("V11_LDR_TIME_STOP_BARS_1H", 36, minimum=12, maximum=72)
+LDR_EDGE_CONTINUATION_ATR4 = _env_float("V11_LDR_EDGE_CONTINUATION_ATR4", 0.50, minimum=0.10, maximum=2.00)
+
+
+def _nearest_htf_opposing_room_r(
+    c4: list[Candle],
+    c12: list[Candle],
+    c1d: list[Candle],
+    entry: float,
+    stop: float,
+    side: str,
+) -> float | None:
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    levels: list[float] = []
+    for candles in (c12, c1d):
+        highs, lows = _swing_points(candles, 3, 3)
+        if side == "LONG":
+            levels.extend(float(p) for _, p in highs if float(p) > entry)
+        else:
+            levels.extend(float(p) for _, p in lows if float(p) < entry)
+    if not levels:
+        return None
+    room = min(levels) - entry if side == "LONG" else entry - max(levels)
+    return room / risk if room > 0 else 0.0
+
+
+def _reclaim_at_level(
+    candles: list[Candle],
+    start_idx: int,
+    side: str,
+    level: float,
+    max_bars: int,
+    atr1: float,
+) -> dict[str, Any]:
+    """Causal sweep + reclaim against a pre-defined HTF liquidity level."""
+    empty = {
+        "ready": False,
+        "sweep_idx": None,
+        "reclaim_idx": None,
+        "swept_level": float(level),
+        "quality": 0.0,
+        "rvol": 0.0,
+        "body_ratio": 0.0,
+        "close_location": 0.0,
+        "reason": "no causal level sweep + reclaim",
+    }
+    if start_idx < 0 or start_idx >= len(candles):
+        return empty
+    end = min(len(candles) - 1, start_idx + max_bars)
+    min_pen = max(0.0, float(atr1)) * 0.0 + LDR_SWEEP_MIN_ATR1 * max(float(atr1), 1e-12)
+    for i in range(start_idx, end + 1):
+        c = candles[i]
+        low = float(c["low"]); high = float(c["high"])
+        swept = (low < level - min_pen) if side == "LONG" else (high > level + min_pen)
+        if not swept:
+            continue
+        for j in range(i + 1, end + 1):
+            r = candles[j]
+            ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
+            rrng = max(rhigh - rlow, 1e-12)
+            body = abs(rclose - ropen) / rrng
+            loc_up = (rclose - rlow) / rrng
+            loc = loc_up if side == "LONG" else 1.0 - loc_up
+            reclaimed = (rclose > level and rclose > ropen) if side == "LONG" else (rclose < level and rclose < ropen)
+            if not reclaimed:
+                continue
+            rvol = _relative_volume(candles[:j + 1], 20)
+            quality = _clamp(
+                0.40
+                + 0.25 * _clamp(body / 0.50, 0, 1)
+                + 0.20 * _clamp(rvol / 1.20, 0, 1)
+                + 0.15 * _clamp(loc / 0.70, 0, 1),
+                0,
+                1,
+            )
+            return {
+                "ready": True,
+                "sweep_idx": i,
+                "reclaim_idx": j,
+                "swept_level": float(level),
+                "quality": quality,
+                "rvol": rvol,
+                "body_ratio": body,
+                "close_location": loc,
+                "reason": "HTF liquidity level swept and reclaimed",
+                "trigger_time": int(r["time"]),
+                "sweep_time": int(c["time"]),
+            }
+    return empty
+
+
+def _latest_confirmed_level(
+    c12: list[Candle],
+    c1d: list[Candle],
+    side: str,
+    reference: float,
+) -> tuple[float | None, str]:
+    candidates: list[tuple[int, float, str]] = []
+    for candles, tf in ((c12, "12H"), (c1d, "1D")):
+        highs, lows = _swing_points(candles, 3, 3)
+        points = lows if side == "LONG" else highs
+        for idx, price in points:
+            price = float(price)
+            if side == "LONG" and price <= reference:
+                candidates.append((int(candles[idx]["time"]), price, tf))
+            elif side == "SHORT" and price >= reference:
+                candidates.append((int(candles[idx]["time"]), price, tf))
+    if not candidates:
+        return None, "NONE"
+    _, price, tf = max(candidates, key=lambda x: x[0])
+    return price, tf
+
+
+def _nearest_structural_target(
+    c4: list[Candle],
+    c12: list[Candle],
+    c1d: list[Candle],
+    entry: float,
+    side: str,
+    preferred: float | None = None,
+) -> tuple[float | None, str, int | None]:
+    levels: list[tuple[float, str, int]] = []
+    if preferred is not None:
+        p = float(preferred)
+        if (side == "LONG" and p > entry) or (side == "SHORT" and p < entry):
+            levels.append((p, "RANGE_ANCHOR", 0))
+    for candles, tf in ((c4, "4H"), (c12, "12H"), (c1d, "1D")):
+        highs, lows = _swing_points(candles, 3, 3)
+        points = highs if side == "LONG" else lows
+        for idx, price in points:
+            price = float(price)
+            if (side == "LONG" and price > entry) or (side == "SHORT" and price < entry):
+                levels.append((price, tf, int(candles[idx]["time"])))
+    if not levels:
+        return None, "NONE", None
+    if side == "LONG":
+        return min(levels, key=lambda x: x[0] - entry)
+    return min(levels, key=lambda x: entry - x[0])
+
+
+def _prepare_strategy_candles(
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list,
+    *,
+    now_ms: int,
+    cache: Optional[dict[str, Any]],
+) -> tuple[list[Candle], list[Candle], list[Candle], list[Candle]]:
+    """Prepare only information available at the causal decision timestamp."""
+    if cache is not None and bool(cache.get("_preclosed_candles")):
+        c1d = _coerce_candles(candles_1d or [])
+        c4 = _coerce_candles(candles_4h or [])
+        c1 = _coerce_candles(candles_1h or [])
+        c12 = _coerce_candles(candles_12h or []) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now_ms)
+    else:
+        c1d = closed_candle_rows(candles_1d or [], "1D", now_ms)
+        c4 = closed_candle_rows(candles_4h or [], "4H", now_ms)
+        c1 = closed_candle_rows(candles_1h or [], "1H", now_ms)
+        c12 = closed_candle_rows(candles_12h, "12H", now_ms) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now_ms)
+    return c1d, c12, c4, c1
+
+def _alt_signal_payload(
+    *,
+    symbol: str,
+    side: str,
+    daily: dict[str, Any],
+    context: dict[str, Any],
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+    entry: float,
+    stop: float,
+    tp: float,
+    rr: float,
+    rr_gross: float,
+    trigger_type: str,
+    trigger: dict[str, Any],
+    target_tf: str,
+    target_reason: str,
+    target_path: dict[str, Any],
+    score: int,
+    score_groups: dict[str, int],
+    basis: str,
+    hold_minutes: float = DEFAULT_MAX_HOLD_MINUTES,
+    cost_pct: float = 0.0,
+    btc_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    atr4 = _safe_atr(c4)
+    atr1 = _safe_atr(c1)
+    risk = abs(entry - stop)
+    sl_atr4 = risk / atr4 if atr4 > 0 else 999.0
+    sl_atr1 = risk / atr1 if atr1 > 0 else 999.0
+    last = c1[-1]
+    range1 = max(float(last["high"]) - float(last["low"]), 1e-12)
+    close_loc = (float(last["close"]) - float(last["low"])) / range1
+    if side == "SHORT":
+        close_loc = 1.0 - close_loc
+    shock_ok = not (atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1)
+    geometry_ok = bool((stop < entry < tp) if side == "LONG" else (tp < entry < stop))
+    btc_ok, btc_reason = btc_filter_ok(side, btc_context or {}, is_btc=symbol.upper().startswith("BTC"))
+    structure_4h = "HH/HL" if side == "LONG" else "LH/LL"
+    target_clear = bool((target_path or {}).get("clear", True))
+    stage_status = {
+        "1D_REGIME": True,
+        "12H_BIAS": not bool(context.get("hostile")),
+        "4H_SETUP": True,
+        "1H_TRIGGER": True,
+        "ENTRY_DISTANCE": True,
+        "VOLATILITY": shock_ok,
+        "CONFIRMATION_FAMILIES": True,
+        "TARGET_PATH": target_clear,
+        "RISK": geometry_ok,
+        "RR": rr >= (BRT_MIN_RR if trigger_type.startswith("BOS") else LDR_MIN_RR),
+        "QUALITY": True,
+        "BTC": btc_ok,
+        "SHOCK": shock_ok,
+    }
+    families = {
+        "trend_context": "PASS" if context.get("healthy") else "SUPPORT",
+        "structure_quality": "PASS",
+        "entry_quality": "PASS" if float(trigger.get("quality", 0.0)) >= 0.60 else "SUPPORT",
+        "relative_volume": "PASS" if float(trigger.get("rvol", 0.0)) >= 1.20 else "SUPPORT",
+        "volatility": "PASS" if shock_ok else "SUPPORT",
+        "target_geometry": "PASS" if target_clear else "SUPPORT",
+    }
+    return {
+        "symbol": symbol.upper(),
+        "price": float(entry),
+        "setup": side,
+        "setup_candidate": side,
+        "regime_1d": daily.get("regime"),
+        "trend_4h": structure_4h,
+        "bias_12h": context.get("status"),
+        "daily_structure_1d": daily.get("structure"),
+        "structure_12h": context.get("structure"),
+        "structure_4h": structure_4h,
+        "protected_structure_4h": "BULLISH" if side == "LONG" else "BEARISH",
+        "ema21_1d": daily.get("e21"),
+        "ema50_1d": daily.get("e50"),
+        "ema200_1d": daily.get("e200"),
+        "ema21_12h": context.get("e21"),
+        "ema50_12h": context.get("e50"),
+        "ema21_4h": _safe_ema([float(c["close"]) for c in c4], 21),
+        "ema50_4h": _safe_ema([float(c["close"]) for c in c4], 50),
+        "ema21_1h": _safe_ema([float(c["close"]) for c in c1], 21),
+        "ema50_1h": _safe_ema([float(c["close"]) for c in c1], 50),
+        "rsi": _safe_rsi([float(c["close"]) for c in c1]),
+        "rsi_1h_entry": _safe_rsi([float(c["close"]) for c in c1]),
+        "atr": atr1,
+        "atr_1h": atr1,
+        "atr_4h": atr4,
+        "atr_percentile": _atr_percentile(c4),
+        "rvol": _relative_volume(c1, 20),
+        "rvol_1h": float(trigger.get("rvol", 0.0)),
+        "volume": volume_status(c1),
+        "adx_1d": _adx(c1d),
+        "ema50_slope_1d": daily.get("slope"),
+        "estimated_round_trip_cost_pct": float(cost_pct),
+        "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
+        "futures_ok": None,
+        "futures_execution_ok": None,
+        "data_fresh": None,
+        "signal_engine_version": ENGINE_VERSION,
+        "signal_basis": basis,
+        "strategy_variant": V11_STRATEGY_VARIANT,
+        "primary_entry_timeframe": "1H",
+        "setup_timeframe": "4H",
+        "signal_candle_timeframe": "1H",
+        "intraday_max_hold_minutes": hold_minutes,
+        "trigger_side": side,
+        "trigger_quality": float(trigger.get("quality", 0.0)),
+        "trigger_quality_1h": float(trigger.get("quality", 0.0)),
+        "trigger_type": trigger_type,
+        "trigger_reason": trigger.get("reason"),
+        "trigger_close_location": float(trigger.get("close_location", close_loc)),
+        "structure_quality_ok": True,
+        "trade_geometry_ok": geometry_ok,
+        "momentum_quality": _clamp(float(trigger.get("body_ratio", 0.0)) / 0.60, 0, 1),
+        "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
+        "volatility_quality": 1.0 if shock_ok else 0.0,
+        "entry_efficiency": 1.0,
+        "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
+        "entry_mode": "MARKET",
+        "limit_price": None,
+        "entry_1h_ready": True,
+        "shock_veto_ok": shock_ok,
+        "shock_veto_reason": "OK" if shock_ok else "1H shock candle",
+        "score": int(score),
+        "score_groups": dict(score_groups),
+        "confirmation_families": families,
+        "confirmation_families_passed": sum(v == "PASS" for v in families.values()),
+        "confirmation_families_available": len(families),
+        "confirmation_family_diversity_ok": True,
+        "direction_ok": True,
+        "structure_ok": True,
+        "setup_ok": True,
+        "confirmation_ok": True,
+        "momentum_ok": True,
+        "volume_ok": True,
+        "location_ok": target_clear,
+        "volatility_ok": shock_ok,
+        "risk_ok": geometry_ok and V11_MIN_SL_ATR_SANITY <= sl_atr4 <= V11_MAX_SL_ATR_SANITY,
+        "rr_ok": bool(rr >= (BRT_MIN_RR if trigger_type.startswith("BOS") else LDR_MIN_RR)),
+        "entry_distance_ok": True,
+        "stage_status": stage_status,
+        "stage_failures": {k: [] for k in stage_status},
+        "technical_candidate": bool(geometry_ok and target_clear and shock_ok and btc_ok and V11_MIN_SL_ATR_SANITY <= sl_atr4 <= V11_MAX_SL_ATR_SANITY),
+        "signal_blocked": False,
+        "rejection_stage": None,
+        "technical_gate_failures": [],
+        "diagnostic_failures": [],
+        "side_diagnostics": [],
+        "primary_rejection_reason": None,
+        "reasons": [
+            f"1D {daily.get('regime')} permission",
+            f"12H {context.get('status')}",
+            trigger.get("reason") or trigger_type,
+            f"{trigger_type}",
+            f"Target {target_tf}; post-cost RR {rr:.2f}",
+        ],
+        "entry": float(entry),
+        "stop_loss": float(stop),
+        "tp": float(tp),
+        "rr": float(rr),
+        "rr_gross": float(rr_gross),
+        "sl_atr": sl_atr4,
+        "sl_atr_1h": sl_atr1,
+        "sl_atr_4h": sl_atr4,
+        "stop_distance_pct": risk / entry if entry > 0 else 0.0,
+        "tp_distance_atr": abs(tp - entry) / atr4 if atr4 > 0 else 0.0,
+        "tp_distance_atr_1h": abs(tp - entry) / atr1 if atr1 > 0 else 0.0,
+        "tp_distance_pct": abs(tp - entry) / entry if entry > 0 else 0.0,
+        "target_path_ok": target_clear,
+        "target_path_structural": target_tf != "RANGE_ANCHOR",
+        "target_path_clear": target_clear,
+        "target_path_reason": target_reason,
+        "target_path_obstacles": (target_path or {}).get("obstacles") or [],
+        "target_timeframe": target_tf,
+        "target_levels": [{"price": float(tp), "timeframe": target_tf}],
+        "blocking_level": None,
+        "stop_source": "breakout-retest structural invalidation + volatility buffer" if trigger_type.startswith("BOS") else "liquidity-displacement sweep invalidation + volatility buffer",
+        "sl_mode": "STRATEGY",
+        "geometry_reason": "OK" if geometry_ok else "invalid geometry",
+        "entry_limit_price": None,
+        "limit_entry_expiry_minutes": 0,
+        "candle_open_time": int(c1[-1]["time"]),
+        "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
+        "trigger_candle_open_time": trigger.get("trigger_time"),
+        "setup_impulse_high_time": trigger.get("breakout_time"),
+        "setup_impulse_low_time": trigger.get("breakout_time"),
+        "setup_pullback_touch_time": trigger.get("sweep_time"),
+        "setup_retest_time": trigger.get("trigger_time"),
+        "setup_retest_1h_time": trigger.get("trigger_time"),
+        "setup_bos_time": trigger.get("breakout_time"),
+        "setup_departure_time": None,
+        "value_zone_low": float(trigger.get("level", entry)),
+        "value_zone_high": float(trigger.get("level", entry)),
+        "value_deep": True,
+        "swept_level_1h": trigger.get("swept_level"),
+        "sweep_time_1h": trigger.get("sweep_time"),
+        "reclaim_time_1h": trigger.get("trigger_time"),
+        "rolling_vwap_12h": None,
+        "flow_proxy_ratio": None,
+        "closed_1d_candles": len(c1d),
+        "closed_12h_candles": len(c12),
+        "closed_4h_candles": len(c4),
+        "closed_1h_candles": len(c1),
+        "btc_filter_ok": btc_ok,
+        "btc_filter_reason": btc_reason,
+        "btc_would_block": not btc_ok,
+        "btc_risk_mode": "OBSERVE",
+        "btc_context": btc_context or {"ok": False},
+    }
+
+
+def _strategy_a_quality_gate(
+    result: dict[str, Any],
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+) -> dict[str, Any]:
+    if not result.get("technical_candidate"):
+        return result
+    side = str(result.get("setup") or "").upper()
+    entry = _num(result.get("entry"), 0.0)
+    stop = _num(result.get("stop_loss"), 0.0)
+    atr4 = _num(result.get("atr_4h"), 0.0)
+    atr1 = _num(result.get("atr_1h"), 0.0)
+    vetoes: list[str] = []
+    details: dict[str, Any] = {}
+
+    if QG_ENABLE_G1:
+        room_r = _nearest_htf_opposing_room_r(c4, c12, c1d, entry, stop, side)
+        details["room_to_opposing_htf_r"] = room_r
+        if room_r is not None and room_r < QG_ROOM_MIN_R:
+            vetoes.append(f"G1_ROOM_{room_r:.2f}R<{QG_ROOM_MIN_R:.2f}R")
+
+    if QG_ENABLE_G2:
+        reclaim_ts = _num(result.get("reclaim_time_1h"), 0.0)
+        reclaim = next((c for c in c1 if int(c["time"]) == int(reclaim_ts)), None)
+        if reclaim is None:
+            vetoes.append("G2_RECLAIM_CANDLE_UNAVAILABLE")
+        else:
+            rrng = max(float(reclaim["high"]) - float(reclaim["low"]), 1e-12)
+            body = abs(float(reclaim["close"]) - float(reclaim["open"]))
+            loc = (float(reclaim["close"]) - float(reclaim["low"])) / rrng
+            if side == "SHORT":
+                loc = 1.0 - loc
+            details["reclaim_close_location"] = loc
+            details["reclaim_range_atr1"] = rrng / atr1 if atr1 > 0 else 999.0
+            if loc < QG_RQ_MIN:
+                vetoes.append(f"G2_RECLAIM_LOCATION_{loc:.2f}<{QG_RQ_MIN:.2f}")
+            if atr1 > 0 and rrng > QG_RANGE_CAP_ATR1 * atr1:
+                vetoes.append(f"G2_RECLAIM_RANGE_{rrng / atr1:.2f}ATR>{QG_RANGE_CAP_ATR1:.2f}ATR")
+
+    if QG_ENABLE_G3:
+        zlow = _num(result.get("value_zone_low"), entry)
+        zhigh = _num(result.get("value_zone_high"), entry)
+        value_mid = (zlow + zhigh) / 2.0
+        ext = abs(entry - value_mid) / atr4 if atr4 > 0 else 999.0
+        details["entry_to_value_mid_atr4"] = ext
+        if ext > QG_EXT_MAX_ATR4:
+            vetoes.append(f"G3_EXTENSION_{ext:.2f}ATR>{QG_EXT_MAX_ATR4:.2f}ATR")
+
+    result["strategy_variant"] = "A"
+    result["quality_gate"] = {
+        "enabled": True,
+        "g1_room": QG_ENABLE_G1,
+        "g2_reclaim": QG_ENABLE_G2,
+        "g3_extension": QG_ENABLE_G3,
+        "details": details,
+        "vetoes": list(vetoes),
+    }
+    if vetoes:
+        result["technical_candidate"] = False
+        result["signal_blocked"] = True
+        result["rejection_stage"] = "QUALITY_GATE"
+        result["technical_gate_failures"] = [f"{side}: {v}" for v in vetoes]
+        result["diagnostic_failures"] = list(result["technical_gate_failures"])
+        result["primary_rejection_reason"] = result["technical_gate_failures"][0]
+        result["reasons"] = list(result.get("reasons") or []) + [f"Quality gate veto: {v}" for v in vetoes]
+    return result
+
+
+def _strategy_a_analyze_candles(
+    symbol: str,
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list,
+    *,
+    now_ms: Optional[int] = None,
+    cache: Optional[dict[str, Any]] = None,
+    btc_context: Optional[dict[str, Any]] = None,
+    estimated_round_trip_cost_pct: float = 0.0015,
+) -> dict[str, Any]:
+    result = _analyze_v11_control_candles(
+        symbol, candles_1d, candles_12h, candles_4h, candles_1h,
+        now_ms=now_ms, cache=cache, btc_context=btc_context,
+        estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+    )
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    qa_1d, qa_12, qa_4, qa_1 = _prepare_strategy_candles(
+        candles_1d, candles_12h, candles_4h, candles_1h,
+        now_ms=now, cache=cache,
+    )
+    return _strategy_a_quality_gate(result, qa_1d, qa_12, qa_4, qa_1)
+
+
+def _strategy_b_side(
+    symbol: str,
+    side: str,
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+    daily: dict[str, Any],
+    cost_pct: float,
+    btc_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+    context = _v11_context_12h(c12, side)
+    if not direction_ok:
+        return {"side": side, "candidate": False, "direction_ok": False, "reason": f"{side}: 1D permission unavailable", "primary_rejection_reason": f"{side}: 1D permission unavailable", "diagnostic_key": f"1D:{int(c1d[-1]['time'])}"}
+    if context.get("hostile"):
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": f"{side}: hostile 12H context", "primary_rejection_reason": f"{side}: hostile 12H context", "diagnostic_key": f"12H:{int(c12[-1]['time'])}"}
+    if len(c4) < BRT_LOOKBACK_4H + 10:
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": f"{side}: insufficient 4H breakout history", "primary_rejection_reason": f"{side}: insufficient 4H breakout history", "diagnostic_key": "4H:HISTORY"}
+
+    atrs = _atr_series(c4, 14)
+    best: dict[str, Any] | None = None
+    first_reason = f"{side}: no completed 4H breakout + retest hold"
+    max_age_4h = max(18, V11_SETUP_MAX_4H_BARS)
+    for i in range(BRT_LOOKBACK_4H, len(c4)):
+        age = len(c4) - 1 - i
+        if age > max_age_4h:
+            continue
+        atr4 = _num(atrs[i] if i < len(atrs) else 0.0)
+        if atr4 <= 0:
+            continue
+        prior = c4[i - BRT_LOOKBACK_4H:i]
+        range_high = max(float(x["high"]) for x in prior)
+        range_low = min(float(x["low"]) for x in prior)
+        c = c4[i]
+        crange = max(float(c["high"]) - float(c["low"]), 1e-12)
+        body_ratio = abs(float(c["close"]) - float(c["open"])) / crange
+        breakout_level = range_high if side == "LONG" else range_low
+        breakout_ok = (float(c["close"]) > range_high + BRT_BREAKOUT_BUFFER_ATR4 * atr4) if side == "LONG" else (float(c["close"]) < range_low - BRT_BREAKOUT_BUFFER_ATR4 * atr4)
+        size_atr = crange / atr4
+        if not breakout_ok or body_ratio < BRT_BODY_MIN or not (BRT_MIN_BREAKOUT_ATR4 <= size_atr <= BRT_MAX_BREAKOUT_ATR4):
+            continue
+        breakout_close_time = int(c["time"]) + TIMEFRAME_MS["4h"]
+        eligible_1h = [
+            (idx, bar) for idx, bar in enumerate(c1)
+            if int(bar["time"]) >= breakout_close_time
+            and int(bar["time"]) <= breakout_close_time + BRT_RETEST_BARS_1H * TIMEFRAME_MS["1h"]
+        ]
+        if not eligible_1h:
+            continue
+        retest_idx = None
+        hold_idx = None
+        for idx, bar in eligible_1h:
+            bh, bl, bc = map(float, (bar["high"], bar["low"], bar["close"]))
+            atr1_now = _safe_atr(c1)
+            lower = breakout_level - BRT_RETEST_INVALIDATION_ATR1 * max(atr1_now, 1e-12)
+            upper = breakout_level + BRT_RETEST_ZONE_ATR4 * atr4
+            touched = (bl <= upper and bh >= lower)
+            invalid_close = (bc < lower) if side == "LONG" else (bc > upper)
+            if invalid_close:
+                first_reason = f"{side}: retest failed through breakout level"
+                continue
+            if retest_idx is None and touched:
+                retest_idx = idx
+                continue
+            if retest_idx is not None and idx > retest_idx:
+                rrng = max(float(bar["high"]) - float(bar["low"]), 1e-12)
+                loc_up = (bc - float(bar["low"])) / rrng
+                loc = loc_up if side == "LONG" else 1.0 - loc_up
+                holds = (bc >= breakout_level if side == "LONG" else bc <= breakout_level) and loc >= 0.55
+                if holds:
+                    hold_idx = idx
+                    break
+        if retest_idx is None or hold_idx is None or hold_idx != len(c1) - 1:
+            continue
+        atr1 = _safe_atr(c1)
+        sweep_start = retest_idx
+        sweep_low = min(float(x["low"]) for x in c1[sweep_start:hold_idx + 1])
+        sweep_high = max(float(x["high"]) for x in c1[sweep_start:hold_idx + 1])
+        buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
+        stop = sweep_low - buffer if side == "LONG" else sweep_high + buffer
+        entry = float(c1[-1]["close"])
+        risk = abs(entry - stop)
+        sl_atr = risk / atr4 if atr4 > 0 else 999.0
+        if risk <= 0 or not (V11_MIN_SL_ATR_SANITY <= sl_atr <= V11_MAX_SL_ATR_SANITY):
+            continue
+        proxy = {
+            "side": side,
+            "low": float(range_low),
+            "high": float(c["high"]),
+            "high_time": int(c["time"]),
+            "low_time": int(c["time"]),
+            "atr": atr4,
+        }
+        target = _v11_target(c4, c12, c1d, entry, side, proxy)
+        if not target.get("ok"):
+            continue
+        tp = float(target["price"])
+        target_path = _v11_target_path(c4, c12, c1d, entry, tp, side, target_time=int(target.get("time")) if target.get("time") is not None else None)
+        if not target_path.get("clear"):
+            continue
+        rr_gross = abs(tp - entry) / risk
+        cost_price = entry * max(0.0, cost_pct)
+        rr_net = (abs(tp - entry) - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
+        if rr_net < BRT_MIN_RR:
+            continue
+        last = c1[-1]
+        range1 = max(float(last["high"]) - float(last["low"]), 1e-12)
+        shock_ok = not (atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1)
+        if not shock_ok:
+            continue
+        btc_ok, btc_reason = btc_filter_ok(side, btc_context or {}, is_btc=symbol.upper().startswith("BTC"))
+        if not btc_ok:
+            return {"side": side, "candidate": False, "direction_ok": True, "reason": f"{side}: BTC veto ({btc_reason})", "primary_rejection_reason": f"{side}: BTC veto ({btc_reason})", "diagnostic_key": "BTC"}
+        hold = c1[hold_idx]
+        rrng = max(float(hold["high"]) - float(hold["low"]), 1e-12)
+        loc_up = (float(hold["close"]) - float(hold["low"])) / rrng
+        loc = loc_up if side == "LONG" else 1.0 - loc_up
+        trig = {
+            "quality": _clamp(0.35 + 0.35 * _clamp(body_ratio / 0.70, 0, 1) + 0.20 * _clamp(loc / 0.70, 0, 1) + 0.10 * _clamp(_relative_volume(c1, 20) / 1.20, 0, 1), 0, 1),
+            "rvol": _relative_volume(c1, 20),
+            "body_ratio": body_ratio,
+            "close_location": loc,
+            "swept_level": breakout_level,
+            "sweep_time": int(c1[retest_idx]["time"]),
+            "trigger_time": int(hold["time"]),
+            "reason": "4H structural breakout accepted; 1H retest held",
+            "breakout_time": int(c["time"]),
+            "level": breakout_level,
+        }
+        score = int(round(100 * (_clamp(body_ratio / 0.70, 0, 1) * 0.35 + _clamp(loc / 0.70, 0, 1) * 0.25 + _clamp(_relative_volume(c1, 20) / 1.20, 0, 1) * 0.20 + _clamp(1.0 - abs(float(c1[hold_idx]["low"]) - breakout_level) / max(atr4, 1e-12), 0, 1) * 0.20)))
+        candidate = _alt_signal_payload(
+            symbol=symbol, side=side, daily=daily, context=context, c1d=c1d, c12=c12, c4=c4, c1=c1,
+            entry=entry, stop=stop, tp=tp, rr=rr_net, rr_gross=rr_gross,
+            trigger_type="BOS_RETEST_HOLD", trigger=trig,
+            target_tf=str(target.get("timeframe") or "4H"),
+            target_reason=str(target_path.get("reason") or "nearest structural target"),
+            target_path=target_path, score=score,
+            score_groups={"breakout": int(round(score * 0.35)), "retest_hold": int(round(score * 0.35)), "participation": int(round(score * 0.20)), "location": int(round(score * 0.10))},
+            basis="1D permission → 12H context → 4H breakout acceptance → 1H retest hold → next 1H open",
+            cost_pct=cost_pct,
+            btc_context=btc_context,
+        )
+        candidate["signal_engine_version"] = ENGINE_VERSION + "-BRT"
+        candidate["target_path_structural"] = True
+        best = candidate
+        break
+    if best:
+        return best
+    return {"side": side, "candidate": False, "direction_ok": True, "reason": first_reason, "primary_rejection_reason": first_reason, "diagnostic_key": f"4H:{int(c4[-1]['time'])}"}
+
+
+def _strategy_b_analyze_candles(
+    symbol: str,
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list,
+    *,
+    now_ms: Optional[int] = None,
+    cache: Optional[dict[str, Any]] = None,
+    btc_context: Optional[dict[str, Any]] = None,
+    estimated_round_trip_cost_pct: float = 0.0015,
+) -> dict[str, Any]:
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    c1d, c12, c4, c1 = _prepare_strategy_candles(
+        candles_1d, candles_12h, candles_4h, candles_1h,
+        now_ms=now, cache=cache,
+    )
+    for c, tf, minimum in ((c1d, "1d", 210), (c12, "12h", 60), (c4, "4h", 180), (c1, "1h", 180)):
+        ok, reason = _data_quality(c, tf, minimum)
+        if not ok:
+            raise ValueError(f"{symbol}: {reason}")
+    daily = _v11_regime_1d(c1d)
+    cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
+    candidates: list[dict[str, Any]] = []
+    diags: list[dict[str, Any]] = []
+    for side in ("LONG", "SHORT"):
+        r = _strategy_b_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
+        if r.get("candidate"):
+            candidates.append(r)
+            diags.append({"side": side, "candidate": True, "primary_failure": None, "diagnostic_key": r.get("diagnostic_key")})
+        else:
+            primary = str(r.get("primary_rejection_reason") or r.get("reason") or f"{side}: rejected")
+            diags.append({"side": side, "candidate": False, "primary_failure": primary, "diagnostic_key": r.get("diagnostic_key")})
+    if not candidates:
+        empty = _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(d["primary_failure"] for d in diags), daily, btc_context, side_failures=[d["primary_failure"] for d in diags], cache=cache)
+        empty["strategy_variant"] = "B"
+        empty["signal_engine_version"] = ENGINE_VERSION + "-BRT"
+        empty["signal_basis"] = "1D permission → 12H context → 4H breakout acceptance → 1H retest hold → next 1H open"
+        empty["side_diagnostics"] = diags
+        empty["primary_rejection_reason"] = diags[0]["primary_failure"] if diags else "BRT rejected"
+        return empty
+    chosen = max(candidates, key=lambda x: (int(x.get("score", 0)), int(x.get("entry_time", 0))))
+    chosen["side_diagnostics"] = diags
+    chosen["strategy_variant"] = "B"
+    return chosen
+
+
+def _strategy_c_side(
+    symbol: str,
+    side: str,
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+    daily: dict[str, Any],
+    cost_pct: float,
+    btc_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if str(daily.get("regime") or "NEUTRAL").upper() != "NEUTRAL":
+        reason = f"{side}: LDR requires 1D NEUTRAL/RANGE regime"
+        return {"side": side, "candidate": False, "direction_ok": False, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": f"1D:{int(c1d[-1]['time'])}"}
+    context = _v11_context_12h(c12, side)
+    if context.get("hostile"):
+        reason = f"{side}: hostile 12H context"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": f"12H:{int(c12[-1]['time'])}"}
+    if len(c4) < LDR_RANGE_LOOKBACK_4H + 20:
+        reason = f"{side}: insufficient 4H range history"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "4H:HISTORY"}
+    prior = c4[-LDR_RANGE_LOOKBACK_4H - 1:-1]
+    range_high = max(float(x["high"]) for x in prior)
+    range_low = min(float(x["low"]) for x in prior)
+    anchor = (range_high + range_low) / 2.0
+    atrs = _atr_series(c4, 14)
+    latest_a4 = _num(atrs[-1] if atrs else 0.0)
+    if latest_a4 <= 0:
+        reason = f"{side}: ATR unavailable"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "4H:ATR"}
+
+    # Reject a mature continuation beyond the opposite range edge. This is a
+    # causal safety veto against fading a genuine range escape.
+    if side == "LONG" and float(c4[-1]["close"]) < range_low - LDR_EDGE_CONTINUATION_ATR4 * latest_a4:
+        reason = f"{side}: 4H downside acceptance still outside range"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": f"4H:{int(c4[-1]['time'])}"}
+    if side == "SHORT" and float(c4[-1]["close"]) > range_high + LDR_EDGE_CONTINUATION_ATR4 * latest_a4:
+        reason = f"{side}: 4H upside acceptance still outside range"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": f"4H:{int(c4[-1]['time'])}"}
+
+    displaced_idx = None
+    for i in range(max(20, len(c4) - LDR_DISP_LOOKBACK_4H), len(c4)):
+        a4 = _num(atrs[i] if i < len(atrs) else latest_a4)
+        close = float(c4[i]["close"])
+        if side == "LONG" and close <= anchor - LDR_DISP_ATR4 * a4:
+            displaced_idx = i
+        elif side == "SHORT" and close >= anchor + LDR_DISP_ATR4 * a4:
+            displaced_idx = i
+    if displaced_idx is None:
+        reason = f"{side}: no 4H displacement >= {LDR_DISP_ATR4:.2f} ATR from range anchor"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": f"4H:{int(c4[-1]['time'])}"}
+
+    reference = range_low if side == "LONG" else range_high
+    level, level_tf = _latest_confirmed_level(c12, c1d, side, reference)
+    if level is None:
+        reason = f"{side}: no confirmed 12H/1D liquidity level"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "HTF:SWING"}
+
+    start_time = int(c4[displaced_idx]["time"]) + TIMEFRAME_MS["4h"]
+    start_idx = next((i for i, c in enumerate(c1) if int(c["time"]) >= start_time), len(c1))
+    atr1 = _safe_atr(c1)
+    trig = _reclaim_at_level(c1, start_idx, side, level, LDR_RECLAIM_BARS_1H, atr1)
+    if not trig.get("ready") or int(trig.get("reclaim_idx", -1)) != len(c1) - 1:
+        reason = f"{side}: no current-candle 1H liquidity sweep + reclaim of completed HTF level"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": f"HTF:{level_tf}:{int(level)}"}
+
+    trigger_idx = int(trig["reclaim_idx"])
+    sweep_idx = int(trig["sweep_idx"])
+    sweep_low = min(float(c["low"]) for c in c1[sweep_idx:trigger_idx + 1])
+    sweep_high = max(float(c["high"]) for c in c1[sweep_idx:trigger_idx + 1])
+    buffer = max(V11_STOP_BUFFER_ATR_4H * latest_a4, V11_STOP_BUFFER_ATR_1H * atr1)
+    stop = sweep_low - buffer if side == "LONG" else sweep_high + buffer
+    entry = float(c1[-1]["close"])
+    risk = abs(entry - stop)
+    sl_atr = risk / latest_a4 if latest_a4 > 0 else 999.0
+    if risk <= 0 or not (V11_MIN_SL_ATR_SANITY <= sl_atr <= V11_MAX_SL_ATR_SANITY):
+        reason = f"{side}: LDR SL distance outside V11 sanity bounds"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "SL:SANITY"}
+
+    preferred = anchor - 0.10 * latest_a4 if side == "LONG" else anchor + 0.10 * latest_a4
+    target_price, target_tf, target_time = _nearest_structural_target(c4, c12, c1d, entry, side, preferred=preferred)
+    if target_price is None:
+        reason = f"{side}: no objective reversion target"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "TARGET:NONE"}
+    tp = float(target_price)
+    target_path = _v11_target_path(c4, c12, c1d, entry, tp, side, target_time=target_time if target_time else None)
+    rr_gross = abs(tp - entry) / risk
+    cost_price = entry * max(0.0, cost_pct)
+    rr_net = (abs(tp - entry) - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
+    if rr_net < LDR_MIN_RR:
+        reason = f"{side}: LDR post-cost RR {rr_net:.2f} < {LDR_MIN_RR:.2f}"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "RR"}
+    if not target_path.get("clear"):
+        reason = f"{side}: LDR target path blocked"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "PATH"}
+    last = c1[-1]
+    range1 = max(float(last["high"]) - float(last["low"]), 1e-12)
+    if atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1:
+        reason = f"{side}: 1H shock candle exceeds {V11_SHOCK_RANGE_ATR:.2f} ATR"
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": reason, "primary_rejection_reason": reason, "diagnostic_key": "1H:SHOCK"}
+    btc_ok, btc_reason = btc_filter_ok(side, btc_context or {}, is_btc=symbol.upper().startswith("BTC"))
+    if not btc_ok:
+        return {"side": side, "candidate": False, "direction_ok": True, "reason": f"{side}: BTC veto ({btc_reason})", "primary_rejection_reason": f"{side}: BTC veto ({btc_reason})", "diagnostic_key": "BTC"}
+
+    trig["level"] = level
+    trig["breakout_time"] = int(c4[displaced_idx]["time"])
+    score = int(round(100 * (
+        _clamp(abs(float(c4[displaced_idx]["close"]) - anchor) / max(latest_a4 * 3.0, 1e-12), 0, 1) * 0.45
+        + _clamp(float(trig.get("quality", 0.0)), 0, 1) * 0.35
+        + _clamp(_relative_volume(c1, 20) / 1.20, 0, 1) * 0.20
+    )))
+    candidate = _alt_signal_payload(
+        symbol=symbol, side=side, daily=daily, context=context, c1d=c1d, c12=c12, c4=c4, c1=c1,
+        entry=entry, stop=stop, tp=tp, rr=rr_net, rr_gross=rr_gross,
+        trigger_type="LDR_LIQUIDITY_REVERSION", trigger=trig,
+        target_tf=target_tf, target_reason="range anchor / nearest opposing structural target",
+        target_path=target_path, score=score,
+        score_groups={"displacement": int(round(score * 0.45)), "reclaim": int(round(score * 0.35)), "participation": int(round(score * 0.20))},
+        basis="1D neutral/range → 4H displacement from range anchor → 12H/1D liquidity sweep → 1H reclaim → next 1H open",
+        hold_minutes=LDR_TIME_STOP_BARS_1H * 60,
+        cost_pct=cost_pct,
+        btc_context=btc_context,
+    )
+    candidate["signal_engine_version"] = ENGINE_VERSION + "-LDR"
+    candidate["structure_4h"] = "RANGE"
+    candidate["trend_4h"] = "RANGE"
+    candidate["protected_structure_4h"] = "NEUTRAL"
+    candidate["value_zone_low"] = range_low
+    candidate["value_zone_high"] = range_high
+    candidate["value_deep"] = False
+    candidate["setup_impulse_high_time"] = int(c4[displaced_idx]["time"])
+    candidate["setup_impulse_low_time"] = int(c4[displaced_idx]["time"])
+    candidate["stop_source"] = "LDR HTF liquidity-sweep invalidation + volatility buffer"
+    return candidate
+
+
+def _strategy_c_analyze_candles(
+    symbol: str,
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list,
+    *,
+    now_ms: Optional[int] = None,
+    cache: Optional[dict[str, Any]] = None,
+    btc_context: Optional[dict[str, Any]] = None,
+    estimated_round_trip_cost_pct: float = 0.0015,
+) -> dict[str, Any]:
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    c1d, c12, c4, c1 = _prepare_strategy_candles(
+        candles_1d, candles_12h, candles_4h, candles_1h,
+        now_ms=now, cache=cache,
+    )
+    for c, tf, minimum in ((c1d, "1d", 210), (c12, "12h", 60), (c4, "4h", 180), (c1, "1h", 180)):
+        ok, reason = _data_quality(c, tf, minimum)
+        if not ok:
+            raise ValueError(f"{symbol}: {reason}")
+    daily = _v11_regime_1d(c1d)
+    cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
+    candidates: list[dict[str, Any]] = []
+    diags: list[dict[str, Any]] = []
+    for side in ("LONG", "SHORT"):
+        r = _strategy_c_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
+        if r.get("candidate"):
+            candidates.append(r)
+            diags.append({"side": side, "candidate": True, "primary_failure": None, "diagnostic_key": r.get("diagnostic_key")})
+        else:
+            primary = str(r.get("primary_rejection_reason") or r.get("reason") or f"{side}: rejected")
+            diags.append({"side": side, "candidate": False, "primary_failure": primary, "diagnostic_key": r.get("diagnostic_key")})
+    if not candidates:
+        empty = _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(d["primary_failure"] for d in diags), daily, btc_context, side_failures=[d["primary_failure"] for d in diags], cache=cache)
+        empty["strategy_variant"] = "C"
+        empty["signal_engine_version"] = ENGINE_VERSION + "-LDR"
+        empty["signal_basis"] = "1D neutral/range → 4H displacement from range anchor → 12H/1D liquidity sweep → 1H reclaim → next 1H open"
+        empty["side_diagnostics"] = diags
+        empty["primary_rejection_reason"] = diags[0]["primary_failure"] if diags else "LDR rejected"
+        return empty
+    chosen = max(candidates, key=lambda x: (int(x.get("score", 0)), int(x.get("entry_time", 0))))
+    chosen["side_diagnostics"] = diags
+    chosen["strategy_variant"] = "C"
+    return chosen
+
+
+def analyze_candles(
+    symbol: str,
+    candles_1d: list,
+    candles_12h: list | None,
+    candles_4h: list,
+    candles_1h: list,
+    *,
+    now_ms: Optional[int] = None,
+    cache: Optional[dict[str, Any]] = None,
+    btc_context: Optional[dict[str, Any]] = None,
+    estimated_round_trip_cost_pct: float = 0.0015,
+) -> dict[str, Any]:
+    """Dispatch the selected strategy while preserving the common V11 API."""
+    if V11_STRATEGY_VARIANT == "A":
+        return _strategy_a_analyze_candles(
+            symbol, candles_1d, candles_12h, candles_4h, candles_1h,
+            now_ms=now_ms, cache=cache, btc_context=btc_context,
+            estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+        )
+    if V11_STRATEGY_VARIANT == "B":
+        return _strategy_b_analyze_candles(
+            symbol, candles_1d, candles_12h, candles_4h, candles_1h,
+            now_ms=now_ms, cache=cache, btc_context=btc_context,
+            estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+        )
+    if V11_STRATEGY_VARIANT == "C":
+        return _strategy_c_analyze_candles(
+            symbol, candles_1d, candles_12h, candles_4h, candles_1h,
+            now_ms=now_ms, cache=cache, btc_context=btc_context,
+            estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+        )
+    return _analyze_v11_control_candles(
+        symbol, candles_1d, candles_12h, candles_4h, candles_1h,
+        now_ms=now_ms, cache=cache, btc_context=btc_context,
+        estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+    )
 
 def build_btc_context(
     candles_1d: list,

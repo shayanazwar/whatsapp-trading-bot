@@ -601,6 +601,14 @@ class BacktestRunner:
         seen_first_failures: set[tuple[str, str, str]] = set()
         active_until_ms = 0
 
+        # Backtest-only memoization. It never changes strategy decisions; it
+        # only reuses deterministic calculations for unchanged HTF prefixes.
+        engine_cache: dict[str, Any] = {"_preclosed_candles": True}
+        prefix_1d_idx = prefix_12_idx = prefix_4_idx = -1
+        c1d_prefix: list = []
+        c12_prefix: list = []
+        c4_prefix: list = []
+
         def inc(key: str, amount: int = 1) -> None:
             diagnostics[key] = diagnostics.get(key, 0) + int(amount)
 
@@ -610,6 +618,33 @@ class BacktestRunner:
             inc("TP_COUNTERFACTUAL_R_X100", int(round(counterfactual_tp_r * 100)))
         else:
             inc("TP_COUNTERFACTUAL_CONTROL")
+
+        max_hold = float(
+            _safe_number(
+                getattr(self.settings, "backtest_max_holding_minutes", MAX_HOLD_MINUTES)
+            )
+            or MAX_HOLD_MINUTES
+        )
+        fee_rate = float(
+            _safe_number(
+                getattr(
+                    self.settings,
+                    "backtest_fee_rate",
+                    DEFAULT_FEE_RATE,
+                )
+            )
+            or DEFAULT_FEE_RATE
+        )
+        slippage_bps = float(
+            _safe_number(
+                getattr(
+                    self.settings,
+                    "backtest_slippage_bps",
+                    DEFAULT_SLIPPAGE_BPS,
+                )
+            )
+            or DEFAULT_SLIPPAGE_BPS
+        )
 
         # Only 1H bars create decisions.
         for row in history.candles_1h:
@@ -624,30 +659,32 @@ class BacktestRunner:
                 inc("OVERLAP_SKIPPED")
                 continue
 
-            c1d = _closed_candles(
-                history.candles_1d,
-                history.times_1d,
-                signal_close_ms,
-                ONE_DAY_MS,
-            )
-            c12 = _closed_candles(
-                history.candles_12h,
-                history.times_12h,
-                signal_close_ms,
-                TWELVE_HOURS_MS,
-            )
-            c4 = _closed_candles(
-                history.candles_4h,
-                history.times_4h,
-                signal_close_ms,
-                FOUR_HOURS_MS,
-            )
-            c1 = _closed_candles(
-                history.candles_1h,
+            cutoff_1d = signal_close_ms - ONE_DAY_MS
+            idx_1d = bisect_right(history.times_1d, cutoff_1d)
+            if idx_1d != prefix_1d_idx:
+                prefix_1d_idx = idx_1d
+                c1d_prefix = history.candles_1d[:idx_1d]
+
+            cutoff_12 = signal_close_ms - TWELVE_HOURS_MS
+            idx_12 = bisect_right(history.times_12h, cutoff_12)
+            if idx_12 != prefix_12_idx:
+                prefix_12_idx = idx_12
+                c12_prefix = history.candles_12h[:idx_12]
+
+            cutoff_4 = signal_close_ms - FOUR_HOURS_MS
+            idx_4 = bisect_right(history.times_4h, cutoff_4)
+            if idx_4 != prefix_4_idx:
+                prefix_4_idx = idx_4
+                c4_prefix = history.candles_4h[:idx_4]
+
+            idx_1 = bisect_right(
                 history.times_1h,
-                signal_close_ms,
-                ONE_HOUR_MS,
+                signal_close_ms - ONE_HOUR_MS,
             )
+            c1 = history.candles_1h[:idx_1]
+            c1d = c1d_prefix
+            c12 = c12_prefix
+            c4 = c4_prefix
 
             if (
                 len(c1d) < 210
@@ -674,6 +711,7 @@ class BacktestRunner:
                     c4,
                     c1,
                     now_ms=signal_close_ms,
+                    cache=engine_cache,
                     btc_context=btc_context,
                     estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
                 )
@@ -808,41 +846,10 @@ class BacktestRunner:
                 inc("NO_FUTURE_CANDLES")
                 continue
 
-            max_hold = float(
+            effective_max_hold = float(
                 _safe_number(analysis.get("intraday_max_hold_minutes"))
-                or getattr(
-                    self.settings,
-                    "backtest_max_holding_minutes",
-                    MAX_HOLD_MINUTES,
-                )
+                or max_hold
             )
-            fee_rate = float(
-                _safe_number(
-                    getattr(
-                        self.settings,
-                        "backtest_fee_rate",
-                        DEFAULT_FEE_RATE,
-                    )
-                )
-                or 0.0
-            )
-            # If the setting is missing, use the simulator's documented default.
-            if not hasattr(self.settings, "backtest_fee_rate"):
-                fee_rate = DEFAULT_FEE_RATE
-
-            slippage_bps = float(
-                _safe_number(
-                    getattr(
-                        self.settings,
-                        "backtest_slippage_bps",
-                        DEFAULT_SLIPPAGE_BPS,
-                    )
-                )
-                or 0.0
-            )
-            if not hasattr(self.settings, "backtest_slippage_bps"):
-                slippage_bps = DEFAULT_SLIPPAGE_BPS
-
             try:
                 trade = simulate_trade_1h(
                     analysis,
@@ -850,7 +857,7 @@ class BacktestRunner:
                     signal_close_time_ms=signal_close_ms,
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
-                    max_holding_minutes=max_hold,
+                    max_holding_minutes=effective_max_hold,
                     counterfactual_tp_r=counterfactual_tp_r,
                 )
             except Exception as exc:

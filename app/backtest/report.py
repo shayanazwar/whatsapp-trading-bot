@@ -13,7 +13,6 @@ class BacktestSummary:
     days: int
     period_start_ms: int
     period_end_ms: int
-    tp_mode: str
     timeframes: tuple[str, ...]
     coins_tested: int
     coins_selected: int
@@ -43,24 +42,13 @@ class BacktestSummary:
     market_entries: int = 0
     limit_entries: int = 0
     diagnostics: Mapping[str, int] = field(default_factory=dict)
-    snapshot_id: str | None = None
-    universe_hash: str | None = None
-    data_snapshot_hash: str | None = None
-    snapshot_status: str = "UNKNOWN"
-    avg_mae_r_winners: float | None = None
-    avg_mae_r_losers: float | None = None
-    avg_mfe_r_winners: float | None = None
-    avg_mfe_r_losers: float | None = None
-    gross_total_r: float = 0.0
-    fee_total_r: float = 0.0
-    ledger_reconciled: bool = True
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
     return [t for t in trades if t.outcome in {"TP", "SL", "EXPIRED"} and t.r_multiple is not None and math.isfinite(float(t.r_multiple))]
 
 
-def summarize(*, days: int, period_start_ms: int, period_end_ms: int, tp_mode: str = "CONTROL", coins_selected: int, coins_tested: int, data_errors: int, execution_errors: int, rejected_setups: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None, snapshot_id: str | None = None, universe_hash: str | None = None, data_snapshot_hash: str | None = None, snapshot_status: str = "UNKNOWN") -> BacktestSummary:
+def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_selected: int, coins_tested: int, data_errors: int, execution_errors: int, rejected_setups: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None) -> BacktestSummary:
     ordered = sorted(trades, key=lambda t: (int(t.signal_time_ms), t.symbol, t.side))
     resolved = _resolved(ordered)
     values = [float(t.r_multiple) for t in resolved]
@@ -102,30 +90,10 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, tp_mode: s
     diagnostics_out.setdefault("PORTFOLIO_SKIPPED", 0)
     mae_values = [float(t.mae_r) for t in ordered if t.mae_r is not None and math.isfinite(float(t.mae_r))]
     mfe_values = [float(t.mfe_r) for t in ordered if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
-    winner_mae = [float(t.mae_r) for t in resolved if t.outcome == "TP" and t.mae_r is not None and math.isfinite(float(t.mae_r))]
-    loser_mae = [float(t.mae_r) for t in resolved if t.outcome == "SL" and t.mae_r is not None and math.isfinite(float(t.mae_r))]
-    winner_mfe = [float(t.mfe_r) for t in resolved if t.outcome == "TP" and t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
-    loser_mfe = [float(t.mfe_r) for t in resolved if t.outcome == "SL" and t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
-    gross_values = [float(t.gross_r) for t in resolved if t.gross_r is not None and math.isfinite(float(t.gross_r))]
-    fee_values = [float(t.fees_r) for t in resolved if t.fees_r is not None and math.isfinite(float(t.fees_r))]
-    gross_total = sum(gross_values)
-    fee_total = sum(fee_values)
-    ledger_component_total = gross_total - fee_total
-    ledger_reconciled = abs(ledger_component_total - sum(values)) <= 1e-8
-    diagnostics_out["R_LEDGER_RECONCILED"] = 1 if ledger_reconciled else 0
-    diagnostics_out["R_LEDGER_MISMATCH_X1E6"] = int(round(abs(ledger_component_total - sum(values)) * 1_000_000))
-    diagnostics_out["GROSS_REALIZED_R_X100"] = int(round(gross_total * 100))
-    diagnostics_out["FEES_R_X100"] = int(round(fee_total * 100))
-    diagnostics_out["NET_REALIZED_R_X100"] = int(round(sum(values) * 100))
-    diagnostics_out.setdefault("MFE_1R_HIT", sum(bool(getattr(t, "mfe_1r_hit", False)) for t in resolved))
-    diagnostics_out.setdefault("MFE_1_5R_HIT", sum(bool(getattr(t, "mfe_1_5r_hit", False)) for t in resolved))
-    diagnostics_out.setdefault("MFE_2R_HIT", sum(bool(getattr(t, "mfe_2r_hit", False)) for t in resolved))
-    diagnostics_out.setdefault("MFE_2_5R_HIT", sum(bool(getattr(t, "mfe_2_5r_hit", False)) for t in resolved))
     return BacktestSummary(
         days=days,
         period_start_ms=period_start_ms,
         period_end_ms=period_end_ms,
-        tp_mode=str(tp_mode or "CONTROL").upper(),
         timeframes=("1D", "12H", "4H", "1H"),
         coins_tested=coins_tested,
         coins_selected=coins_selected,
@@ -155,17 +123,6 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, tp_mode: s
         market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
         limit_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() == "LIMIT"),
         diagnostics=diagnostics_out,
-        snapshot_id=snapshot_id,
-        universe_hash=universe_hash,
-        data_snapshot_hash=data_snapshot_hash,
-        snapshot_status=str(snapshot_status or "UNKNOWN").upper(),
-        avg_mae_r_winners=mean(winner_mae) if winner_mae else None,
-        avg_mae_r_losers=mean(loser_mae) if loser_mae else None,
-        avg_mfe_r_winners=mean(winner_mfe) if winner_mfe else None,
-        avg_mfe_r_losers=mean(loser_mfe) if loser_mfe else None,
-        gross_total_r=gross_total,
-        fee_total_r=fee_total,
-        ledger_reconciled=ledger_reconciled,
     )
 
 
@@ -181,10 +138,6 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
-        f"TP MODE: {summary.tp_mode}",
-        f"Snapshot: {summary.snapshot_status} | ID {summary.snapshot_id or 'N/A'}",
-        f"Universe Hash: {(summary.universe_hash or 'N/A')[:16]}",
-        f"Data Hash: {(summary.data_snapshot_hash or 'N/A')[:16]}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",
@@ -207,16 +160,15 @@ def format_report(summary: BacktestSummary) -> str:
         f"📉 Max Drawdown: {summary.max_drawdown_r:.2f}R",
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
         f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r)}R / {_fmt(summary.avg_mfe_r)}R",
-        f"🧪 Winners MAE/MFE: {_fmt(summary.avg_mae_r_winners)}R / {_fmt(summary.avg_mfe_r_winners)}R",
-        f"🧪 Losers MAE/MFE: {_fmt(summary.avg_mae_r_losers)}R / {_fmt(summary.avg_mfe_r_losers)}R",
-        f"🧾 R Ledger: Gross {summary.gross_total_r:+.2f}R | Fees {summary.fee_total_r:.2f}R | Net {summary.total_r:+.2f}R | Check {'PASS' if summary.ledger_reconciled else 'FAIL'}",
-        f"🎯 MFE Reach: 1R {summary.diagnostics.get('MFE_1R_HIT', 0)} | 1.5R {summary.diagnostics.get('MFE_1_5R_HIT', 0)} | 2R {summary.diagnostics.get('MFE_2R_HIT', 0)} | 2.5R {summary.diagnostics.get('MFE_2_5R_HIT', 0)}",
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
         f"⚠️ Data Errors: {summary.data_errors}",
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
     ]
+    cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
+    if cf is not None:
+        lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
     if summary.diagnostics:
         active_experiments = []
         sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))
@@ -226,7 +178,7 @@ def format_report(summary: BacktestSummary) -> str:
         if sl_origin:
             active_experiments.append("SL=4H_ORIGIN")
         if impulse_x100 != 250:
-            active_experiments.append(f"4H_IMPULSE_MIN={impulse_x100 / 100.0:.2f}ATR")
+            active_experiments.append(f"4H_IMPULSE={impulse_x100 / 100.0:.2f}ATR")
         if trigger_bars != 6:
             active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
         if short_relaxed:

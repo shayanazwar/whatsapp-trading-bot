@@ -21,13 +21,10 @@ The runner is designed to match V11 value-pullback engine:
 """
 
 import asyncio
-import hashlib
 import inspect
-import json
 import logging
 import os
 import time
-from pathlib import Path
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -81,14 +78,6 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 
 SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 60, 90, 180, 365}
 
-# Backtest reproducibility is an infrastructure concern, not a strategy rule.
-# A snapshot records the exact universe selection and SHA-256 fingerprints of
-# the historical candle sets used for that period. TP mode is deliberately NOT
-# part of the snapshot identity so CONTROL/1.5R/2.0R/2.5R reuse one dataset.
-BACKTEST_SNAPSHOT_SCHEMA = 1
-BACKTEST_SNAPSHOT_DIR_ENV = "V11_BACKTEST_SNAPSHOT_DIR"
-
-
 
 # ============================================================
 # EXCEPTIONS
@@ -104,10 +93,6 @@ class BacktestAnalysisProcessError(RuntimeError):
 
 class BacktestAlreadyRunning(RuntimeError):
     """Raised when a second backtest is started while one is active."""
-
-
-class BacktestSnapshotError(RuntimeError):
-    """Raised when a frozen backtest dataset cannot be trusted or reused."""
 
 
 # ============================================================
@@ -154,31 +139,6 @@ class SymbolHistory:
                 "times_1h",
                 tuple(_candle_time(c) for c in self.candles_1h),
             )
-
-
-@dataclass(frozen=True)
-class BacktestTPConfig:
-    """Immutable TP selection scoped to one backtest execution."""
-
-    mode: str = "CONTROL"
-    r_multiple: float | None = None
-
-    @classmethod
-    def from_mode(cls, mode: str) -> "BacktestTPConfig":
-        normalized = str(mode or "CONTROL").strip().upper()
-        mapping = {
-            "CONTROL": ("CONTROL", None),
-            "1.5R": ("1.5R", 1.5),
-            "2R": ("2.0R", 2.0),
-            "2.0R": ("2.0R", 2.0),
-            "2.5R": ("2.5R", 2.5),
-        }
-        selected = mapping.get(normalized)
-        if selected is None:
-            raise ValueError(
-                "Invalid TP. Use CONTROL, 1.5R, 2.0R, or 2.5R."
-            )
-        return cls(mode=selected[0], r_multiple=selected[1])
 
 
 # ============================================================
@@ -264,45 +224,36 @@ def _utc_hour(timestamp_ms: int) -> int:
 
 
 def _period(days: int) -> tuple[int, int]:
-    """Return an exact, hour-aligned backtest period with no future candles.
+    """Calculate a causal historical window, optionally frozen by environment.
 
-    Fixed periods accept Unix seconds or milliseconds for compatibility, but
-    the requested duration must exactly match the BACKTEST command. A fixed
-    end timestamp may not be in the future or inside the current 1H candle.
-    This prevents right-censoring and moving-window drift from contaminating A/B tests.
+    Default behavior is unchanged. For controlled A/B tests, set
+    V11_BACKTEST_END_MS, or set both V11_BACKTEST_START_MS and
+    V11_BACKTEST_END_MS. This lets two strategy variants use the exact same
+    historical window without changing the WhatsApp command interface.
     """
-    days = int(days)
     raw_start = os.getenv("V11_BACKTEST_START_MS")
     raw_end = os.getenv("V11_BACKTEST_END_MS")
-
-    def _parse_timestamp(raw: str, name: str) -> int:
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"{name} must be an integer Unix timestamp in seconds or milliseconds"
-            ) from exc
-        return value * 1000 if abs(value) < 100_000_000_000 else value
 
     if raw_start or raw_end:
         if not raw_end:
             raise ValueError("V11_BACKTEST_END_MS is required when freezing a backtest period")
-        end_ms = _parse_timestamp(raw_end, "V11_BACKTEST_END_MS")
-        start_ms = _parse_timestamp(raw_start, "V11_BACKTEST_START_MS") if raw_start else end_ms - days * ONE_DAY_MS
+        try:
+            end_ms = int(raw_end)
+        except ValueError as exc:
+            raise ValueError("V11_BACKTEST_END_MS must be an integer Unix timestamp in seconds or milliseconds") from exc
+        if abs(end_ms) < 100_000_000_000:
+            end_ms *= 1000
+        if raw_start:
+            try:
+                start_ms = int(raw_start)
+            except ValueError as exc:
+                raise ValueError("V11_BACKTEST_START_MS must be an integer Unix timestamp in seconds or milliseconds") from exc
+            if abs(start_ms) < 100_000_000_000:
+                start_ms *= 1000
+        else:
+            start_ms = end_ms - int(days) * ONE_DAY_MS
         if start_ms >= end_ms:
             raise ValueError("V11_BACKTEST_START_MS must be earlier than V11_BACKTEST_END_MS")
-        if end_ms % ONE_HOUR_MS != 0 or start_ms % ONE_HOUR_MS != 0:
-            raise ValueError("Fixed backtest start/end must be aligned to whole 1H boundaries")
-        if end_ms - start_ms != days * ONE_DAY_MS:
-            raise ValueError(f"Fixed backtest period must be exactly {days}D")
-        current_hour_ms = int(
-            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp() * 1000
-        )
-        if end_ms > current_hour_ms:
-            raise ValueError(
-                "Fixed backtest end is in the future or inside the current 1H candle; "
-                "use a fully completed historical end timestamp"
-            )
         return start_ms, end_ms
 
     end_dt = datetime.now(timezone.utc).replace(
@@ -311,217 +262,8 @@ def _period(days: int) -> tuple[int, int]:
         microsecond=0,
     )
     end_ms = int(end_dt.timestamp() * 1000) - MAX_HOLD_MINUTES * 60_000
-    start_ms = end_ms - days * ONE_DAY_MS
+    start_ms = end_ms - int(days) * ONE_DAY_MS
     return start_ms, end_ms
-
-
-# ============================================================
-# BACKTEST SNAPSHOT / REPRODUCIBILITY HELPERS
-# ============================================================
-
-def _snapshot_root(settings: Settings) -> Path:
-    raw = str(os.getenv(BACKTEST_SNAPSHOT_DIR_ENV, "")).strip()
-    if raw:
-        return Path(raw).expanduser()
-    db_path = str(getattr(settings, "database_path", "signals.db") or "signals.db")
-    try:
-        return Path(db_path).expanduser().resolve().parent / "backtest_snapshots"
-    except Exception:
-        return Path("backtest_snapshots")
-
-
-def _json_bytes(payload: Any) -> bytes:
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-        default=str,
-    ).encode("utf-8")
-
-
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _sha256_json(payload: Any) -> str:
-    return _sha256_bytes(_json_bytes(payload))
-
-
-def _atomic_write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(_json_bytes(payload))
-    os.replace(tmp, path)
-
-
-def _strategy_fingerprint(settings: Settings) -> str:
-    """Fingerprint signal-generation code/config, excluding TP mode by design."""
-    try:
-        engine_path = Path(inspect.getfile(analyze_candles))
-        engine_hash = _sha256_bytes(engine_path.read_bytes())
-    except Exception as exc:
-        raise BacktestSnapshotError(
-            f"Unable to fingerprint the V11 engine source: {exc}"
-        ) from exc
-
-    config = {
-        "engine_sha256": engine_hash,
-        "engine_version": "V11-1D-12H-4H-1H",
-        "V11_MIN_IMPULSE_ATR": float(V11_MIN_IMPULSE_ATR),
-        "V11_SL_MODE": str(V11_SL_MODE),
-        "V11_MAX_TRIGGER_BARS": int(V11_MAX_TRIGGER_BARS),
-        "V11_SHORT_RANGE_RELAXED": bool(V11_SHORT_RANGE_RELAXED),
-        "estimated_round_trip_cost_pct": float(
-            getattr(settings, "estimated_round_trip_cost_pct", 0.0015)
-        ),
-    }
-    return _sha256_json(config)[:20]
-
-
-def _universe_selection_fingerprint(universe: MexcUniverse) -> str:
-    test_symbols = sorted(str(x).upper() for x in getattr(universe, "test_symbols", set()) or set())
-    try:
-        refresh_path = Path(inspect.getfile(universe.refresh))
-        refresh_hash = _sha256_bytes(refresh_path.read_bytes())
-    except Exception as exc:
-        raise BacktestSnapshotError(
-            f"Unable to fingerprint universe-selection source: {exc}"
-        ) from exc
-    payload = {
-        "refresh_sha256": refresh_hash,
-        "test_symbols": test_symbols,
-        "max_symbols": int(getattr(universe, "max_symbols", MAX_BACKTEST_SYMBOLS)),
-    }
-    return _sha256_json(payload)[:12]
-
-
-def _snapshot_id(
-    *,
-    start_ms: int,
-    end_ms: int,
-    max_symbols: int,
-    strategy_fingerprint: str,
-    universe_selection_fingerprint: str,
-) -> str:
-    return (
-        f"v{BACKTEST_SNAPSHOT_SCHEMA}_{strategy_fingerprint}_"
-        f"{int(start_ms)}_{int(end_ms)}_{int(max_symbols)}_"
-        f"{universe_selection_fingerprint}"
-    )
-
-
-def _canonical_symbols(symbols: Iterable[Any], max_symbols: int) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols:
-        symbol = str(raw_symbol).strip().upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        output.append(symbol)
-        if len(output) >= int(max_symbols):
-            break
-    return output
-
-
-def _serialize_candles(rows: Iterable[Any]) -> list[Any]:
-    output: list[Any] = []
-    for candle in rows:
-        if isinstance(candle, dict):
-            output.append(dict(candle))
-        else:
-            try:
-                output.append(list(candle[:6]))
-            except Exception:
-                output.append(str(candle))
-    return output
-
-
-def _history_payload(history: SymbolHistory) -> dict[str, Any]:
-    # 12H is derived deterministically from 4H and is intentionally not stored
-    # as an independent source dataset. This keeps one authoritative source set.
-    return {
-        "schema": BACKTEST_SNAPSHOT_SCHEMA,
-        "symbol": history.symbol,
-        "candles_1d": _serialize_candles(history.candles_1d),
-        "candles_4h": _serialize_candles(history.candles_4h),
-        "candles_1h": _serialize_candles(history.candles_1h),
-    }
-
-
-def _history_fingerprint(history: SymbolHistory) -> str:
-    return _sha256_json(_history_payload(history))
-
-
-def _data_snapshot_hash(data_hashes: Mapping[str, str]) -> str:
-    ordered = {str(key): str(data_hashes[key]) for key in sorted(data_hashes)}
-    return _sha256_json(ordered)
-
-
-def _load_manifest(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise BacktestSnapshotError(
-            f"Unreadable backtest snapshot manifest: {path}: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise BacktestSnapshotError(f"Invalid backtest snapshot manifest: {path}")
-    return payload
-
-
-def _validate_ready_manifest(
-    manifest: Mapping[str, Any],
-    *,
-    snapshot_id: str,
-    start_ms: int,
-    end_ms: int,
-    max_symbols: int,
-    strategy_fingerprint: str,
-) -> tuple[list[str], dict[str, str], str, str]:
-    if int(manifest.get("schema", -1)) != BACKTEST_SNAPSHOT_SCHEMA:
-        raise BacktestSnapshotError("Backtest snapshot schema mismatch; rebuild the snapshot")
-    if str(manifest.get("status", "")).upper() != "READY":
-        raise BacktestSnapshotError("Backtest snapshot is incomplete; rebuild it")
-    if str(manifest.get("snapshot_id")) != snapshot_id:
-        raise BacktestSnapshotError("Backtest snapshot identity mismatch")
-    if int(manifest.get("period_start_ms", -1)) != int(start_ms) or int(manifest.get("period_end_ms", -1)) != int(end_ms):
-        raise BacktestSnapshotError("Backtest snapshot period mismatch")
-    if int(manifest.get("max_symbols", -1)) != int(max_symbols):
-        raise BacktestSnapshotError("Backtest snapshot universe-size mismatch")
-    if str(manifest.get("strategy_fingerprint")) != strategy_fingerprint:
-        raise BacktestSnapshotError("Backtest strategy/config fingerprint changed; do not reuse the old snapshot")
-    symbols = [str(x).upper() for x in (manifest.get("symbols") or [])]
-    expected_hashes = manifest.get("data_hashes") or {}
-    if not isinstance(expected_hashes, dict) or not symbols:
-        raise BacktestSnapshotError("Backtest snapshot has no frozen symbol/data manifest")
-    if len(symbols) != len(set(symbols)):
-        raise BacktestSnapshotError("Backtest snapshot contains duplicate symbols")
-    if set(expected_hashes) != set(symbols) | {"BTC_USDT"}:
-        raise BacktestSnapshotError("Backtest snapshot data manifest does not match its symbol set")
-    universe_hash = str(manifest.get("universe_hash") or "")
-    data_hash = str(manifest.get("data_snapshot_hash") or "")
-    if not universe_hash or not data_hash:
-        raise BacktestSnapshotError("Backtest snapshot is missing integrity hashes")
-    if _sha256_json(symbols) != universe_hash:
-        raise BacktestSnapshotError("Backtest universe hash mismatch")
-    if _data_snapshot_hash({str(k): str(v) for k, v in expected_hashes.items()}) != data_hash:
-        raise BacktestSnapshotError("Backtest data snapshot hash mismatch")
-    return symbols, {str(k): str(v) for k, v in expected_hashes.items()}, universe_hash, data_hash
-
-
-@dataclass(frozen=True)
-class BacktestSnapshot:
-    snapshot_id: str
-    directory: Path
-    symbols: tuple[str, ...]
-    expected_data_hashes: dict[str, str]
-    universe_hash: str
-    data_snapshot_hash: str
-    reused: bool
 
 
 # ============================================================
@@ -604,23 +346,9 @@ async def _fetch_symbol_history(
     start_ms: int,
     end_ms: int,
 ) -> SymbolHistory:
-    """Fetch the authoritative source candles without crossing a fixed cutoff."""
+    """Fetch exactly the authoritative 1D/12H/4H/1H source set."""
 
-    # Normal rolling backtests intentionally end 72h before "now" so the
-    # simulator can resolve trades through the configured holding horizon.
-    # A fixed-period experiment is different: its end is the hard historical
-    # cutoff. In that mode, never fetch or fingerprint candles after end_ms.
-    fixed_period = bool(str(os.getenv("V11_BACKTEST_END_MS", "")).strip())
-    raw_future_end = int(end_ms) if fixed_period else int(end_ms) + MAX_HOLD_MINUTES * 60_000
-
-    def _complete_source_end(cutoff_ms: int, interval_ms: int) -> int:
-        # API endpoints are inclusive by candle-open timestamp; the candle
-        # opening exactly at cutoff_ms is still incomplete at that boundary.
-        return int(cutoff_ms) - int(interval_ms)
-
-    end_1d = _complete_source_end(raw_future_end, ONE_DAY_MS)
-    end_4h = _complete_source_end(raw_future_end, FOUR_HOURS_MS)
-    end_1h = _complete_source_end(raw_future_end, ONE_HOUR_MS)
+    future_end = int(end_ms) + MAX_HOLD_MINUTES * 60_000
 
     c1d_raw, c4_raw, c1_raw = await asyncio.gather(
         _fetch_paged_range(
@@ -628,21 +356,21 @@ async def _fetch_symbol_history(
             symbol,
             "Day1",
             start_ms - WARMUP_1D,
-            end_1d,
+            future_end,
         ),
         _fetch_paged_range(
             client,
             symbol,
             "Hour4",
             start_ms - WARMUP_4H,
-            end_4h,
+            future_end,
         ),
         _fetch_paged_range(
             client,
             symbol,
             "Min60",
             start_ms - WARMUP_1H,
-            end_1h,
+            future_end,
         ),
     )
 
@@ -678,7 +406,6 @@ def simulate_trade_1h(
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
-    tp_r_multiple: float | None = None,
     counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
     """Single authoritative 1H paper simulator used by the V11 Runner."""
@@ -689,7 +416,6 @@ def simulate_trade_1h(
         fee_rate=float(fee_rate),
         slippage_bps=float(slippage_bps),
         max_holding_minutes=max_holding_minutes,
-        tp_r_multiple=tp_r_multiple,
         counterfactual_tp_r=counterfactual_tp_r,
     )
 
@@ -831,47 +557,93 @@ class BacktestRunner:
         start_ms: int,
         end_ms: int,
         btc_context_cache: dict[int, Any] | None = None,
-        tp_config: BacktestTPConfig | None = None,
-    ) -> tuple[list[SimulatedTrade], dict[str, int], int, int, int]:
-        """Generate the TP-independent accepted signal set, then simulate it.
+    ) -> tuple[
+        list[SimulatedTrade],
+        dict[str, int],
+        int,
+        int,
+        int,
+    ]:
+        """Evaluate one symbol at every causal 1H close in the backtest window."""
 
-        IMPORTANT: TP mode never participates in signal generation or signal
-        eligibility. This is the controlled A/B invariant: CONTROL, 1.5R, 2R
-        and 2.5R all receive the same engine-generated signal population.
-        """
         symbol_started = time.monotonic()
         trades: list[SimulatedTrade] = []
         diagnostics: dict[str, int] = {}
         data_errors = 0
         simulation_errors = 0
         engine_errors = 0
-        accepted_signals: list[tuple[int, dict[str, Any]]] = []
+
         seen_structures: set[tuple[Any, ...]] = set()
         seen_first_failures: set[tuple[str, str, str]] = set()
-        tp_config = tp_config or BacktestTPConfig()
+        active_until_ms = 0
 
         def inc(key: str, amount: int = 1) -> None:
             diagnostics[key] = diagnostics.get(key, 0) + int(amount)
 
-        # -----------------------------
-        # PHASE 1: SIGNAL GENERATION
-        # -----------------------------
+        counterfactual_tp_r = _safe_number(os.getenv("V11_COUNTERFACTUAL_TP_R"))
+        if counterfactual_tp_r is not None and counterfactual_tp_r <= 0:
+            counterfactual_tp_r = None
+        if counterfactual_tp_r is not None:
+            inc("TP_COUNTERFACTUAL_ENABLED")
+            inc("TP_COUNTERFACTUAL_R_X100", int(round(counterfactual_tp_r * 100)))
+        else:
+            inc("TP_COUNTERFACTUAL_CONTROL")
+
+        # Only 1H bars create decisions.
         for row in history.candles_1h:
             signal_open_ms = _candle_time(row)
             signal_close_ms = signal_open_ms + ONE_HOUR_MS
-            if signal_close_ms <= start_ms or signal_close_ms > end_ms:
+
+            if signal_close_ms <= start_ms:
+                continue
+            if signal_close_ms > end_ms:
+                continue
+            if signal_close_ms <= active_until_ms:
+                inc("OVERLAP_SKIPPED")
                 continue
 
-            c1d = _closed_candles(history.candles_1d, history.times_1d, signal_close_ms, ONE_DAY_MS)
-            c12 = _closed_candles(history.candles_12h, history.times_12h, signal_close_ms, TWELVE_HOURS_MS)
-            c4 = _closed_candles(history.candles_4h, history.times_4h, signal_close_ms, FOUR_HOURS_MS)
-            c1 = _closed_candles(history.candles_1h, history.times_1h, signal_close_ms, ONE_HOUR_MS)
+            c1d = _closed_candles(
+                history.candles_1d,
+                history.times_1d,
+                signal_close_ms,
+                ONE_DAY_MS,
+            )
+            c12 = _closed_candles(
+                history.candles_12h,
+                history.times_12h,
+                signal_close_ms,
+                TWELVE_HOURS_MS,
+            )
+            c4 = _closed_candles(
+                history.candles_4h,
+                history.times_4h,
+                signal_close_ms,
+                FOUR_HOURS_MS,
+            )
+            c1 = _closed_candles(
+                history.candles_1h,
+                history.times_1h,
+                signal_close_ms,
+                ONE_HOUR_MS,
+            )
 
-            if len(c1d) < 210 or len(c12) < 60 or len(c4) < 180 or len(c1) < 180:
+            if (
+                len(c1d) < 210
+                or len(c12) < 60
+                or len(c4) < 180
+                or len(c1) < 180
+            ):
+                # This is a warmup condition, not a signal rejection. Avoid
+                # exploding the diagnostic/error count for every early hour.
                 inc("WARMUP_SKIPPED")
                 continue
 
-            btc_context = btc_context_cache.get(signal_close_ms) if btc_context_cache is not None else None
+            btc_context = (
+                btc_context_cache.get(signal_close_ms)
+                if btc_context_cache is not None
+                else None
+            )
+
             try:
                 analysis = analyze_candles(
                     history.symbol,
@@ -881,9 +653,7 @@ class BacktestRunner:
                     c1,
                     now_ms=signal_close_ms,
                     btc_context=btc_context,
-                    estimated_round_trip_cost_pct=float(
-                        getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)
-                    ),
+                    estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -891,20 +661,34 @@ class BacktestRunner:
             except ValueError as exc:
                 data_errors += 1
                 inc("ENGINE_DATA_ERRORS")
-                normalized = (str(exc).strip() or "ValueError").upper().replace(" ", "_").replace(":", "").replace("/", "_")[:120]
+                reason = str(exc).strip() or "ValueError"
+                normalized = (
+                    reason.upper()
+                    .replace(" ", "_")
+                    .replace(":", "")
+                    .replace("/", "_")
+                )[:120]
                 inc(f"ENGINE_DATA_QUALITY_{normalized}")
                 LOGGER.warning(
-                    "BACKTEST DATA_QUALITY_ERROR | symbol=%s signal_close_ms=%s reason=%s",
-                    history.symbol, signal_close_ms, exc,
+                    "BACKTEST DATA_QUALITY_ERROR | "
+                    "symbol=%s signal_close_ms=%s reason=%s",
+                    history.symbol,
+                    signal_close_ms,
+                    reason,
                 )
+                # A historical data gap can roll out of the engine's lookback
+                # window later. Do not prematurely terminate the entire symbol.
                 continue
             except Exception as exc:
                 engine_errors += 1
                 inc("ENGINE_ERRORS")
                 inc(f"ENGINE_ERROR_{type(exc).__name__}")
                 LOGGER.exception(
-                    "BACKTEST ENGINE_ERROR | symbol=%s signal_close_ms=%s reason=%s",
-                    history.symbol, signal_close_ms, exc,
+                    "BACKTEST ENGINE_ERROR | "
+                    "symbol=%s signal_close_ms=%s reason=%s",
+                    history.symbol,
+                    signal_close_ms,
+                    exc,
                 )
                 continue
 
@@ -913,7 +697,8 @@ class BacktestRunner:
 
             if not analysis.get("technical_candidate"):
                 inc("TECHNICAL_REJECT")
-                for side_diag in analysis.get("side_diagnostics") or []:
+                side_diags = analysis.get("side_diagnostics") or []
+                for side_diag in side_diags:
                     side_name = str(side_diag.get("side") or "UNKNOWN").upper()
                     if side_name not in {"LONG", "SHORT"}:
                         continue
@@ -923,21 +708,36 @@ class BacktestRunner:
                         continue
                     inc(f"FIRST_FAILURE_{side_name}_TOTAL")
                     reason = str(side_diag.get("primary_failure") or "rejected")
-                    normalized_first = reason.upper().replace(" ", "_").replace(":", "").replace("/", "_")[:160]
+                    normalized_first = (
+                        reason.upper()
+                        .replace(" ", "_")
+                        .replace(":", "")
+                        .replace("/", "_")
+                    )[:160]
                     inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
                     diag_key = str(side_diag.get("diagnostic_key") or "")
                     unique_key = (side_name, normalized_first, diag_key)
                     if unique_key not in seen_first_failures:
                         seen_first_failures.add(unique_key)
                         inc(f"UNIQUE_FIRST_FAILURE_{side_name}_{normalized_first}")
-                failures = analysis.get("technical_gate_failures") or [analysis.get("rejection_stage") or "technical_candidate"]
+
+                failures = analysis.get("technical_gate_failures") or [
+                    analysis.get("rejection_stage") or "technical_candidate"
+                ]
                 for failure in failures[:8]:
-                    key = "REJECT_" + str(failure).upper().replace(" ", "_").replace(":", "").replace("/", "_")
+                    key = (
+                        "REJECT_"
+                        + str(failure)
+                        .upper()
+                        .replace(" ", "_")
+                        .replace(":", "")
+                        .replace("/", "_")
+                    )
                     inc(key)
                 continue
 
             inc("TECHNICAL_ACCEPT")
-            for side_diag in analysis.get("side_diagnostics") or []:
+            for side_diag in (analysis.get("side_diagnostics") or []):
                 side_name = str(side_diag.get("side") or "UNKNOWN").upper()
                 if side_name in {"LONG", "SHORT"}:
                     inc(f"SIDE_EVALUATIONS_{side_name}")
@@ -946,7 +746,7 @@ class BacktestRunner:
                     else:
                         inc(f"FIRST_FAILURE_{side_name}_TOTAL")
                         reason = str(side_diag.get("primary_failure") or "rejected")
-                        normalized_first = reason.upper().replace(" ", "_").replace(":", "").replace("/", "_")[:160]
+                        normalized_first = (reason.upper().replace(" ", "_").replace(":", "").replace("/", "_"))[:160]
                         inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
                         diag_key = str(side_diag.get("diagnostic_key") or "")
                         unique_key = (side_name, normalized_first, diag_key)
@@ -954,10 +754,16 @@ class BacktestRunner:
                             seen_first_failures.add(unique_key)
                             inc(f"UNIQUE_FIRST_FAILURE_{side_name}_{normalized_first}")
 
-            side = str(analysis.get("setup") or analysis.get("setup_candidate") or "").upper()
+            side = str(
+                analysis.get("setup")
+                or analysis.get("setup_candidate")
+                or ""
+            ).upper()
             if side not in {"LONG", "SHORT"}:
                 inc("INVALID_ENGINE_SIDE")
                 continue
+
+            inc(f"FULL_ENGINE_ACCEPT_{side}")
 
             structure_key = (
                 side,
@@ -970,33 +776,51 @@ class BacktestRunner:
                 inc("DUPLICATE_STRUCTURE_SKIPPED")
                 continue
             seen_structures.add(structure_key)
-            accepted_signals.append((signal_close_ms, analysis))
-            inc("SIGNAL_SET_ACCEPTED")
 
-        # -----------------------------
-        # PHASE 2: EXIT-ONLY SIMULATION
-        # -----------------------------
-        diagnostics["SIGNAL_GENERATION_COMPLETE"] = 1
-        diagnostics["TP_MODE_EXIT_ONLY"] = 1
-        diagnostics["SIGNALS_READY_FOR_TP_SIMULATION"] = len(accepted_signals)
-        for signal_close_ms, analysis in accepted_signals:
-            future = _future_candles(history.candles_1h, history.times_1h, signal_close_ms)
+            future = _future_candles(
+                history.candles_1h,
+                history.times_1h,
+                signal_close_ms,
+            )
             if not future:
                 inc("NO_FUTURE_CANDLES")
                 continue
 
             max_hold = float(
                 _safe_number(analysis.get("intraday_max_hold_minutes"))
-                or getattr(self.settings, "backtest_max_holding_minutes", MAX_HOLD_MINUTES)
+                or getattr(
+                    self.settings,
+                    "backtest_max_holding_minutes",
+                    MAX_HOLD_MINUTES,
+                )
             )
             fee_rate = float(
-                _safe_number(getattr(self.settings, "backtest_fee_rate", DEFAULT_FEE_RATE))
-                or DEFAULT_FEE_RATE
+                _safe_number(
+                    getattr(
+                        self.settings,
+                        "backtest_fee_rate",
+                        DEFAULT_FEE_RATE,
+                    )
+                )
+                or 0.0
             )
+            # If the setting is missing, use the simulator's documented default.
+            if not hasattr(self.settings, "backtest_fee_rate"):
+                fee_rate = DEFAULT_FEE_RATE
+
             slippage_bps = float(
-                _safe_number(getattr(self.settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS))
-                or DEFAULT_SLIPPAGE_BPS
+                _safe_number(
+                    getattr(
+                        self.settings,
+                        "backtest_slippage_bps",
+                        DEFAULT_SLIPPAGE_BPS,
+                    )
+                )
+                or 0.0
             )
+            if not hasattr(self.settings, "backtest_slippage_bps"):
+                slippage_bps = DEFAULT_SLIPPAGE_BPS
+
             try:
                 trade = simulate_trade_1h(
                     analysis,
@@ -1005,14 +829,16 @@ class BacktestRunner:
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
                     max_holding_minutes=max_hold,
-                    tp_r_multiple=tp_config.r_multiple,
+                    counterfactual_tp_r=counterfactual_tp_r,
                 )
             except Exception as exc:
                 simulation_errors += 1
                 inc("SIMULATION_ERRORS")
                 LOGGER.exception(
                     "BACKTEST SIMULATION_ERROR | symbol=%s signal_close_ms=%s reason=%s",
-                    history.symbol, signal_close_ms, exc,
+                    history.symbol,
+                    signal_close_ms,
+                    exc,
                 )
                 continue
 
@@ -1025,6 +851,7 @@ class BacktestRunner:
             trades.append(trade)
             inc("SIMULATION_ACCEPT")
             inc(f"OUTCOME_{trade.outcome}")
+
             if trade.tp1_hit:
                 inc("TP1_HIT")
             if trade.tp2_hit:
@@ -1033,10 +860,17 @@ class BacktestRunner:
                 inc("SL_HIT")
             if trade.expired:
                 inc("EXPIRY")
-            if trade.outcome == "OPEN":
-                inc("OPEN_AT_END")
 
-        diagnostics["CANDIDATES_ENGINE_EVALUATED"] = diagnostics.get("ENGINE_CALLS", 0)
+            if trade.exit_time_ms is not None:
+                active_until_ms = max(
+                    active_until_ms,
+                    int(trade.exit_time_ms),
+                )
+
+        diagnostics["CANDIDATES_ENGINE_EVALUATED"] = diagnostics.get(
+            "ENGINE_CALLS",
+            0,
+        )
         diagnostics["ENGINE_OUTCOME_UNKNOWN_CALLS"] = 0
         diagnostics["TECHNICAL_ACCOUNTING_GAP"] = max(
             0,
@@ -1044,29 +878,29 @@ class BacktestRunner:
             - diagnostics.get("TECHNICAL_ACCEPT", 0)
             - diagnostics.get("TECHNICAL_REJECT", 0),
         )
-        diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int((time.monotonic() - symbol_started) * 1000)
+        diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int(
+            (time.monotonic() - symbol_started) * 1000
+        )
         diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
-        diagnostics["V11_MIN_IMPULSE_ATR_ACTUAL_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
         diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
         diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
         diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
-        diagnostics["MAE_USES_BAR_EXTREMES"] = 1
-        diagnostics["TP_SIGNAL_COUPLING_REMOVED"] = 1
-        diagnostics["FIXED_PERIOD_HARD_CUTOFF"] = 1 if str(os.getenv("V11_BACKTEST_END_MS", "")).strip() else 0
 
         reject_items = [
-            (key, int(value)) for key, value in diagnostics.items()
+            (key, int(value))
+            for key, value in diagnostics.items()
             if key.startswith("REJECT_") and int(value) > 0
         ]
         top_reject = max(reject_items, key=lambda item: item[1])[0] if reject_items else "NONE"
         LOGGER.info(
-            "BACKTEST SYMBOL COMPLETE | symbol=%s engine_calls=%d technical_accept=%d technical_reject=%d "
-            "signals_ready=%d top_reject=%s trades=%d data_errors=%d engine_errors=%d simulation_errors=%d seconds=%.2f",
+            "BACKTEST SYMBOL COMPLETE | "
+            "symbol=%s engine_calls=%d technical_accept=%d technical_reject=%d "
+            "top_reject=%s trades=%d data_errors=%d engine_errors=%d simulation_errors=%d "
+            "seconds=%.2f",
             history.symbol,
             diagnostics.get("ENGINE_CALLS", 0),
             diagnostics.get("TECHNICAL_ACCEPT", 0),
             diagnostics.get("TECHNICAL_REJECT", 0),
-            diagnostics.get("SIGNALS_READY_FOR_TP_SIMULATION", 0),
             top_reject,
             len(trades),
             data_errors,
@@ -1074,7 +908,14 @@ class BacktestRunner:
             simulation_errors,
             time.monotonic() - symbol_started,
         )
-        return trades, diagnostics, data_errors, simulation_errors, engine_errors
+
+        return (
+            trades,
+            diagnostics,
+            data_errors,
+            simulation_errors,
+            engine_errors,
+        )
 
     async def _heartbeat(
         self,
@@ -1114,169 +955,126 @@ class BacktestRunner:
                 state.get("symbol", "-"),
             )
 
-    async def run(self, days: int, *, tp_mode: str = "CONTROL") -> BacktestSummary:
-        """Run a causal paper backtest on a frozen, integrity-verified dataset."""
+    async def run(self, days: int) -> BacktestSummary:
+        """Run a complete 1D/7D/30D/60D/90D/180D/365D causal paper backtest."""
+
         days = int(days)
-        tp_config = BacktestTPConfig.from_mode(tp_mode)
         if days not in SUPPORTED_BACKTEST_DAYS:
-            raise ValueError("Supported backtests: 1D, 7D, 30D, 60D, 90D, 180D, 365D")
+            raise ValueError(
+                "Supported backtests: 1D, 7D, 30D, 60D, 90D, 180D, 365D"
+            )
+
         if self._running or self._run_lock.locked():
-            raise BacktestAlreadyRunning("A backtest is already running. Please wait for it to finish.")
+            raise BacktestAlreadyRunning(
+                "A backtest is already running. Please wait for it to finish."
+            )
 
         async with self._run_lock:
             self._running = True
             started = time.monotonic()
             stop_event = asyncio.Event()
-            state: dict[str, Any] = {
-                "phase": "INITIALIZING", "total": 0, "processed": 0, "tested": 0,
-                "data_errors": 0, "engine_errors": 0, "simulation_errors": 0,
-                "analysis_errors": 0, "signals": 0, "symbol": "-",
-            }
             heartbeat = asyncio.create_task(
-                self._heartbeat(state, started, stop_event, days),
+                self._heartbeat(
+                    state := {
+                        "phase": "INITIALIZING",
+                        "total": 0,
+                        "processed": 0,
+                        "tested": 0,
+                        "data_errors": 0,
+                        "engine_errors": 0,
+                        "simulation_errors": 0,
+                        "analysis_errors": 0,
+                        "signals": 0,
+                        "symbol": "-",
+                    },
+                    started,
+                    stop_event,
+                    days,
+                ),
                 name="backtest-heartbeat",
             )
+
             diagnostics: dict[str, int] = {}
             trades: list[SimulatedTrade] = []
 
             def inc_global(key: str, amount: int = 1) -> None:
                 diagnostics[key] = diagnostics.get(key, 0) + int(amount)
 
-            snapshot: BacktestSnapshot | None = None
-            snapshot_ready = False
             try:
                 start_ms, end_ms = self._period(days)
+                state["phase"] = "UNIVERSE"
+
+                all_symbols = list(
+                    await asyncio.wait_for(
+                        self.universe.refresh(),
+                        timeout=FETCH_TIMEOUT_SECONDS,
+                    )
+                )
                 max_symbols = max(1, min(
                     int(getattr(self.settings, "backtest_max_symbols", MAX_BACKTEST_SYMBOLS)),
                     MAX_BACKTEST_SYMBOLS,
                 ))
-                strategy_fingerprint = _strategy_fingerprint(self.settings)
-                universe_selection_fp = _universe_selection_fingerprint(self.universe)
-                snapshot_id = _snapshot_id(
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    max_symbols=max_symbols,
-                    strategy_fingerprint=strategy_fingerprint,
-                    universe_selection_fingerprint=universe_selection_fp,
+                symbols = []
+                seen_symbols: set[str] = set()
+                for raw_symbol in all_symbols:
+                    symbol = str(raw_symbol).strip().upper()
+                    if not symbol or symbol in seen_symbols:
+                        continue
+                    seen_symbols.add(symbol)
+                    symbols.append(symbol)
+                    if len(symbols) >= max_symbols:
+                        break
+
+                if not symbols:
+                    LOGGER.warning("BACKTEST EMPTY UNIVERSE | days=%d", days)
+                    summary_payload = {
+                        "days": days,
+                        "period_start_ms": int(start_ms),
+                        "period_end_ms": int(end_ms),
+                        "coins_selected": 0,
+                        "coins_tested": 0,
+                        "data_errors": 0,
+                        "execution_errors": 0,
+                        "rejected_setups": 0,
+                        "trades": [],
+                        "diagnostics": {"NO_ELIGIBLE_SYMBOLS": 1, "CURRENT_UNIVERSE_SNAPSHOT_BIAS": 1},
+                    }
+                    params = inspect.signature(summarize).parameters
+                    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                        summary_payload = {k: v for k, v in summary_payload.items() if k in params}
+                    return summarize(**summary_payload)
+
+                state["total"] = len(symbols)
+                inc_global("SYMBOLS_DISCOVERED", len(all_symbols))
+                inc_global("SYMBOLS_SELECTED", len(symbols))
+
+                LOGGER.info(
+                    "BACKTEST START | days=%d symbols=%d start=%d end=%d "
+                    "strategy=1D>12H>4H>1H",
+                    days,
+                    len(symbols),
+                    start_ms,
+                    end_ms,
                 )
-                root = _snapshot_root(self.settings)
-                snapshot_dir = root / snapshot_id
-                manifest_path = snapshot_dir / "manifest.json"
-                manifest = _load_manifest(manifest_path)
 
-                if manifest is not None and str(manifest.get("status", "")).upper() == "READY":
-                    symbols, expected_data_hashes, universe_hash, data_snapshot_hash = _validate_ready_manifest(
-                        manifest,
-                        snapshot_id=snapshot_id,
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        max_symbols=max_symbols,
-                        strategy_fingerprint=strategy_fingerprint,
-                    )
-                    snapshot = BacktestSnapshot(
-                        snapshot_id=snapshot_id,
-                        directory=snapshot_dir,
-                        symbols=tuple(symbols),
-                        expected_data_hashes=expected_data_hashes,
-                        universe_hash=universe_hash,
-                        data_snapshot_hash=data_snapshot_hash,
-                        reused=True,
-                    )
-                    snapshot_ready = True
-                    inc_global("BACKTEST_SNAPSHOT_REUSED", 1)
-                    LOGGER.info(
-                        "BACKTEST SNAPSHOT REUSED | id=%s symbols=%d universe_hash=%s data_hash=%s",
-                        snapshot_id, len(symbols), universe_hash[:16], data_snapshot_hash[:16],
-                    )
-                else:
-                    # A partial/failed snapshot is never silently reused. The next
-                    # clean run rebuilds the universe and fingerprints from scratch.
-                    if snapshot_dir.exists():
-                        import shutil
-                        shutil.rmtree(snapshot_dir, ignore_errors=True)
-                    state["phase"] = "UNIVERSE"
-                    all_symbols = list(await asyncio.wait_for(self.universe.refresh(), timeout=FETCH_TIMEOUT_SECONDS))
-                    symbols = _canonical_symbols(all_symbols, max_symbols)
-                    if not symbols:
-                        inc_global("NO_ELIGIBLE_SYMBOLS", 1)
-                        summary = summarize(
-                            days=days,
-                            coins_selected=0,
-                            coins_tested=0,
-                            data_errors=0,
-                            period_start_ms=start_ms,
-                            period_end_ms=end_ms,
-                            tp_mode=tp_config.mode,
-                            execution_errors=0,
-                            rejected_setups=0,
-                            trades=[],
-                            diagnostics={**diagnostics, "CURRENT_UNIVERSE_SNAPSHOT_BIAS": 1},
-                        )
-                        return summary
-                    universe_hash = _sha256_json(symbols)
-                    snapshot_dir.mkdir(parents=True, exist_ok=True)
-                    _atomic_write_json(
-                        manifest_path,
-                        {
-                            "schema": BACKTEST_SNAPSHOT_SCHEMA,
-                            "status": "BUILDING",
-                            "snapshot_id": snapshot_id,
-                            "period_start_ms": int(start_ms),
-                            "period_end_ms": int(end_ms),
-                            "max_symbols": int(max_symbols),
-                            "strategy_fingerprint": strategy_fingerprint,
-                            "universe_selection_fingerprint": universe_selection_fp,
-                            "universe_source": "CURRENT_LIVE_RANKING_SNAPSHOT",
-                            "symbols": symbols,
-                            "universe_hash": universe_hash,
-                            "data_hashes": {},
-                        },
-                    )
-                    snapshot = BacktestSnapshot(
-                        snapshot_id=snapshot_id,
-                        directory=snapshot_dir,
-                        symbols=tuple(symbols),
-                        expected_data_hashes={},
-                        universe_hash=universe_hash,
-                        data_snapshot_hash="",
-                        reused=False,
-                    )
-                    inc_global("BACKTEST_SNAPSHOT_CREATED", 1)
-                    LOGGER.info(
-                        "BACKTEST SNAPSHOT CREATED | id=%s symbols=%d universe_hash=%s",
-                        snapshot_id, len(symbols), universe_hash[:16],
-                    )
-
-                state["total"] = len(snapshot.symbols)
-                inc_global("SYMBOLS_DISCOVERED", len(snapshot.symbols))
-                inc_global("SYMBOLS_SELECTED", len(snapshot.symbols))
+                # --------------------------------------------------------
+                # BTC history/context. Failure is non-fatal because the
+                # V9.2 engine treats unavailable BTC context as abstain.
+                # --------------------------------------------------------
                 state["phase"] = "BTC_DATA"
-
-                # BTC is part of the frozen data set, even though it is not in
-                # the selected altcoin universe. Its hash is required for strict A/B.
                 btc_history: SymbolHistory | None = None
                 try:
                     btc_history = await asyncio.wait_for(
                         self._fetch_btc_history(start_ms, end_ms),
                         timeout=FETCH_TIMEOUT_SECONDS,
                     )
-                    btc_hash = _history_fingerprint(btc_history)
-                    expected_btc_hash = snapshot.expected_data_hashes.get("BTC_USDT")
-                    if snapshot_ready and expected_btc_hash and btc_hash != expected_btc_hash:
-                        raise BacktestSnapshotError(
-                            f"BTC historical data changed for frozen snapshot {snapshot.snapshot_id}"
-                        )
                     inc_global("BTC_DATA_READY")
-                    inc_global("BTC_DATA_FINGERPRINT_VERIFIED", 1 if snapshot_ready else 0)
-                except BacktestSnapshotError:
-                    raise
                 except Exception as exc:
                     inc_global("BTC_DATA_ERROR")
-                    LOGGER.exception("BACKTEST BTC DATA ERROR | reason=%s", exc)
-                    raise BacktestSnapshotError(
-                        "BTC historical data could not be fetched/fingerprinted; "
-                        "the backtest cannot create or reuse a strict A/B dataset snapshot"
-                    ) from exc
+                    LOGGER.exception(
+                        "BACKTEST BTC DATA ERROR | reason=%s",
+                        exc,
+                    )
 
                 btc_context_cache: dict[int, Any] = {}
                 if btc_history is not None:
@@ -1291,16 +1089,22 @@ class BacktestRunner:
                         btc_history,
                         decision_times,
                     )
-                    inc_global("BTC_CONTEXT_CACHE_ITEMS", len(btc_context_cache))
+                    inc_global(
+                        "BTC_CONTEXT_CACHE_ITEMS",
+                        len(btc_context_cache),
+                    )
 
+                # --------------------------------------------------------
+                # Symbol workers
+                # --------------------------------------------------------
                 state["phase"] = "SYMBOL_ANALYSIS"
                 queue: asyncio.Queue[str | None] = asyncio.Queue()
-                for symbol in snapshot.symbols:
+                for symbol in symbols:
                     queue.put_nowait(symbol)
                 for _ in range(self.max_concurrency):
                     queue.put_nowait(None)
+
                 state_lock = asyncio.Lock()
-                observed_data_hashes: dict[str, str] = {"BTC_USDT": btc_hash} if btc_hash else {}
 
                 async def worker(worker_id: int) -> None:
                     while True:
@@ -1308,49 +1112,45 @@ class BacktestRunner:
                         try:
                             if symbol is None:
                                 return
+
                             state["symbol"] = symbol
-                            state["phase"] = "FETCH_HISTORY"
+                            data_started = time.monotonic()
+
                             try:
-                                # BTC_USDT is fetched once above because it is
-                                # also used for the causal macro context. If BTC
-                                # happens to be inside the frozen universe, reuse
-                                # that exact history instead of fetching it a
-                                # second time. This avoids duplicate I/O and, more
-                                # importantly, avoids treating BTC as two distinct
-                                # fingerprint records during snapshot validation.
-                                if symbol == "BTC_USDT" and btc_history is not None:
-                                    history = btc_history
-                                else:
-                                    history = await asyncio.wait_for(
-                                        self._fetch_history(symbol, start_ms, end_ms),
-                                        timeout=FETCH_TIMEOUT_SECONDS,
-                                    )
-                                symbol_hash = _history_fingerprint(history)
-                                expected_hash = snapshot.expected_data_hashes.get(symbol)
-                                if snapshot_ready and expected_hash and symbol_hash != expected_hash:
-                                    raise BacktestSnapshotError(
-                                        f"Historical data changed for frozen snapshot {snapshot.snapshot_id}: {symbol}"
-                                    )
-                                observed_data_hashes[symbol] = symbol_hash
+                                history = await asyncio.wait_for(
+                                    self._fetch_history(
+                                        symbol,
+                                        start_ms,
+                                        end_ms,
+                                    ),
+                                    timeout=FETCH_TIMEOUT_SECONDS,
+                                )
                                 async with state_lock:
                                     inc_global("SYMBOLS_DATA_READY")
                                     state["tested"] += 1
-                            except BacktestSnapshotError:
-                                raise
                             except asyncio.CancelledError:
                                 raise
                             except Exception as exc:
                                 async with state_lock:
                                     state["data_errors"] += 1
                                     inc_global("SYMBOLS_DATA_ERROR")
-                                    inc_global(f"DATA_ERROR_{type(exc).__name__}")
+                                    inc_global(
+                                        f"DATA_ERROR_{type(exc).__name__}"
+                                    )
                                 LOGGER.exception(
                                     "BACKTEST DATA ERROR | worker=%d symbol=%s reason=%s",
-                                    worker_id, symbol, exc,
+                                    worker_id,
+                                    symbol,
+                                    exc,
                                 )
                                 continue
 
-                            data_started = time.monotonic()
+                            data_seconds = time.monotonic() - data_started
+                            inc_global(
+                                "DATA_SECONDS_X1000",
+                                int(data_seconds * 1000),
+                            )
+
                             try:
                                 (
                                     symbol_trades,
@@ -1365,32 +1165,32 @@ class BacktestRunner:
                                         start_ms,
                                         end_ms,
                                         btc_context_cache,
-                                        tp_config,
                                     ),
-                                    timeout=max(
-                                        1.0,
-                                        float(getattr(self.settings, "backtest_analysis_timeout_seconds", 120.0)),
-                                    ),
+                                    timeout=max(1.0, float(getattr(self.settings, "backtest_analysis_timeout_seconds", 120.0))),
                                 )
                             except asyncio.CancelledError:
                                 raise
                             except asyncio.TimeoutError as exc:
-                                async with state_lock:
-                                    state["analysis_errors"] += 1
-                                    inc_global("ANALYSIS_TIMEOUT")
+                                state["analysis_errors"] = int(state.get("analysis_errors", 0)) + 1
+                                inc_global("ANALYSIS_TIMEOUT")
                                 LOGGER.error(
                                     "BACKTEST ANALYSIS TIMEOUT | worker=%d symbol=%s reason=%s",
-                                    worker_id, symbol, exc,
+                                    worker_id,
+                                    symbol,
+                                    exc,
                                 )
                                 continue
                             except Exception as exc:
-                                async with state_lock:
-                                    state["analysis_errors"] += 1
-                                    inc_global("SYMBOLS_ANALYSIS_FAILED")
-                                    inc_global(f"ANALYSIS_ERROR_{type(exc).__name__}")
+                                state["analysis_errors"] = int(state.get("analysis_errors", 0)) + 1
+                                inc_global("SYMBOLS_ANALYSIS_FAILED")
+                                inc_global(
+                                    f"ANALYSIS_ERROR_{type(exc).__name__}"
+                                )
                                 LOGGER.exception(
                                     "BACKTEST ANALYSIS ERROR | worker=%d symbol=%s reason=%s",
-                                    worker_id, symbol, exc,
+                                    worker_id,
+                                    symbol,
+                                    exc,
                                 )
                                 continue
 
@@ -1404,137 +1204,123 @@ class BacktestRunner:
                                 state["signals"] = len(trades)
 
                             LOGGER.info(
-                                "BACKTEST PROGRESS | worker=%d days=%d processed=%d/%d tested=%d signals=%d "
-                                "data_errors=%d engine_errors=%d simulation_errors=%d symbol=%s duration_symbol=%.2fs",
-                                worker_id, days, state["processed"], len(snapshot.symbols), state["tested"], len(trades),
-                                state["data_errors"], state["engine_errors"], state["simulation_errors"], symbol,
-                                time.monotonic() - data_started,
+                                "BACKTEST PROGRESS | worker=%d days=%d processed=%d/%d "
+                                "tested=%d signals=%d data_errors=%d engine_errors=%d "
+                                "simulation_errors=%d symbol=%s",
+                                worker_id,
+                                days,
+                                state["processed"],
+                                len(symbols),
+                                state["tested"],
+                                len(trades),
+                                state["data_errors"],
+                                state["engine_errors"],
+                                state["simulation_errors"],
+                                symbol,
                             )
+
                         finally:
-                            state["processed"] += 1 if symbol is not None else 0
+                            if symbol is not None:
+                                async with state_lock:
+                                    state["processed"] += 1
+                                    processed = int(state["processed"])
+                                    total = int(state["total"])
+                                LOGGER.info(
+                                    "BACKTEST SYMBOL WORKER FINISHED | "
+                                    "worker=%d symbol=%s processed=%d/%d",
+                                    worker_id,
+                                    symbol,
+                                    processed,
+                                    total,
+                                )
                             queue.task_done()
 
                 workers = [
-                    asyncio.create_task(worker(index), name=f"backtest-worker-{index}")
+                    asyncio.create_task(
+                        worker(index),
+                        name=f"backtest-worker-{index}",
+                    )
                     for index in range(self.max_concurrency)
                 ]
-                worker_results = await asyncio.gather(*workers, return_exceptions=True)
-                for result in worker_results:
-                    if isinstance(result, BacktestSnapshotError):
-                        raise result
-                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                        raise result
 
-                trades.sort(key=lambda trade: (int(trade.signal_time_ms), trade.symbol, trade.side))
-
-                # A new snapshot becomes READY only after every selected symbol
-                # and BTC dataset has been fetched successfully and fingerprinted.
-                if not snapshot_ready:
-                    # BTC_USDT can legitimately be part of the selected universe
-                    # as well as the mandatory macro-context dataset. Compare key
-                    # identity sets rather than adding the two counts, otherwise
-                    # a valid 200-symbol snapshot containing BTC is incorrectly
-                    # rejected because the BTC hash is shared by both roles.
-                    expected_fingerprint_keys = set(snapshot.symbols)
-                    if btc_hash:
-                        expected_fingerprint_keys.add("BTC_USDT")
-                    observed_fingerprint_keys = set(observed_data_hashes)
-                    if observed_fingerprint_keys != expected_fingerprint_keys:
-                        missing = sorted(expected_fingerprint_keys - observed_fingerprint_keys)
-                        unexpected = sorted(observed_fingerprint_keys - expected_fingerprint_keys)
-                        LOGGER.error(
-                            "BACKTEST SNAPSHOT FINGERPRINT INCOMPLETE | expected=%d observed=%d missing=%s unexpected=%s",
-                            len(expected_fingerprint_keys),
-                            len(observed_fingerprint_keys),
-                            missing[:10],
-                            unexpected[:10],
-                        )
-                        raise BacktestSnapshotError(
-                            "Backtest dataset could not be fully fingerprinted; "
-                            f"missing={missing[:10]} unexpected={unexpected[:10]}"
-                        )
-                    final_data_hash = _data_snapshot_hash(observed_data_hashes)
-                    _atomic_write_json(
-                        manifest_path,
-                        {
-                            "schema": BACKTEST_SNAPSHOT_SCHEMA,
-                            "status": "READY",
-                            "snapshot_id": snapshot.snapshot_id,
-                            "period_start_ms": int(start_ms),
-                            "period_end_ms": int(end_ms),
-                            "max_symbols": int(max_symbols),
-                            "strategy_fingerprint": strategy_fingerprint,
-                            "universe_selection_fingerprint": universe_selection_fp,
-                            "universe_source": "CURRENT_LIVE_RANKING_SNAPSHOT",
-                            "symbols": list(snapshot.symbols),
-                            "universe_hash": snapshot.universe_hash,
-                            "data_hashes": observed_data_hashes,
-                            "data_snapshot_hash": final_data_hash,
-                            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                    snapshot = BacktestSnapshot(
-                        snapshot_id=snapshot.snapshot_id,
-                        directory=snapshot.directory,
-                        symbols=snapshot.symbols,
-                        expected_data_hashes=observed_data_hashes,
-                        universe_hash=snapshot.universe_hash,
-                        data_snapshot_hash=final_data_hash,
-                        reused=False,
-                    )
+                await asyncio.gather(*workers)
 
                 state["phase"] = "FINALIZING"
-                rejected_setups = int(diagnostics.get("TECHNICAL_REJECT", 0))
+                trades.sort(key=lambda trade: trade.signal_time_ms)
+
+                # Build the complete current summary payload.  The deployed
+                # report.py may be one of two compatible schema generations:
+                # older builds do not have the four forensic keyword fields,
+                # while newer builds require them.  Detect the active callable
+                # signature rather than allowing an avoidable TypeError to abort
+                # an otherwise completed backtest.
+                rejected_setups = int(
+                    diagnostics.get("TECHNICAL_REJECT", 0)
+                )
                 execution_errors = int(
                     state.get("engine_errors", 0)
                     + state.get("simulation_errors", 0)
                     + state.get("analysis_errors", 0)
                 )
-                diagnostics["BACKTEST_SNAPSHOT_VERIFIED"] = 1
-                diagnostics["BACKTEST_UNIVERSE_HASH_PRESENT"] = 1 if snapshot.universe_hash else 0
-                diagnostics["BACKTEST_DATA_HASH_PRESENT"] = 1 if snapshot.data_snapshot_hash else 0
-                diagnostics["TP_OVERRIDE_EXIT_ONLY"] = 1
-                diagnostics["SIGNAL_GENERATION_TP_INDEPENDENT"] = 1
-                diagnostics["MAE_BAR_EXTREME_DEFINITION"] = 1
-                diagnostics["OPEN_AT_BACKTEST_END"] = sum(1 for t in trades if str(t.outcome).upper() == "OPEN")
 
-                summary = summarize(
-                    days=days,
-                    coins_selected=len(snapshot.symbols),
-                    coins_tested=int(state["tested"]),
-                    data_errors=int(state["data_errors"]),
-                    period_start_ms=int(start_ms),
-                    period_end_ms=int(end_ms),
-                    tp_mode=tp_config.mode,
-                    execution_errors=execution_errors,
-                    rejected_setups=rejected_setups,
-                    trades=trades,
-                    diagnostics=diagnostics,
-                    snapshot_id=snapshot.snapshot_id,
-                    universe_hash=snapshot.universe_hash,
-                    data_snapshot_hash=snapshot.data_snapshot_hash,
-                    snapshot_status="REUSED" if snapshot.reused else "CREATED",
-                )
+                summary_payload = {
+                    "days": days,
+                    "coins_selected": len(symbols),
+                    "coins_tested": int(state["tested"]),
+                    "data_errors": int(state["data_errors"]),
+                    "period_start_ms": int(start_ms),
+                    "period_end_ms": int(end_ms),
+                    "execution_errors": execution_errors,
+                    "rejected_setups": rejected_setups,
+                    "trades": trades,
+                    "diagnostics": diagnostics,
+                }
+
+                try:
+                    summarize_parameters = inspect.signature(summarize).parameters
+                    accepts_kwargs = any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in summarize_parameters.values()
+                    )
+                    if not accepts_kwargs:
+                        summary_payload = {
+                            key: value
+                            for key, value in summary_payload.items()
+                            if key in summarize_parameters
+                        }
+
+                    summary = summarize(**summary_payload)
+                except (TypeError, ValueError) as exc:
+                    LOGGER.exception(
+                        "BACKTEST SUMMARY ERROR | summarize() schema mismatch | reason=%s",
+                        exc,
+                    )
+                    raise
+
                 LOGGER.info(
-                    "BACKTEST COMPLETE | days=%d tested=%d/%d signals=%d data_errors=%d engine_errors=%d "
-                    "simulation_errors=%d analysis_errors=%d snapshot=%s id=%s duration=%.2fs",
+                    "BACKTEST COMPLETE | days=%d tested=%d/%d signals=%d "
+                    "data_errors=%d engine_errors=%d simulation_errors=%d analysis_errors=%d "
+                    "duration=%.2fs",
                     days,
                     state["tested"],
-                    len(snapshot.symbols),
+                    len(symbols),
                     len(trades),
                     state["data_errors"],
                     state["engine_errors"],
                     state["simulation_errors"],
-                    state["analysis_errors"],
-                    "REUSED" if snapshot.reused else "CREATED",
-                    snapshot.snapshot_id,
+                    state.get("analysis_errors", 0),
                     time.monotonic() - started,
                 )
+
                 return summary
+
             finally:
                 stop_event.set()
                 heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
+                await asyncio.gather(
+                    heartbeat,
+                    return_exceptions=True,
+                )
                 self._running = False
 
 
@@ -1553,9 +1339,7 @@ __all__ = [
     "BacktestAlreadyRunning",
     "BacktestAnalysisTimeout",
     "BacktestAnalysisProcessError",
-    "BacktestSnapshotError",
     "BacktestRunner",
-    "BacktestTPConfig",
     "SymbolHistory",
     "build_12h_candles",
     "simulate_trade_1h",

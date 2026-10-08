@@ -66,16 +66,6 @@ class SimulatedTrade:
     time_to_1r_minutes: float | None = None
     time_to_1_5r_minutes: float | None = None
     counterfactual_tp_r: float | None = None
-    control_tp: float | None = None
-    planned_risk_price: float | None = None
-    actual_risk_price: float | None = None
-    mae_price: float | None = None
-    mfe_price: float | None = None
-    gross_r: float | None = None
-    mfe_2r_hit: bool = False
-    mfe_2_5r_hit: bool = False
-    time_to_2r_minutes: float | None = None
-    time_to_2_5r_minutes: float | None = None
 
     @property
     def tp(self) -> float:
@@ -204,7 +194,6 @@ def simulate_trade(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
     same_bar_rule: str | None = None,
-    tp_r_multiple: float | None = None,
     counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
     """Simulate a deterministic single-TP / single-SL trade.
@@ -236,31 +225,21 @@ def simulate_trade(
     if planned_risk <= 0 or not isfinite(planned_risk):
         return None
     # The engine's original TP is the control target and is always validated here.
-    # An explicit R-multiple TP is an exit-only backtest override; the accepted
-    # entry/SL population is never regenerated from that override.
+    # A counterfactual TP, when supplied, is applied only after the entry fill so
+    # that the accepted entry/SL population is unchanged.
     original_tp = tp
     if side == "LONG" and not (stop < entry < original_tp):
         return None
     if side == "SHORT" and not (original_tp < entry < stop):
         return None
-    selected_r = tp_r_multiple if tp_r_multiple is not None else counterfactual_tp_r
     counterfactual_r = None
-    if selected_r is not None:
+    if counterfactual_tp_r is not None:
         try:
-            candidate_r = float(selected_r)
+            candidate_r = float(counterfactual_tp_r)
         except (TypeError, ValueError, OverflowError):
             candidate_r = 0.0
         if isfinite(candidate_r) and candidate_r > 0:
             counterfactual_r = candidate_r
-            tp = (
-                entry + candidate_r * planned_risk
-                if side == "LONG"
-                else entry - candidate_r * planned_risk
-            )
-            if side == "LONG" and not (stop < entry < tp):
-                return None
-            if side == "SHORT" and not (tp < entry < stop):
-                return None
 
     size_data = _position_size(signal)
     if size_data is None:
@@ -305,14 +284,8 @@ def simulate_trade(
     mfe_r = 0.0
     mfe_1r_hit = False
     mfe_1_5r_hit = False
-    mfe_2r_hit = False
-    mfe_2_5r_hit = False
     time_to_1r_minutes: float | None = None
     time_to_1_5r_minutes: float | None = None
-    time_to_2r_minutes: float | None = None
-    time_to_2_5r_minutes: float | None = None
-    mae_price = 0.0
-    mfe_price = 0.0
 
     def execute_exit(base_price: float) -> float | None:
         nonlocal realized_pnl, gross_pnl, exit_fees, slippage_cash
@@ -339,8 +312,7 @@ def simulate_trade(
         denominator = initial_risk_cash if initial_risk_cash > 0 else 0.0
         fees_r = (entry_fee + exit_fees) / denominator if denominator else 0.0
         slip_r = slippage_cash / denominator if denominator else 0.0
-        gross_r = gross_pnl / denominator if denominator else None
-        signal_rr = abs(tp - entry) / planned_risk if planned_risk > 0 else 0.0
+        signal_rr = abs(original_tp - entry) / planned_risk if planned_risk > 0 else 0.0
         actual_fill_rr = None
         if entry_exec is not None:
             actual_fill_risk = abs(entry_exec - stop)
@@ -366,11 +338,7 @@ def simulate_trade(
             mae_r=mae_r if fill_ts is not None else None, mfe_r=mfe_r if fill_ts is not None else None,
             mfe_1r_hit=mfe_1r_hit, mfe_1_5r_hit=mfe_1_5r_hit,
             time_to_1r_minutes=time_to_1r_minutes, time_to_1_5r_minutes=time_to_1_5r_minutes,
-            counterfactual_tp_r=counterfactual_r, control_tp=original_tp,
-            planned_risk_price=planned_risk, actual_risk_price=risk_exec if fill_ts is not None else None,
-            mae_price=mae_price if fill_ts is not None else None, mfe_price=mfe_price if fill_ts is not None else None,
-            gross_r=gross_r, mfe_2r_hit=mfe_2r_hit, mfe_2_5r_hit=mfe_2_5r_hit,
-            time_to_2r_minutes=time_to_2r_minutes, time_to_2_5r_minutes=time_to_2_5r_minutes,
+            counterfactual_tp_r=counterfactual_r,
         )
 
     expiry_ts = int(signal_time + max_hold * 60_000)
@@ -409,6 +377,12 @@ def simulate_trade(
             if not isfinite(entry_exec) or entry_exec <= 0:
                 return None
             risk_exec = abs(entry_exec - stop)
+            if counterfactual_r is not None:
+                tp = (
+                    entry_exec + counterfactual_r * risk_exec
+                    if side == "LONG"
+                    else entry_exec - counterfactual_r * risk_exec
+                )
             if side == "LONG" and not (stop < entry_exec < tp):
                 return None
             if side == "SHORT" and not (tp < entry_exec < stop):
@@ -439,15 +413,11 @@ def simulate_trade(
         # Track normalized adverse/favorable excursion before resolving the bar.
         if risk_exec > 0 and entry_exec is not None:
             if side == "LONG":
-                adverse_price = max(0.0, entry_exec - low)
-                favorable_price = max(0.0, high - entry_exec)
+                mae_r = max(mae_r, max(0.0, entry_exec - low) / risk_exec)
+                current_mfe = max(0.0, high - entry_exec) / risk_exec
             else:
-                adverse_price = max(0.0, high - entry_exec)
-                favorable_price = max(0.0, entry_exec - low)
-            mae_price = max(mae_price, adverse_price)
-            mfe_price = max(mfe_price, favorable_price)
-            mae_r = max(mae_r, adverse_price / risk_exec)
-            current_mfe = favorable_price / risk_exec
+                mae_r = max(mae_r, max(0.0, high - entry_exec) / risk_exec)
+                current_mfe = max(0.0, entry_exec - low) / risk_exec
             mfe_r = max(mfe_r, current_mfe)
             if current_mfe >= 1.0 and not mfe_1r_hit:
                 mfe_1r_hit = True
@@ -455,12 +425,6 @@ def simulate_trade(
             if current_mfe >= 1.5 and not mfe_1_5r_hit:
                 mfe_1_5r_hit = True
                 time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
-            if current_mfe >= 2.0 and not mfe_2r_hit:
-                mfe_2r_hit = True
-                time_to_2r_minutes = _hold_minutes(fill_ts, close_time)
-            if current_mfe >= 2.5 and not mfe_2_5r_hit:
-                mfe_2_5r_hit = True
-                time_to_2_5r_minutes = _hold_minutes(fill_ts, close_time)
 
         if side == "LONG":
             sl_touched = low <= stop

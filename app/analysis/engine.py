@@ -408,6 +408,7 @@ V11_MIN_RR = 1.60
 V11_MIN_IMPULSE_ATR = 2.50
 V11_SETUP_MAX_4H_BARS = 30
 V11_MAX_TRIGGER_BARS = 6
+V11_SHORT_RANGE_RELAXED = False
 V11_STOP_BUFFER_ATR_4H = 0.20
 V11_STOP_BUFFER_ATR_1H = 0.15
 V11_MIN_SL_ATR_SANITY = 0.20
@@ -669,7 +670,7 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
             continue
         # Reclaim may occur on any subsequent candle within the full V11.2
         # trigger window. The previous implementation unintentionally limited
-        # this to only the next 1–2 candles despite max_bars=6.
+        # this to only the next 1â€“2 candles despite max_bars=6.
         for j in range(i + 1, end + 1):
             r = candles[j]
             ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
@@ -743,7 +744,7 @@ def _v11_target_path(
     This is intentionally limited to completed 4H/12H/1D structure. It does
     not inspect any future candle after the 1H decision close. The target is
     structural-first; this function verifies the path diagnostic independently
-    instead of equating “a target exists” with “the path is clear”.
+    instead of equating â€œa target existsâ€ with â€œthe path is clearâ€.
     """
     side = str(side).upper()
     if side not in {"LONG", "SHORT"} or entry <= 0 or target <= 0:
@@ -1123,7 +1124,7 @@ def analyze_candles(
         "estimated_round_trip_cost_pct": cost_pct, "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
         "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
         "signal_engine_version": ENGINE_VERSION,
-        "signal_basis": "1D macro vote → 12H health → 4H impulse/pullback into value → 1H liquidity sweep/reclaim → next 1H open",
+        "signal_basis": "1D macro vote â†’ 12H health â†’ 4H impulse/pullback into value â†’ 1H liquidity sweep/reclaim â†’ next 1H open",
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
         "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),

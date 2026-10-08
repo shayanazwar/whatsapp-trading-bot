@@ -95,6 +95,29 @@ class BacktestAlreadyRunning(RuntimeError):
     """Raised when a second backtest is started while one is active."""
 
 
+@dataclass(frozen=True)
+class BacktestTPConfig:
+    """Validated TP experiment mode for an exit-only backtest."""
+
+    mode: str
+    risk_multiple: float | None = None
+
+    @classmethod
+    def from_mode(cls, value: str | None) -> "BacktestTPConfig":
+        raw = str(value or "CONTROL").strip().upper()
+        mapping = {
+            "CONTROL": None,
+            "1.5R": 1.5,
+            "2.0R": 2.0,
+            "2.5R": 2.5,
+        }
+        if raw not in mapping:
+            raise ValueError(
+                "Invalid TP. Use CONTROL, 1.5R, 2.0R, or 2.5R."
+            )
+        return cls(mode=raw, risk_multiple=mapping[raw])
+
+
 # ============================================================
 # DATA STRUCTURES
 # ============================================================
@@ -557,6 +580,7 @@ class BacktestRunner:
         start_ms: int,
         end_ms: int,
         btc_context_cache: dict[int, Any] | None = None,
+        counterfactual_tp_r: float | None = None,
     ) -> tuple[
         list[SimulatedTrade],
         dict[str, int],
@@ -580,10 +604,8 @@ class BacktestRunner:
         def inc(key: str, amount: int = 1) -> None:
             diagnostics[key] = diagnostics.get(key, 0) + int(amount)
 
-        counterfactual_tp_r = _safe_number(os.getenv("V11_COUNTERFACTUAL_TP_R"))
-        if counterfactual_tp_r is not None and counterfactual_tp_r <= 0:
-            counterfactual_tp_r = None
         if counterfactual_tp_r is not None:
+            counterfactual_tp_r = float(counterfactual_tp_r)
             inc("TP_COUNTERFACTUAL_ENABLED")
             inc("TP_COUNTERFACTUAL_R_X100", int(round(counterfactual_tp_r * 100)))
         else:
@@ -955,10 +977,15 @@ class BacktestRunner:
                 state.get("symbol", "-"),
             )
 
-    async def run(self, days: int) -> BacktestSummary:
-        """Run a complete 1D/7D/30D/60D/90D/180D/365D causal paper backtest."""
+    async def run(
+        self,
+        days: int,
+        tp_mode: str = "CONTROL",
+    ) -> BacktestSummary:
+        """Run a complete causal paper backtest with an exit-only TP mode."""
 
         days = int(days)
+        tp_config = BacktestTPConfig.from_mode(tp_mode)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
                 "Supported backtests: 1D, 7D, 30D, 60D, 90D, 180D, 365D"
@@ -1037,7 +1064,18 @@ class BacktestRunner:
                         "execution_errors": 0,
                         "rejected_setups": 0,
                         "trades": [],
-                        "diagnostics": {"NO_ELIGIBLE_SYMBOLS": 1, "CURRENT_UNIVERSE_SNAPSHOT_BIAS": 1},
+                        "diagnostics": {
+                            "NO_ELIGIBLE_SYMBOLS": 1,
+                            "CURRENT_UNIVERSE_SNAPSHOT_BIAS": 1,
+                            "TP_MODE_X100": int(round((tp_config.risk_multiple or 0.0) * 100)),
+                            **(
+                                {
+                                    "TP_COUNTERFACTUAL_R_X100": int(round(tp_config.risk_multiple * 100))
+                                }
+                                if tp_config.risk_multiple is not None
+                                else {}
+                            ),
+                        },
                     }
                     params = inspect.signature(summarize).parameters
                     if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
@@ -1165,6 +1203,7 @@ class BacktestRunner:
                                         start_ms,
                                         end_ms,
                                         btc_context_cache,
+                                        tp_config.risk_multiple,
                                     ),
                                     timeout=max(1.0, float(getattr(self.settings, "backtest_analysis_timeout_seconds", 120.0))),
                                 )
@@ -1254,6 +1293,14 @@ class BacktestRunner:
                 # while newer builds require them.  Detect the active callable
                 # signature rather than allowing an avoidable TypeError to abort
                 # an otherwise completed backtest.
+                diagnostics["TP_MODE_X100"] = int(
+                    round((tp_config.risk_multiple or 0.0) * 100)
+                )
+                if tp_config.risk_multiple is not None:
+                    diagnostics["TP_COUNTERFACTUAL_R_X100"] = int(
+                        round(tp_config.risk_multiple * 100)
+                    )
+
                 rejected_setups = int(
                     diagnostics.get("TECHNICAL_REJECT", 0)
                 )
@@ -1340,6 +1387,7 @@ __all__ = [
     "BacktestAnalysisTimeout",
     "BacktestAnalysisProcessError",
     "BacktestRunner",
+    "BacktestTPConfig",
     "SymbolHistory",
     "build_12h_candles",
     "simulate_trade_1h",

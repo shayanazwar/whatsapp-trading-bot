@@ -134,10 +134,13 @@ def format_report(summary: BacktestSummary) -> str:
     start = summary.period_start_ms // 1000
     end = summary.period_end_ms // 1000
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
+    tp_mode_x100 = int(summary.diagnostics.get("TP_MODE_X100", 0)) if summary.diagnostics else 0
+    tp_mode = "CONTROL" if tp_mode_x100 == 0 else f"{tp_mode_x100 / 100.0:.1f}R"
     lines = [
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
+        f"TP MODE: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",

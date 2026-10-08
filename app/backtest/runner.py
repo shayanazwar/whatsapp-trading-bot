@@ -1045,20 +1045,9 @@ class BacktestRunner:
             - diagnostics.get("TECHNICAL_REJECT", 0),
         )
         diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int((time.monotonic() - symbol_started) * 1000)
-        effective_impulse_x100 = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
-        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = effective_impulse_x100
-        diagnostics["V11_MIN_IMPULSE_ATR_EFFECTIVE_X100"] = effective_impulse_x100
-        raw_impulse = os.getenv("V11_MIN_IMPULSE_ATR")
-        try:
-            diagnostics["V11_MIN_IMPULSE_ATR_ENV_RAW_X100"] = int(round(float(raw_impulse) * 100)) if raw_impulse is not None else -1
-        except (TypeError, ValueError, OverflowError):
-            diagnostics["V11_MIN_IMPULSE_ATR_ENV_RAW_X100"] = -1
+        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
+        diagnostics["V11_MIN_IMPULSE_ATR_ACTUAL_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
         diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
-        raw_trigger = os.getenv("V11_MAX_TRIGGER_BARS")
-        try:
-            diagnostics["V11_MAX_TRIGGER_BARS_ENV_RAW"] = int(raw_trigger) if raw_trigger is not None else -1
-        except (TypeError, ValueError, OverflowError):
-            diagnostics["V11_MAX_TRIGGER_BARS_ENV_RAW"] = -1
         diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
         diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
         diagnostics["MAE_USES_BAR_EXTREMES"] = 1
@@ -1322,10 +1311,20 @@ class BacktestRunner:
                             state["symbol"] = symbol
                             state["phase"] = "FETCH_HISTORY"
                             try:
-                                history = await asyncio.wait_for(
-                                    self._fetch_history(symbol, start_ms, end_ms),
-                                    timeout=FETCH_TIMEOUT_SECONDS,
-                                )
+                                # BTC_USDT is fetched once above because it is
+                                # also used for the causal macro context. If BTC
+                                # happens to be inside the frozen universe, reuse
+                                # that exact history instead of fetching it a
+                                # second time. This avoids duplicate I/O and, more
+                                # importantly, avoids treating BTC as two distinct
+                                # fingerprint records during snapshot validation.
+                                if symbol == "BTC_USDT" and btc_history is not None:
+                                    history = btc_history
+                                else:
+                                    history = await asyncio.wait_for(
+                                        self._fetch_history(symbol, start_ms, end_ms),
+                                        timeout=FETCH_TIMEOUT_SECONDS,
+                                    )
                                 symbol_hash = _history_fingerprint(history)
                                 expected_hash = snapshot.expected_data_hashes.get(symbol)
                                 if snapshot_ready and expected_hash and symbol_hash != expected_hash:
@@ -1431,9 +1430,28 @@ class BacktestRunner:
                 # A new snapshot becomes READY only after every selected symbol
                 # and BTC dataset has been fetched successfully and fingerprinted.
                 if not snapshot_ready:
-                    if len(observed_data_hashes) != len(snapshot.symbols) + (1 if btc_hash else 0):
+                    # BTC_USDT can legitimately be part of the selected universe
+                    # as well as the mandatory macro-context dataset. Compare key
+                    # identity sets rather than adding the two counts, otherwise
+                    # a valid 200-symbol snapshot containing BTC is incorrectly
+                    # rejected because the BTC hash is shared by both roles.
+                    expected_fingerprint_keys = set(snapshot.symbols)
+                    if btc_hash:
+                        expected_fingerprint_keys.add("BTC_USDT")
+                    observed_fingerprint_keys = set(observed_data_hashes)
+                    if observed_fingerprint_keys != expected_fingerprint_keys:
+                        missing = sorted(expected_fingerprint_keys - observed_fingerprint_keys)
+                        unexpected = sorted(observed_fingerprint_keys - expected_fingerprint_keys)
+                        LOGGER.error(
+                            "BACKTEST SNAPSHOT FINGERPRINT INCOMPLETE | expected=%d observed=%d missing=%s unexpected=%s",
+                            len(expected_fingerprint_keys),
+                            len(observed_fingerprint_keys),
+                            missing[:10],
+                            unexpected[:10],
+                        )
                         raise BacktestSnapshotError(
-                            "Backtest dataset could not be fully fingerprinted; snapshot remains invalid"
+                            "Backtest dataset could not be fully fingerprinted; "
+                            f"missing={missing[:10]} unexpected={unexpected[:10]}"
                         )
                     final_data_hash = _data_snapshot_hash(observed_data_hashes)
                     _atomic_write_json(

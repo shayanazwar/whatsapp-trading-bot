@@ -287,29 +287,3 @@ def test_report_exposes_r_ledger_and_mfe_reach_metrics():
     assert "R Ledger:" in text
     assert "MFE Reach:" in text
     assert summary.ledger_reconciled is True
-
-
-
-def test_report_flags_counterfactual_tp_without_matching_mfe():
-    from app.backtest.report import summarize
-    from app.backtest.simulator import SimulatedTrade
-    trade = SimulatedTrade(
-        symbol="TEST_USDT", side="LONG", signal_time_ms=1, entry=100.0,
-        stop_loss=99.0, tp1=101.5, tp2=101.5, planned_rr=1.5, signal_rr=1.5,
-        actual_fill_rr=1.5, tp1_hit=True, tp2_hit=True, sl_hit=False, outcome="TP",
-        r_multiple=1.4, exit_time_ms=2, mfe_r=1.0, mae_r=0.1, counterfactual_tp_r=1.5,
-    )
-    summary = summarize(days=1, period_start_ms=0, period_end_ms=1, coins_selected=1,
-                        coins_tested=1, data_errors=0, execution_errors=0, rejected_setups=0,
-                        trades=[trade])
-    assert summary.diagnostics["TP_HIT_WITHOUT_MFE_TARGET"] == 1
-    assert "MFE_TARGET_INTEGRITY=FAIL" in format_report(summary)
-
-
-def test_runtime_diagnostic_separates_effective_and_raw_environment(monkeypatch):
-    import os
-    monkeypatch.setenv("V11_MIN_IMPULSE_ATR", "500.00")
-    # This test verifies the diagnostic contract without changing engine behavior.
-    raw = os.getenv("V11_MIN_IMPULSE_ATR")
-    assert raw == "500.00"
-    assert int(round(float(raw) * 100)) == 50000

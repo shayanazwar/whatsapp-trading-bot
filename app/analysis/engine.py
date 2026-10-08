@@ -153,6 +153,33 @@ def _coerce_candles(rows: Iterable[Any] | None) -> List[Candle]:
     return convert_candles(rows)
 
 
+def _backtest_cache_get(cache: Optional[dict[str, Any]], bucket_name: str, key: Any) -> tuple[bool, Any]:
+    """Read a backtest-only memoized value without affecting normal/live analysis."""
+    if cache is None:
+        return False, None
+    bucket = cache.setdefault(bucket_name, {})
+    if key in bucket:
+        return True, bucket[key]
+    return False, None
+
+
+def _backtest_cache_put(
+    cache: Optional[dict[str, Any]],
+    bucket_name: str,
+    key: Any,
+    value: Any,
+) -> Any:
+    if cache is not None:
+        cache.setdefault(bucket_name, {})[key] = value
+    return value
+
+
+def _backtest_prefix_key(candles: list[Candle]) -> tuple[int, int]:
+    if not candles:
+        return 0, 0
+    return len(candles), int(candles[-1]["time"])
+
+
 def closed_candle_rows(candles: Iterable[Any] | None, timeframe_ms: Any, now_ms: Optional[int] = None) -> List[Candle]:
     interval = _timeframe_ms(timeframe_ms)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -538,14 +565,23 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
     }
 
 
-def _v11_context_12h(candles: list[Candle], side: str) -> dict[str, Any]:
+def _v11_context_12h(candles: list[Candle], side: str, cache: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    cache_key = (_backtest_prefix_key(candles), str(side).upper())
+    hit, cached = _backtest_cache_get(cache, "_v11_context_12h", cache_key)
+    if hit:
+        return cached
     closes = [float(c["close"]) for c in candles]
     e21 = _safe_ema(closes, 21)
     e50 = _safe_ema(closes, 50)
     slope = _ema_slope(closes, 50, lookback=5)
     structure = _v11_structure(candles, 3, 3)
     if e21 is None or e50 is None:
-        return {"status": "NEUTRAL", "hostile": False, "structure": structure, "e21": e21, "e50": e50, "slope": slope}
+        return _backtest_cache_put(
+            cache,
+            "_v11_context_12h",
+            cache_key,
+            {"status": "NEUTRAL", "hostile": False, "structure": structure, "e21": e21, "e50": e50, "slope": slope},
+        )
     price = closes[-1]
     if side == "LONG":
         hostile = bool(structure == "LH/LL" and price < e50 and slope < 0)
@@ -553,27 +589,36 @@ def _v11_context_12h(candles: list[Candle], side: str) -> dict[str, Any]:
     else:
         hostile = bool(structure == "HH/HL" and price > e50 and slope > 0)
         healthy = bool(not hostile and (structure == "LH/LL" or price <= e50))
-    return {
-        "status": "HOSTILE" if hostile else "HEALTHY" if healthy else "NEUTRAL",
-        "hostile": hostile,
-        "healthy": healthy,
-        "structure": structure,
-        "e21": e21,
-        "e50": e50,
-        "slope": slope,
-        "price": price,
-    }
+    return _backtest_cache_put(
+        cache,
+        "_v11_context_12h",
+        cache_key,
+        {
+            "status": "HOSTILE" if hostile else "HEALTHY" if healthy else "NEUTRAL",
+            "hostile": hostile,
+            "healthy": healthy,
+            "structure": structure,
+            "e21": e21,
+            "e50": e50,
+            "slope": slope,
+            "price": price,
+        },
+    )
 
 
-def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> list[dict[str, Any]]:
+def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30, cache: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     """Find completed 4H impulse legs without future leakage.
 
     Pivots are 3/3, so a pivot is only used after its three right-side candles
     are closed. Multiple active candidates are returned; the caller may select
     the newest still-valid setup rather than forcing a single latest-only setup.
     """
+    cache_key = (_backtest_prefix_key(candles), str(side).upper(), int(max_age))
+    hit, cached = _backtest_cache_get(cache, "_v11_impulses", cache_key)
+    if hit:
+        return cached
     if side not in {"LONG", "SHORT"} or len(candles) < 30:
-        return []
+        return _backtest_cache_put(cache, "_v11_impulses", cache_key, [])
     highs, lows = _swing_points(candles, left=3, right=3)
     atrs = _atr_series(candles, 14)
     events: list[dict[str, Any]] = []
@@ -629,7 +674,12 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 "high_time": int(candles[hi_idx]["time"]),
                 "low_time": int(candles[lo_idx]["time"]),
             })
-    return sorted(events, key=lambda x: int(x["high_idx"] if side == "LONG" else x["low_idx"]))
+    return _backtest_cache_put(
+        cache,
+        "_v11_impulses",
+        cache_key,
+        sorted(events, key=lambda x: int(x["high_idx"] if side == "LONG" else x["low_idx"])),
+    )
 
 
 def _v11_value_zone(leg: dict[str, Any], ema21: float | None, ema50: float | None) -> dict[str, float | bool]:
@@ -851,9 +901,10 @@ def _v11_analyze_side(
     daily: dict[str, Any],
     cost_pct: float,
     btc_context: dict[str, Any] | None,
+    cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
-    context = _v11_context_12h(c12, side)
+    context = _v11_context_12h(c12, side, cache=cache)
     short_range_exception = bool(
         side == "SHORT"
         and V11_SHORT_RANGE_RELAXED
@@ -892,9 +943,16 @@ def _v11_analyze_side(
             diagnostic_key=f"12H:{int(c12[-1]['time'])}",
         )
 
-    e21_4 = _safe_ema([float(c["close"]) for c in c4], 21)
-    e50_4 = _safe_ema([float(c["close"]) for c in c4], 50)
-    impulses = _v11_find_impulses(c4, side)
+    ema_key = _backtest_prefix_key(c4)
+    hit, ema_pair = _backtest_cache_get(cache, "_v11_ema_4h", ema_key)
+    if not hit:
+        ema_pair = (
+            _safe_ema([float(c["close"]) for c in c4], 21),
+            _safe_ema([float(c["close"]) for c in c4], 50),
+        )
+        _backtest_cache_put(cache, "_v11_ema_4h", ema_key, ema_pair)
+    e21_4, e50_4 = ema_pair
+    impulses = _v11_find_impulses(c4, side, cache=cache)
     if not impulses:
         return reject(
             f"{side}: no completed 4H HH/HL or LH/LL impulse >= {V11_MIN_IMPULSE_ATR:.2f} ATR",
@@ -953,8 +1011,17 @@ def _v11_analyze_side(
 
         trigger_idx = int(trigger["reclaim_idx"])
         entry = float(c1[-1]["close"])
-        atr4 = max(_safe_atr(c4), float(impulse["atr"]))
-        atr1 = _safe_atr(c1)
+        atr4_key = _backtest_prefix_key(c4)
+        hit, atr4_base = _backtest_cache_get(cache, "_v11_atr", (atr4_key, "4H", 14))
+        if not hit:
+            atr4_base = _safe_atr(c4)
+            _backtest_cache_put(cache, "_v11_atr", (atr4_key, "4H", 14), atr4_base)
+        atr4 = max(float(atr4_base), float(impulse["atr"]))
+        atr1_key = _backtest_prefix_key(c1)
+        hit, atr1 = _backtest_cache_get(cache, "_v11_atr", (atr1_key, "1H", 14))
+        if not hit:
+            atr1 = _safe_atr(c1)
+            _backtest_cache_put(cache, "_v11_atr", (atr1_key, "1H", 14), atr1)
         sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
@@ -1007,7 +1074,11 @@ def _v11_analyze_side(
             last_reason = f"{side}: post-cost RR {rr_net:.2f} < required {V11_MIN_RR:.2f} (gross {rr_gross:.2f})"
             continue
 
-        atr_rank = _atr_percentile(c4)
+        atr_rank_key = (_backtest_prefix_key(c4), 14, 100)
+        hit, atr_rank = _backtest_cache_get(cache, "_v11_atr_percentile", atr_rank_key)
+        if not hit:
+            atr_rank = _atr_percentile(c4)
+            _backtest_cache_put(cache, "_v11_atr_percentile", atr_rank_key, atr_rank)
         last = c1[-1]
         range1 = float(last["high"]) - float(last["low"])
         shock_ok = not (atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1)
@@ -1075,8 +1146,29 @@ def _v11_empty(
     btc_context: dict[str, Any] | None = None,
     *,
     side_failures: list[str] | None = None,
+    cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     price = float(c1[-1]["close"])
+    c4_key = (_backtest_prefix_key(c4), 14)
+    hit, atr4 = _backtest_cache_get(cache, "_v11_atr", c4_key)
+    if not hit:
+        atr4 = _safe_atr(c4)
+        _backtest_cache_put(cache, "_v11_atr", c4_key, atr4)
+    c1_key = (_backtest_prefix_key(c1), 14)
+    hit, atr1 = _backtest_cache_get(cache, "_v11_atr", c1_key)
+    if not hit:
+        atr1 = _safe_atr(c1)
+        _backtest_cache_put(cache, "_v11_atr", c1_key, atr1)
+    pct_key = (_backtest_prefix_key(c4), 14, 100)
+    hit, atr_pct = _backtest_cache_get(cache, "_v11_atr_percentile", pct_key)
+    if not hit:
+        atr_pct = _atr_percentile(c4)
+        _backtest_cache_put(cache, "_v11_atr_percentile", pct_key, atr_pct)
+    rvol_key = (_backtest_prefix_key(c1), 20)
+    hit, rvol = _backtest_cache_get(cache, "_v11_rvol", rvol_key)
+    if not hit:
+        rvol = _relative_volume(c1, 20)
+        _backtest_cache_put(cache, "_v11_rvol", rvol_key, rvol)
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
@@ -1094,8 +1186,8 @@ def _v11_empty(
         "btc_filter_ok": True, "btc_filter_reason": "not evaluated", "score": 0, "score_groups": {},
         "stage_status": {"1D_REGIME": False, "12H_BIAS": False, "4H_SETUP": False, "1H_TRIGGER": False, "RISK": False, "RR": False, "QUALITY": True, "BTC": True, "SHOCK": True},
         "stage_failures": {"SETUP": [reason]}, "entry": None, "stop_loss": None, "tp": None, "rr": None,
-        "atr_4h": _safe_atr(c4), "atr_1h": _safe_atr(c1), "atr": _safe_atr(c1),
-        "atr_percentile": _atr_percentile(c4), "rvol_1h": _relative_volume(c1, 20),
+        "atr_4h": float(atr4), "atr_1h": float(atr1), "atr": float(atr1),
+        "atr_percentile": float(atr_pct), "rvol_1h": float(rvol),
         "entry_mode": "MARKET", "limit_price": None, "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES,
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
@@ -1122,21 +1214,42 @@ def analyze_candles(
     Authoritative timeframes: 1D / 12H / 4H / 1H only.
     """
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    c1d = closed_candle_rows(candles_1d or [], "1D", now)
-    c4 = closed_candle_rows(candles_4h or [], "4H", now)
-    c1 = closed_candle_rows(candles_1h or [], "1H", now)
-    c12 = closed_candle_rows(candles_12h, "12H", now) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now)
+    if cache is not None and bool(cache.get("_preclosed_candles")):
+        c1d = _coerce_candles(candles_1d or [])
+        c4 = _coerce_candles(candles_4h or [])
+        c1 = _coerce_candles(candles_1h or [])
+        c12 = _coerce_candles(candles_12h or []) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now)
+    else:
+        c1d = closed_candle_rows(candles_1d or [], "1D", now)
+        c4 = closed_candle_rows(candles_4h or [], "4H", now)
+        c1 = closed_candle_rows(candles_1h or [], "1H", now)
+        c12 = closed_candle_rows(candles_12h, "12H", now) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now)
     for c, tf, minimum in ((c1d, "1d", 210), (c12, "12h", 60), (c4, "4h", 180), (c1, "1h", 180)):
         ok, reason = _data_quality(c, tf, minimum)
         if not ok:
             raise ValueError(f"{symbol}: {reason}")
-    daily = _v11_regime_1d(c1d)
+    daily_key = _backtest_prefix_key(c1d)
+    hit, daily = _backtest_cache_get(cache, "_v11_daily_regime", daily_key)
+    if not hit:
+        daily = _v11_regime_1d(c1d)
+        _backtest_cache_put(cache, "_v11_daily_regime", daily_key, daily)
     cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
     side_diagnostics: list[dict[str, Any]] = []
     for side in ("LONG", "SHORT"):
-        result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
+        result = _v11_analyze_side(
+            symbol,
+            side,
+            c1d,
+            c12,
+            c4,
+            c1,
+            daily,
+            cost_pct,
+            btc_context,
+            cache=cache,
+        )
         if result.get("candidate"):
             candidates.append(result)
             side_diagnostics.append({"side": side, "candidate": True, "primary_failure": None, "diagnostic_key": result.get("diagnostic_key")})
@@ -1146,7 +1259,18 @@ def analyze_candles(
             side_diagnostics.append({"side": side, "candidate": False, "primary_failure": primary, "diagnostic_key": result.get("diagnostic_key")})
     if not candidates:
         reasons = side_failures or ["no active V11 value-pullback trigger"]
-        result = _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context, side_failures=reasons)
+        result = _v11_empty(
+            symbol,
+            c1d,
+            c12,
+            c4,
+            c1,
+            "; ".join(reasons),
+            daily,
+            btc_context,
+            side_failures=reasons,
+            cache=cache,
+        )
         result["side_diagnostics"] = side_diagnostics
         result["primary_rejection_reason"] = side_diagnostics[0]["primary_failure"] if side_diagnostics else reasons[0]
         return result

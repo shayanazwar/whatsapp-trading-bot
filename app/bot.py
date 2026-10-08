@@ -4,8 +4,6 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Optional
-
 from .charts import ChartRenderer
 from .formatting import fmt_price
 from .analysis.engine import analyze_symbol
@@ -16,7 +14,7 @@ from .backtest.runner import (
 )
 from .config import Settings
 from .database import Alert, Database
-from .market import MarketData, MarketRef, TIMEFRAME_ALIASES
+from .market import MarketData, TIMEFRAME_ALIASES
 from .whatsapp import WhatsAppClient
 from .telegram import TelegramClient
 
@@ -790,10 +788,7 @@ class Bot:
                 tp_mode=tp_mode,
             )
 
-            try:
-                from .backtest.report import format_report
-            except ImportError:
-                from app.backtest.report import format_report
+            from .backtest.report import format_report
 
             await self._send_text(
                 phone,

@@ -60,7 +60,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V11-B-accuracy-research-variant"
+ENGINE_VERSION = "V11-C-accuracy-research-variant"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -1442,7 +1442,7 @@ def _rolling_vwap(candles: list[Candle], window: int = 48) -> float | None:
 # deliberately implemented as a thin strategy layer so data, candle handling,
 # timeframes, cost model, and existing infrastructure remain reusable.
 
-V11_DEFAULT_STRATEGY = os.getenv("V11_DEFAULT_STRATEGY", "B").strip().upper() or "B"
+V11_DEFAULT_STRATEGY = os.getenv("V11_DEFAULT_STRATEGY", "C").strip().upper() or "C"
 if V11_DEFAULT_STRATEGY not in {"CONTROL", "A", "B", "C"}:
     V11_DEFAULT_STRATEGY = "CONTROL"
 V11_STRATEGY_VARIANT = os.getenv("V11_STRATEGY_VARIANT", V11_DEFAULT_STRATEGY).strip().upper() or V11_DEFAULT_STRATEGY

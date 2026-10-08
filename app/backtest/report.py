@@ -121,6 +121,13 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, tp_mode: s
     diagnostics_out.setdefault("MFE_1_5R_HIT", sum(bool(getattr(t, "mfe_1_5r_hit", False)) for t in resolved))
     diagnostics_out.setdefault("MFE_2R_HIT", sum(bool(getattr(t, "mfe_2r_hit", False)) for t in resolved))
     diagnostics_out.setdefault("MFE_2_5R_HIT", sum(bool(getattr(t, "mfe_2_5r_hit", False)) for t in resolved))
+    diagnostics_out["TP_HIT_WITHOUT_MFE_TARGET"] = sum(
+        1 for t in resolved
+        if t.outcome == "TP"
+        and getattr(t, "counterfactual_tp_r", None) is not None
+        and getattr(t, "mfe_r", None) is not None
+        and float(t.mfe_r) + 1e-9 < float(t.counterfactual_tp_r)
+    )
     return BacktestSummary(
         days=days,
         period_start_ms=period_start_ms,
@@ -220,15 +227,25 @@ def format_report(summary: BacktestSummary) -> str:
     if summary.diagnostics:
         active_experiments = []
         sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))
-        impulse_x100 = int(summary.diagnostics.get("V11_MIN_IMPULSE_ATR_X100", 250))
+        impulse_x100 = int(summary.diagnostics.get("V11_MIN_IMPULSE_ATR_EFFECTIVE_X100", summary.diagnostics.get("V11_MIN_IMPULSE_ATR_X100", 250)))
+        impulse_raw_x100 = int(summary.diagnostics.get("V11_MIN_IMPULSE_ATR_ENV_RAW_X100", -1))
         trigger_bars = int(summary.diagnostics.get("V11_MAX_TRIGGER_BARS", 6))
+        trigger_raw = int(summary.diagnostics.get("V11_MAX_TRIGGER_BARS_ENV_RAW", -1))
         short_relaxed = int(summary.diagnostics.get("V11_SHORT_RANGE_RELAXED", 0))
         if sl_origin:
             active_experiments.append("SL=4H_ORIGIN")
-        if impulse_x100 != 250:
-            active_experiments.append(f"4H_IMPULSE_MIN={impulse_x100 / 100.0:.2f}ATR")
-        if trigger_bars != 6:
-            active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
+        if impulse_x100 != 250 or (impulse_raw_x100 >= 0 and impulse_raw_x100 != impulse_x100):
+            if impulse_raw_x100 >= 0 and impulse_raw_x100 != impulse_x100:
+                active_experiments.append(f"4H_IMPULSE_EFFECTIVE={impulse_x100 / 100.0:.2f}ATR|ENV_RAW={impulse_raw_x100 / 100.0:.2f}ATR")
+            else:
+                active_experiments.append(f"4H_IMPULSE_MIN={impulse_x100 / 100.0:.2f}ATR")
+        if trigger_bars != 6 or (trigger_raw >= 0 and trigger_raw != trigger_bars):
+            if trigger_raw >= 0 and trigger_raw != trigger_bars:
+                active_experiments.append(f"SWEEP_RECLAIM_EFFECTIVE={trigger_bars}B|ENV_RAW={trigger_raw}B")
+            else:
+                active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
+        if int(summary.diagnostics.get("TP_HIT_WITHOUT_MFE_TARGET", 0)) > 0:
+            active_experiments.append("MFE_TARGET_INTEGRITY=FAIL")
         if short_relaxed:
             active_experiments.append("SHORT_RANGE_RELAXED=ON")
         if active_experiments:

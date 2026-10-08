@@ -10,7 +10,7 @@ try:
     from .charts import ChartRenderer
     from .formatting import fmt_price
     from .analysis.engine import analyze_symbol
-    from .backtest.runner import BacktestAlreadyRunning, BacktestRunner
+    from .backtest.runner import BacktestAlreadyRunning, BacktestRunner, BacktestTPConfig
     from .config import Settings
     from .database import Alert, Database
     from .market import MarketData, MarketRef, TIMEFRAME_ALIASES
@@ -20,7 +20,7 @@ except ImportError:
     from charts import ChartRenderer
     from formatting import fmt_price
     from app.analysis.engine import analyze_symbol
-    from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner
+    from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner, BacktestTPConfig
     from config import Settings
     from database import Alert, Database
     from market import MarketData, MarketRef, TIMEFRAME_ALIASES
@@ -50,6 +50,10 @@ SEARCH PEPE
 🧪 BACKTEST
 BACKTEST 1D
 BACKTEST 7D
+BACKTEST 7D TP=CONTROL
+BACKTEST 7D TP=1.5R
+BACKTEST 7D TP=2.0R
+BACKTEST 7D TP=2.5R
 BACKTEST 30D
 BACKTEST 60D
 BACKTEST 90D
@@ -65,6 +69,44 @@ COMMAND_RE = re.compile(r"^/?([A-Z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
 
 def normalize_symbol_token(value: str) -> str:
     return value.strip().upper()
+
+
+BACKTEST_PERIODS = {
+    "1D": 1,
+    "7D": 7,
+    "30D": 30,
+    "60D": 60,
+    "90D": 90,
+    "180D": 180,
+    "365D": 365,
+}
+
+
+def parse_backtest_args(args: str) -> tuple[str, int, str]:
+    """Parse BACKTEST period and optional TP mode without mutating shared state."""
+    tokens = str(args or "").strip().upper().split()
+    if not tokens or tokens[0] not in BACKTEST_PERIODS or len(tokens) > 2:
+        raise ValueError(
+            "Usage: BACKTEST 1D, 7D, 30D, 60D, 90D, 180D, or 365D [TP=CONTROL|1.5R|2.0R|2.5R]"
+        )
+
+    period = tokens[0]
+    tp_mode = "CONTROL"
+    if len(tokens) == 2:
+        token = tokens[1]
+        if not token.startswith("TP="):
+            raise ValueError(
+                "Invalid BACKTEST option. Use TP=CONTROL, TP=1.5R, TP=2.0R, or TP=2.5R."
+            )
+        raw_tp = token[3:].strip().upper()
+        try:
+            tp_mode = BacktestTPConfig.from_mode(raw_tp).mode
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid TP. Use CONTROL, 1.5R, 2.0R, or 2.5R."
+            ) from exc
+
+    return period, BACKTEST_PERIODS[period], tp_mode
 
 
 
@@ -610,21 +652,7 @@ class Bot:
                 "Backtest service is not configured."
             )
 
-        period = args.strip().upper()
-        periods = {
-            "1D": 1,
-            "7D": 7,
-            "30D": 30,
-            "60D": 60,
-            "90D": 90,
-            "180D": 180,
-            "365D": 365,
-        }
-
-        if period not in periods:
-            raise ValueError(
-                "Usage: BACKTEST 1D, 7D, 30D, 60D, 90D, 180D, or 365D"
-            )
+        period, days, tp_mode = parse_backtest_args(args)
 
         if self.backtest_runner.is_running:
             await self._send_text(
@@ -633,12 +661,10 @@ class Bot:
             )
             return
 
-        days = periods[period]
-
         await self._send_text(
             phone,
             (
-                f"⏳ BACKTEST {period} STARTED\n\n"
+                f"⏳ BACKTEST {period} TP={tp_mode} STARTED\n\n"
                 "Up to 200 eligible MEXC Futures coins will be tested.\n"
                 "No real trades will be executed.\n\n"
                 "I'll send the report here when finished."
@@ -646,7 +672,7 @@ class Bot:
         )
 
         try:
-            summary = await self.backtest_runner.run(days)
+            summary = await self.backtest_runner.run(days, tp_mode=tp_mode)
             try:
                 from .backtest.report import format_report
             except ImportError:
@@ -663,12 +689,13 @@ class Bot:
             )
         except Exception as exc:
             LOGGER.exception(
-                "BACKTEST %s failed",
+                "BACKTEST %s TP=%s failed",
                 period,
+                tp_mode,
             )
             await self._send_text(
                 phone,
-                f"❌ BACKTEST {period} failed: {exc}",
+                f"❌ BACKTEST {period} TP={tp_mode} failed: {exc}",
             )
     async def _shortcut(
         self,

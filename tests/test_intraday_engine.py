@@ -8,19 +8,6 @@ import app.analysis.engine as engine
 from app.analysis.engine import _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path
 
 
-@pytest.fixture(autouse=True)
-def _legacy_control_mode(monkeypatch):
-    """These legacy fixture tests validate the pre-accuracy V11 control path."""
-    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
-    monkeypatch.delenv("V11_SL_MODE", raising=False)
-    monkeypatch.delenv("V11_MAX_TRIGGER_BARS", raising=False)
-    monkeypatch.delenv("V11_MAX_RECLAIM_RECENCY_BARS", raising=False)
-    monkeypatch.delenv("V11_MAX_ENTRY_EXTENSION_ATR", raising=False)
-    monkeypatch.delenv("V11_MAX_TARGET_R", raising=False)
-    monkeypatch.delenv("V11_MAX_RETEST_DEPTH", raising=False)
-    monkeypatch.delenv("V11_REQUIRE_BREAKOUT_QUALITY", raising=False)
-
-
 def candle(ts: int, o: float, h: float, l: float, c: float, v: float = 1000.0):
     return [ts, o, h, l, c, v]
 

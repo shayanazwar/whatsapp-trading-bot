@@ -194,6 +194,7 @@ def simulate_trade(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
     same_bar_rule: str | None = None,
+    tp_r_multiple: float | None = None,
     counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
     """Simulate a deterministic single-TP / single-SL trade.
@@ -225,21 +226,31 @@ def simulate_trade(
     if planned_risk <= 0 or not isfinite(planned_risk):
         return None
     # The engine's original TP is the control target and is always validated here.
-    # A counterfactual TP, when supplied, is applied only after the entry fill so
-    # that the accepted entry/SL population is unchanged.
+    # An explicit R-multiple TP is an exit-only backtest override; the accepted
+    # entry/SL population is never regenerated from that override.
     original_tp = tp
     if side == "LONG" and not (stop < entry < original_tp):
         return None
     if side == "SHORT" and not (original_tp < entry < stop):
         return None
+    selected_r = tp_r_multiple if tp_r_multiple is not None else counterfactual_tp_r
     counterfactual_r = None
-    if counterfactual_tp_r is not None:
+    if selected_r is not None:
         try:
-            candidate_r = float(counterfactual_tp_r)
+            candidate_r = float(selected_r)
         except (TypeError, ValueError, OverflowError):
             candidate_r = 0.0
         if isfinite(candidate_r) and candidate_r > 0:
             counterfactual_r = candidate_r
+            tp = (
+                entry + candidate_r * planned_risk
+                if side == "LONG"
+                else entry - candidate_r * planned_risk
+            )
+            if side == "LONG" and not (stop < entry < tp):
+                return None
+            if side == "SHORT" and not (tp < entry < stop):
+                return None
 
     size_data = _position_size(signal)
     if size_data is None:
@@ -312,7 +323,7 @@ def simulate_trade(
         denominator = initial_risk_cash if initial_risk_cash > 0 else 0.0
         fees_r = (entry_fee + exit_fees) / denominator if denominator else 0.0
         slip_r = slippage_cash / denominator if denominator else 0.0
-        signal_rr = abs(original_tp - entry) / planned_risk if planned_risk > 0 else 0.0
+        signal_rr = abs(tp - entry) / planned_risk if planned_risk > 0 else 0.0
         actual_fill_rr = None
         if entry_exec is not None:
             actual_fill_risk = abs(entry_exec - stop)
@@ -377,12 +388,6 @@ def simulate_trade(
             if not isfinite(entry_exec) or entry_exec <= 0:
                 return None
             risk_exec = abs(entry_exec - stop)
-            if counterfactual_r is not None:
-                tp = (
-                    entry_exec + counterfactual_r * risk_exec
-                    if side == "LONG"
-                    else entry_exec - counterfactual_r * risk_exec
-                )
             if side == "LONG" and not (stop < entry_exec < tp):
                 return None
             if side == "SHORT" and not (tp < entry_exec < stop):

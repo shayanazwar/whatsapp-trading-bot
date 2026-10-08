@@ -141,6 +141,31 @@ class SymbolHistory:
             )
 
 
+@dataclass(frozen=True)
+class BacktestTPConfig:
+    """Immutable TP selection scoped to one backtest execution."""
+
+    mode: str = "CONTROL"
+    r_multiple: float | None = None
+
+    @classmethod
+    def from_mode(cls, mode: str) -> "BacktestTPConfig":
+        normalized = str(mode or "CONTROL").strip().upper()
+        mapping = {
+            "CONTROL": ("CONTROL", None),
+            "1.5R": ("1.5R", 1.5),
+            "2R": ("2.0R", 2.0),
+            "2.0R": ("2.0R", 2.0),
+            "2.5R": ("2.5R", 2.5),
+        }
+        selected = mapping.get(normalized)
+        if selected is None:
+            raise ValueError(
+                "Invalid TP. Use CONTROL, 1.5R, 2.0R, or 2.5R."
+            )
+        return cls(mode=selected[0], r_multiple=selected[1])
+
+
 # ============================================================
 # CANDLE / TIME HELPERS
 # ============================================================
@@ -406,6 +431,7 @@ def simulate_trade_1h(
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     max_holding_minutes: float | None = None,
+    tp_r_multiple: float | None = None,
     counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
     """Single authoritative 1H paper simulator used by the V11 Runner."""
@@ -416,6 +442,7 @@ def simulate_trade_1h(
         fee_rate=float(fee_rate),
         slippage_bps=float(slippage_bps),
         max_holding_minutes=max_holding_minutes,
+        tp_r_multiple=tp_r_multiple,
         counterfactual_tp_r=counterfactual_tp_r,
     )
 
@@ -557,6 +584,7 @@ class BacktestRunner:
         start_ms: int,
         end_ms: int,
         btc_context_cache: dict[int, Any] | None = None,
+        tp_config: BacktestTPConfig | None = None,
     ) -> tuple[
         list[SimulatedTrade],
         dict[str, int],
@@ -580,14 +608,7 @@ class BacktestRunner:
         def inc(key: str, amount: int = 1) -> None:
             diagnostics[key] = diagnostics.get(key, 0) + int(amount)
 
-        counterfactual_tp_r = _safe_number(os.getenv("V11_COUNTERFACTUAL_TP_R"))
-        if counterfactual_tp_r is not None and counterfactual_tp_r <= 0:
-            counterfactual_tp_r = None
-        if counterfactual_tp_r is not None:
-            inc("TP_COUNTERFACTUAL_ENABLED")
-            inc("TP_COUNTERFACTUAL_R_X100", int(round(counterfactual_tp_r * 100)))
-        else:
-            inc("TP_COUNTERFACTUAL_CONTROL")
+        tp_config = tp_config or BacktestTPConfig()
 
         # Only 1H bars create decisions.
         for row in history.candles_1h:
@@ -829,7 +850,7 @@ class BacktestRunner:
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
                     max_holding_minutes=max_hold,
-                    counterfactual_tp_r=counterfactual_tp_r,
+                    tp_r_multiple=tp_config.r_multiple,
                 )
             except Exception as exc:
                 simulation_errors += 1
@@ -955,10 +976,11 @@ class BacktestRunner:
                 state.get("symbol", "-"),
             )
 
-    async def run(self, days: int) -> BacktestSummary:
+    async def run(self, days: int, *, tp_mode: str = "CONTROL") -> BacktestSummary:
         """Run a complete 1D/7D/30D/60D/90D/180D/365D causal paper backtest."""
 
         days = int(days)
+        tp_config = BacktestTPConfig.from_mode(tp_mode)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
                 "Supported backtests: 1D, 7D, 30D, 60D, 90D, 180D, 365D"
@@ -1031,6 +1053,7 @@ class BacktestRunner:
                         "days": days,
                         "period_start_ms": int(start_ms),
                         "period_end_ms": int(end_ms),
+                        "tp_mode": tp_config.mode,
                         "coins_selected": 0,
                         "coins_tested": 0,
                         "data_errors": 0,
@@ -1050,11 +1073,12 @@ class BacktestRunner:
 
                 LOGGER.info(
                     "BACKTEST START | days=%d symbols=%d start=%d end=%d "
-                    "strategy=1D>12H>4H>1H",
+                    "strategy=1D>12H>4H>1H tp_mode=%s",
                     days,
                     len(symbols),
                     start_ms,
                     end_ms,
+                    tp_config.mode,
                 )
 
                 # --------------------------------------------------------
@@ -1165,6 +1189,7 @@ class BacktestRunner:
                                         start_ms,
                                         end_ms,
                                         btc_context_cache,
+                                        tp_config,
                                     ),
                                     timeout=max(1.0, float(getattr(self.settings, "backtest_analysis_timeout_seconds", 120.0))),
                                 )
@@ -1270,6 +1295,7 @@ class BacktestRunner:
                     "data_errors": int(state["data_errors"]),
                     "period_start_ms": int(start_ms),
                     "period_end_ms": int(end_ms),
+                    "tp_mode": tp_config.mode,
                     "execution_errors": execution_errors,
                     "rejected_setups": rejected_setups,
                     "trades": trades,
@@ -1340,6 +1366,7 @@ __all__ = [
     "BacktestAnalysisTimeout",
     "BacktestAnalysisProcessError",
     "BacktestRunner",
+    "BacktestTPConfig",
     "SymbolHistory",
     "build_12h_candles",
     "simulate_trade_1h",

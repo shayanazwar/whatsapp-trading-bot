@@ -13,6 +13,7 @@ class BacktestSummary:
     days: int
     period_start_ms: int
     period_end_ms: int
+    tp_mode: str
     timeframes: tuple[str, ...]
     coins_tested: int
     coins_selected: int
@@ -48,7 +49,7 @@ def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
     return [t for t in trades if t.outcome in {"TP", "SL", "EXPIRED"} and t.r_multiple is not None and math.isfinite(float(t.r_multiple))]
 
 
-def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_selected: int, coins_tested: int, data_errors: int, execution_errors: int, rejected_setups: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None) -> BacktestSummary:
+def summarize(*, days: int, period_start_ms: int, period_end_ms: int, tp_mode: str = "CONTROL", coins_selected: int, coins_tested: int, data_errors: int, execution_errors: int, rejected_setups: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None) -> BacktestSummary:
     ordered = sorted(trades, key=lambda t: (int(t.signal_time_ms), t.symbol, t.side))
     resolved = _resolved(ordered)
     values = [float(t.r_multiple) for t in resolved]
@@ -94,6 +95,7 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         days=days,
         period_start_ms=period_start_ms,
         period_end_ms=period_end_ms,
+        tp_mode=str(tp_mode or "CONTROL").upper(),
         timeframes=("1D", "12H", "4H", "1H"),
         coins_tested=coins_tested,
         coins_selected=coins_selected,
@@ -138,6 +140,7 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
+        f"TP MODE: {summary.tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",
@@ -166,9 +169,6 @@ def format_report(summary: BacktestSummary) -> str:
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
     ]
-    cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
-    if cf is not None:
-        lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
     if summary.diagnostics:
         active_experiments = []
         sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))

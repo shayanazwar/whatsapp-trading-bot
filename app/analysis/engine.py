@@ -189,6 +189,48 @@ def synthesize_12h_from_4h(candles_4h: Iterable[Any] | None, *, now_ms: Optional
     return output
 
 
+def _frame_cache_key(candles: list[Candle]) -> tuple[Any, ...]:
+    """Identify an unchanged candle prefix for backtest-only memoization.
+
+    The runner reuses the same normalized Candle objects while building causal
+    prefixes. Including their identities prevents equal timestamps from making
+    independently fetched candle sets share cached values.
+    """
+    if not candles:
+        return (0, None, None, None, None)
+    return (
+        len(candles),
+        int(candles[0]["time"]),
+        int(candles[-1]["time"]),
+        id(candles[0]),
+        id(candles[-1]),
+    )
+
+
+def _memoized_frame_value(
+    cache: Optional[dict[str, Any]],
+    cache_name: str,
+    candles: list[Candle],
+    compute,
+) -> Any:
+    """Cache a pure calculation only for the runner's immutable candle prefixes.
+
+    Cache entries are single-prefix slots, so memory remains bounded during long
+    backtests. Calls without the runner's explicit flag retain uncached behavior.
+    """
+    if not isinstance(cache, dict) or cache.get("_preclosed_candles") is not True:
+        return compute()
+
+    key = _frame_cache_key(candles)
+    current = cache.get(cache_name)
+    if isinstance(current, tuple) and len(current) == 2 and current[0] == key:
+        return current[1]
+
+    value = compute()
+    cache[cache_name] = (key, value)
+    return value
+
+
 def _safe_ema(values: list[float], period: int) -> float | None:
     try:
         value = ema(values, period)
@@ -820,9 +862,13 @@ def _v11_analyze_side(
     daily: dict[str, Any],
     cost_pct: float,
     btc_context: dict[str, Any] | None,
+    cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
-    context = _v11_context_12h(c12, side)
+    context = _memoized_frame_value(
+        cache, f"_v11_context_12h_{side.lower()}", c12,
+        lambda: _v11_context_12h(c12, side),
+    )
     direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
 
     def reject(reason: str) -> dict[str, Any]:
@@ -851,9 +897,17 @@ def _v11_analyze_side(
             f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})"
         )
 
-    e21_4 = _safe_ema([float(c["close"]) for c in c4], 21)
-    e50_4 = _safe_ema([float(c["close"]) for c in c4], 50)
-    impulses = _v11_find_impulses(c4, side)
+    e21_4, e50_4 = _memoized_frame_value(
+        cache, "_v11_ema21_50_4h", c4,
+        lambda: (
+            _safe_ema([float(c["close"]) for c in c4], 21),
+            _safe_ema([float(c["close"]) for c in c4], 50),
+        ),
+    )
+    impulses = _memoized_frame_value(
+        cache, f"_v11_impulses_{side.lower()}", c4,
+        lambda: _v11_find_impulses(c4, side),
+    )
     if not impulses:
         return reject(f"{side}: no completed 4H HH/HL or LH/LL impulse >= {V11_MIN_IMPULSE_ATR:.2f} ATR")
 
@@ -908,8 +962,13 @@ def _v11_analyze_side(
 
         trigger_idx = int(trigger["reclaim_idx"])
         entry = float(c1[-1]["close"])
-        atr4 = max(_safe_atr(c4), float(impulse["atr"]))
-        atr1 = _safe_atr(c1)
+        atr4 = max(
+            _memoized_frame_value(cache, "_v11_atr_4h", c4, lambda: _safe_atr(c4)),
+            float(impulse["atr"]),
+        )
+        atr1 = _memoized_frame_value(
+            cache, "_v11_atr_1h", c1, lambda: _safe_atr(c1)
+        )
         sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
@@ -952,7 +1011,9 @@ def _v11_analyze_side(
             last_reason = f"{side}: post-cost RR {rr_net:.2f} < required {V11_MIN_RR:.2f} (gross {rr_gross:.2f})"
             continue
 
-        atr_rank = _atr_percentile(c4)
+        atr_rank = _memoized_frame_value(
+            cache, "_v11_atr_percentile_4h", c4, lambda: _atr_percentile(c4)
+        )
         last = c1[-1]
         range1 = float(last["high"]) - float(last["low"])
         shock_ok = not (atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1)
@@ -1023,8 +1084,18 @@ def _v11_empty(
     *,
     side_failures: list[str] | None = None,
     side_diagnostics: list[dict[str, Any]] | None = None,
+    cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     price = float(c1[-1]["close"])
+    atr_4h = _memoized_frame_value(
+        cache, "_v11_atr_4h", c4, lambda: _safe_atr(c4)
+    )
+    atr_1h = _memoized_frame_value(
+        cache, "_v11_atr_1h", c1, lambda: _safe_atr(c1)
+    )
+    atr_percentile = _memoized_frame_value(
+        cache, "_v11_atr_percentile_4h", c4, lambda: _atr_percentile(c4)
+    )
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
@@ -1048,8 +1119,8 @@ def _v11_empty(
         "btc_filter_ok": True, "btc_filter_reason": "not evaluated", "score": 0, "score_groups": {},
         "stage_status": {"1D_REGIME": False, "12H_BIAS": False, "4H_SETUP": False, "1H_TRIGGER": False, "RISK": False, "RR": False, "QUALITY": True, "BTC": True, "SHOCK": True},
         "stage_failures": {"SETUP": [reason]}, "entry": None, "stop_loss": None, "tp": None, "rr": None,
-        "atr_4h": _safe_atr(c4), "atr_1h": _safe_atr(c1), "atr": _safe_atr(c1),
-        "atr_percentile": _atr_percentile(c4), "rvol_1h": _relative_volume(c1, 20),
+        "atr_4h": atr_4h, "atr_1h": atr_1h, "atr": atr_1h,
+        "atr_percentile": atr_percentile, "rvol_1h": _relative_volume(c1, 20),
         "entry_mode": "MARKET", "limit_price": None, "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES,
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
@@ -1085,13 +1156,17 @@ def analyze_candles(
         ok, reason = _data_quality(c, tf, minimum)
         if not ok:
             raise ValueError(f"{symbol}: {reason}")
-    daily = _v11_regime_1d(c1d)
+    daily = _memoized_frame_value(
+        cache, "_v11_regime_1d", c1d, lambda: _v11_regime_1d(c1d)
+    )
     cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
     side_diagnostics: list[dict[str, Any]] = []
     for side in ("LONG", "SHORT"):
-        result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
+        result = _v11_analyze_side(
+            symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache
+        )
         is_candidate = bool(result.get("candidate"))
         side_diagnostics.append({
             "side": side,
@@ -1110,7 +1185,7 @@ def analyze_candles(
         reasons = side_failures or ["no active V11 value-pullback trigger"]
         return _v11_empty(
             symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context,
-            side_failures=reasons, side_diagnostics=side_diagnostics,
+            side_failures=reasons, side_diagnostics=side_diagnostics, cache=cache,
         )
     # If both sides somehow qualify, rank by structural setup quality only; this is
     # not an accuracy score and is not used as a threshold.

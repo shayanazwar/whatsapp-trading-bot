@@ -1,43 +1,31 @@
-# V11 Accuracy-First Applied Changes
+# V11 Configuration / Backtest Integrity Fix
 
-Applied to the supplied current codebase.
+## What was wrong
 
-## Frozen architecture
-- Only 1D / 12H / 4H / 1H.
-- Completed candles only.
-- Causal 12H aggregation from contiguous completed 4H candles.
-- Breakout + retest / value re-entry framework retained.
-- No lower timeframes added.
+The backtest aggregated each symbol's diagnostics by summing every numeric key. The strategy configuration keys were incorrectly included in those sums. With 200 symbols, the default `2.50 ATR` threshold was reported as `500.00 ATR` and the default 6-bar reclaim window was reported as `1200B` (`2.50 * 200` and `6 * 200`). These were reporting errors; they did not represent the engine's effective settings.
 
-## Accuracy-first controls now available and enabled by default
-- `V11_ACCURACY_MODE=true`
-- Structural 4H-origin stop option enabled by default.
-- Fresh 1H reclaim: max 3 bars from sweep to reclaim and reclaim must be no more than 2 bars old at entry.
-- Maximum entry extension: 0.75 ATR(1H) from swept liquidity level.
-- Structural target realism cap: reject structural targets requiring >2.50R before costs.
-- Maximum retest depth: 70% of the impulse.
-- Breakout quality is measured/tagged but NOT a hard gate by default to avoid unverified filter stacking.
+## Fix applied
 
-## Implementation integrity
-- V11 config is read at decision time, avoiding stale module-import configuration.
-- Runtime config fingerprint is included in backtest reports/logs.
-- Rejection messages use the actual runtime impulse threshold.
-- 500 ATR can now be supplied for plumbing tests without being silently clamped by the engine.
+- Per-symbol event counters are still summed.
+- Run-level configuration metadata is excluded from per-symbol aggregation and written exactly once after the run.
+- Backtest reports now show the engine build, effective impulse/reclaim/stop configuration, and a stable configuration fingerprint.
+- Startup logs include the same fingerprint.
+- The run fails rather than returning a report if its engine configuration fingerprint changes mid-run.
+- Configuration validation rejects impossible scale values such as `500 ATR` and rejects trigger windows outside 1–24 completed 1H bars.
+- Configuration validation also checks the stop-loss mode.
 
-## Trade diagnostics added
-Each accepted signal records:
-- breakout time
-- breakout candle body/range metrics
-- retest depth
-- reclaim recency
-- entry extension
-These features can be analyzed against winners/losers later.
+## Effective defaults in this source
 
-## Backtest diagnostics added
-- MFE reach rates for 1R / 1.5R / 2R / 2.5R.
-- Runtime V11 accuracy configuration in the report.
+- Strategy timeframes: 1D / 12H / 4H / 1H only.
+- Minimum 4H impulse: `2.50 ATR`.
+- 1H sweep/reclaim trigger window: `6` completed 1H bars.
+- Stop-loss mode: `LIQUIDITY_SWEEP`.
+- No environment-variable override for these strategy constants is implemented in this source; change them only through reviewed code changes.
+
+## Scope and safety
+
+This patch fixes configuration provenance and backtest diagnostics. It does not tune the trading strategy, claim profitability, or execute live trades. The previously listed `V11_ACCURACY_MODE`, 0.75 ATR extension option, and 2.50R structural-target cap are not independently implemented as runtime controls in this source and must not be assumed active.
 
 ## Validation
-Full test suite: 79 passed.
 
-A live MEXC historical backtest was not executed from this archive because that requires the external MEXC data/API environment.
+Run `python -m compileall -q app tests` and `pytest -q` from the project root. A live MEXC historical backtest still requires access to the external MEXC Futures market-data API.

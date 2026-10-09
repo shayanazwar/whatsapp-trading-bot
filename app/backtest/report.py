@@ -169,9 +169,16 @@ def format_report(summary: BacktestSummary) -> str:
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
     ]
-    cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
+    diagnostics = summary.diagnostics or {}
+    fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
+    lines.insert(
+        3,
+        "🗓️ Window Mode: FIXED" if fixed_period else "🗓️ Window Mode: ROLLING (set V11_BACKTEST_START_MS / V11_BACKTEST_END_MS for comparisons)",
+    )
+    cf = diagnostics.get("TP_COUNTERFACTUAL_R_X100")
     if cf is not None:
         lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
+        lines.insert(5, "🧭 TP comparison uses CONTROL exit schedule for candidate eligibility")
     if summary.diagnostics:
         active_experiments = []
         sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))

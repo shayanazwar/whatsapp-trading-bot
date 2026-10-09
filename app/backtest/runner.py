@@ -854,6 +854,51 @@ class BacktestRunner:
                 _safe_number(analysis.get("intraday_max_hold_minutes"))
                 or max_hold
             )
+            # TP counterfactuals must be exit-only. The position-overlap schedule
+            # is therefore derived from the CONTROL (structural-target) trade,
+            # never from the experimental target's potentially earlier/later exit.
+            # Otherwise 1.5R/2R/2.5R runs change which later signals are evaluated,
+            # making their win rates and trade counts incomparable to CONTROL.
+            if counterfactual_tp_r is not None:
+                try:
+                    control_schedule_trade = simulate_trade_1h(
+                        analysis,
+                        future,
+                        signal_close_time_ms=signal_close_ms,
+                        fee_rate=fee_rate,
+                        slippage_bps=slippage_bps,
+                        max_holding_minutes=effective_max_hold,
+                        counterfactual_tp_r=None,
+                    )
+                except Exception as exc:
+                    simulation_errors += 1
+                    inc("SIMULATION_ERRORS")
+                    inc("TP_COUNTERFACTUAL_CONTROL_SCHEDULE_ERRORS")
+                    LOGGER.exception(
+                        "BACKTEST CONTROL-SCHEDULE SIMULATION_ERROR | symbol=%s signal_close_ms=%s reason=%s",
+                        history.symbol,
+                        signal_close_ms,
+                        exc,
+                    )
+                    continue
+
+                # Match CONTROL semantics exactly: if CONTROL could not create a
+                # simulated trade for this candidate, do not count it only in an
+                # experimental TP mode. No overlap lock is created in this case.
+                if control_schedule_trade is None:
+                    inc("SIMULATION_NO_TRADE")
+                    inc("TP_COUNTERFACTUAL_CONTROL_SCHEDULE_NO_TRADE")
+                    if str(analysis.get("entry_mode") or "MARKET").upper() == "LIMIT":
+                        inc("SIMULATION_LIMIT_NOT_FILLED")
+                    continue
+
+                inc("TP_COUNTERFACTUAL_CONTROL_SCHEDULE_USED")
+                if control_schedule_trade.exit_time_ms is not None:
+                    active_until_ms = max(
+                        active_until_ms,
+                        int(control_schedule_trade.exit_time_ms),
+                    )
+
             try:
                 trade = simulate_trade_1h(
                     analysis,
@@ -867,6 +912,8 @@ class BacktestRunner:
             except Exception as exc:
                 simulation_errors += 1
                 inc("SIMULATION_ERRORS")
+                if counterfactual_tp_r is not None:
+                    inc("TP_COUNTERFACTUAL_OUTPUT_SIMULATION_ERRORS")
                 LOGGER.exception(
                     "BACKTEST SIMULATION_ERROR | symbol=%s signal_close_ms=%s reason=%s",
                     history.symbol,
@@ -877,6 +924,8 @@ class BacktestRunner:
 
             if trade is None:
                 inc("SIMULATION_NO_TRADE")
+                if counterfactual_tp_r is not None:
+                    inc("TP_COUNTERFACTUAL_OUTPUT_NO_TRADE")
                 if str(analysis.get("entry_mode") or "MARKET").upper() == "LIMIT":
                     inc("SIMULATION_LIMIT_NOT_FILLED")
                 continue
@@ -894,7 +943,9 @@ class BacktestRunner:
             if trade.expired:
                 inc("EXPIRY")
 
-            if trade.exit_time_ms is not None:
+            # CONTROL trades define the opportunity/overlap schedule. In a
+            # counterfactual run this was already set from control_schedule_trade.
+            if counterfactual_tp_r is None and trade.exit_time_ms is not None:
                 active_until_ms = max(
                     active_until_ms,
                     int(trade.exit_time_ms),

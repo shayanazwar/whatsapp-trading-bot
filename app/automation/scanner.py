@@ -18,6 +18,7 @@ from ..config import Settings
 from .executor import MexcExecutor
 from .mexc_client import MexcAPIError, MexcClient
 from .signal_manager import SignalManager
+from .paper_trader import PaperTrader
 from .signal_validator import validate_signal
 from .universe import MexcUniverse
 
@@ -40,12 +41,14 @@ class MexcScanner:
         universe: MexcUniverse,
         signal_manager: SignalManager,
         executor: MexcExecutor | None = None,
+        paper_trader: PaperTrader | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         self.universe = universe
         self.signal_manager = signal_manager
         self.executor = executor
+        self.paper_trader = paper_trader
         self._btc_context: dict[str, Any] = {"ok": False, "reason": "not loaded"}
         self._candle_cache: dict[tuple[str, str], tuple[int, list[Any]]] = {}
         self._candle_fetch_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -423,13 +426,29 @@ class MexcScanner:
                 return self._reject(symbol, reasons, "FINAL", payload)
 
             payload["final_pass"] = 1
-            try:
-                sent = await self.signal_manager.publish(signal)
-            except Exception as exc:
-                LOGGER.exception("Signal dispatch failed for %s", symbol)
-                return self._error(symbol, f"dispatch exception: {exc}", payload)
 
-            if sent and self.executor is not None and getattr(self.settings, "auto_trade_enabled", False) and getattr(self.settings, "allow_live_execution", False):
+            # Paper trading consumes the same fully validated V11 signal, but
+            # is independent from outbound message delivery and live execution.
+            if self.paper_trader is not None and getattr(self.settings, "paper_trading_enabled", False):
+                try:
+                    self.paper_trader.open_from_signal(signal)
+                except Exception:
+                    LOGGER.exception("Paper trade opening failed for %s", symbol)
+
+            sent = False
+            if getattr(self.settings, "auto_signal_enabled", False):
+                try:
+                    sent = await self.signal_manager.publish(signal)
+                except Exception as exc:
+                    LOGGER.exception("Signal dispatch failed for %s", symbol)
+                    return self._error(symbol, f"dispatch exception: {exc}", payload)
+
+            # Live execution is explicitly suppressed whenever the virtual-money
+            # mode is enabled, even if environment flags are accidentally mixed.
+            if (sent and not getattr(self.settings, "paper_trading_enabled", False)
+                    and self.executor is not None
+                    and getattr(self.settings, "auto_trade_enabled", False)
+                    and getattr(self.settings, "allow_live_execution", False)):
                 try:
                     await self._execute_signal(signal)
                 except Exception:

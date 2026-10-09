@@ -9,6 +9,8 @@ MEXC Futures does not expose a native 12H kline interval, so 12H candles are
 causally synthesized from three completed 4H candles.
 """
 
+import hashlib
+import json
 import math
 import time
 from bisect import bisect_right
@@ -59,7 +61,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V11-balanced-value-pullback-liquidity-reclaim"
+ENGINE_VERSION = "V11-balanced-value-pullback-liquidity-reclaim-config-guard-1"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -460,17 +462,52 @@ V11_SHOCK_RANGE_ATR = 4.50
 # same module successfully and reports the active mode truthfully.
 V11_SL_MODE = "LIQUIDITY_SWEEP"
 
+def engine_config_snapshot() -> dict[str, Any]:
+    """Return the effective strategy configuration and a stable fingerprint.
+
+    The fingerprint is intentionally derived from the same module constants
+    used by the engine. Backtest reports can therefore prove which effective
+    settings produced their results instead of guessing from experiment labels.
+    """
+    config: dict[str, Any] = {
+        "engine_version": ENGINE_VERSION,
+        "timeframes": list(APPROVED_TIMEFRAMES),
+        "min_rr": float(V11_MIN_RR),
+        "min_impulse_atr": float(V11_MIN_IMPULSE_ATR),
+        "setup_max_4h_bars": int(V11_SETUP_MAX_4H_BARS),
+        "max_trigger_bars_1h": int(V11_MAX_TRIGGER_BARS),
+        "short_range_relaxed": bool(V11_SHORT_RANGE_RELAXED),
+        "stop_loss_mode": str(V11_SL_MODE).upper(),
+        "stop_buffer_atr_4h": float(V11_STOP_BUFFER_ATR_4H),
+        "stop_buffer_atr_1h": float(V11_STOP_BUFFER_ATR_1H),
+        "min_sl_atr_sanity": float(V11_MIN_SL_ATR_SANITY),
+        "max_sl_atr_sanity": float(V11_MAX_SL_ATR_SANITY),
+        "shock_range_atr": float(V11_SHOCK_RANGE_ATR),
+    }
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    config["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return config
+
+
 def validate_engine_config() -> None:
-    """Fail fast on malformed experiment values instead of silent zero-signal runs."""
-    impulse_atr = float(V11_MIN_IMPULSE_ATR)
+    """Fail fast on malformed config instead of silently creating zero signals."""
+    try:
+        impulse_atr = float(V11_MIN_IMPULSE_ATR)
+        trigger_bars = int(V11_MAX_TRIGGER_BARS)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Invalid V11 impulse/reclaim config: expected numeric values.") from exc
     if not math.isfinite(impulse_atr) or not 0.25 <= impulse_atr <= 10.0:
         raise ValueError(
             f"Invalid V11_MIN_IMPULSE_ATR={V11_MIN_IMPULSE_ATR!r}; expected 0.25..10.0 ATR. "
             "Values such as 500 usually indicate a scaled-config/unit error."
         )
-    if not 1 <= int(V11_MAX_TRIGGER_BARS) <= 24:
+    if not 1 <= trigger_bars <= 24:
         raise ValueError(
             f"Invalid V11_MAX_TRIGGER_BARS={V11_MAX_TRIGGER_BARS!r}; expected 1..24 completed 1H bars."
+        )
+    if str(V11_SL_MODE).upper() not in {"LIQUIDITY_SWEEP", "4H_ORIGIN"}:
+        raise ValueError(
+            f"Invalid V11_SL_MODE={V11_SL_MODE!r}; expected LIQUIDITY_SWEEP or 4H_ORIGIN."
         )
     if tuple(APPROVED_TIMEFRAMES) != ("1D", "12H", "4H", "1H"):
         raise RuntimeError("V11 timeframe contract changed; allowed frames are exactly 1D/12H/4H/1H.")

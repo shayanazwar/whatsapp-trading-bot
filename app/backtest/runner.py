@@ -30,13 +30,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from ..analysis import engine as engine_module
 from ..analysis.engine import (
-    V11_MAX_TRIGGER_BARS,
-    V11_MIN_IMPULSE_ATR,
-    V11_SHORT_RANGE_RELAXED,
-    ENGINE_VERSION,
-    V11_SL_MODE,
-    validate_engine_config,
     analyze_candles,
     build_btc_context,
     convert_candles,
@@ -79,6 +74,37 @@ FETCH_TIMEOUT_SECONDS = 180
 HEARTBEAT_INTERVAL_SECONDS = 30
 
 SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 60, 90, 180, 365}
+
+# These are configuration metadata, not per-symbol event counters. They must
+# never be summed over the symbol universe (e.g. 2.50 * 200 -> a false 500 ATR).
+ENGINE_CONFIG_DIAGNOSTIC_KEYS = frozenset({
+    "V11_MIN_IMPULSE_ATR_X100",
+    "V11_MAX_TRIGGER_BARS",
+    "V11_SL_MODE_4H_ORIGIN",
+    "V11_SL_MODE_LIQUIDITY_SWEEP",
+    "V11_SHORT_RANGE_RELAXED",
+    "FIXED_BACKTEST_PERIOD_ENABLED",
+})
+
+
+def _merge_symbol_diagnostics(total: dict[str, int], per_symbol: dict[str, int]) -> None:
+    """Aggregate event counters while excluding run-level config metadata."""
+    for key, value in per_symbol.items():
+        if key in ENGINE_CONFIG_DIAGNOSTIC_KEYS:
+            continue
+        total[key] = total.get(key, 0) + int(value)
+
+
+def _write_engine_config_diagnostics(
+    diagnostics: dict[str, int], config: dict[str, Any], *, fixed_period_enabled: bool
+) -> None:
+    """Write exact run-level config values after all per-symbol aggregation."""
+    diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(config["min_impulse_atr"]) * 100))
+    diagnostics["V11_MAX_TRIGGER_BARS"] = int(config["max_trigger_bars_1h"])
+    diagnostics["V11_SL_MODE_4H_ORIGIN"] = int(str(config["stop_loss_mode"]).upper() == "4H_ORIGIN")
+    diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = int(str(config["stop_loss_mode"]).upper() == "LIQUIDITY_SWEEP")
+    diagnostics["V11_SHORT_RANGE_RELAXED"] = int(bool(config["short_range_relaxed"]))
+    diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(fixed_period_enabled))
 
 
 # ============================================================
@@ -965,13 +991,6 @@ class BacktestRunner:
         diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int(
             (time.monotonic() - symbol_started) * 1000
         )
-        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
-        diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
-        diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
-        diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = 1 if str(V11_SL_MODE).upper() == "LIQUIDITY_SWEEP" else 0
-        diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
-        diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")))
-
         reject_items = [
             (key, int(value))
             for key, value in diagnostics.items()
@@ -1049,7 +1068,9 @@ class BacktestRunner:
         """Run a complete causal paper backtest with an exit-only TP mode."""
 
         days = int(days)
-        validate_engine_config()
+        engine_module.validate_engine_config()
+        active_engine_config = engine_module.engine_config_snapshot()
+        fixed_period_enabled = bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS"))
         tp_config = BacktestTPConfig.from_mode(tp_mode)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
@@ -1141,7 +1162,14 @@ class BacktestRunner:
                                 else {}
                             ),
                         },
+                        "engine_version": active_engine_config["engine_version"],
+                        "engine_config_fingerprint": active_engine_config["fingerprint"],
+                        "engine_config": active_engine_config,
                     }
+                    _write_engine_config_diagnostics(
+                        summary_payload["diagnostics"], active_engine_config,
+                        fixed_period_enabled=fixed_period_enabled,
+                    )
                     params = inspect.signature(summarize).parameters
                     if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
                         summary_payload = {k: v for k, v in summary_payload.items() if k in params}
@@ -1153,17 +1181,18 @@ class BacktestRunner:
 
                 LOGGER.info(
                     "BACKTEST START | days=%d symbols=%d start=%d end=%d "
-                    "strategy=1D>12H>4H>1H engine_version=%s impulse_min_atr=%.2f "
+                    "strategy=1D>12H>4H>1H engine_version=%s config_fingerprint=%s impulse_min_atr=%.2f "
                     "trigger_bars_1h=%d sl_mode=%s fixed_period=%s",
                     days,
                     len(symbols),
                     start_ms,
                     end_ms,
-                    ENGINE_VERSION,
-                    float(V11_MIN_IMPULSE_ATR),
-                    int(V11_MAX_TRIGGER_BARS),
-                    str(V11_SL_MODE),
-                    bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")),
+                    active_engine_config["engine_version"],
+                    active_engine_config["fingerprint"],
+                    float(active_engine_config["min_impulse_atr"]),
+                    int(active_engine_config["max_trigger_bars_1h"]),
+                    str(active_engine_config["stop_loss_mode"]),
+                    fixed_period_enabled,
                 )
 
                 # --------------------------------------------------------
@@ -1305,8 +1334,7 @@ class BacktestRunner:
                                 continue
 
                             async with state_lock:
-                                for key, value in symbol_diag.items():
-                                    inc_global(key, int(value))
+                                _merge_symbol_diagnostics(diagnostics, symbol_diag)
                                 state["data_errors"] += int(symbol_data_errors)
                                 state["engine_errors"] += int(symbol_engine_errors)
                                 state["simulation_errors"] += int(symbol_simulation_errors)
@@ -1358,6 +1386,18 @@ class BacktestRunner:
                 state["phase"] = "FINALIZING"
                 trades.sort(key=lambda trade: trade.signal_time_ms)
 
+                # Configuration values are metadata, not per-symbol counters.
+                # Set them exactly once at run level after all symbols complete.
+                final_engine_config = engine_module.engine_config_snapshot()
+                if final_engine_config["fingerprint"] != active_engine_config["fingerprint"]:
+                    raise RuntimeError(
+                        "V11 engine configuration changed during backtest; discard this run and restart."
+                    )
+                _write_engine_config_diagnostics(
+                    diagnostics, active_engine_config,
+                    fixed_period_enabled=fixed_period_enabled,
+                )
+
                 # Build the complete current summary payload.  The deployed
                 # report.py may be one of two compatible schema generations:
                 # older builds do not have the four forensic keyword fields,
@@ -1392,6 +1432,9 @@ class BacktestRunner:
                     "rejected_setups": rejected_setups,
                     "trades": trades,
                     "diagnostics": diagnostics,
+                    "engine_version": active_engine_config["engine_version"],
+                    "engine_config_fingerprint": active_engine_config["fingerprint"],
+                    "engine_config": active_engine_config,
                 }
 
                 try:

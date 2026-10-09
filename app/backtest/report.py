@@ -42,13 +42,31 @@ class BacktestSummary:
     market_entries: int = 0
     limit_entries: int = 0
     diagnostics: Mapping[str, int] = field(default_factory=dict)
+    engine_version: str = ""
+    engine_config_fingerprint: str = ""
+    engine_config: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
     return [t for t in trades if t.outcome in {"TP", "SL", "EXPIRED"} and t.r_multiple is not None and math.isfinite(float(t.r_multiple))]
 
 
-def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_selected: int, coins_tested: int, data_errors: int, execution_errors: int, rejected_setups: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None) -> BacktestSummary:
+def summarize(
+    *,
+    days: int,
+    period_start_ms: int,
+    period_end_ms: int,
+    coins_selected: int,
+    coins_tested: int,
+    data_errors: int,
+    execution_errors: int,
+    rejected_setups: int,
+    trades: Sequence[SimulatedTrade],
+    diagnostics: Mapping[str, int] | None = None,
+    engine_version: str = "",
+    engine_config_fingerprint: str = "",
+    engine_config: Mapping[str, Any] | None = None,
+) -> BacktestSummary:
     ordered = sorted(trades, key=lambda t: (int(t.signal_time_ms), t.symbol, t.side))
     resolved = _resolved(ordered)
     values = [float(t.r_multiple) for t in resolved]
@@ -123,6 +141,9 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
         limit_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() == "LIMIT"),
         diagnostics=diagnostics_out,
+        engine_version=str(engine_version or ""),
+        engine_config_fingerprint=str(engine_config_fingerprint or ""),
+        engine_config=dict(engine_config or {}),
     )
 
 
@@ -156,13 +177,13 @@ def format_report(summary: BacktestSummary) -> str:
         f"📈 Win Rate: {_fmt(summary.win_rate, 1, '%')}",
         f"⚖️ Avg Signal RR: {_fmt(summary.avg_signal_rr)}",
         f"🎯 Avg Actual Fill RR: {_fmt(summary.avg_actual_fill_rr)}",
-        f"💰 Avg Realized R: {_fmt(summary.avg_realized_r)}R",
+        f"💰 Avg Realized R: {_fmt(summary.avg_realized_r, 2, 'R')}",
         f"💰 Total R: {summary.total_r:+.2f}R",
-        f"📊 Expectancy: {_fmt(summary.expectancy_r)}R/trade",
+        f"📊 Expectancy: {_fmt(summary.expectancy_r, 2, 'R/trade')}",
         f"📐 Profit Factor: {pf}",
         f"📉 Max Drawdown: {summary.max_drawdown_r:.2f}R",
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
-        f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r)}R / {_fmt(summary.avg_mfe_r)}R",
+        f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r, 2, 'R')} / {_fmt(summary.avg_mfe_r, 2, 'R')}",
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
         f"⚠️ Data Errors: {summary.data_errors}",
@@ -171,6 +192,20 @@ def format_report(summary: BacktestSummary) -> str:
     ]
     diagnostics = summary.diagnostics or {}
     fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
+    if summary.engine_version:
+        lines.insert(5, f"🧬 Engine Build: {summary.engine_version}")
+    config = summary.engine_config or {}
+    if config:
+        impulse = float(config.get("min_impulse_atr", 2.50))
+        trigger_bars = int(config.get("max_trigger_bars_1h", 6))
+        stop_mode = str(config.get("stop_loss_mode", "UNKNOWN"))
+        short_relaxed = "ON" if bool(config.get("short_range_relaxed", False)) else "OFF"
+        lines.insert(
+            6,
+            f"⚙️ Effective Config: Impulse {impulse:.2f} ATR | Reclaim {trigger_bars} x 1H | SL {stop_mode} | Short-range relaxed {short_relaxed}",
+        )
+    if summary.engine_config_fingerprint:
+        lines.insert(7, f"🔐 Config Fingerprint: {summary.engine_config_fingerprint}")
     lines.insert(
         3,
         "🗓️ Window Mode: FIXED" if fixed_period else "🗓️ Window Mode: ROLLING (set V11_BACKTEST_START_MS / V11_BACKTEST_END_MS for comparisons)",

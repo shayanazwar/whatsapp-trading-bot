@@ -22,6 +22,7 @@ The runner is designed to match V11 value-pullback engine:
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import time
@@ -105,6 +106,50 @@ def _write_engine_config_diagnostics(
     diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = int(str(config["stop_loss_mode"]).upper() == "LIQUIDITY_SWEEP")
     diagnostics["V11_SHORT_RANGE_RELAXED"] = int(bool(config["short_range_relaxed"]))
     diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(fixed_period_enabled))
+
+
+def _utc_iso(timestamp_ms: int | None) -> str:
+    if timestamp_ms is None:
+        return "N/A"
+    try:
+        return datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "N/A"
+
+
+def _log_forensic_trade_audit(trades: Iterable[SimulatedTrade]) -> None:
+    """Emit one compact, reproducible audit line for each SL/expired trade."""
+    audited = [trade for trade in trades if str(trade.outcome).upper() in {"SL", "EXPIRED"}]
+    LOGGER.info(
+        "BACKTEST LOSS AUDIT START | sl=%d expired=%d total=%d",
+        sum(str(t.outcome).upper() == "SL" for t in audited),
+        sum(str(t.outcome).upper() == "EXPIRED" for t in audited), len(audited),
+    )
+    for trade in audited:
+        quality = json.dumps(dict(trade.quality or {}), sort_keys=True, separators=(",", ":"), default=str)
+        LOGGER.info(
+            "BACKTEST LOSS AUDIT | symbol=%s side=%s outcome=%s reason=%s "
+            "signal_utc=%s entry_fill_utc=%s exit_utc=%s "
+            "entry=%.10g fill=%s stop=%.10g target=%.10g "
+            "signal_rr=%.3f actual_fill_rr=%s realized_r=%s "
+            "mae_r=%s mfe_r=%s mfe_1r=%s mfe_1_5r=%s hold_min=%s "
+            "regime=%s entry_mode=%s fees_r=%.4f slippage_r=%.4f quality=%s",
+            trade.symbol, trade.side, str(trade.outcome).upper(),
+            "STOP_LOSS_TOUCHED" if str(trade.outcome).upper() == "SL" else "MAX_HOLDING_LIMIT",
+            _utc_iso(trade.signal_time_ms), _utc_iso(trade.entry_filled_time_ms), _utc_iso(trade.exit_time_ms),
+            float(trade.entry),
+            "N/A" if trade.entry_execution is None else f"{float(trade.entry_execution):.10g}",
+            float(trade.stop_loss), float(trade.tp1), float(trade.signal_rr),
+            "N/A" if trade.actual_fill_rr is None else f"{float(trade.actual_fill_rr):.3f}",
+            "N/A" if trade.r_multiple is None else f"{float(trade.r_multiple):+.3f}",
+            "N/A" if trade.mae_r is None else f"{float(trade.mae_r):.3f}",
+            "N/A" if trade.mfe_r is None else f"{float(trade.mfe_r):.3f}",
+            int(bool(trade.mfe_1r_hit)), int(bool(trade.mfe_1_5r_hit)),
+            "N/A" if trade.hold_minutes is None else f"{float(trade.hold_minutes):.1f}",
+            str(trade.regime or "UNKNOWN"), str(trade.entry_mode or "MARKET"),
+            float(trade.fees_r), float(trade.slippage_r), quality,
+        )
+    LOGGER.info("BACKTEST LOSS AUDIT END | audited=%d", len(audited))
 
 
 # ============================================================
@@ -1385,6 +1430,8 @@ class BacktestRunner:
 
                 state["phase"] = "FINALIZING"
                 trades.sort(key=lambda trade: trade.signal_time_ms)
+                # Emit per-trade evidence for SL/expiry diagnosis without changing strategy.
+                _log_forensic_trade_audit(trades)
 
                 # Configuration values are metadata, not per-symbol counters.
                 # Set them exactly once at run level after all symbols complete.

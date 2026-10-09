@@ -414,6 +414,24 @@ V11_STOP_BUFFER_ATR_1H = 0.15
 V11_MIN_SL_ATR_SANITY = 0.20
 V11_MAX_SL_ATR_SANITY = 3.00
 V11_SHOCK_RANGE_ATR = 4.50
+# Explicitly declare the stop geometry used below so the runner imports the
+# same module successfully and reports the active mode truthfully.
+V11_SL_MODE = "LIQUIDITY_SWEEP"
+
+def validate_engine_config() -> None:
+    """Fail fast on malformed experiment values instead of silent zero-signal runs."""
+    impulse_atr = float(V11_MIN_IMPULSE_ATR)
+    if not math.isfinite(impulse_atr) or not 0.25 <= impulse_atr <= 10.0:
+        raise ValueError(
+            f"Invalid V11_MIN_IMPULSE_ATR={V11_MIN_IMPULSE_ATR!r}; expected 0.25..10.0 ATR. "
+            "Values such as 500 usually indicate a scaled-config/unit error."
+        )
+    if not 1 <= int(V11_MAX_TRIGGER_BARS) <= 24:
+        raise ValueError(
+            f"Invalid V11_MAX_TRIGGER_BARS={V11_MAX_TRIGGER_BARS!r}; expected 1..24 completed 1H bars."
+        )
+    if tuple(APPROVED_TIMEFRAMES) != ("1D", "12H", "4H", "1H"):
+        raise RuntimeError("V11 timeframe contract changed; allowed frames are exactly 1D/12H/4H/1H.")
 
 def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
     highs, lows = _swing_points(candles, left=left, right=right)
@@ -808,13 +826,19 @@ def _v11_analyze_side(
     direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
 
     def reject(reason: str) -> dict[str, Any]:
+        message = str(reason)
+        # Keep the detailed reason for humans while exposing a stable first
+        # failure to the runner's gate accounting.
+        diagnostic_key = message.split("(", 1)[0].strip().upper()
         return {
             "side": side,
             "direction_ok": direction_ok,
             "context": context,
             "candidate": False,
-            "reason": str(reason),
-            "technical_gate_failures": [f"{side}: {reason}"],
+            "reason": message,
+            "primary_failure": message,
+            "diagnostic_key": diagnostic_key,
+            "technical_gate_failures": [message],
             "rejection_stage": "SETUP",
         }
 
@@ -957,6 +981,8 @@ def _v11_analyze_side(
                 "context": context,
                 "candidate": False,
                 "reason": f"{side}: BTC context veto ({btc_reason})",
+                "primary_failure": f"{side}: BTC context veto ({btc_reason})",
+                "diagnostic_key": f"{side}: BTC context veto".upper(),
                 "technical_gate_failures": [f"{side}: BTC context veto ({btc_reason})"],
                 "rejection_stage": "BTC",
                 "btc_filter_ok": False,
@@ -979,6 +1005,8 @@ def _v11_analyze_side(
         "context": context,
         "candidate": False,
         "reason": last_reason,
+        "primary_failure": last_reason,
+        "diagnostic_key": last_reason.split("(", 1)[0].strip().upper(),
         "technical_gate_failures": [last_reason],
         "rejection_stage": "SETUP",
     }
@@ -994,14 +1022,22 @@ def _v11_empty(
     btc_context: dict[str, Any] | None = None,
     *,
     side_failures: list[str] | None = None,
+    side_diagnostics: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     price = float(c1[-1]["close"])
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
         "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
+        "engine_config": {
+            "min_impulse_atr": V11_MIN_IMPULSE_ATR,
+            "max_trigger_bars_1h": V11_MAX_TRIGGER_BARS,
+            "sl_mode": V11_SL_MODE,
+            "approved_timeframes": list(APPROVED_TIMEFRAMES),
+        },
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
+        "side_diagnostics": list(side_diagnostics or []),
         "technical_gate_failures": list(side_failures or [reason]),
         "diagnostic_failures": list(side_failures or [reason]),
         "reasons": list(side_failures or [reason]),
@@ -1039,6 +1075,7 @@ def analyze_candles(
     Execution baseline: next 1H open.
     Authoritative timeframes: 1D / 12H / 4H / 1H only.
     """
+    validate_engine_config()
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     c1d = closed_candle_rows(candles_1d or [], "1D", now)
     c4 = closed_candle_rows(candles_4h or [], "4H", now)
@@ -1052,16 +1089,29 @@ def analyze_candles(
     cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
+    side_diagnostics: list[dict[str, Any]] = []
     for side in ("LONG", "SHORT"):
         result = _v11_analyze_side(symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context)
-        if result.get("candidate"):
+        is_candidate = bool(result.get("candidate"))
+        side_diagnostics.append({
+            "side": side,
+            "candidate": is_candidate,
+            "primary_failure": None if is_candidate else str(result.get("primary_failure") or result.get("reason") or f"{side}: rejected"),
+            "diagnostic_key": str(result.get("diagnostic_key") or result.get("rejection_stage") or "UNKNOWN"),
+            "rejection_stage": result.get("rejection_stage"),
+            "direction_ok": bool(result.get("direction_ok")),
+        })
+        if is_candidate:
             candidates.append(result)
         else:
             failures = result.get("technical_gate_failures") or [result.get("reason") or f"{side}: rejected"]
             side_failures.extend(str(x) for x in failures[:2])
     if not candidates:
         reasons = side_failures or ["no active V11 value-pullback trigger"]
-        return _v11_empty(symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context, side_failures=reasons)
+        return _v11_empty(
+            symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context,
+            side_failures=reasons, side_diagnostics=side_diagnostics,
+        )
     # If both sides somehow qualify, rank by structural setup quality only; this is
     # not an accuracy score and is not used as a threshold.
     chosen = max(candidates, key=lambda x: (float(x["score"]), int(x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"])))
@@ -1124,6 +1174,13 @@ def analyze_candles(
         "estimated_round_trip_cost_pct": cost_pct, "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
         "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
         "signal_engine_version": ENGINE_VERSION,
+        "engine_config": {
+            "min_impulse_atr": V11_MIN_IMPULSE_ATR,
+            "max_trigger_bars_1h": V11_MAX_TRIGGER_BARS,
+            "sl_mode": V11_SL_MODE,
+            "approved_timeframes": list(APPROVED_TIMEFRAMES),
+        },
+        "side_diagnostics": side_diagnostics,
         "signal_basis": "1D macro vote â†’ 12H health â†’ 4H impulse/pullback into value â†’ 1H liquidity sweep/reclaim â†’ next 1H open",
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,

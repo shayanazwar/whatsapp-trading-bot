@@ -34,7 +34,9 @@ from ..analysis.engine import (
     V11_MAX_TRIGGER_BARS,
     V11_MIN_IMPULSE_ATR,
     V11_SHORT_RANGE_RELAXED,
+    ENGINE_VERSION,
     V11_SL_MODE,
+    validate_engine_config,
     analyze_candles,
     build_btc_context,
     convert_candles,
@@ -768,8 +770,9 @@ class BacktestRunner:
                         continue
                     inc(f"FIRST_FAILURE_{side_name}_TOTAL")
                     reason = str(side_diag.get("primary_failure") or "rejected")
+                    diagnostic_reason = str(side_diag.get("diagnostic_key") or reason)
                     normalized_first = (
-                        reason.upper()
+                        diagnostic_reason.upper()
                         .replace(" ", "_")
                         .replace(":", "")
                         .replace("/", "_")
@@ -806,7 +809,8 @@ class BacktestRunner:
                     else:
                         inc(f"FIRST_FAILURE_{side_name}_TOTAL")
                         reason = str(side_diag.get("primary_failure") or "rejected")
-                        normalized_first = (reason.upper().replace(" ", "_").replace(":", "").replace("/", "_"))[:160]
+                        diagnostic_reason = str(side_diag.get("diagnostic_key") or reason)
+                        normalized_first = (diagnostic_reason.upper().replace(" ", "_").replace(":", "").replace("/", "_"))[:160]
                         inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
                         diag_key = str(side_diag.get("diagnostic_key") or "")
                         unique_key = (side_name, normalized_first, diag_key)
@@ -913,7 +917,9 @@ class BacktestRunner:
         diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
         diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
         diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
+        diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = 1 if str(V11_SL_MODE).upper() == "LIQUIDITY_SWEEP" else 0
         diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
+        diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")))
 
         reject_items = [
             (key, int(value))
@@ -992,6 +998,7 @@ class BacktestRunner:
         """Run a complete causal paper backtest with an exit-only TP mode."""
 
         days = int(days)
+        validate_engine_config()
         tp_config = BacktestTPConfig.from_mode(tp_mode)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
@@ -1095,11 +1102,17 @@ class BacktestRunner:
 
                 LOGGER.info(
                     "BACKTEST START | days=%d symbols=%d start=%d end=%d "
-                    "strategy=1D>12H>4H>1H",
+                    "strategy=1D>12H>4H>1H engine_version=%s impulse_min_atr=%.2f "
+                    "trigger_bars_1h=%d sl_mode=%s fixed_period=%s",
                     days,
                     len(symbols),
                     start_ms,
                     end_ms,
+                    ENGINE_VERSION,
+                    float(V11_MIN_IMPULSE_ATR),
+                    int(V11_MAX_TRIGGER_BARS),
+                    str(V11_SL_MODE),
+                    bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")),
                 )
 
                 # --------------------------------------------------------

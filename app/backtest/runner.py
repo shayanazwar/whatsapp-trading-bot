@@ -30,6 +30,7 @@ import time
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable
 
 from ..analysis import engine as engine_module
@@ -43,6 +44,7 @@ from ..automation.mexc_client import MexcAPIError, MexcClient
 from ..automation.universe import MexcUniverse
 from ..config import Settings
 from .report import BacktestSummary, summarize
+from .reproducibility import BacktestReproStore
 from .simulator import (
     DEFAULT_FEE_RATE,
     DEFAULT_MAX_HOLDING_MINUTES,
@@ -589,6 +591,7 @@ class BacktestRunner:
         self.max_concurrency = max(1, int(max_concurrency))
         self._running = False
         self._run_lock = asyncio.Lock()
+        self._repro_store: BacktestReproStore | None = None
 
     @property
     def is_running(self) -> bool:
@@ -604,24 +607,34 @@ class BacktestRunner:
         start_ms: int,
         end_ms: int,
     ) -> SymbolHistory:
-        return await _fetch_symbol_history(
+        if self._repro_store is not None and self._repro_store.mode == "replay":
+            return self._repro_store.load_history(symbol, role="symbol")
+        history = await _fetch_symbol_history(
             self.client,
             symbol,
             start_ms,
             end_ms,
         )
+        if self._repro_store is not None and self._repro_store.mode == "capture":
+            self._repro_store.write_history(history, role="symbol")
+        return history
 
     async def _fetch_btc_history(
         self,
         start_ms: int,
         end_ms: int,
     ) -> SymbolHistory:
-        return await _fetch_symbol_history(
+        if self._repro_store is not None and self._repro_store.mode == "replay":
+            return self._repro_store.load_history("BTC_USDT", role="btc_context")
+        history = await _fetch_symbol_history(
             self.client,
             "BTC_USDT",
             start_ms,
             end_ms,
         )
+        if self._repro_store is not None and self._repro_store.mode == "capture":
+            self._repro_store.write_history(history, role="btc_context")
+        return history
 
     @staticmethod
     def _build_btc_context_cache(
@@ -1377,28 +1390,59 @@ class BacktestRunner:
 
             try:
                 start_ms, end_ms = self._period(days)
+                snapshot_parent = os.getenv("V11_BACKTEST_SNAPSHOT_DIR", "").strip()
+                replay_path = os.getenv("V11_BACKTEST_REPLAY_DIR", "").strip()
+                if snapshot_parent and replay_path:
+                    raise ValueError("Set only one of V11_BACKTEST_SNAPSHOT_DIR or V11_BACKTEST_REPLAY_DIR")
+                if snapshot_parent or replay_path:
+                    if not os.getenv("V11_BACKTEST_START_MS") or not os.getenv("V11_BACKTEST_END_MS"):
+                        raise ValueError(
+                            "Snapshot capture/replay requires BOTH V11_BACKTEST_START_MS and V11_BACKTEST_END_MS"
+                        )
+                    if snapshot_parent:
+                        self._repro_store = BacktestReproStore.capture(
+                            snapshot_parent, start_ms=start_ms, end_ms=end_ms
+                        )
+                    else:
+                        self._repro_store = BacktestReproStore.replay(
+                            replay_path, start_ms=start_ms, end_ms=end_ms
+                        )
                 state["phase"] = "UNIVERSE"
 
-                all_symbols = list(
-                    await asyncio.wait_for(
-                        self.universe.refresh(),
-                        timeout=FETCH_TIMEOUT_SECONDS,
-                    )
-                )
                 max_symbols = max(1, min(
                     int(getattr(self.settings, "backtest_max_symbols", MAX_BACKTEST_SYMBOLS)),
                     MAX_BACKTEST_SYMBOLS,
                 ))
-                symbols = []
-                seen_symbols: set[str] = set()
-                for raw_symbol in all_symbols:
-                    symbol = str(raw_symbol).strip().upper()
-                    if not symbol or symbol in seen_symbols:
-                        continue
-                    seen_symbols.add(symbol)
-                    symbols.append(symbol)
-                    if len(symbols) >= max_symbols:
-                        break
+                if self._repro_store is not None and self._repro_store.mode == "replay":
+                    symbols = self._repro_store.symbols
+                    if not symbols or len(symbols) > MAX_BACKTEST_SYMBOLS:
+                        raise ValueError(
+                            f"Invalid frozen symbol count in replay snapshot: {len(symbols)}"
+                        )
+                    if len(set(symbols)) != len(symbols):
+                        raise ValueError("Replay snapshot contains duplicate symbols")
+                    # Preserve the existing discovered-symbol diagnostic in replay mode.
+                    all_symbols = list(symbols)
+                else:
+                    all_symbols = list(
+                        await asyncio.wait_for(
+                            self.universe.refresh(),
+                            timeout=FETCH_TIMEOUT_SECONDS,
+                        )
+                    )
+                    symbols = []
+                    seen_symbols: set[str] = set()
+                    for raw_symbol in all_symbols:
+                        symbol = str(raw_symbol).strip().upper()
+                        if not symbol or symbol in seen_symbols:
+                            continue
+                        seen_symbols.add(symbol)
+                        symbols.append(symbol)
+                        if len(symbols) >= max_symbols:
+                            break
+
+                if self._repro_store is not None and self._repro_store.mode == "capture":
+                    self._repro_store.set_symbols(symbols)
 
                 if not symbols:
                     LOGGER.warning("BACKTEST EMPTY UNIVERSE | days=%d", days)
@@ -1730,6 +1774,32 @@ class BacktestRunner:
                     )
                     raise
 
+                if self._repro_store is not None:
+                    project_root = Path(__file__).resolve().parents[2]
+                    if self._repro_store.mode == "capture":
+                        self._repro_store.finalize(
+                            start_ms=start_ms,
+                            end_ms=end_ms,
+                            symbols=symbols,
+                            engine_config=active_engine_config,
+                            settings=self.settings,
+                            tp_mode=tp_config.mode,
+                            project_root=project_root,
+                            runner_max_concurrency=self.max_concurrency,
+                        )
+                    self._repro_store.write_run_artifacts(
+                        summary=summary,
+                        trades=trades,
+                        symbols=symbols,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        tp_mode=tp_config.mode,
+                        engine_config=active_engine_config,
+                        settings=self.settings,
+                        project_root=project_root,
+                        runner_max_concurrency=self.max_concurrency,
+                    )
+
                 LOGGER.info(
                     "BACKTEST COMPLETE | days=%d tested=%d/%d signals=%d "
                     "data_errors=%d engine_errors=%d simulation_errors=%d analysis_errors=%d "
@@ -1755,6 +1825,7 @@ class BacktestRunner:
                     return_exceptions=True,
                 )
                 self._running = False
+                self._repro_store = None
 
 
 # ============================================================

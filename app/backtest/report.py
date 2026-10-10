@@ -152,27 +152,26 @@ def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
 
 
 def format_report(summary: BacktestSummary) -> str:
+    """Render a concise user-facing report; keep internal diagnostics out of WhatsApp."""
     start = summary.period_start_ms // 1000
     end = summary.period_end_ms // 1000
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
-    tp_mode_x100 = int(summary.diagnostics.get("TP_MODE_X100", 0)) if summary.diagnostics else 0
+    diagnostics = summary.diagnostics or {}
+    fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
+    tp_mode_x100 = int(diagnostics.get("TP_MODE_X100", 0))
     tp_mode = "CONTROL" if tp_mode_x100 == 0 else f"{tp_mode_x100 / 100.0:.1f}R"
+
     lines = [
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Period: {summary.days}D ({start} → {end})",
-        f"TP MODE: {tp_mode}",
+        f"Period: {summary.days}D ({start} → {end}) | {'FIXED' if fixed_period else 'ROLLING'}",
+        f"TP Mode: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",
-        f"📡 Signals: {summary.signals}",
-        f"🟢 LONG: {summary.long_signals}",
-        f"🔴 SHORT: {summary.short_signals}",
-        f"✅ Resolved: {summary.resolved}",
-        f"⏳ Open/Unresolved: {summary.unresolved}",
-        f"🎯 TP: {summary.tp_hits}",
-        f"🛑 SL: {summary.sl_hits}",
-        f"⌛ Expired: {summary.expired}",
+        f"📡 Signals: {summary.signals} (LONG {summary.long_signals} / SHORT {summary.short_signals})",
+        f"✅ Resolved: {summary.resolved} | ⏳ Open: {summary.unresolved}",
+        f"🎯 TP: {summary.tp_hits} | 🛑 SL: {summary.sl_hits} | ⌛ Expired: {summary.expired}",
         "",
         f"📈 Win Rate: {_fmt(summary.win_rate, 1, '%')}",
         f"⚖️ Avg Signal RR: {_fmt(summary.avg_signal_rr)}",
@@ -186,148 +185,10 @@ def format_report(summary: BacktestSummary) -> str:
         f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r, 2, 'R')} / {_fmt(summary.avg_mfe_r, 2, 'R')}",
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
-        f"⚠️ Data Errors: {summary.data_errors}",
-        f"⚠️ Execution Errors: {summary.execution_errors}",
+        f"⚠️ Data Errors: {summary.data_errors} | Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ PAPER BACKTEST — no real trades executed.",
+        "Fees and slippage are simulated; funding is an estimate, not historical settlement data.",
     ]
-    diagnostics = summary.diagnostics or {}
-    fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
-    if summary.engine_version:
-        lines.insert(5, f"🧬 Engine Build: {summary.engine_version}")
-    config = summary.engine_config or {}
-    if config:
-        impulse = float(config.get("min_impulse_atr", 2.50))
-        trigger_bars = int(config.get("max_trigger_bars_1h", 6))
-        stop_mode = str(config.get("stop_loss_mode", "UNKNOWN"))
-        short_relaxed = "ON" if bool(config.get("short_range_relaxed", False)) else "OFF"
-        lines.insert(
-            6,
-            f"⚙️ Effective Config: Impulse {impulse:.2f} ATR | Reclaim {trigger_bars} x 1H | SL {stop_mode} | Short-range flag {short_relaxed} (metadata-only)",
-        )
-    if summary.engine_config_fingerprint:
-        lines.insert(7, f"🔐 Config Fingerprint: {summary.engine_config_fingerprint}")
-    lines.append(
-        "⚠️ V11_SHORT_RANGE_RELAXED is metadata-only in this build; toggling it does not change entry gates."
-    )
-    lines.insert(
-        3,
-        "🗓️ Window Mode: FIXED" if fixed_period else "🗓️ Window Mode: ROLLING (set V11_BACKTEST_START_MS / V11_BACKTEST_END_MS for comparisons)",
-    )
-    cf = diagnostics.get("TP_COUNTERFACTUAL_R_X100")
-    if cf is not None:
-        lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
-        lines.insert(5, "🧭 TP comparison uses CONTROL exit schedule for candidate eligibility")
-    if summary.diagnostics:
-        active_experiments = []
-        sl_origin = int(summary.diagnostics.get("V11_SL_MODE_4H_ORIGIN", 0))
-        impulse_x100 = int(summary.diagnostics.get("V11_MIN_IMPULSE_ATR_X100", 250))
-        trigger_bars = int(summary.diagnostics.get("V11_MAX_TRIGGER_BARS", 6))
-        short_relaxed = int(summary.diagnostics.get("V11_SHORT_RANGE_RELAXED", 0))
-        if sl_origin:
-            active_experiments.append("SL=4H_ORIGIN")
-        if impulse_x100 != 250:
-            active_experiments.append(f"4H_IMPULSE={impulse_x100 / 100.0:.2f}ATR")
-        if trigger_bars != 6:
-            active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
-        if active_experiments:
-            lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
-        if int(summary.diagnostics.get("SHORT_SHADOW_MODE_ENABLED", 0)) > 0:
-            lines.insert(5, "🧪 SHORT daily-gate shadow: ON (research-only; not added to portfolio trades)")
-            ppm_cost = int(summary.diagnostics.get("BACKTEST_QUALIFICATION_COST_PPM", 0))
-            funding_ppm = int(summary.diagnostics.get("BACKTEST_FUNDING_RESERVE_PPM", 0))
-            lines.insert(6, f"⚖️ Qualification cost: {ppm_cost / 10000:.4f}% | Funding reserve: {funding_ppm / 10000:.4f}%")
-        lines.extend(("", "GATE DIAGNOSTICS"))
-        important = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))
-        lines.extend(f"{key}: {value}" for key, value in important[:20])
-
-        short_failure_items = sorted(
-            (
-                (key, int(value))
-                for key, value in summary.diagnostics.items()
-                if key.startswith("FIRST_FAILURE_SHORT_")
-                and key != "FIRST_FAILURE_SHORT_TOTAL"
-                and int(value) > 0
-            ),
-            key=lambda item: (-item[1], item[0]),
-        )
-        lines.extend(("", "SHORT FIRST-FAILURE HISTOGRAM (NORMAL STRATEGY EVALUATIONS)"))
-        if short_failure_items:
-            lines.extend(f"{key}: {value}" for key, value in short_failure_items)
-        else:
-            lines.append("No per-reason SHORT failure counters were recorded.")
-        histogram_total = sum(value for _, value in short_failure_items)
-        first_failure_total = int(summary.diagnostics.get("FIRST_FAILURE_SHORT_TOTAL", 0))
-        lines.append(
-            f"Histogram reconciliation: categorized={histogram_total} | "
-            f"first_failures={first_failure_total} | "
-            f"difference={histogram_total - first_failure_total}"
-        )
-
-        overlap_failure_items = sorted(
-            (
-                (key, int(value))
-                for key, value in summary.diagnostics.items()
-                if key.startswith("OVERLAP_FIRST_FAILURE_SHORT_") and int(value) > 0
-            ),
-            key=lambda item: (-item[1], item[0]),
-        )
-        if int(summary.diagnostics.get("SHORT_SHADOW_MODE_ENABLED", 0)) > 0:
-            lines.extend(("", "ACTIVE-POSITION OVERLAP DIAGNOSTICS"))
-            lines.append(
-                "Strict SHORT checks are diagnostic-only on skipped closes; these candidates are not added to portfolio trades."
-            )
-            lines.append(
-                f"Overlap closes checked: {int(summary.diagnostics.get('OVERLAP_DIAGNOSTIC_EVALUATIONS', 0))} | "
-                f"Strict SHORT side candidates found: {int(summary.diagnostics.get('OVERLAP_SHORT_SIDE_CANDIDATES', 0))}"
-            )
-            lines.append(
-                f"Overlap diagnostic data/engine errors: "
-                f"{int(summary.diagnostics.get('OVERLAP_DIAGNOSTIC_DATA_QUALITY_ERRORS', 0))}/"
-                f"{int(summary.diagnostics.get('OVERLAP_DIAGNOSTIC_ENGINE_ERRORS', 0))}"
-            )
-            if overlap_failure_items:
-                lines.extend(f"{key}: {value}" for key, value in overlap_failure_items)
-            else:
-                lines.append("No strict SHORT failures were recorded at overlap-skipped closes.")
-
-        if int(summary.diagnostics.get("SHORT_SHADOW_MODE_ENABLED", 0)) > 0:
-            shadow_simulated = int(summary.diagnostics.get("SHORT_SHADOW_SIMULATED_TRADES", 0))
-            shadow_resolved = int(summary.diagnostics.get("SHORT_SHADOW_RESOLVED_TRADES", 0))
-            shadow_tp = int(summary.diagnostics.get("SHORT_SHADOW_OUTCOME_TP", 0))
-            shadow_sl = int(summary.diagnostics.get("SHORT_SHADOW_OUTCOME_SL", 0))
-            shadow_expired = int(summary.diagnostics.get("SHORT_SHADOW_OUTCOME_EXPIRED", 0))
-            total_r = int(summary.diagnostics.get("SHORT_SHADOW_TOTAL_REALIZED_R_X1000", 0)) / 1000.0
-            positive_r = int(summary.diagnostics.get("SHORT_SHADOW_POSITIVE_R_X1000", 0)) / 1000.0
-            negative_r = int(summary.diagnostics.get("SHORT_SHADOW_NEGATIVE_R_ABS_X1000", 0)) / 1000.0
-            expectancy = total_r / shadow_resolved if shadow_resolved else None
-            pf = positive_r / negative_r if negative_r > 0 else (float("inf") if positive_r > 0 else None)
-            shadow_wr = (100.0 * shadow_tp / (shadow_tp + shadow_sl)) if shadow_tp + shadow_sl else None
-            pf_text = "∞" if pf == float("inf") else _fmt(pf)
-            lines.extend((
-                "",
-                "🧪 SHORT DAILY-GATE SHADOW — OPPORTUNITY SAMPLE ONLY",
-                "These overlapping counterfactual outcomes are NOT a portfolio backtest.",
-                f"Shadow exit target: matches main TP mode ({tp_mode}).",
-                f"Daily gate denied: {int(summary.diagnostics.get('SHORT_SHADOW_DAILY_PERMISSION_DENIED_EVALUATIONS', 0))}",
-                f"Passed downstream setup/risk gates: {int(summary.diagnostics.get('SHORT_SHADOW_SETUP_CANDIDATES', 0))}",
-                f"Simulated / resolved: {shadow_simulated} / {shadow_resolved}",
-                f"TP / SL / expired: {shadow_tp} / {shadow_sl} / {shadow_expired}",
-                f"Win rate (TP / TP+SL): {_fmt(shadow_wr, 1, '%')}",
-                f"Total R / expectancy: {total_r:+.3f}R / {_fmt(expectancy, 3, 'R/trade')}",
-                f"Profit factor (independent outcomes): {pf_text}",
-            ))
-            for regime in ("BULLISH", "NEUTRAL"):
-                regime_resolved = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_RESOLVED_TRADES", 0))
-                regime_total_r = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_TOTAL_REALIZED_R_X1000", 0)) / 1000.0
-                regime_tp = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_OUTCOME_TP", 0))
-                regime_sl = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_OUTCOME_SL", 0))
-                regime_expired = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_OUTCOME_EXPIRED", 0))
-                regime_expectancy = regime_total_r / regime_resolved if regime_resolved else None
-                lines.append(
-                    f"{regime.title()} 1D: denied={int(summary.diagnostics.get(f'SHORT_SHADOW_{regime}_DAILY_DENIED_EVALUATIONS', 0))} | "
-                    f"setups={int(summary.diagnostics.get(f'SHORT_SHADOW_{regime}_SETUP_CANDIDATES', 0))} | "
-                    f"TP/SL/expired={regime_tp}/{regime_sl}/{regime_expired} | "
-                    f"R={regime_total_r:+.3f} | E={_fmt(regime_expectancy, 3, 'R/trade')}"
-                )
-    lines.extend(("━━━━━━━━━━━━━━━━━━━━", "⚠️ PAPER BACKTEST", "Decisions use only completed 1D / 12H / 4H / 1H candles.", "12H is a causal aggregation of three contiguous completed 4H candles.", "No real trades executed. Fees, slippage, and a flat estimated funding reserve are simulated; funding is not historical settlement-level data."))
     return "\n".join(lines)

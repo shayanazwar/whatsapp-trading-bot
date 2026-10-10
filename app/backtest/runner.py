@@ -85,6 +85,11 @@ ENGINE_CONFIG_DIAGNOSTIC_KEYS = frozenset({
     "V11_SL_MODE_LIQUIDITY_SWEEP",
     "V11_SHORT_RANGE_RELAXED",
     "FIXED_BACKTEST_PERIOD_ENABLED",
+    "SHORT_SHADOW_MODE_ENABLED",
+    "BACKTEST_QUALIFICATION_COST_PPM",
+    "BACKTEST_FUNDING_RESERVE_PPM",
+    "BACKTEST_FEE_RATE_PPM",
+    "BACKTEST_SLIPPAGE_BPS_X100",
 })
 
 
@@ -106,6 +111,21 @@ def _write_engine_config_diagnostics(
     diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = int(str(config["stop_loss_mode"]).upper() == "LIQUIDITY_SWEEP")
     diagnostics["V11_SHORT_RANGE_RELAXED"] = int(bool(config["short_range_relaxed"]))
     diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(fixed_period_enabled))
+
+
+def _write_backtest_cost_diagnostics(
+    diagnostics: dict[str, int], settings: Settings, *, short_shadow_enabled: bool
+) -> None:
+    """Record the cost assumptions used by qualification and realized P&L."""
+    effective_cost = _safe_number(
+        getattr(settings, "effective_round_trip_cost_pct", None),
+        _safe_number(getattr(settings, "estimated_round_trip_cost_pct", 0.0015), 0.0015),
+    ) or 0.0
+    diagnostics["SHORT_SHADOW_MODE_ENABLED"] = int(bool(short_shadow_enabled))
+    diagnostics["BACKTEST_QUALIFICATION_COST_PPM"] = int(round(max(0.0, effective_cost) * 1_000_000))
+    diagnostics["BACKTEST_FUNDING_RESERVE_PPM"] = int(round(max(0.0, _safe_number(getattr(settings, "estimated_funding_cost_pct", 0.0), 0.0) or 0.0) * 1_000_000))
+    diagnostics["BACKTEST_FEE_RATE_PPM"] = int(round(max(0.0, _safe_number(getattr(settings, "backtest_fee_rate", DEFAULT_FEE_RATE), DEFAULT_FEE_RATE) or 0.0) * 1_000_000))
+    diagnostics["BACKTEST_SLIPPAGE_BPS_X100"] = int(round(max(0.0, _safe_number(getattr(settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS), DEFAULT_SLIPPAGE_BPS) or 0.0) * 100))
 
 
 def _utc_iso(timestamp_ms: int | None) -> str:
@@ -133,7 +153,7 @@ def _log_forensic_trade_audit(trades: Iterable[SimulatedTrade]) -> None:
             "entry=%.10g fill=%s stop=%.10g target=%.10g "
             "signal_rr=%.3f actual_fill_rr=%s realized_r=%s "
             "mae_r=%s mfe_r=%s mfe_1r=%s mfe_1_5r=%s hold_min=%s "
-            "regime=%s entry_mode=%s fees_r=%.4f slippage_r=%.4f quality=%s",
+            "regime=%s entry_mode=%s fees_r=%.4f slippage_r=%.4f funding_r=%.4f quality=%s",
             trade.symbol, trade.side, str(trade.outcome).upper(),
             "STOP_LOSS_TOUCHED" if str(trade.outcome).upper() == "SL" else "MAX_HOLDING_LIMIT",
             _utc_iso(trade.signal_time_ms), _utc_iso(trade.entry_filled_time_ms), _utc_iso(trade.exit_time_ms),
@@ -147,7 +167,7 @@ def _log_forensic_trade_audit(trades: Iterable[SimulatedTrade]) -> None:
             int(bool(trade.mfe_1r_hit)), int(bool(trade.mfe_1_5r_hit)),
             "N/A" if trade.hold_minutes is None else f"{float(trade.hold_minutes):.1f}",
             str(trade.regime or "UNKNOWN"), str(trade.entry_mode or "MARKET"),
-            float(trade.fees_r), float(trade.slippage_r), quality,
+            float(trade.fees_r), float(trade.slippage_r), float(getattr(trade, "funding_r", 0.0)), quality,
         )
     LOGGER.info("BACKTEST LOSS AUDIT END | audited=%d", len(audited))
 
@@ -501,6 +521,7 @@ def simulate_trade_1h(
     signal_close_time_ms: int,
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    funding_cost_pct: float = 0.0,
     max_holding_minutes: float | None = None,
     counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
@@ -511,6 +532,7 @@ def simulate_trade_1h(
         signal_close_time_ms=int(signal_close_time_ms),
         fee_rate=float(fee_rate),
         slippage_bps=float(slippage_bps),
+        funding_cost_pct=float(funding_cost_pct),
         max_holding_minutes=max_holding_minutes,
         counterfactual_tp_r=counterfactual_tp_r,
     )
@@ -681,6 +703,8 @@ class BacktestRunner:
         c1d_prefix: list = []
         c12_prefix: list = []
         c4_prefix: list = []
+        short_shadow_enabled = bool(getattr(self.settings, "backtest_short_shadow_enabled", False))
+        seen_shadow_structures: set[tuple[Any, ...]] = set()
 
         def inc(key: str, amount: int = 1) -> None:
             diagnostics[key] = diagnostics.get(key, 0) + int(amount)
@@ -698,26 +722,13 @@ class BacktestRunner:
             )
             or MAX_HOLD_MINUTES
         )
-        fee_rate = float(
-            _safe_number(
-                getattr(
-                    self.settings,
-                    "backtest_fee_rate",
-                    DEFAULT_FEE_RATE,
-                )
-            )
-            or DEFAULT_FEE_RATE
-        )
-        slippage_bps = float(
-            _safe_number(
-                getattr(
-                    self.settings,
-                    "backtest_slippage_bps",
-                    DEFAULT_SLIPPAGE_BPS,
-                )
-            )
-            or DEFAULT_SLIPPAGE_BPS
-        )
+        fee_value = _safe_number(getattr(self.settings, "backtest_fee_rate", DEFAULT_FEE_RATE), DEFAULT_FEE_RATE)
+        slip_value = _safe_number(getattr(self.settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS), DEFAULT_SLIPPAGE_BPS)
+        fee_rate = max(0.0, DEFAULT_FEE_RATE if fee_value is None else fee_value)
+        slippage_bps = max(0.0, DEFAULT_SLIPPAGE_BPS if slip_value is None else slip_value)
+        funding_cost_pct = max(0.0, _safe_number(getattr(self.settings, "estimated_funding_cost_pct", 0.0), 0.0) or 0.0)
+        effective_cost_value = _safe_number(getattr(self.settings, "effective_round_trip_cost_pct", None), None)
+        qualification_cost_pct = max(0.0, effective_cost_value if effective_cost_value is not None else (_safe_number(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015), 0.0015) or 0.0015))
 
         # Only 1H bars create decisions.
         for row in history.candles_1h:
@@ -728,7 +739,8 @@ class BacktestRunner:
                 continue
             if signal_close_ms > end_ms:
                 continue
-            if signal_close_ms <= active_until_ms:
+            overlap_skipped = signal_close_ms <= active_until_ms
+            if overlap_skipped and not short_shadow_enabled:
                 inc("OVERLAP_SKIPPED")
                 continue
 
@@ -776,6 +788,134 @@ class BacktestRunner:
                 else None
             )
 
+            # Opt-in research-only pass. Unlike the live/control path, this
+            # evaluates every eligible 1H close even while a control trade is
+            # open. Resulting observations are independent opportunity samples,
+            # not a portfolio backtest, and are never added to `trades`.
+            if short_shadow_enabled:
+                inc("SHORT_SHADOW_EVALUATIONS")
+                try:
+                    shadow_analysis = analyze_candles(
+                        history.symbol,
+                        c1d,
+                        c12,
+                        c4,
+                        c1,
+                        now_ms=signal_close_ms,
+                        cache=engine_cache,
+                        btc_context=btc_context,
+                        estimated_round_trip_cost_pct=qualification_cost_pct,
+                        research_short_shadow=True,
+                    )
+                except ValueError:
+                    inc("SHORT_SHADOW_DATA_QUALITY_ERRORS")
+                    shadow_analysis = None
+                except Exception as exc:
+                    inc("SHORT_SHADOW_ENGINE_ERRORS")
+                    LOGGER.exception(
+                        "SHORT DAILY-GATE SHADOW ENGINE_ERROR | symbol=%s signal_close_ms=%s reason=%s",
+                        history.symbol, signal_close_ms, exc,
+                    )
+                    shadow_analysis = None
+
+                if shadow_analysis is not None:
+                    if shadow_analysis.get("short_shadow_daily_permission_available"):
+                        inc("SHORT_SHADOW_DAILY_PERMISSION_ALREADY_AVAILABLE")
+                    else:
+                        inc("SHORT_SHADOW_DAILY_PERMISSION_DENIED_EVALUATIONS")
+                        shadow_regime = str(shadow_analysis.get("regime_1d") or "UNKNOWN").upper()
+                        if shadow_regime not in {"BULLISH", "NEUTRAL", "BEARISH"}:
+                            shadow_regime = "UNKNOWN"
+                        inc(f"SHORT_SHADOW_{shadow_regime}_DAILY_DENIED_EVALUATIONS")
+                        if not shadow_analysis.get("technical_candidate") or str(shadow_analysis.get("setup") or "").upper() != "SHORT":
+                            inc("SHORT_SHADOW_REJECTED_BY_DOWNSTREAM_GATES")
+                            inc(f"SHORT_SHADOW_{shadow_regime}_REJECTED_DOWNSTREAM")
+                            diag = next(
+                                (item for item in (shadow_analysis.get("side_diagnostics") or []) if str(item.get("side") or "").upper() == "SHORT"),
+                                {},
+                            )
+                            reason = str(diag.get("primary_failure") or (shadow_analysis.get("technical_gate_failures") or ["unknown"])[0])
+                            normalized = reason.upper().replace(" ", "_").replace(":", "").replace("/", "_")[:120]
+                            inc(f"SHORT_SHADOW_FIRST_FAILURE_{normalized}")
+                        else:
+                            shadow_key = (
+                                "SHORT",
+                                shadow_analysis.get("setup_impulse_high_time"),
+                                shadow_analysis.get("setup_impulse_low_time"),
+                                shadow_analysis.get("swept_level_1h"),
+                                shadow_analysis.get("reclaim_time_1h") or shadow_analysis.get("setup_retest_1h_time"),
+                            )
+                            if shadow_key in seen_shadow_structures:
+                                inc("SHORT_SHADOW_DUPLICATE_STRUCTURE_SKIPPED")
+                            else:
+                                seen_shadow_structures.add(shadow_key)
+                                inc("SHORT_SHADOW_SETUP_CANDIDATES")
+                                inc(f"SHORT_SHADOW_{shadow_regime}_SETUP_CANDIDATES")
+                                shadow_future = _future_candles(
+                                    history.candles_1h, history.times_1h, signal_close_ms
+                                )
+                                if not shadow_future:
+                                    inc("SHORT_SHADOW_NO_FUTURE_CANDLES")
+                                else:
+                                    try:
+                                        shadow_hold = float(
+                                            _safe_number(shadow_analysis.get("intraday_max_hold_minutes"))
+                                            or max_hold
+                                        )
+                                        shadow_trade = simulate_trade_1h(
+                                            shadow_analysis,
+                                            shadow_future,
+                                            signal_close_time_ms=signal_close_ms,
+                                            fee_rate=fee_rate,
+                                            slippage_bps=slippage_bps,
+                                            funding_cost_pct=funding_cost_pct,
+                                            max_holding_minutes=shadow_hold,
+                                        )
+                                    except Exception as exc:
+                                        inc("SHORT_SHADOW_SIMULATION_ERRORS")
+                                        LOGGER.exception(
+                                            "SHORT DAILY-GATE SHADOW SIMULATION_ERROR | symbol=%s signal_close_ms=%s reason=%s",
+                                            history.symbol, signal_close_ms, exc,
+                                        )
+                                        shadow_trade = None
+                                    if shadow_trade is None:
+                                        inc("SHORT_SHADOW_SIMULATION_NO_TRADE")
+                                    else:
+                                        inc("SHORT_SHADOW_SIMULATED_TRADES")
+                                        inc(f"SHORT_SHADOW_OUTCOME_{str(shadow_trade.outcome).upper()}")
+                                        inc(f"SHORT_SHADOW_{shadow_regime}_OUTCOME_{str(shadow_trade.outcome).upper()}")
+                                        if shadow_trade.r_multiple is None:
+                                            inc("SHORT_SHADOW_UNRESOLVED_TRADES")
+                                            inc(f"SHORT_SHADOW_{shadow_regime}_UNRESOLVED_TRADES")
+                                        else:
+                                            r_value = float(shadow_trade.r_multiple)
+                                            inc("SHORT_SHADOW_RESOLVED_TRADES")
+                                            inc(f"SHORT_SHADOW_{shadow_regime}_RESOLVED_TRADES")
+                                            inc("SHORT_SHADOW_TOTAL_REALIZED_R_X1000", int(round(r_value * 1000)))
+                                            inc(f"SHORT_SHADOW_{shadow_regime}_TOTAL_REALIZED_R_X1000", int(round(r_value * 1000)))
+                                            if r_value > 0:
+                                                inc("SHORT_SHADOW_POSITIVE_R_X1000", int(round(r_value * 1000)))
+                                                inc(f"SHORT_SHADOW_{shadow_regime}_POSITIVE_R_X1000", int(round(r_value * 1000)))
+                                            elif r_value < 0:
+                                                inc("SHORT_SHADOW_NEGATIVE_R_ABS_X1000", int(round(abs(r_value) * 1000)))
+                                                inc(f"SHORT_SHADOW_{shadow_regime}_NEGATIVE_R_ABS_X1000", int(round(abs(r_value) * 1000)))
+                                        if shadow_trade.mae_r is not None:
+                                            inc("SHORT_SHADOW_MAE_R_X1000_SUM", int(round(float(shadow_trade.mae_r) * 1000)))
+                                        if shadow_trade.mfe_r is not None:
+                                            inc("SHORT_SHADOW_MFE_R_X1000_SUM", int(round(float(shadow_trade.mfe_r) * 1000)))
+                                        LOGGER.info(
+                                            "SHORT DAILY-GATE SHADOW TRADE | symbol=%s signal_close_ms=%d outcome=%s r=%s rr=%.3f fee_r=%.4f slippage_r=%.4f funding_r=%.4f daily_regime=%s",
+                                            shadow_trade.symbol, signal_close_ms, shadow_trade.outcome,
+                                            "N/A" if shadow_trade.r_multiple is None else f"{float(shadow_trade.r_multiple):+.4f}",
+                                            float(shadow_trade.signal_rr), float(shadow_trade.fees_r),
+                                            float(shadow_trade.slippage_r), float(shadow_trade.funding_r),
+                                            str(shadow_analysis.get("regime_1d") or "UNKNOWN"),
+                                        )
+
+            if overlap_skipped:
+                inc("OVERLAP_SKIPPED")
+                continue
+
             try:
                 analysis = analyze_candles(
                     history.symbol,
@@ -786,7 +926,7 @@ class BacktestRunner:
                     now_ms=signal_close_ms,
                     cache=engine_cache,
                     btc_context=btc_context,
-                    estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+                    estimated_round_trip_cost_pct=qualification_cost_pct,
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -938,6 +1078,7 @@ class BacktestRunner:
                         signal_close_time_ms=signal_close_ms,
                         fee_rate=fee_rate,
                         slippage_bps=slippage_bps,
+                        funding_cost_pct=funding_cost_pct,
                         max_holding_minutes=effective_max_hold,
                         counterfactual_tp_r=None,
                     )
@@ -977,6 +1118,7 @@ class BacktestRunner:
                     signal_close_time_ms=signal_close_ms,
                     fee_rate=fee_rate,
                     slippage_bps=slippage_bps,
+                    funding_cost_pct=funding_cost_pct,
                     max_holding_minutes=effective_max_hold,
                     counterfactual_tp_r=counterfactual_tp_r,
                 )
@@ -1215,6 +1357,10 @@ class BacktestRunner:
                         summary_payload["diagnostics"], active_engine_config,
                         fixed_period_enabled=fixed_period_enabled,
                     )
+                    _write_backtest_cost_diagnostics(
+                        summary_payload["diagnostics"], self.settings,
+                        short_shadow_enabled=bool(getattr(self.settings, "backtest_short_shadow_enabled", False)),
+                    )
                     params = inspect.signature(summarize).parameters
                     if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
                         summary_payload = {k: v for k, v in summary_payload.items() if k in params}
@@ -1443,6 +1589,10 @@ class BacktestRunner:
                 _write_engine_config_diagnostics(
                     diagnostics, active_engine_config,
                     fixed_period_enabled=fixed_period_enabled,
+                )
+                _write_backtest_cost_diagnostics(
+                    diagnostics, self.settings,
+                    short_shadow_enabled=bool(getattr(self.settings, "backtest_short_shadow_enabled", False)),
                 )
 
                 # Build the complete current summary payload.  The deployed

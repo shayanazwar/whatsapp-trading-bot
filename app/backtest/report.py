@@ -230,8 +230,51 @@ def format_report(summary: BacktestSummary) -> str:
             active_experiments.append("SHORT_RANGE_RELAXED=ON")
         if active_experiments:
             lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
+        if int(summary.diagnostics.get("SHORT_SHADOW_MODE_ENABLED", 0)) > 0:
+            lines.insert(5, "🧪 SHORT daily-gate shadow: ON (research-only; not added to portfolio trades)")
+            ppm_cost = int(summary.diagnostics.get("BACKTEST_QUALIFICATION_COST_PPM", 0))
+            funding_ppm = int(summary.diagnostics.get("BACKTEST_FUNDING_RESERVE_PPM", 0))
+            lines.insert(6, f"⚖️ Qualification cost: {ppm_cost / 10000:.4f}% | Funding reserve: {funding_ppm / 10000:.4f}%")
         lines.extend(("", "GATE DIAGNOSTICS"))
         important = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))
         lines.extend(f"{key}: {value}" for key, value in important[:20])
-    lines.extend(("━━━━━━━━━━━━━━━━━━━━", "⚠️ PAPER BACKTEST", "Decisions use only completed 1D / 12H / 4H / 1H candles.", "12H is a causal aggregation of three contiguous completed 4H candles.", "No real trades executed. Fees/slippage are simulated conservatively."))
+        if int(summary.diagnostics.get("SHORT_SHADOW_MODE_ENABLED", 0)) > 0:
+            shadow_simulated = int(summary.diagnostics.get("SHORT_SHADOW_SIMULATED_TRADES", 0))
+            shadow_resolved = int(summary.diagnostics.get("SHORT_SHADOW_RESOLVED_TRADES", 0))
+            shadow_tp = int(summary.diagnostics.get("SHORT_SHADOW_OUTCOME_TP", 0))
+            shadow_sl = int(summary.diagnostics.get("SHORT_SHADOW_OUTCOME_SL", 0))
+            shadow_expired = int(summary.diagnostics.get("SHORT_SHADOW_OUTCOME_EXPIRED", 0))
+            total_r = int(summary.diagnostics.get("SHORT_SHADOW_TOTAL_REALIZED_R_X1000", 0)) / 1000.0
+            positive_r = int(summary.diagnostics.get("SHORT_SHADOW_POSITIVE_R_X1000", 0)) / 1000.0
+            negative_r = int(summary.diagnostics.get("SHORT_SHADOW_NEGATIVE_R_ABS_X1000", 0)) / 1000.0
+            expectancy = total_r / shadow_resolved if shadow_resolved else None
+            pf = positive_r / negative_r if negative_r > 0 else (float("inf") if positive_r > 0 else None)
+            shadow_wr = (100.0 * shadow_tp / (shadow_tp + shadow_sl)) if shadow_tp + shadow_sl else None
+            pf_text = "∞" if pf == float("inf") else _fmt(pf)
+            lines.extend((
+                "",
+                "🧪 SHORT DAILY-GATE SHADOW — OPPORTUNITY SAMPLE ONLY",
+                "These overlapping counterfactual outcomes are NOT a portfolio backtest.",
+                f"Daily gate denied: {int(summary.diagnostics.get('SHORT_SHADOW_DAILY_PERMISSION_DENIED_EVALUATIONS', 0))}",
+                f"Passed downstream setup/risk gates: {int(summary.diagnostics.get('SHORT_SHADOW_SETUP_CANDIDATES', 0))}",
+                f"Simulated / resolved: {shadow_simulated} / {shadow_resolved}",
+                f"TP / SL / expired: {shadow_tp} / {shadow_sl} / {shadow_expired}",
+                f"Win rate (TP / TP+SL): {_fmt(shadow_wr, 1, '%')}",
+                f"Total R / expectancy: {total_r:+.3f}R / {_fmt(expectancy, 3, 'R/trade')}",
+                f"Profit factor (independent outcomes): {pf_text}",
+            ))
+            for regime in ("BULLISH", "NEUTRAL"):
+                regime_resolved = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_RESOLVED_TRADES", 0))
+                regime_total_r = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_TOTAL_REALIZED_R_X1000", 0)) / 1000.0
+                regime_tp = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_OUTCOME_TP", 0))
+                regime_sl = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_OUTCOME_SL", 0))
+                regime_expired = int(summary.diagnostics.get(f"SHORT_SHADOW_{regime}_OUTCOME_EXPIRED", 0))
+                regime_expectancy = regime_total_r / regime_resolved if regime_resolved else None
+                lines.append(
+                    f"{regime.title()} 1D: denied={int(summary.diagnostics.get(f'SHORT_SHADOW_{regime}_DAILY_DENIED_EVALUATIONS', 0))} | "
+                    f"setups={int(summary.diagnostics.get(f'SHORT_SHADOW_{regime}_SETUP_CANDIDATES', 0))} | "
+                    f"TP/SL/expired={regime_tp}/{regime_sl}/{regime_expired} | "
+                    f"R={regime_total_r:+.3f} | E={_fmt(regime_expectancy, 3, 'R/trade')}"
+                )
+    lines.extend(("━━━━━━━━━━━━━━━━━━━━", "⚠️ PAPER BACKTEST", "Decisions use only completed 1D / 12H / 4H / 1H candles.", "12H is a causal aggregation of three contiguous completed 4H candles.", "No real trades executed. Fees, slippage, and a flat estimated funding reserve are simulated; funding is not historical settlement-level data."))
     return "\n".join(lines)

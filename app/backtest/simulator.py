@@ -54,6 +54,8 @@ class SimulatedTrade:
     gross_pnl: float = 0.0
     entry_fee: float = 0.0
     exit_fees: float = 0.0
+    funding_cost: float = 0.0
+    funding_r: float = 0.0
     position_contract_size: float = 1.0
     same_bar_rule: str = DEFAULT_SAME_BAR_RULE
     state: str = "FINALIZED"
@@ -192,6 +194,7 @@ def simulate_trade(
     signal_close_time_ms: int,
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    funding_cost_pct: float = 0.0,
     max_holding_minutes: float | None = None,
     same_bar_rule: str | None = None,
     counterfactual_tp_r: float | None = None,
@@ -254,11 +257,12 @@ def simulate_trade(
         )
         fee_rate = max(0.0, float(fee_rate))
         slippage_bps = max(0.0, float(slippage_bps))
+        funding_cost_pct = max(0.0, float(funding_cost_pct))
     except (TypeError, ValueError, OverflowError):
         return None
     if not isfinite(max_hold) or max_hold <= 0:
         max_hold = DEFAULT_MAX_HOLDING_MINUTES
-    if not isfinite(fee_rate) or not isfinite(slippage_bps):
+    if not all(isfinite(value) for value in (fee_rate, slippage_bps, funding_cost_pct)):
         return None
 
     rule = _same_bar_rule(same_bar_rule if same_bar_rule is not None else signal.get("same_bar_rule"))
@@ -271,6 +275,7 @@ def simulate_trade(
     risk_exec = 0.0
     initial_risk_cash = 0.0
     entry_fee = 0.0
+    funding_cost_cash = 0.0
     realized_pnl = 0.0
     gross_pnl = 0.0
     exit_fees = 0.0
@@ -333,6 +338,8 @@ def simulate_trade(
             tp1_execution=final_exec if tp_hit else None, breakeven_execution=None,
             final_exit_execution=final_exec if close_position else None, realized_pnl=realized_pnl,
             gross_pnl=gross_pnl, entry_fee=entry_fee, exit_fees=exit_fees,
+            funding_cost=funding_cost_cash,
+            funding_r=(funding_cost_cash / denominator) if denominator else 0.0,
             position_contract_size=contract_size, same_bar_rule=rule,
             state="FINALIZED" if close_position else "OPEN", entry_filled_time_ms=fill_ts, entry_mode=entry_mode,
             mae_r=mae_r if fill_ts is not None else None, mfe_r=mfe_r if fill_ts is not None else None,
@@ -391,7 +398,11 @@ def simulate_trade(
             if risk_exec <= 0 or initial_risk_cash <= 0 or not isfinite(initial_risk_cash):
                 return None
             entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
-            realized_pnl = -entry_fee
+            # Flat conservative reserve per trade, matching the configured
+            # admission-cost allowance. This is not historical settlement-level
+            # funding; that requires timestamped funding-rate data.
+            funding_cost_cash = abs(entry_exec) * initial_size * contract_size * funding_cost_pct
+            realized_pnl = -entry_fee - funding_cost_cash
             slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
             # A passive limit can fill at an unknown point inside the candle.
             # Do not evaluate that same candle's full high/low after the fill,

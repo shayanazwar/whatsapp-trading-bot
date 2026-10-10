@@ -25,6 +25,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -51,6 +52,36 @@ from .simulator import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_failure_diagnostic_key(value: str) -> str:
+    """Collapse volatile numeric details so first-failure counts are actionable.
+
+    This affects diagnostic labels only; it must never affect strategy decisions.
+    """
+    normalized = (
+        str(value or "UNKNOWN").upper()
+        .replace(" ", "_")
+        .replace(":", "")
+        .replace("/", "_")
+    )
+    number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?"
+    normalized = re.sub(
+        rf"(SHORT_4H_IMPULSE_INVALIDATED_(?:ABOVE|BELOW)_ORIGIN)_{number}",
+        r"\1",
+        normalized,
+    )
+    normalized = re.sub(
+        rf"SHORT_POST-COST_RR_{number}_<_REQUIRED_{number}",
+        "SHORT_POST-COST_RR_BELOW_REQUIRED",
+        normalized,
+    )
+    normalized = re.sub(
+        rf"SHORT_SL_DISTANCE_{number}_ATR_OUTSIDE_{number}-{number}_SAFETY_BOUNDS",
+        "SHORT_SL_DISTANCE_OUTSIDE_SAFETY_BOUNDS",
+        normalized,
+    )
+    return normalized[:160]
 
 
 # ============================================================
@@ -961,12 +992,7 @@ class BacktestRunner:
                                 or short_diag.get("primary_failure")
                                 or "UNKNOWN"
                             )
-                            normalized_reason = (
-                                diagnostic_reason.upper()
-                                .replace(" ", "_")
-                                .replace(":", "")
-                                .replace("/", "_")
-                            )[:160]
+                            normalized_reason = _normalize_failure_diagnostic_key(diagnostic_reason)
                             inc(f"OVERLAP_FIRST_FAILURE_SHORT_{normalized_reason}")
                 continue
 
@@ -1036,12 +1062,7 @@ class BacktestRunner:
                     inc(f"FIRST_FAILURE_{side_name}_TOTAL")
                     reason = str(side_diag.get("primary_failure") or "rejected")
                     diagnostic_reason = str(side_diag.get("diagnostic_key") or reason)
-                    normalized_first = (
-                        diagnostic_reason.upper()
-                        .replace(" ", "_")
-                        .replace(":", "")
-                        .replace("/", "_")
-                    )[:160]
+                    normalized_first = _normalize_failure_diagnostic_key(diagnostic_reason)
                     inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
                     diag_key = str(side_diag.get("diagnostic_key") or "")
                     unique_key = (side_name, normalized_first, diag_key)
@@ -1075,7 +1096,7 @@ class BacktestRunner:
                         inc(f"FIRST_FAILURE_{side_name}_TOTAL")
                         reason = str(side_diag.get("primary_failure") or "rejected")
                         diagnostic_reason = str(side_diag.get("diagnostic_key") or reason)
-                        normalized_first = (diagnostic_reason.upper().replace(" ", "_").replace(":", "").replace("/", "_"))[:160]
+                        normalized_first = _normalize_failure_diagnostic_key(diagnostic_reason)
                         inc(f"FIRST_FAILURE_{side_name}_{normalized_first}")
                         diag_key = str(side_diag.get("diagnostic_key") or "")
                         unique_key = (side_name, normalized_first, diag_key)

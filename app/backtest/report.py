@@ -255,6 +255,13 @@ def format_report(summary: BacktestSummary) -> str:
             lines.extend(f"{key}: {value}" for key, value in short_failure_items)
         else:
             lines.append("No per-reason SHORT failure counters were recorded.")
+        histogram_total = sum(value for _, value in short_failure_items)
+        first_failure_total = int(summary.diagnostics.get("FIRST_FAILURE_SHORT_TOTAL", 0))
+        lines.append(
+            f"Histogram reconciliation: categorized={histogram_total} | "
+            f"first_failures={first_failure_total} | "
+            f"difference={histogram_total - first_failure_total}"
+        )
 
         overlap_failure_items = sorted(
             (

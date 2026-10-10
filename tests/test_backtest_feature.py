@@ -6,7 +6,10 @@ import pathlib
 import pytest
 
 from app.backtest.report import format_report, summarize
-from app.backtest.runner import BacktestAlreadyRunning, BacktestRunner, MAX_BACKTEST_SYMBOLS
+from app.backtest.runner import (
+    BacktestAlreadyRunning, BacktestRunner, MAX_BACKTEST_SYMBOLS,
+    _normalize_failure_diagnostic_key,
+)
 from app.backtest.simulator import simulate_trade
 from app.automation.mexc_client import MexcClient
 from app.config import Settings
@@ -14,6 +17,19 @@ from app.config import Settings
 
 def candle(ts, o, h, l, c, v=1000.0):
     return [ts, o, h, l, c, v]
+
+
+
+def test_short_failure_diagnostics_group_volatile_numeric_values():
+    assert _normalize_failure_diagnostic_key(
+        "SHORT: 4H impulse invalidated above origin 1.242"
+    ) == "SHORT_4H_IMPULSE_INVALIDATED_ABOVE_ORIGIN"
+    assert _normalize_failure_diagnostic_key(
+        "SHORT: post-cost RR 0.52 < required 1.60"
+    ) == "SHORT_POST-COST_RR_BELOW_REQUIRED"
+    assert _normalize_failure_diagnostic_key(
+        "SHORT: SL distance 3.82 ATR outside 0.20-3.00 safety bounds"
+    ) == "SHORT_SL_DISTANCE_OUTSIDE_SAFETY_BOUNDS"
 
 
 def test_backtest_universe_is_capped_at_200_symbols():
@@ -221,3 +237,4 @@ def test_report_prints_full_short_failure_and_overlap_diagnostics():
     assert "OVERLAP_FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT: 12" in report
     assert "Shadow exit target: matches main TP mode (1.5R)." in report
     assert "V11_SHORT_RANGE_RELAXED is metadata-only" in report
+    assert "Histogram reconciliation: categorized=100 | first_failures=100 | difference=0" in report

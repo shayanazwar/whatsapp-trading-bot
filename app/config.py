@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     backtest_total_open_risk_r: float = Field(default=3.0, alias="BACKTEST_TOTAL_OPEN_RISK_R")
     backtest_fee_rate: float = Field(default=0.0006, alias="BACKTEST_FEE_RATE")
     backtest_slippage_bps: float = Field(default=2.0, alias="BACKTEST_SLIPPAGE_BPS")
+    # Research-only counterfactual evaluation of SHORT setups rejected solely
+    # by the existing daily bearish-permission gate. Never changes live signals.
+    backtest_short_shadow_enabled: bool = Field(default=False, alias="V11_BACKTEST_SHORT_SHADOW_ENABLED")
 
     # Additional live-trading kill switch
     allow_live_execution: bool = Field(default=False, alias="ALLOW_LIVE_EXECUTION")

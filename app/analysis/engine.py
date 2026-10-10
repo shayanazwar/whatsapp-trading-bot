@@ -900,6 +900,8 @@ def _v11_analyze_side(
     cost_pct: float,
     btc_context: dict[str, Any] | None,
     cache: Optional[dict[str, Any]] = None,
+    *,
+    research_short_daily_gate_bypass: bool = False,
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
     context = _memoized_frame_value(
@@ -907,6 +909,9 @@ def _v11_analyze_side(
         lambda: _v11_context_12h(c12, side),
     )
     direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+    daily_permission_bypassed = bool(
+        research_short_daily_gate_bypass and side == "SHORT" and not direction_ok
+    )
 
     def reject(reason: str) -> dict[str, Any]:
         message = str(reason)
@@ -925,7 +930,9 @@ def _v11_analyze_side(
             "rejection_stage": "SETUP",
         }
 
-    if not direction_ok:
+    if research_short_daily_gate_bypass and side == "SHORT" and direction_ok:
+        return reject("SHORT shadow not applicable: strict 1D bearish permission is already available")
+    if not direction_ok and not daily_permission_bypassed:
         return reject(
             f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
         )
@@ -1086,7 +1093,8 @@ def _v11_analyze_side(
                 "btc_filter_ok": False,
             }
         return {
-            "side": side, "candidate": True, "direction_ok": True, "context": context,
+            "side": side, "candidate": True, "direction_ok": direction_ok,
+            "daily_permission_bypassed": daily_permission_bypassed, "context": context,
             "impulse": impulse, "value_zone": zone, "trigger": trigger,
             "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr_net, "rr_gross": rr_gross,
             "atr_4h": atr4, "atr_1h": atr1, "sl_atr": sl_atr,
@@ -1176,6 +1184,7 @@ def analyze_candles(
     cache: Optional[dict[str, Any]] = None,
     btc_context: Optional[dict[str, Any]] = None,
     estimated_round_trip_cost_pct: float = 0.0015,
+    research_short_shadow: bool = False,
 ) -> dict[str, Any]:
     """V11 deterministic Trend Pullback / Value Re-entry engine.
 
@@ -1197,12 +1206,39 @@ def analyze_candles(
         cache, "_v11_regime_1d", c1d, lambda: _v11_regime_1d(c1d)
     )
     cost_pct = max(0.0, _num(estimated_round_trip_cost_pct, 0.0015))
+
+    # Research-only counterfactual mode. It only tests SHORT evaluations that
+    # the original daily permission gate would reject, and never participates
+    # in the normal LONG/SHORT candidate ranking or execution path.
+    if research_short_shadow and bool(daily.get("bear")):
+        result = _v11_empty(
+            symbol, c1d, c12, c4, c1,
+            "SHORT shadow not applicable: strict 1D bearish permission is already available",
+            daily, btc_context,
+            side_failures=["SHORT shadow not applicable: strict 1D bearish permission is already available"],
+            side_diagnostics=[{
+                "side": "SHORT", "candidate": False,
+                "primary_failure": "SHORT shadow not applicable: strict 1D bearish permission is already available",
+                "diagnostic_key": "SHORT_SHADOW_NOT_APPLICABLE_DAILY_PERMISSION_AVAILABLE",
+                "rejection_stage": "SHADOW_SCOPE", "direction_ok": True,
+            }],
+            cache=cache,
+        )
+        result.update({
+            "short_shadow_mode": True,
+            "short_shadow_daily_permission_available": True,
+            "short_daily_permission_bypassed": False,
+        })
+        return result
+
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
     side_diagnostics: list[dict[str, Any]] = []
-    for side in ("LONG", "SHORT"):
+    sides_to_evaluate = ("SHORT",) if research_short_shadow else ("LONG", "SHORT")
+    for side in sides_to_evaluate:
         result = _v11_analyze_side(
-            symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache
+            symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache,
+            research_short_daily_gate_bypass=research_short_shadow,
         )
         is_candidate = bool(result.get("candidate"))
         side_diagnostics.append({
@@ -1220,10 +1256,17 @@ def analyze_candles(
             side_failures.extend(str(x) for x in failures[:2])
     if not candidates:
         reasons = side_failures or ["no active V11 value-pullback trigger"]
-        return _v11_empty(
+        empty = _v11_empty(
             symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context,
             side_failures=reasons, side_diagnostics=side_diagnostics, cache=cache,
         )
+        if research_short_shadow:
+            empty.update({
+                "short_shadow_mode": True,
+                "short_shadow_daily_permission_available": bool(daily.get("bear")),
+                "short_daily_permission_bypassed": not bool(daily.get("bear")),
+            })
+        return empty
     # If both sides somehow qualify, rank by structural setup quality only; this is
     # not an accuracy score and is not used as a threshold.
     chosen = max(candidates, key=lambda x: (float(x["score"]), int(x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"])))
@@ -1345,6 +1388,9 @@ def analyze_candles(
         "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12), "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
         "btc_filter_ok": btc_ok, "btc_filter_reason": chosen.get("btc_filter_reason", "OK"), "btc_would_block": not btc_ok,
         "btc_risk_mode": "OBSERVE", "btc_context": btc_context or {"ok": False},
+        "short_shadow_mode": bool(research_short_shadow),
+        "short_shadow_daily_permission_available": bool(daily.get("bear")) if research_short_shadow else None,
+        "short_daily_permission_bypassed": bool(chosen.get("daily_permission_bypassed", False)),
     }
 
 

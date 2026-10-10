@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 
 import pytest
 
 from app.backtest.report import format_report, summarize
 from app.backtest.runner import (
-    BacktestAlreadyRunning, BacktestRunner, MAX_BACKTEST_SYMBOLS,
+    BacktestAlreadyRunning, BacktestRunner, MAX_BACKTEST_SYMBOLS, SymbolHistory,
     _normalize_failure_diagnostic_key,
 )
+from app.backtest.reproducibility import BacktestReproStore
+from app.analysis.engine import convert_candles
 from app.backtest.simulator import simulate_trade
 from app.automation.mexc_client import MexcClient
 from app.config import Settings
@@ -238,3 +241,122 @@ def test_report_prints_full_short_failure_and_overlap_diagnostics():
     assert "Shadow exit target: matches main TP mode (1.5R)." in report
     assert "V11_SHORT_RANGE_RELAXED is metadata-only" in report
     assert "Histogram reconciliation: categorized=100 | first_failures=100 | difference=0" in report
+
+
+def test_frozen_snapshot_round_trip_preserves_normalized_candles_and_universe(tmp_path):
+    start_ms = 1_790_780_400_000
+    end_ms = 1_791_385_200_000
+    candles = convert_candles([
+        [1_790_000_000_000, 100.0, 105.0, 98.0, 102.0, 123.0],
+        [1_790_003_600_000, 102.0, 106.0, 101.0, 104.0, 145.0],
+    ])
+    history = SymbolHistory(
+        symbol="ABC_USDT",
+        candles_1d=candles,
+        candles_12h=candles,
+        candles_4h=candles,
+        candles_1h=candles,
+    )
+    btc = SymbolHistory(
+        symbol="BTC_USDT",
+        candles_1d=candles,
+        candles_12h=candles,
+        candles_4h=candles,
+        candles_1h=candles,
+    )
+    store = BacktestReproStore.capture(str(tmp_path), start_ms=start_ms, end_ms=end_ms)
+    store.set_symbols(["ABC_USDT"])
+    store.write_history(history, role="symbol")
+    store.write_history(btc, role="btc_context")
+    manifest = store.finalize(
+        start_ms=start_ms,
+        end_ms=end_ms,
+        symbols=["ABC_USDT"],
+        engine_config={"fingerprint": "test-fingerprint", "min_impulse_atr": 2.5},
+        settings=Settings(),
+        tp_mode="CONTROL",
+        project_root=pathlib.Path.cwd(),
+    )
+    assert manifest["complete"] is True
+    replay = BacktestReproStore.replay(str(store.path), start_ms=start_ms, end_ms=end_ms)
+    restored = replay.load_history("ABC_USDT", role="symbol")
+    assert restored.symbol == "ABC_USDT"
+    assert restored.times_1h == history.times_1h
+    assert restored.candles_1h == history.candles_1h
+    assert replay.symbols == ["ABC_USDT"]
+
+
+def test_frozen_snapshot_refuses_tampered_candle_data(tmp_path):
+    start_ms = 1_790_780_400_000
+    end_ms = 1_791_385_200_000
+    candles = convert_candles([
+        [1_790_000_000_000, 100.0, 105.0, 98.0, 102.0, 123.0],
+    ])
+    history = SymbolHistory(
+        symbol="ABC_USDT",
+        candles_1d=candles,
+        candles_12h=candles,
+        candles_4h=candles,
+        candles_1h=candles,
+    )
+    store = BacktestReproStore.capture(str(tmp_path), start_ms=start_ms, end_ms=end_ms)
+    store.set_symbols(["ABC_USDT"])
+    store.write_history(history, role="symbol")
+    store.write_history(SymbolHistory("BTC_USDT", candles, candles, candles, candles), role="btc_context")
+    store.finalize(
+        start_ms=start_ms,
+        end_ms=end_ms,
+        symbols=["ABC_USDT"],
+        engine_config={"fingerprint": "test-fingerprint"},
+        settings=Settings(),
+        tp_mode="CONTROL",
+        project_root=pathlib.Path.cwd(),
+    )
+    file_path = store.path / store.manifest["history_files"]["symbol:ABC_USDT"]["path"]
+    file_path.write_bytes(file_path.read_bytes() + b"tamper")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        BacktestReproStore.replay(str(store.path), start_ms=start_ms, end_ms=end_ms)
+
+
+def test_replay_mode_bypasses_live_universe_and_exchange_fetches(tmp_path, monkeypatch):
+    start_ms = 1_790_780_400_000
+    end_ms = 1_791_385_200_000
+    monkeypatch.setenv("V11_BACKTEST_START_MS", str(start_ms))
+    monkeypatch.setenv("V11_BACKTEST_END_MS", str(end_ms))
+    monkeypatch.delenv("V11_BACKTEST_SNAPSHOT_DIR", raising=False)
+    snapshot = BacktestReproStore.capture(str(tmp_path), start_ms=start_ms, end_ms=end_ms)
+    snapshot.set_symbols(["ABC_USDT"])
+    empty = SymbolHistory("ABC_USDT", [], [], [], [])
+    btc = SymbolHistory("BTC_USDT", [], [], [], [])
+    snapshot.write_history(empty, role="symbol")
+    snapshot.write_history(btc, role="btc_context")
+    snapshot.finalize(
+        start_ms=start_ms,
+        end_ms=end_ms,
+        symbols=["ABC_USDT"],
+        engine_config={"fingerprint": "test-fingerprint"},
+        settings=Settings(),
+        tp_mode="CONTROL",
+        project_root=pathlib.Path.cwd(),
+    )
+    monkeypatch.setenv("V11_BACKTEST_REPLAY_DIR", str(snapshot.path))
+
+    class ForbiddenUniverse:
+        async def refresh(self):
+            raise AssertionError("Replay must not query the live universe")
+
+    runner = BacktestRunner(
+        client=None,
+        universe=ForbiddenUniverse(),
+        settings=Settings(backtest_max_symbols=1),
+        max_concurrency=1,
+    )
+    summaries = [asyncio.run(runner.run(7, tp_mode="CONTROL")) for _ in range(3)]
+    assert all(summary.coins_selected == 1 for summary in summaries)
+    assert all(summary.coins_tested == 1 for summary in summaries)
+    assert all(summary.signals == 0 for summary in summaries)
+    run_files = sorted((snapshot.path / "results").glob("run_CONTROL_*.json"))
+    assert len(run_files) == 3
+    run_records = [json.loads(path.read_text(encoding="utf-8")) for path in run_files]
+    assert len({record["trade_ledger_sha256"] for record in run_records}) == 1
+    assert len({record["source_sha256"] for record in run_records}) == 1

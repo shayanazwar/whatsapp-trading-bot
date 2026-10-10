@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 from app.backtest.runner import _log_forensic_trade_audit
 from app.backtest.simulator import SimulatedTrade
+from app.backtest.report import format_report, summarize
 
 
 def _trade(outcome: str) -> SimulatedTrade:
@@ -30,3 +32,26 @@ def test_loss_audit_logs_sl_and_expired_details(caplog):
     assert "mae_r=1.000 mfe_r=0.700" in output
     assert "quality={\"score\":84.0}" in output
     assert "BACKTEST LOSS AUDIT END | audited=2" in output
+
+
+def test_portfolio_drawdown_and_losing_streak_follow_realized_exit_order():
+    # Signal order is SL, TP, SL; actual exit order is TP, SL, SL.
+    first_signal_last_exit = replace(
+        _trade("SL"), symbol="A_USDT", signal_time_ms=10, exit_time_ms=30, r_multiple=-1.2,
+    )
+    second_signal_first_exit = replace(
+        _trade("TP"), symbol="B_USDT", signal_time_ms=20, exit_time_ms=25, r_multiple=2.0,
+    )
+    third_signal_last_exit = replace(
+        _trade("SL"), symbol="C_USDT", signal_time_ms=30, exit_time_ms=40, r_multiple=-1.0,
+    )
+
+    summary = summarize(
+        days=7, period_start_ms=0, period_end_ms=100,
+        coins_selected=3, coins_tested=3, data_errors=0,
+        execution_errors=0, rejected_setups=0,
+        trades=[first_signal_last_exit, second_signal_first_exit, third_signal_last_exit],
+    )
+    assert summary.max_drawdown_r == 2.2
+    assert summary.max_losing_streak == 2
+    assert format_report(summary).count("Total R:") == 1

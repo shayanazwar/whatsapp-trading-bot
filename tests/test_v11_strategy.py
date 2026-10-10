@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, convert_candles
+from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, _v11_structure, convert_candles
 
 DAY = 86_400_000
 HOUR = 3_600_000
@@ -209,6 +209,9 @@ def test_v11_balanced_1d_macro_permission_uses_three_of_five_votes(monkeypatch):
     assert out["bull"] is True
     assert out["bear"] is False
     assert out["bull_votes"] == 4
+    assert out["bull_directional_votes"] == 3
+    assert out["bear_directional_votes"] == 0
+    assert out["adx_trend_vote"] is True
 
 
 def test_v11_liquidity_trigger_reclaim_can_occur_four_bars_after_sweep():
@@ -252,3 +255,39 @@ def test_v11_impulse_requires_correct_swing_sequence_for_both_sides(monkeypatch)
 def test_convert_candles_rejects_open_outside_reported_high_low():
     row = {"time": 0, "open": 105.0, "high": 104.0, "low": 100.0, "close": 102.0, "volume": 100.0}
     assert convert_candles([row]) == []
+
+
+def test_v11_structure_rejects_swings_with_invalid_chronological_order(monkeypatch):
+    rows = convert_candles([
+        {"time": i * FOUR_HOUR, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0}
+        for i in range(40)
+    ])
+
+    # Correct HH/HL sequence: old low -> old high -> higher low -> higher high.
+    monkeypatch.setattr(
+        "app.analysis.engine._swing_points",
+        lambda *args, **kwargs: ([(10, 120.0), (30, 130.0)], [(5, 90.0), (20, 100.0)]),
+    )
+    assert _v11_structure(rows) == "HH/HL"
+
+    # The latest higher low formed before the prior high; independent price
+    # comparisons alone used to mislabel this as HH/HL.
+    monkeypatch.setattr(
+        "app.analysis.engine._swing_points",
+        lambda *args, **kwargs: ([(10, 120.0), (30, 130.0)], [(5, 90.0), (8, 100.0)]),
+    )
+    assert _v11_structure(rows) == "RANGE"
+
+    # Correct LH/LL inverse: old high -> old low -> lower high -> lower low.
+    monkeypatch.setattr(
+        "app.analysis.engine._swing_points",
+        lambda *args, **kwargs: ([(5, 130.0), (20, 120.0)], [(10, 100.0), (30, 90.0)]),
+    )
+    assert _v11_structure(rows) == "LH/LL"
+
+    # The lower high formed before the prior low; this is not valid LH/LL.
+    monkeypatch.setattr(
+        "app.analysis.engine._swing_points",
+        lambda *args, **kwargs: ([(5, 130.0), (8, 120.0)], [(10, 100.0), (30, 90.0)]),
+    )
+    assert _v11_structure(rows) == "RANGE"

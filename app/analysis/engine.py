@@ -520,12 +520,26 @@ def validate_engine_config() -> None:
         raise RuntimeError("V11 timeframe contract changed; allowed frames are exactly 1D/12H/4H/1H.")
 
 def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
+    """Return a swing structure only when price pivots form a valid sequence.
+
+    Comparing the last two highs and lows independently can mislabel structure:
+    for example, a higher low formed *before* the prior high is not a valid
+    HH/HL sequence. Daily regime permission and 12H context both consume this
+    result, so chronology is part of the structure definition, not just a setup
+    quality preference.
+    """
     highs, lows = _swing_points(candles, left=left, right=right)
     if len(highs) < 2 or len(lows) < 2:
         return "UNKNOWN"
-    if highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]:
+
+    (h1_idx, h1), (h2_idx, h2) = highs[-2], highs[-1]
+    (l1_idx, l1), (l2_idx, l2) = lows[-2], lows[-1]
+
+    bullish_sequence = l1_idx < h1_idx < l2_idx < h2_idx
+    bearish_sequence = h1_idx < l1_idx < h2_idx < l2_idx
+    if h2 > h1 and l2 > l1 and bullish_sequence:
         return "HH/HL"
-    if highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]:
+    if h2 < h1 and l2 < l1 and bearish_sequence:
         return "LH/LL"
     return "RANGE"
 
@@ -559,6 +573,8 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
             "e21": e21, "e50": e50, "e200": e200, "slope": slope,
             "adx": adx, "structure": structure, "price": price,
             "bull_votes": 0, "bear_votes": 0,
+            "bull_directional_votes": 0, "bear_directional_votes": 0,
+            "adx_trend_vote": bool(adx >= ADX_TREND_MIN),
         }
 
     bull_votes = sum((
@@ -581,6 +597,13 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
         "regime": "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
         "bull": bull,
         "bear": bear,
+        # Keep the independent directional evidence separate from ADX, which
+        # measures trend strength but has no bullish/bearish polarity. The
+        # existing documented 3-of-5 permission rule remains unchanged here;
+        # these fields make ADX's contribution auditable in rejection logs.
+        "bull_directional_votes": int(price > e200) + int(e50 > e200) + int(structure == "HH/HL") + int(slope > 0),
+        "bear_directional_votes": int(price < e200) + int(e50 < e200) + int(structure == "LH/LL") + int(slope < 0),
+        "adx_trend_vote": bool(adx >= ADX_TREND_MIN),
         "e21": e21,
         "e50": e50,
         "e200": e200,
@@ -947,7 +970,7 @@ def _v11_analyze_side(
         return reject("SHORT shadow not applicable: strict 1D bearish permission is already available")
     if not direction_ok and not daily_permission_bypassed:
         return reject(
-            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
+            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)}, bull_directional={daily.get('bull_directional_votes', 'NA')}, bear_directional={daily.get('bear_directional_votes', 'NA')}, adx={daily.get('adx', 'NA')})"
         )
     if context.get("hostile"):
         return reject(

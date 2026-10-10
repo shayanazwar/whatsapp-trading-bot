@@ -136,7 +136,14 @@ def convert_candles(rows: Iterable[Any] | None) -> List[Candle]:
                 continue
             if candle["volume"] < 0:
                 continue
-            if candle["low"] > candle["high"] or not (candle["low"] <= candle["close"] <= candle["high"]):
+            # A valid OHLC bar must contain both its open and close within
+            # the reported high/low range. Reject malformed bars before any
+            # indicator or swing calculation can consume them.
+            if (
+                candle["low"] > candle["high"]
+                or not (candle["low"] <= candle["open"] <= candle["high"])
+                or not (candle["low"] <= candle["close"] <= candle["high"])
+            ):
                 continue
             output.append(candle)
         except (TypeError, ValueError, OverflowError, KeyError):
@@ -629,7 +636,7 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
         for hi_pos, (hi_idx, hi_price) in enumerate(highs):
             if hi_idx < 7 or len(candles) - 1 - hi_idx > max_age:
                 continue
-            prior_high = highs[hi_pos - 1][1] if hi_pos > 0 else None
+            prior_high_idx, prior_high = highs[hi_pos - 1] if hi_pos > 0 else (None, None)
             if prior_high is None or hi_price <= prior_high:
                 continue
             eligible_lows = [(idx, price) for idx, price in lows if idx < hi_idx]
@@ -637,7 +644,10 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 continue
             lo_idx, lo_price = eligible_lows[-1]
             prev_lo_idx, prev_lo_price = eligible_lows[-2]
-            if lo_idx < 3 or lo_price <= prev_lo_price or prev_lo_idx >= lo_idx:
+            # For a true HH/HL impulse, the higher low must form after the
+            # prior swing high and before the new higher high. Since swing
+            # lists are chronological, prev_lo_idx >= lo_idx was a dead check.
+            if lo_idx < 3 or lo_price <= prev_lo_price or lo_idx <= int(prior_high_idx):
                 continue
             leg = hi_price - lo_price
             atr4 = _num(atrs[hi_idx] if hi_idx < len(atrs) else 0.0)
@@ -655,7 +665,7 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
         for lo_pos, (lo_idx, lo_price) in enumerate(lows):
             if lo_idx < 7 or len(candles) - 1 - lo_idx > max_age:
                 continue
-            prior_low = lows[lo_pos - 1][1] if lo_pos > 0 else None
+            prior_low_idx, prior_low = lows[lo_pos - 1] if lo_pos > 0 else (None, None)
             if prior_low is None or lo_price >= prior_low:
                 continue
             eligible_highs = [(idx, price) for idx, price in highs if idx < lo_idx]
@@ -663,7 +673,10 @@ def _v11_find_impulses(candles: list[Candle], side: str, max_age: int = 30) -> l
                 continue
             hi_idx, hi_price = eligible_highs[-1]
             prev_hi_idx, prev_hi_price = eligible_highs[-2]
-            if hi_idx < 3 or hi_price >= prev_hi_price or prev_hi_idx >= hi_idx:
+            # For a true LH/LL impulse, the lower high must form after the
+            # prior swing low and before the new lower low (the inverse HH/HL
+            # sequence rule).
+            if hi_idx < 3 or hi_price >= prev_hi_price or hi_idx <= int(prior_low_idx):
                 continue
             leg = hi_price - lo_price
             atr4 = _num(atrs[lo_idx] if lo_idx < len(atrs) else 0.0)

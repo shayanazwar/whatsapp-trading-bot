@@ -332,6 +332,12 @@ class MexcScanner:
                 stage = str(analysis.get("rejection_stage") or "SETUP")
                 return self._reject(symbol, failures, stage, payload)
 
+            # Keep SHORT analysis available for diagnostics, but optionally block
+            # SHORT signal/trade creation at the scanner boundary.
+            if side == "SHORT" and not bool(getattr(self.settings, "shorts_enabled", True)):
+                payload["short_analysis_detected"] = 1
+                return self._reject(symbol, "SHORT signals disabled by SHORTS_ENABLED=false", "SIDE_DISABLED", payload)
+
             # Check all strategy stages for diagnostics; reject at the first failed gate.
             # Reject at the first failed strategy gate while retaining all stage counters.
             ordered = [

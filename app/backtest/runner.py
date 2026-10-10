@@ -870,6 +870,7 @@ class BacktestRunner:
                                             slippage_bps=slippage_bps,
                                             funding_cost_pct=funding_cost_pct,
                                             max_holding_minutes=shadow_hold,
+                                            counterfactual_tp_r=counterfactual_tp_r,
                                         )
                                     except Exception as exc:
                                         inc("SHORT_SHADOW_SIMULATION_ERRORS")
@@ -914,6 +915,59 @@ class BacktestRunner:
 
             if overlap_skipped:
                 inc("OVERLAP_SKIPPED")
+                # When short-shadow diagnostics are enabled, run the unchanged
+                # strict engine on skipped decision points as a diagnostic only.
+                # This measures whether a SHORT side actually passed the normal
+                # daily/context/setup gates before the active-position lock hid it.
+                # It does not create or simulate a portfolio trade.
+                if short_shadow_enabled:
+                    inc("OVERLAP_DIAGNOSTIC_EVALUATIONS")
+                    try:
+                        overlap_analysis = analyze_candles(
+                            history.symbol,
+                            c1d,
+                            c12,
+                            c4,
+                            c1,
+                            now_ms=signal_close_ms,
+                            cache=engine_cache,
+                            btc_context=btc_context,
+                            estimated_round_trip_cost_pct=qualification_cost_pct,
+                        )
+                    except ValueError:
+                        inc("OVERLAP_DIAGNOSTIC_DATA_QUALITY_ERRORS")
+                    except Exception as exc:
+                        inc("OVERLAP_DIAGNOSTIC_ENGINE_ERRORS")
+                        LOGGER.exception(
+                            "BACKTEST OVERLAP DIAGNOSTIC ENGINE_ERROR | symbol=%s signal_close_ms=%s reason=%s",
+                            history.symbol, signal_close_ms, exc,
+                        )
+                    else:
+                        short_diag = next(
+                            (
+                                item
+                                for item in (overlap_analysis.get("side_diagnostics") or [])
+                                if str(item.get("side") or "").upper() == "SHORT"
+                            ),
+                            None,
+                        )
+                        if short_diag is None:
+                            inc("OVERLAP_SHORT_DIAGNOSTIC_MISSING")
+                        elif bool(short_diag.get("candidate")):
+                            inc("OVERLAP_SHORT_SIDE_CANDIDATES")
+                        else:
+                            diagnostic_reason = str(
+                                short_diag.get("diagnostic_key")
+                                or short_diag.get("primary_failure")
+                                or "UNKNOWN"
+                            )
+                            normalized_reason = (
+                                diagnostic_reason.upper()
+                                .replace(" ", "_")
+                                .replace(":", "")
+                                .replace("/", "_")
+                            )[:160]
+                            inc(f"OVERLAP_FIRST_FAILURE_SHORT_{normalized_reason}")
                 continue
 
             try:

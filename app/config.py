@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # Scanner switches
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
+    shorts_enabled: bool = Field(default=True, alias="SHORTS_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(default=3600, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")

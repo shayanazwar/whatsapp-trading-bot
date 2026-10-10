@@ -223,3 +223,32 @@ def test_v11_liquidity_trigger_reclaim_can_occur_four_bars_after_sweep():
     assert out["ready"] is True
     assert out["sweep_idx"] == 3
     assert out["reclaim_idx"] == 7
+
+
+def test_v11_impulse_requires_correct_swing_sequence_for_both_sides(monkeypatch):
+    rows = [
+        {"time": i * FOUR_HOUR, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0}
+        for i in range(40)
+    ]
+    candles = convert_candles(rows)
+    monkeypatch.setattr(
+        "app.analysis.engine._swing_points",
+        lambda _candles, left=3, right=3: ([(20, 125.0), (30, 130.0)], [(5, 100.0), (10, 110.0)]),
+    )
+    monkeypatch.setattr("app.analysis.engine._atr_series", lambda _candles, period=14: [1.0] * len(_candles))
+
+    # The latest higher low occurred BEFORE the previous high, so it cannot
+    # structurally validate a new HH/HL impulse.
+    assert _v11_find_impulses(candles, "LONG") == []
+
+    monkeypatch.setattr(
+        "app.analysis.engine._swing_points",
+        lambda _candles, left=3, right=3: ([(5, 120.0), (10, 110.0)], [(20, 95.0), (30, 90.0)]),
+    )
+    # Inverse case: the latest lower high occurred BEFORE the previous low.
+    assert _v11_find_impulses(candles, "SHORT") == []
+
+
+def test_convert_candles_rejects_open_outside_reported_high_low():
+    row = {"time": 0, "open": 105.0, "high": 104.0, "low": 100.0, "close": 102.0, "volume": 100.0}
+    assert convert_candles([row]) == []

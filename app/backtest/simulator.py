@@ -100,7 +100,9 @@ def _candle_values(candle: Any) -> tuple[int, float, float, float, float] | None
         return None
     if timestamp <= 0 or not all(isfinite(v) for v in (open_price, high, low, close)):
         return None
-    if low > high or close < low or close > high:
+    # OHLC bars must contain their own open and close; reject corrupt rows
+    # rather than allowing impossible gap/stop behavior into the simulation.
+    if low > high or open_price < low or open_price > high or close < low or close > high:
         return None
     return timestamp, open_price, high, low, close
 
@@ -355,7 +357,7 @@ def simulate_trade(
         parsed = _candle_values(candle)
         if parsed is None:
             continue
-        timestamp, _open_price, high, low, close = parsed
+        timestamp, open_price, high, low, close = parsed
         close_time = timestamp + ONE_HOUR_MS
         if close_time <= signal_time:
             continue
@@ -377,7 +379,7 @@ def simulate_trade(
             else:
                 # Signal is produced at the completed 1H close; market execution
                 # occurs at the next 1H open, then receives adverse slippage.
-                base_entry = _open_price if timestamp >= signal_close_time_ms else entry
+                base_entry = open_price if timestamp >= signal_close_time_ms else entry
                 entry_exec = _adverse_slippage(base_entry, side, is_entry=True, slippage_bps=slippage_bps)
                 fill_ts = timestamp
 
@@ -403,7 +405,10 @@ def simulate_trade(
             # funding; that requires timestamped funding-rate data.
             funding_cost_cash = abs(entry_exec) * initial_size * contract_size * funding_cost_pct
             realized_pnl = -entry_fee - funding_cost_cash
-            slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
+            # Attribute only execution slippage here. The signal-close-to-next-open
+            # move is a market gap, not slippage; realized P&L still uses the actual fill.
+            entry_reference_price = entry if entry_mode == "LIMIT" else base_entry
+            slippage_cash = abs(entry_exec - entry_reference_price) * initial_size * contract_size
             # A passive limit can fill at an unknown point inside the candle.
             # Do not evaluate that same candle's full high/low after the fill,
             # because its pre-fill movement is unknowable without tick data.
@@ -461,7 +466,15 @@ def simulate_trade(
             final_ts = close_time
             return build_trade("TP", final_ts)
         if first == "SL":
-            final_exec = execute_exit(stop)
+            # Stop-market orders can gap through the stop. Fill at the worse bar
+            # open when the open has already crossed the stop, then apply slippage.
+            if side == "LONG" and open_price <= stop:
+                stop_fill_base = min(stop, open_price)
+            elif side == "SHORT" and open_price >= stop:
+                stop_fill_base = max(stop, open_price)
+            else:
+                stop_fill_base = stop
+            final_exec = execute_exit(stop_fill_base)
             if final_exec is None:
                 return None
             sl_hit = True

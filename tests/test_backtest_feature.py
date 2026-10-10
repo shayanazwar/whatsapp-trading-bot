@@ -73,6 +73,48 @@ def test_backtest_simulator_same_bar_rule_is_conservative_by_default():
     assert trade.outcome == "SL"
 
 
+
+def test_simulator_stop_loss_gap_fills_at_worse_open():
+    long_signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp": 110}
+    long_trade = simulate_trade(
+        long_signal, [candle(3_600_000, 100, 102, 99, 101), candle(7_200_000, 90, 100, 89, 96)],
+        signal_close_time_ms=0, fee_rate=0, slippage_bps=0,
+    )
+    assert long_trade is not None
+    assert long_trade.outcome == "SL"
+    assert long_trade.exit_execution == pytest.approx(90)
+    assert long_trade.realized_pnl == pytest.approx(-10)
+
+    short_signal = {"symbol": "ABC_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp": 90}
+    short_trade = simulate_trade(
+        short_signal, [candle(3_600_000, 100, 101, 99, 100), candle(7_200_000, 110, 111, 99, 101)],
+        signal_close_time_ms=0, fee_rate=0, slippage_bps=0,
+    )
+    assert short_trade is not None
+    assert short_trade.outcome == "SL"
+    assert short_trade.exit_execution == pytest.approx(110)
+    assert short_trade.realized_pnl == pytest.approx(-10)
+
+
+def test_simulator_slippage_excludes_signal_to_next_open_gap():
+    signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100, "stop_loss": 90, "tp": 120}
+    trade = simulate_trade(
+        signal, [candle(3_600_000, 105, 106, 104, 105)],
+        signal_close_time_ms=0, fee_rate=0, slippage_bps=0, max_holding_minutes=30,
+    )
+    assert trade is not None
+    assert trade.entry_execution == pytest.approx(105)
+    assert trade.slippage_r == pytest.approx(0)
+
+
+def test_simulator_rejects_ohlc_open_outside_bar_range():
+    signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp": 110}
+    trade = simulate_trade(
+        signal, [candle(3_600_000, 90, 105, 95, 100)],
+        signal_close_time_ms=0, fee_rate=0, slippage_bps=0,
+    )
+    assert trade is None
+
 def test_zero_trade_report_is_rendered_with_bias_diagnostic():
     summary = summarize(
         days=1,

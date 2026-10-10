@@ -126,3 +126,62 @@ def test_simulator_reports_signal_rr_and_actual_fill_rr_separately():
     assert summary.avg_actual_fill_rr == pytest.approx(8.0 / 7.0)
     assert "Avg Signal RR" in format_report(summary)
     assert "Avg Actual Fill RR" in format_report(summary)
+
+
+def test_simulator_applies_configured_funding_reserve_to_realized_r():
+    signal = {
+        "symbol": "ABC_USDT", "setup": "LONG", "entry": 100.0,
+        "stop_loss": 95.0, "tp": 110.0,
+    }
+    future = [candle(3_600_000, 100.0, 111.0, 99.0, 108.0)]
+    without_reserve = simulate_trade(
+        signal, future, signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0,
+    )
+    with_reserve = simulate_trade(
+        signal, future, signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0,
+        funding_cost_pct=0.01,
+    )
+    assert without_reserve is not None and with_reserve is not None
+    assert with_reserve.funding_cost == pytest.approx(1.0)
+    assert with_reserve.funding_r == pytest.approx(0.2)
+    assert with_reserve.realized_pnl == pytest.approx(without_reserve.realized_pnl - 1.0)
+    assert with_reserve.r_multiple == pytest.approx(without_reserve.r_multiple - 0.2)
+
+
+def test_backtest_short_shadow_is_opt_in_and_cost_model_is_conservative():
+    settings = Settings()
+    assert settings.backtest_short_shadow_enabled is False
+    assert settings.effective_round_trip_cost_pct == pytest.approx(0.0018)
+    enabled = Settings(V11_BACKTEST_SHORT_SHADOW_ENABLED=True)
+    assert enabled.backtest_short_shadow_enabled is True
+
+
+def test_short_shadow_report_labels_outcomes_as_non_portfolio_samples():
+    summary = summarize(
+        days=7,
+        period_start_ms=0,
+        period_end_ms=7 * 86_400_000,
+        coins_selected=1,
+        coins_tested=1,
+        data_errors=0,
+        execution_errors=0,
+        rejected_setups=0,
+        trades=[],
+        diagnostics={
+            "SHORT_SHADOW_MODE_ENABLED": 1,
+            "SHORT_SHADOW_DAILY_PERMISSION_DENIED_EVALUATIONS": 100,
+            "SHORT_SHADOW_SETUP_CANDIDATES": 2,
+            "SHORT_SHADOW_SIMULATED_TRADES": 2,
+            "SHORT_SHADOW_RESOLVED_TRADES": 2,
+            "SHORT_SHADOW_OUTCOME_TP": 1,
+            "SHORT_SHADOW_OUTCOME_SL": 1,
+            "SHORT_SHADOW_TOTAL_REALIZED_R_X1000": 500,
+            "SHORT_SHADOW_POSITIVE_R_X1000": 2000,
+            "SHORT_SHADOW_NEGATIVE_R_ABS_X1000": 1500,
+        },
+    )
+    report = format_report(summary)
+    assert "SHORT daily-gate shadow: ON (research-only; not added to portfolio trades)" in report
+    assert "These overlapping counterfactual outcomes are NOT a portfolio backtest." in report
+    assert "Win rate (TP / TP+SL): 50.0%" in report
+    assert "Total R / expectancy: +0.500R / 0.250R/trade" in report

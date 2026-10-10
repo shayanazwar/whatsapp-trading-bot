@@ -145,6 +145,44 @@ def test_v11_short_analysis_is_supported_symmetrically():
     assert result["stop_loss"] > result["entry"] > result["tp"]
 
 
+def test_short_shadow_bypasses_only_the_daily_permission_gate(monkeypatch):
+    daily, c4, c1, now = _build_fixture()
+    k = 316.8
+    daily_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in daily]
+    c4_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in c4]
+    c1_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in c1]
+
+    # Force a bullish daily regime over otherwise valid mirrored SHORT setup
+    # candles so the test isolates the current daily gate, not regime detection.
+    monkeypatch.setattr(
+        "app.analysis.engine._v11_regime_1d",
+        lambda _candles: {
+            "regime": "BULLISH", "bull": True, "bear": False,
+            "e21": 110.0, "e50": 105.0, "e200": 100.0,
+            "slope": 0.01, "adx": 20.0, "structure": "HH/HL",
+            "price": 110.0, "bull_votes": 5, "bear_votes": 1,
+        },
+    )
+
+    strict = analyze_candles("SHORT_SHADOW_TEST", daily_s, None, c4_s, c1_s, now_ms=now)
+    assert strict.get("setup") != "SHORT"
+    assert any(
+        "1D trend permission unavailable" in str(item.get("primary_failure", ""))
+        for item in strict.get("side_diagnostics", [])
+        if item.get("side") == "SHORT"
+    )
+
+    shadow = analyze_candles(
+        "SHORT_SHADOW_TEST", daily_s, None, c4_s, c1_s, now_ms=now,
+        research_short_shadow=True,
+    )
+    assert shadow["short_shadow_mode"] is True
+    assert shadow["short_shadow_daily_permission_available"] is False
+    assert shadow["short_daily_permission_bypassed"] is True
+    assert shadow["technical_candidate"] is True
+    assert shadow["setup"] == "SHORT"
+
+
 def test_v11_liquidity_trigger_accepts_wick_sweep_before_later_reclaim():
     _, _, c1, _ = _build_fixture()
     c1 = list(c1)

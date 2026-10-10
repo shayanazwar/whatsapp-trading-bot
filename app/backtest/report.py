@@ -73,14 +73,32 @@ def summarize(
     wins = sum(t.outcome == "TP" for t in resolved)
     losses = sum(t.outcome == "SL" for t in resolved)
     expired = sum(t.outcome == "EXPIRED" for t in resolved)
+    # Trade outcomes become realized at EXIT, not at signal time. The previous
+    # signal-time ordering could report an incorrect portfolio drawdown/streak
+    # when trades overlapped across symbols or exited in a different order.
+    realized_chronological = sorted(
+        resolved,
+        key=lambda t: (
+            int(t.exit_time_ms) if t.exit_time_ms is not None else int(t.signal_time_ms),
+            int(t.signal_time_ms),
+            str(t.symbol),
+            str(t.side),
+        ),
+    )
+    exit_pnl: dict[int, float] = {}
+    for trade in realized_chronological:
+        exit_time = int(trade.exit_time_ms) if trade.exit_time_ms is not None else int(trade.signal_time_ms)
+        exit_pnl[exit_time] = exit_pnl.get(exit_time, 0.0) + float(trade.r_multiple)
+
     running = peak = 0.0
     drawdown = 0.0
-    losing_streak = max_streak = 0
-    for t in resolved:
-        value = float(t.r_multiple)
-        running += value
+    for exit_time in sorted(exit_pnl):
+        running += exit_pnl[exit_time]
         peak = max(peak, running)
         drawdown = max(drawdown, peak - running)
+
+    losing_streak = max_streak = 0
+    for t in realized_chronological:
         if t.outcome == "SL":
             losing_streak += 1
             max_streak = max(max_streak, losing_streak)

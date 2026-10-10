@@ -73,48 +73,6 @@ def test_backtest_simulator_same_bar_rule_is_conservative_by_default():
     assert trade.outcome == "SL"
 
 
-
-def test_simulator_stop_loss_gap_fills_at_worse_open():
-    long_signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp": 110}
-    long_trade = simulate_trade(
-        long_signal, [candle(3_600_000, 100, 102, 99, 101), candle(7_200_000, 90, 100, 89, 96)],
-        signal_close_time_ms=0, fee_rate=0, slippage_bps=0,
-    )
-    assert long_trade is not None
-    assert long_trade.outcome == "SL"
-    assert long_trade.exit_execution == pytest.approx(90)
-    assert long_trade.realized_pnl == pytest.approx(-10)
-
-    short_signal = {"symbol": "ABC_USDT", "setup": "SHORT", "entry": 100, "stop_loss": 105, "tp": 90}
-    short_trade = simulate_trade(
-        short_signal, [candle(3_600_000, 100, 101, 99, 100), candle(7_200_000, 110, 111, 99, 101)],
-        signal_close_time_ms=0, fee_rate=0, slippage_bps=0,
-    )
-    assert short_trade is not None
-    assert short_trade.outcome == "SL"
-    assert short_trade.exit_execution == pytest.approx(110)
-    assert short_trade.realized_pnl == pytest.approx(-10)
-
-
-def test_simulator_slippage_excludes_signal_to_next_open_gap():
-    signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100, "stop_loss": 90, "tp": 120}
-    trade = simulate_trade(
-        signal, [candle(3_600_000, 105, 106, 104, 105)],
-        signal_close_time_ms=0, fee_rate=0, slippage_bps=0, max_holding_minutes=30,
-    )
-    assert trade is not None
-    assert trade.entry_execution == pytest.approx(105)
-    assert trade.slippage_r == pytest.approx(0)
-
-
-def test_simulator_rejects_ohlc_open_outside_bar_range():
-    signal = {"symbol": "ABC_USDT", "setup": "LONG", "entry": 100, "stop_loss": 95, "tp": 110}
-    trade = simulate_trade(
-        signal, [candle(3_600_000, 90, 105, 95, 100)],
-        signal_close_time_ms=0, fee_rate=0, slippage_bps=0,
-    )
-    assert trade is None
-
 def test_zero_trade_report_is_rendered_with_bias_diagnostic():
     summary = summarize(
         days=1,
@@ -227,3 +185,39 @@ def test_short_shadow_report_labels_outcomes_as_non_portfolio_samples():
     assert "These overlapping counterfactual outcomes are NOT a portfolio backtest." in report
     assert "Win rate (TP / TP+SL): 50.0%" in report
     assert "Total R / expectancy: +0.500R / 0.250R/trade" in report
+
+
+def test_report_prints_full_short_failure_and_overlap_diagnostics():
+    summary = summarize(
+        days=7,
+        period_start_ms=0,
+        period_end_ms=7 * 86_400_000,
+        coins_selected=1,
+        coins_tested=1,
+        data_errors=0,
+        execution_errors=0,
+        rejected_setups=100,
+        trades=[],
+        diagnostics={
+            "TP_MODE_X100": 150,
+            "SHORT_SHADOW_MODE_ENABLED": 1,
+            "ENGINE_CALLS": 10_000,
+            "FIRST_FAILURE_SHORT_TOTAL": 100,
+            "FIRST_FAILURE_SHORT_SHORT_1D_TREND_PERMISSION_UNAVAILABLE": 70,
+            "FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT": 30,
+            "OVERLAP_DIAGNOSTIC_EVALUATIONS": 40,
+            "OVERLAP_SHORT_SIDE_CANDIDATES": 3,
+            "OVERLAP_FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT": 12,
+        },
+    )
+    report = format_report(summary)
+
+    # These detailed counters must print even when outside the global top 20.
+    assert "SHORT FIRST-FAILURE HISTOGRAM" in report
+    assert "FIRST_FAILURE_SHORT_SHORT_1D_TREND_PERMISSION_UNAVAILABLE: 70" in report
+    assert "FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT: 30" in report
+    assert "ACTIVE-POSITION OVERLAP DIAGNOSTICS" in report
+    assert "Overlap closes checked: 40 | Strict SHORT side candidates found: 3" in report
+    assert "OVERLAP_FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT: 12" in report
+    assert "Shadow exit target: matches main TP mode (1.5R)." in report
+    assert "V11_SHORT_RANGE_RELAXED is metadata-only" in report

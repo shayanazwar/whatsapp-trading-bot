@@ -107,7 +107,8 @@ def test_zero_trade_report_is_rendered_with_bias_diagnostic():
     )
     text = format_report(summary)
     assert "Signals: 0" in text
-    assert "CURRENT_UNIVERSE_SNAPSHOT_BIAS" in text
+    assert "CURRENT_UNIVERSE_SNAPSHOT_BIAS" not in text
+    assert "GATE DIAGNOSTICS" not in text
 
 
 def test_simulator_reports_signal_rr_and_actual_fill_rr_separately():
@@ -200,10 +201,9 @@ def test_short_shadow_report_labels_outcomes_as_non_portfolio_samples():
         },
     )
     report = format_report(summary)
-    assert "SHORT daily-gate shadow: ON (research-only; not added to portfolio trades)" in report
-    assert "These overlapping counterfactual outcomes are NOT a portfolio backtest." in report
-    assert "Win rate (TP / TP+SL): 50.0%" in report
-    assert "Total R / expectancy: +0.500R / 0.250R/trade" in report
+    assert "SHORT DAILY-GATE SHADOW" not in report
+    assert "SHORT_SHADOW_" not in report
+    assert "GATE DIAGNOSTICS" not in report
 
 
 def test_report_prints_full_short_failure_and_overlap_diagnostics():
@@ -231,16 +231,14 @@ def test_report_prints_full_short_failure_and_overlap_diagnostics():
     )
     report = format_report(summary)
 
-    # These detailed counters must print even when outside the global top 20.
-    assert "SHORT FIRST-FAILURE HISTOGRAM" in report
-    assert "FIRST_FAILURE_SHORT_SHORT_1D_TREND_PERMISSION_UNAVAILABLE: 70" in report
-    assert "FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT: 30" in report
-    assert "ACTIVE-POSITION OVERLAP DIAGNOSTICS" in report
-    assert "Overlap closes checked: 40 | Strict SHORT side candidates found: 3" in report
-    assert "OVERLAP_FIRST_FAILURE_SHORT_SHORT_HOSTILE_12H_CONTEXT: 12" in report
-    assert "Shadow exit target: matches main TP mode (1.5R)." in report
-    assert "V11_SHORT_RANGE_RELAXED is metadata-only" in report
-    assert "Histogram reconciliation: categorized=100 | first_failures=100 | difference=0" in report
+    # Internal diagnostics remain available in the summary but are not dumped to WhatsApp.
+    assert "SHORT FIRST-FAILURE HISTOGRAM" not in report
+    assert "FIRST_FAILURE_SHORT_" not in report
+    assert "ACTIVE-POSITION OVERLAP DIAGNOSTICS" not in report
+    assert "OVERLAP_FIRST_FAILURE_SHORT_" not in report
+    assert "SHORT DAILY-GATE SHADOW" not in report
+    assert "V11_SHORT_RANGE_RELAXED is metadata-only" not in report
+    assert "GATE DIAGNOSTICS" not in report
 
 
 def test_frozen_snapshot_round_trip_preserves_normalized_candles_and_universe(tmp_path):

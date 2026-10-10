@@ -69,10 +69,10 @@ def test_report_prints_actual_build_config_and_fingerprint():
     )
     report = format_report(summary)
 
-    assert f"Engine Build: {config['engine_version']}" in report
-    assert "Impulse 2.50 ATR" in report
-    assert "Reclaim 6 x 1H" in report
-    assert f"Config Fingerprint: {config['fingerprint']}" in report
+    assert f"Engine Build: {config['engine_version']}" not in report
+    assert "Effective Config" not in report
+    assert "Config Fingerprint" not in report
+    assert "GATE DIAGNOSTICS" not in report
 
 
 def test_zero_trade_report_does_not_render_malformed_r_units():

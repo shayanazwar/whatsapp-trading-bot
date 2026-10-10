@@ -159,7 +159,7 @@ def test_zero_trade_backtest_report_is_always_rendered():
     report = format_report(summary)
     assert "Signals: 0" in report
     assert "Rejected Setups: 10" in report
-    assert "GATE DIAGNOSTICS" in report
+    assert "GATE DIAGNOSTICS" not in report
 
 
 @pytest.mark.parametrize("days", [1, 7])

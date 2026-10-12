@@ -16,7 +16,7 @@ def format_signal(signal: ValidatedSignal) -> str:
     d = signal.analysis
     score = int(d.get("score", 0) or 0)
     target_tf = d.get("target_timeframe") or "HTF"
-    return (
+    message = (
         "🚨 MEXC FUTURES TRADE SIGNAL\n\n"
         f"{signal.symbol} — {signal.side}\n\n"
         f"📍 Entry (NEXT 1H OPEN MARKET): ${fmt_price(signal.plan.entry)}\n"
@@ -33,6 +33,32 @@ def format_signal(signal: ValidatedSignal) -> str:
         f"📈 Score: {score}/100\n\n"
         "⚠️ Deterministic educational signal. Manage risk."
     )
+
+    # Surface model output transparently. In shadow mode it is advisory only.
+    ai = d.get("gemini_review")
+    if isinstance(ai, dict):
+        mode = str(ai.get("mode") or "shadow").strip().upper()
+        status = str(ai.get("status") or "ERROR").strip().upper()
+        if status == "OK":
+            verdict = str(ai.get("verdict") or "UNCERTAIN").strip().upper()
+            try:
+                confidence = max(0, min(100, int(ai.get("confidence", 0))))
+            except (TypeError, ValueError, OverflowError):
+                confidence = 0
+            message += f"\n\n🤖 Gemini Chart Review ({mode}): {verdict} · review confidence {confidence}/100"
+            summary = str(ai.get("summary") or "").strip()[:180]
+            if summary:
+                message += f"\n{summary}"
+            if mode == "SHADOW":
+                if verdict != "SUPPORT":
+                    message += "\n⚠️ AI raised concerns; shadow mode does not block this signal."
+                else:
+                    message += "\nℹ️ Shadow mode: V11 remains authoritative; AI verdict is being evaluated."
+        else:
+            message += "\n\n🤖 Gemini Chart Review: UNAVAILABLE"
+            if mode == "SHADOW":
+                message += " — shadow mode keeps V11 authoritative."
+    return message
 
 
 class SignalManager:

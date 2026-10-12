@@ -426,22 +426,12 @@ def simulate_trade(
                 return None
             return build_trade("EXPIRED", previous_close_time, expired=True)
 
-        # Track normalized adverse/favorable excursion before resolving the bar.
-        if risk_exec > 0 and entry_exec is not None:
-            if side == "LONG":
-                mae_r = max(mae_r, max(0.0, entry_exec - low) / risk_exec)
-                current_mfe = max(0.0, high - entry_exec) / risk_exec
-            else:
-                mae_r = max(mae_r, max(0.0, high - entry_exec) / risk_exec)
-                current_mfe = max(0.0, entry_exec - low) / risk_exec
-            mfe_r = max(mfe_r, current_mfe)
-            if current_mfe >= 1.0 and not mfe_1r_hit:
-                mfe_1r_hit = True
-                time_to_1r_minutes = _hold_minutes(fill_ts, close_time)
-            if current_mfe >= 1.5 and not mfe_1_5r_hit:
-                mfe_1_5r_hit = True
-                time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
-
+        # Resolve exit touches before updating excursions. A 1H OHLC candle does
+        # not reveal whether its high occurred before or after its low. Counting
+        # the entire exit candle first can falsely claim that a stopped trade had
+        # reached +1R/+1.5R, or that it experienced adverse movement beyond its
+        # stop while it was still open. For non-exit candles, the full range is
+        # observable while the trade remains open and is recorded normally.
         if side == "LONG":
             sl_touched = low <= stop
             tp_touched = high >= tp
@@ -458,7 +448,39 @@ def simulate_trade(
         else:
             first = None
 
+        if first is None:
+            if risk_exec > 0 and entry_exec is not None:
+                if side == "LONG":
+                    mae_r = max(mae_r, max(0.0, entry_exec - low) / risk_exec)
+                    current_mfe = max(0.0, high - entry_exec) / risk_exec
+                else:
+                    mae_r = max(mae_r, max(0.0, high - entry_exec) / risk_exec)
+                    current_mfe = max(0.0, entry_exec - low) / risk_exec
+                mfe_r = max(mfe_r, current_mfe)
+                if current_mfe >= 1.0 and not mfe_1r_hit:
+                    mfe_1r_hit = True
+                    time_to_1r_minutes = _hold_minutes(fill_ts, close_time)
+                if current_mfe >= 1.5 and not mfe_1_5r_hit:
+                    mfe_1_5r_hit = True
+                    time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
+            previous_close = close
+            previous_close_time = close_time
+            continue
+
         if first == "TP":
+            # The target level itself is a known favorable excursion. Ignore the
+            # remainder of this candle (which may have printed after exit), and
+            # do not infer the ordering of this candle's adverse extreme.
+            if risk_exec > 0 and entry_exec is not None:
+                target_mfe = abs(tp - entry_exec) / risk_exec
+                mfe_r = max(mfe_r, target_mfe)
+                elapsed = _hold_minutes(fill_ts, close_time)
+                if target_mfe >= 1.0 and not mfe_1r_hit:
+                    mfe_1r_hit = True
+                    time_to_1r_minutes = elapsed
+                if target_mfe >= 1.5 and not mfe_1_5r_hit:
+                    mfe_1_5r_hit = True
+                    time_to_1_5r_minutes = elapsed
             final_exec = execute_exit(tp)
             if final_exec is None:
                 return None
@@ -474,14 +496,23 @@ def simulate_trade(
                 stop_fill_base = max(stop, open_price)
             else:
                 stop_fill_base = stop
+
+            # The stop/gap execution level is known; the exit candle's opposite
+            # extreme is not known to have occurred before the stop. Record only
+            # this known adverse path point, and keep execution slippage separate.
+            if risk_exec > 0 and entry_exec is not None:
+                stop_mae = (
+                    max(0.0, entry_exec - stop_fill_base) / risk_exec
+                    if side == "LONG"
+                    else max(0.0, stop_fill_base - entry_exec) / risk_exec
+                )
+                mae_r = max(mae_r, stop_mae)
             final_exec = execute_exit(stop_fill_base)
             if final_exec is None:
                 return None
             sl_hit = True
             final_ts = close_time
             return build_trade("SL", final_ts)
-
-        previous_close = close
         previous_close_time = close_time
 
     if entry_exec is None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import logging
 import time
 from collections import Counter
@@ -21,7 +20,6 @@ from .mexc_client import MexcAPIError, MexcClient
 from .signal_manager import SignalManager
 from .paper_trader import PaperTrader
 from .signal_validator import validate_signal
-from .gemini_reviewer import GeminiChartReviewer
 from .universe import MexcUniverse
 
 LOGGER = logging.getLogger(__name__)
@@ -44,7 +42,6 @@ class MexcScanner:
         signal_manager: SignalManager,
         executor: MexcExecutor | None = None,
         paper_trader: PaperTrader | None = None,
-        gemini_reviewer: GeminiChartReviewer | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
@@ -52,12 +49,10 @@ class MexcScanner:
         self.signal_manager = signal_manager
         self.executor = executor
         self.paper_trader = paper_trader
-        self.gemini_reviewer = gemini_reviewer
         self._btc_context: dict[str, Any] = {"ok": False, "reason": "not loaded"}
         self._candle_cache: dict[tuple[str, str], tuple[int, list[Any]]] = {}
         self._candle_fetch_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._cache_limit = max(180, int(getattr(settings, "candle_limit", 650)))
-        self._gemini_shadow_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _reprice_for_next_1h_open(
@@ -199,91 +194,6 @@ class MexcScanner:
         self._log_stats(stats)
         return stats
 
-    def _queue_gemini_shadow_review(
-        self, *, symbol: str, side: str, analysis: dict[str, Any], candles: dict[str, list[Any]]
-    ) -> bool:
-        """Launch observation-only AI review without delaying/rejecting the V11 signal."""
-        if self.gemini_reviewer is None:
-            LOGGER.warning("GEMINI SHADOW REVIEW | symbol=%s status=ERROR reason=reviewer_not_configured", symbol)
-            return False
-        try:
-            # Isolate the task from later entry repricing mutations and bound its memory footprint.
-            analysis_snapshot = copy.deepcopy(analysis)
-            chart_bars = max(50, min(160, int(getattr(self.settings, "gemini_chart_bars", 100) or 100)))
-            candle_snapshot = {
-                timeframe: copy.deepcopy(rows[-chart_bars:])
-                for timeframe, rows in candles.items()
-                if timeframe in {"1D", "12H", "4H", "1H"}
-            }
-            task = asyncio.create_task(
-                self._run_gemini_shadow_review(
-                    symbol=symbol, side=side, analysis=analysis_snapshot, candles=candle_snapshot
-                ),
-                name=f"gemini-shadow-review-{symbol}",
-            )
-        except Exception as exc:
-            LOGGER.warning("GEMINI SHADOW REVIEW | symbol=%s status=ERROR reason=%s", symbol, type(exc).__name__)
-            return False
-        self._gemini_shadow_tasks.add(task)
-        task.add_done_callback(self._gemini_shadow_tasks.discard)
-        LOGGER.info(
-            "GEMINI SHADOW REVIEW | phase=queued symbol=%s side=%s candidate_time=%s model=%s",
-            symbol, side, analysis_snapshot.get("candle_close_time", "-"),
-            getattr(self.settings, "gemini_model", "gemini-3.8-flash"),
-        )
-        return True
-
-    async def _run_gemini_shadow_review(
-        self, *, symbol: str, side: str, analysis: dict[str, Any], candles: dict[str, list[Any]]
-    ) -> None:
-        """Run and log shadow review separately; it never mutates signal eligibility or prices."""
-        candidate_time = analysis.get("candle_close_time", "-")
-        try:
-            result = await self.gemini_reviewer.review(
-                symbol=symbol, side=side, analysis=analysis, candles=candles
-            )
-            if not isinstance(result, dict):
-                result = {
-                    "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                    "timeframe_alignment": "UNCLEAR", "reason_codes": ["invalid_reviewer_result"],
-                    "summary": "Gemini reviewer returned an invalid result",
-                }
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOGGER.warning("GEMINI SHADOW REVIEW | symbol=%s status=ERROR error_type=%s", symbol, type(exc).__name__)
-            result = {
-                "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                "timeframe_alignment": "UNCLEAR", "reason_codes": ["review_exception"],
-                "summary": "Gemini review failed",
-            }
-        reasons = result.get("reason_codes") or []
-        if not isinstance(reasons, list):
-            reasons = []
-        raw_confidence = result.get("confidence", 0)
-        confidence = raw_confidence if isinstance(raw_confidence, int) and not isinstance(raw_confidence, bool) else 0
-        LOGGER.info(
-            "GEMINI SHADOW REVIEW | phase=complete candidate_time=%s symbol=%s side=%s "
-            "status=%s verdict=%s confidence=%s alignment=%s cached=%s reasons=%s summary=%s",
-            candidate_time, symbol, side, result.get("status", "ERROR"),
-            result.get("verdict", "UNCERTAIN"), max(0, min(100, confidence)),
-            result.get("timeframe_alignment", "UNCLEAR"), bool(result.get("cached", False)),
-            ",".join(str(item)[:80] for item in reasons[:5]),
-            str(result.get("summary", ""))[:240],
-        )
-
-    async def close_gemini_shadow_reviews(self, timeout_seconds: float = 5.0) -> None:
-        """Drain completed shadow reviews briefly on shutdown, then cancel stragglers."""
-        tasks = list(self._gemini_shadow_tasks)
-        if not tasks:
-            return
-        _, pending = await asyncio.wait(tasks, timeout=max(0.0, float(timeout_seconds)))
-        if pending:
-            LOGGER.warning("Cancelling %d unfinished Gemini shadow reviews during shutdown", len(pending))
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
     def _empty_stats(self, symbols: int) -> dict[str, int]:
         return {
             "symbols": symbols,
@@ -309,12 +219,6 @@ class MexcScanner:
             "rejected_final": 0,
             "duplicate": 0,
             "cache_hits": 0,
-            "gemini_queued": 0,
-            "gemini_reviewed": 0,
-            "gemini_cache_hits": 0,
-            "gemini_veto_suggestions": 0,
-            "gemini_errors": 0,
-            "rejected_gemini": 0,
             "reason_counts": Counter(),
         }
 
@@ -335,15 +239,13 @@ class MexcScanner:
         LOGGER.info(
             "MEXC GATE REPORT | symbols=%d data=%d 1D=%d 12H=%d 4H=%d 1H=%d "
             "regime=%d bias=%d setup=%d trigger=%d quality=%d risk=%d rr=%d final=%d "
-            "sent=%d rejected=%d btc=%d execution=%d duplicate=%d errors=%d cache_hits=%d "
-            "gemini_queued=%d gemini_reviewed=%d gemini_cache_hits=%d gemini_veto_suggestions=%d gemini_errors=%d rejected_gemini=%d",
+            "sent=%d rejected=%d btc=%d execution=%d duplicate=%d errors=%d cache_hits=%d",
             stats["symbols"], stats["data_valid"], stats["pass_1d"], stats["pass_12h"],
             stats["pass_4h"], stats["pass_1h"], stats["regime_pass"], stats["bias_pass"],
             stats["setup_pass"], stats["trigger_pass"], stats["quality_pass"], stats["risk_pass"],
             stats["rr_pass"], stats["final_pass"], stats["sent"], stats["rejected"],
             stats["rejected_btc"], stats["rejected_execution"], stats["duplicate"], stats["errors"],
-            stats["cache_hits"], stats["gemini_queued"], stats["gemini_reviewed"], stats["gemini_cache_hits"],
-            stats["gemini_veto_suggestions"], stats["gemini_errors"], stats["rejected_gemini"],
+            stats["cache_hits"],
         )
         reasons = stats.get("reason_counts") or {}
         if reasons:
@@ -413,6 +315,7 @@ class MexcScanner:
                 symbol, c1d, c12, c4, c1,
                 btc_context=self._btc_context,
                 estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+                allow_shorts=False,
             )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
@@ -430,11 +333,12 @@ class MexcScanner:
                 stage = str(analysis.get("rejection_stage") or "SETUP")
                 return self._reject(symbol, failures, stage, payload)
 
-            # Keep SHORT analysis available for diagnostics, but optionally block
-            # SHORT signal/trade creation at the scanner boundary.
-            if side == "SHORT" and not bool(getattr(self.settings, "shorts_enabled", True)):
+            # This release is a strict LONG-only test: block SHORT at the
+            # execution/signal boundary even if a stale environment variable
+            # tries to re-enable it.
+            if side == "SHORT":
                 payload["short_analysis_detected"] = 1
-                return self._reject(symbol, "SHORT signals disabled by SHORTS_ENABLED=false", "SIDE_DISABLED", payload)
+                return self._reject(symbol, "SHORT signals disabled for LONG-only accuracy test", "SIDE_DISABLED", payload)
 
             # Check all strategy stages for diagnostics; reject at the first failed gate.
             # Reject at the first failed strategy gate while retaining all stage counters.
@@ -461,108 +365,6 @@ class MexcScanner:
             payload["btc_filter_reason"] = btc_reason
             if not btc_ok:
                 return self._reject(symbol, btc_reason, "BTC", payload)
-
-            # Review a technical candidate before live quote checks. This keeps model
-            # latency outside the entry freshness window; the deterministic validator
-            # and next-open reprice run afterward and remain authoritative.
-            gemini_mode = str(getattr(self.settings, "gemini_review_mode", "shadow") or "shadow").strip().lower()
-            if gemini_mode not in {"shadow", "gate"}:
-                LOGGER.error("Invalid GEMINI_REVIEW_MODE; rejecting candidate fail-closed")
-                gemini_mode = "gate"
-            gemini_enabled = bool(getattr(self.settings, "gemini_review_enabled", False))
-            if gemini_mode == "gate" and not gemini_enabled:
-                payload["rejected_gemini"] = 1
-                return self._reject(
-                    symbol, "GEMINI_REVIEW_MODE=gate requires GEMINI_REVIEW_ENABLED=true",
-                    "GEMINI_REVIEW", payload,
-                )
-            if gemini_enabled and gemini_mode == "shadow":
-                if self._queue_gemini_shadow_review(
-                    symbol=symbol, side=side, analysis=analysis,
-                    candles={"1D": c1d, "12H": c12, "4H": c4, "1H": c1},
-                ):
-                    payload["gemini_queued"] = 1
-                # Shadow is truly observational: do not await the API, mutate analysis,
-                # or let model latency consume the deterministic entry-freshness window.
-            elif gemini_enabled:
-                if self.gemini_reviewer is None:
-                    gemini_result = {
-                        "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                        "timeframe_alignment": "UNCLEAR", "reason_codes": ["reviewer_not_configured"],
-                        "summary": "Gemini reviewer is not configured", "error": "reviewer_not_configured",
-                        "model": str(getattr(self.settings, "gemini_model", "")),
-                    }
-                else:
-                    try:
-                        gemini_result = await self.gemini_reviewer.review(
-                            symbol=symbol, side=side, analysis=analysis,
-                            candles={"1D": c1d, "12H": c12, "4H": c4, "1H": c1},
-                        )
-                    except Exception as exc:
-                        # A reviewer bug/network failure must never affect shadow-mode eligibility.
-                        LOGGER.warning("Gemini reviewer raised for %s: %s", symbol, type(exc).__name__)
-                        gemini_result = {
-                            "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                            "timeframe_alignment": "UNCLEAR", "reason_codes": ["review_exception"],
-                            "summary": "Gemini review failed; see application logs",
-                            "error": f"review_exception:{type(exc).__name__}",
-                            "model": str(getattr(self.settings, "gemini_model", "")),
-                        }
-                # Preserve a bounded, structured AI result in signal diagnostics and alerts.
-                if not isinstance(gemini_result, dict):
-                    gemini_result = {
-                        "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                        "timeframe_alignment": "UNCLEAR", "reason_codes": ["invalid_reviewer_result"],
-                        "summary": "Gemini review returned an invalid result",
-                        "error": "invalid_reviewer_result",
-                        "model": str(getattr(self.settings, "gemini_model", "")),
-                    }
-                else:
-                    gemini_result = dict(gemini_result)
-                gemini_result["mode"] = gemini_mode
-                analysis["gemini_review"] = gemini_result
-                verdict = str(gemini_result.get("verdict") or "UNCERTAIN").upper()
-                alignment = str(gemini_result.get("timeframe_alignment") or "UNCLEAR").upper()
-                raw_confidence = gemini_result.get("confidence", 0)
-                if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, int):
-                    review_confidence = 0
-                else:
-                    review_confidence = max(0, min(100, raw_confidence))
-                minimum_gemini_confidence = max(0, min(100, int(getattr(self.settings, "gemini_min_confidence", 65))))
-                review_ok = str(gemini_result.get("status") or "ERROR").upper() == "OK"
-                gate_pass = (
-                    review_ok and verdict == "SUPPORT"
-                    and review_confidence >= minimum_gemini_confidence
-                    and alignment in {"ALIGNED", "MIXED"}
-                )
-                payload["gemini_reviewed"] = int(review_ok and not bool(gemini_result.get("cached", False)))
-                payload["gemini_cache_hits"] = int(bool(gemini_result.get("cached", False)))
-                payload["gemini_veto_suggestions"] = int(review_ok and verdict == "VETO")
-                payload["gemini_errors"] = int(not review_ok)
-                LOGGER.info(
-                    "GEMINI CANDIDATE REVIEW | symbol=%s side=%s mode=%s status=%s verdict=%s "
-                    "confidence=%s alignment=%s cached=%s reasons=%s",
-                    symbol, side, gemini_mode, gemini_result.get("status", "ERROR"), verdict,
-                    review_confidence, alignment,
-                    bool(gemini_result.get("cached", False)),
-                    ",".join(str(x) for x in (gemini_result.get("reason_codes") or [])[:5]),
-                )
-                if gemini_mode == "gate" and not gate_pass:
-                    payload["rejected_gemini"] = 1
-                    if not review_ok:
-                        detail = gemini_result.get("summary") or gemini_result.get("error") or "Gemini review failed"
-                    elif verdict != "SUPPORT":
-                        detail = f"Gemini verdict is {verdict}, not SUPPORT"
-                    elif review_confidence < minimum_gemini_confidence:
-                        detail = (
-                            f"Gemini review confidence {review_confidence} is below required "
-                            f"{minimum_gemini_confidence}"
-                        )
-                    else:
-                        detail = f"Gemini timeframe alignment is {alignment}"
-                    return self._reject(
-                        symbol, [f"Gemini gate rejected candidate: {detail}"], "GEMINI_REVIEW", payload,
-                    )
 
             try:
                 ticker = await self.client.get_ticker(symbol)
@@ -667,11 +469,6 @@ class MexcScanner:
                 "analysis": analysis,
                 "candle_cache_hits": cache_hits,
                 "duplicate": 0,
-                "gemini_queued": int(payload.get("gemini_queued", 0)),
-                "gemini_reviewed": int(payload.get("gemini_reviewed", 0)),
-                "gemini_cache_hits": int(payload.get("gemini_cache_hits", 0)),
-                "gemini_veto_suggestions": int(payload.get("gemini_veto_suggestions", 0)),
-                "gemini_errors": int(payload.get("gemini_errors", 0)),
             }
         except MexcAPIError as exc:
             LOGGER.warning(

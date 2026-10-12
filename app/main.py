@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .alerts import AlertEngine
 from .automation.executor import MexcExecutor
+from .automation.gemini_reviewer import GeminiChartReviewer
 from .automation.mexc_client import MexcClient
 from .automation.paper_trader import PaperTrader
 from .automation.scanner import MexcScanner
@@ -60,6 +61,7 @@ signal_manager = SignalManager(db=db, whatsapp=whatsapp, recipients=settings.aut
 mexc_executor = MexcExecutor(mexc_client, settings)
 paper_trader = PaperTrader(db=db, client=mexc_client, settings=settings)
 bot.set_paper_trader(paper_trader)
+gemini_reviewer = GeminiChartReviewer(settings)
 mexc_scanner = MexcScanner(
     client=mexc_client,
     settings=settings,
@@ -67,6 +69,7 @@ mexc_scanner = MexcScanner(
     signal_manager=signal_manager,
     executor=mexc_executor,
     paper_trader=paper_trader,
+    gemini_reviewer=gemini_reviewer,
 )
 scanner_scheduler = ScannerScheduler(mexc_scanner, interval_seconds=settings.scan_interval_seconds)
 
@@ -272,6 +275,11 @@ async def startup_event() -> None:
     logger.info("Graph API version=%s", settings.meta_graph_version)
     logger.info("MEXC API base=%s", settings.mexc_api_base_url)
     logger.info("Analysis timeframes=1D,12H,4H,1H")
+    logger.info(
+        "Gemini chart review enabled=%s mode=%s model=%s",
+        settings.gemini_review_enabled, settings.gemini_review_mode,
+        settings.gemini_model if settings.gemini_review_enabled else "disabled",
+    )
     logger.info("Scanner enabled=%s auto_signals=%s auto_trade=%s live_execution=%s paper_trading=%s", settings.scanner_enabled, settings.auto_signal_enabled, settings.auto_trade_enabled, settings.allow_live_execution, settings.paper_trading_enabled)
     await market.start()
     await alert_engine.start()
@@ -287,11 +295,15 @@ async def shutdown_event() -> None:
     with suppress(Exception):
         await scanner_scheduler.stop()
     with suppress(Exception):
+        await mexc_scanner.close_gemini_shadow_reviews(timeout_seconds=5.0)
+    with suppress(Exception):
         await paper_trader.stop()
     with suppress(Exception):
         await alert_engine.stop()
     with suppress(Exception):
         await market.close()
+    with suppress(Exception):
+        await gemini_reviewer.aclose()
     with suppress(Exception):
         await mexc_client.close()
     with suppress(Exception):

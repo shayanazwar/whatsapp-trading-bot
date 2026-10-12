@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .alerts import AlertEngine
 from .automation.executor import MexcExecutor
-from .automation.gemini_reviewer import GeminiChartReviewer
 from .automation.mexc_client import MexcClient
 from .automation.paper_trader import PaperTrader
 from .automation.scanner import MexcScanner
@@ -61,7 +60,6 @@ signal_manager = SignalManager(db=db, whatsapp=whatsapp, recipients=settings.aut
 mexc_executor = MexcExecutor(mexc_client, settings)
 paper_trader = PaperTrader(db=db, client=mexc_client, settings=settings)
 bot.set_paper_trader(paper_trader)
-gemini_reviewer = GeminiChartReviewer(settings)
 mexc_scanner = MexcScanner(
     client=mexc_client,
     settings=settings,
@@ -69,7 +67,6 @@ mexc_scanner = MexcScanner(
     signal_manager=signal_manager,
     executor=mexc_executor,
     paper_trader=paper_trader,
-    gemini_reviewer=gemini_reviewer,
 )
 scanner_scheduler = ScannerScheduler(mexc_scanner, interval_seconds=settings.scan_interval_seconds)
 

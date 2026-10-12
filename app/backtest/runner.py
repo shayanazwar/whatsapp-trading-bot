@@ -68,19 +68,23 @@ def _normalize_failure_diagnostic_key(value: str) -> str:
         .replace("/", "_")
     )
     number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?"
+    # Normalize both sides identically. The previous SHORT-only patterns left
+    # LONG diagnostics fragmented by prices/RR/ATR values, which made rejection
+    # histograms misleading precisely when LONG rejections dominated the run.
+    side = r"(?:LONG|SHORT)"
     normalized = re.sub(
-        rf"(SHORT_4H_IMPULSE_INVALIDATED_(?:ABOVE|BELOW)_ORIGIN)_{number}",
+        rf"({side}_4H_IMPULSE_INVALIDATED_(?:ABOVE|BELOW)_ORIGIN)_{number}",
         r"\1",
         normalized,
     )
     normalized = re.sub(
-        rf"SHORT_POST-COST_RR_{number}_<_REQUIRED_{number}",
-        "SHORT_POST-COST_RR_BELOW_REQUIRED",
+        rf"({side}_POST-COST_RR)_{number}_<_REQUIRED_{number}",
+        r"\1_BELOW_REQUIRED",
         normalized,
     )
     normalized = re.sub(
-        rf"SHORT_SL_DISTANCE_{number}_ATR_OUTSIDE_{number}-{number}_SAFETY_BOUNDS",
-        "SHORT_SL_DISTANCE_OUTSIDE_SAFETY_BOUNDS",
+        rf"({side}_SL_DISTANCE)_{number}_ATR_OUTSIDE_{number}-{number}_SAFETY_BOUNDS",
+        r"\1_OUTSIDE_SAFETY_BOUNDS",
         normalized,
     )
     return normalized[:160]
@@ -203,6 +207,39 @@ def _log_forensic_trade_audit(trades: Iterable[SimulatedTrade]) -> None:
             float(trade.fees_r), float(trade.slippage_r), float(getattr(trade, "funding_r", 0.0)), quality,
         )
     LOGGER.info("BACKTEST LOSS AUDIT END | audited=%d", len(audited))
+
+
+def _log_rejection_histogram(diagnostics: dict[str, int], technical_rejects: int, top_n: int = 12) -> None:
+    """Log normalized rejection counts and directional first-failure splits.
+
+    REJECT_* counters are multi-label (one evaluation may fail more than one
+    gate); SIDE_FIRST_FAILURE counters are one primary failure per side/evaluation.
+    Keep that distinction explicit so counts are not mistaken for unique setups.
+    """
+    def top_items(prefix: str, *, exclude_suffixes: tuple[str, ...] = ()) -> list[tuple[str, int]]:
+        rows = []
+        for key, raw_value in diagnostics.items():
+            if not key.startswith(prefix):
+                continue
+            if any(key.endswith(suffix) for suffix in exclude_suffixes):
+                continue
+            value = int(raw_value)
+            if value > 0:
+                rows.append((key[len(prefix):], value))
+        return sorted(rows, key=lambda item: (-item[1], item[0]))[:top_n]
+
+    rejects = top_items("REJECT_")
+    long_first = top_items("FIRST_FAILURE_LONG_", exclude_suffixes=("_TOTAL",))
+    short_first = top_items("FIRST_FAILURE_SHORT_", exclude_suffixes=("_TOTAL",))
+    LOGGER.info(
+        "BACKTEST REJECTION HISTOGRAM | technical_rejects=%d "
+        "reject_counts_are_multi_label=true top_gate_rejections=%s "
+        "long_first_failures=%s short_first_failures=%s",
+        int(technical_rejects),
+        json.dumps(rejects, separators=(",", ":")),
+        json.dumps(long_first, separators=(",", ":")),
+        json.dumps(short_first, separators=(",", ":")),
+    )
 
 
 # ============================================================
@@ -1087,14 +1124,10 @@ class BacktestRunner:
                     analysis.get("rejection_stage") or "technical_candidate"
                 ]
                 for failure in failures[:8]:
-                    key = (
-                        "REJECT_"
-                        + str(failure)
-                        .upper()
-                        .replace(" ", "_")
-                        .replace(":", "")
-                        .replace("/", "_")
-                    )
+                    # Use the same stable key as the side-first-failure counters;
+                    # raw prices otherwise split one failure family into thousands
+                    # of near-unique REJECT_* counters.
+                    key = "REJECT_" + _normalize_failure_diagnostic_key(str(failure))
                     inc(key)
                 continue
 
@@ -1731,6 +1764,7 @@ class BacktestRunner:
                 rejected_setups = int(
                     diagnostics.get("TECHNICAL_REJECT", 0)
                 )
+                _log_rejection_histogram(diagnostics, rejected_setups)
                 execution_errors = int(
                     state.get("engine_errors", 0)
                     + state.get("simulation_errors", 0)

@@ -1221,6 +1221,7 @@ def analyze_candles(
     btc_context: Optional[dict[str, Any]] = None,
     estimated_round_trip_cost_pct: float = 0.0015,
     research_short_shadow: bool = False,
+    allow_shorts: bool = True,
 ) -> dict[str, Any]:
     """V11 deterministic Trend Pullback / Value Re-entry engine.
 
@@ -1270,7 +1271,13 @@ def analyze_candles(
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
     side_diagnostics: list[dict[str, Any]] = []
-    sides_to_evaluate = ("SHORT",) if research_short_shadow else ("LONG", "SHORT")
+    # LONG-only deployments explicitly disable SHORT evaluation. The optional
+    # switch preserves existing research/tests, while live scanning and the
+    # backtest opt in to LONG-only behavior.
+    sides_to_evaluate = (
+        ("SHORT",) if research_short_shadow
+        else (("LONG", "SHORT") if allow_shorts else ("LONG",))
+    )
     for side in sides_to_evaluate:
         result = _v11_analyze_side(
             symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache,
@@ -1529,4 +1536,4 @@ async def analyze_symbol(market, symbol: str) -> dict[str, Any]:
     c4 = await market.ohlcv(ref, "4H", 650)
     c1 = await market.ohlcv(ref, "1H", 250)
     c12 = synthesize_12h_from_4h(c4)
-    return analyze_candles(ref.symbol, c1d, c12, c4, c1)
+    return analyze_candles(ref.symbol, c1d, c12, c4, c1, allow_shorts=False)

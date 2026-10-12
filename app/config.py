@@ -54,6 +54,17 @@ class Settings(BaseSettings):
     paper_fee_rate: float = Field(default=0.0006, alias="PAPER_FEE_RATE")
     paper_slippage_bps: float = Field(default=2.0, alias="PAPER_SLIPPAGE_BPS")
 
+    # Optional Gemini chart review. Shadow mode is deliberately the default and never gates signals.
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-3.8-flash", alias="GEMINI_MODEL")
+    gemini_review_enabled: bool = Field(default=False, alias="GEMINI_REVIEW_ENABLED")
+    gemini_review_mode: str = Field(default="shadow", alias="GEMINI_REVIEW_MODE")
+    gemini_min_confidence: int = Field(default=70, alias="GEMINI_MIN_CONFIDENCE")
+    gemini_timeout_seconds: float = Field(default=45.0, alias="GEMINI_TIMEOUT_SECONDS")
+    gemini_chart_bars: int = Field(default=100, alias="GEMINI_CHART_BARS")
+    gemini_max_concurrency: int = Field(default=2, alias="GEMINI_MAX_CONCURRENCY")
+    gemini_cache_ttl_seconds: int = Field(default=900, alias="GEMINI_CACHE_TTL_SECONDS")
+
     # Scanner switches
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")

@@ -24,11 +24,12 @@ import asyncio
 import inspect
 import json
 import logging
+import hashlib
 import os
 import re
 import time
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -68,23 +69,19 @@ def _normalize_failure_diagnostic_key(value: str) -> str:
         .replace("/", "_")
     )
     number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?"
-    # Normalize both sides identically. The previous SHORT-only patterns left
-    # LONG diagnostics fragmented by prices/RR/ATR values, which made rejection
-    # histograms misleading precisely when LONG rejections dominated the run.
-    side = r"(?:LONG|SHORT)"
     normalized = re.sub(
-        rf"({side}_4H_IMPULSE_INVALIDATED_(?:ABOVE|BELOW)_ORIGIN)_{number}",
+        rf"(SHORT_4H_IMPULSE_INVALIDATED_(?:ABOVE|BELOW)_ORIGIN)_{number}",
         r"\1",
         normalized,
     )
     normalized = re.sub(
-        rf"({side}_POST-COST_RR)_{number}_<_REQUIRED_{number}",
-        r"\1_BELOW_REQUIRED",
+        rf"SHORT_POST-COST_RR_{number}_<_REQUIRED_{number}",
+        "SHORT_POST-COST_RR_BELOW_REQUIRED",
         normalized,
     )
     normalized = re.sub(
-        rf"({side}_SL_DISTANCE)_{number}_ATR_OUTSIDE_{number}-{number}_SAFETY_BOUNDS",
-        r"\1_OUTSIDE_SAFETY_BOUNDS",
+        rf"SHORT_SL_DISTANCE_{number}_ATR_OUTSIDE_{number}-{number}_SAFETY_BOUNDS",
+        "SHORT_SL_DISTANCE_OUTSIDE_SAFETY_BOUNDS",
         normalized,
     )
     return normalized[:160]
@@ -207,39 +204,6 @@ def _log_forensic_trade_audit(trades: Iterable[SimulatedTrade]) -> None:
             float(trade.fees_r), float(trade.slippage_r), float(getattr(trade, "funding_r", 0.0)), quality,
         )
     LOGGER.info("BACKTEST LOSS AUDIT END | audited=%d", len(audited))
-
-
-def _log_rejection_histogram(diagnostics: dict[str, int], technical_rejects: int, top_n: int = 12) -> None:
-    """Log normalized rejection counts and directional first-failure splits.
-
-    REJECT_* counters are multi-label (one evaluation may fail more than one
-    gate); SIDE_FIRST_FAILURE counters are one primary failure per side/evaluation.
-    Keep that distinction explicit so counts are not mistaken for unique setups.
-    """
-    def top_items(prefix: str, *, exclude_suffixes: tuple[str, ...] = ()) -> list[tuple[str, int]]:
-        rows = []
-        for key, raw_value in diagnostics.items():
-            if not key.startswith(prefix):
-                continue
-            if any(key.endswith(suffix) for suffix in exclude_suffixes):
-                continue
-            value = int(raw_value)
-            if value > 0:
-                rows.append((key[len(prefix):], value))
-        return sorted(rows, key=lambda item: (-item[1], item[0]))[:top_n]
-
-    rejects = top_items("REJECT_")
-    long_first = top_items("FIRST_FAILURE_LONG_", exclude_suffixes=("_TOTAL",))
-    short_first = top_items("FIRST_FAILURE_SHORT_", exclude_suffixes=("_TOTAL",))
-    LOGGER.info(
-        "BACKTEST REJECTION HISTOGRAM | technical_rejects=%d "
-        "reject_counts_are_multi_label=true top_gate_rejections=%s "
-        "long_first_failures=%s short_first_failures=%s",
-        int(technical_rejects),
-        json.dumps(rejects, separators=(",", ":")),
-        json.dumps(long_first, separators=(",", ":")),
-        json.dumps(short_first, separators=(",", ":")),
-    )
 
 
 # ============================================================
@@ -1124,10 +1088,14 @@ class BacktestRunner:
                     analysis.get("rejection_stage") or "technical_candidate"
                 ]
                 for failure in failures[:8]:
-                    # Use the same stable key as the side-first-failure counters;
-                    # raw prices otherwise split one failure family into thousands
-                    # of near-unique REJECT_* counters.
-                    key = "REJECT_" + _normalize_failure_diagnostic_key(str(failure))
+                    key = (
+                        "REJECT_"
+                        + str(failure)
+                        .upper()
+                        .replace(" ", "_")
+                        .replace(":", "")
+                        .replace("/", "_")
+                    )
                     inc(key)
                 continue
 
@@ -1764,7 +1732,6 @@ class BacktestRunner:
                 rejected_setups = int(
                     diagnostics.get("TECHNICAL_REJECT", 0)
                 )
-                _log_rejection_histogram(diagnostics, rejected_setups)
                 execution_errors = int(
                     state.get("engine_errors", 0)
                     + state.get("simulation_errors", 0)
@@ -1832,6 +1799,48 @@ class BacktestRunner:
                         settings=self.settings,
                         project_root=project_root,
                         runner_max_concurrency=self.max_concurrency,
+                    )
+
+                # Always emit a compact, deterministic trade ledger fingerprint.
+                # This is intentionally diagnostics-only: it does not feed any
+                # values back into signal generation or simulation. It lets us
+                # distinguish a code/data/universe change from a report-only
+                # metric change using the Render logs, even when snapshot mode
+                # was not enabled for the run.
+                ordered_ledger = sorted(
+                    trades,
+                    key=lambda trade: (
+                        int(trade.signal_time_ms), str(trade.symbol), str(trade.side)
+                    ),
+                )
+                ledger_rows = [
+                    asdict(trade) if is_dataclass(trade) else dict(vars(trade))
+                    for trade in ordered_ledger
+                ]
+                ledger_canonical = json.dumps(
+                    ledger_rows, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
+                ).encode("utf-8")
+                symbol_canonical = json.dumps(
+                    [str(symbol).upper() for symbol in symbols],
+                    separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")
+                LOGGER.info(
+                    "BACKTEST FORENSIC FINGERPRINT | start_ms=%d end_ms=%d "
+                    "tp_mode=%s tested=%d symbols=%d symbols_sha256=%s "
+                    "trade_count=%d trade_ledger_sha256=%s",
+                    int(start_ms), int(end_ms), tp_config.mode, state["tested"],
+                    len(symbols), hashlib.sha256(symbol_canonical).hexdigest(),
+                    len(ledger_rows), hashlib.sha256(ledger_canonical).hexdigest(),
+                )
+                for ledger_index, ledger_row in enumerate(ledger_rows, start=1):
+                    LOGGER.info(
+                        "BACKTEST TRADE LEDGER ROW | index=%d payload=%s",
+                        ledger_index,
+                        json.dumps(
+                            ledger_row, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=False, allow_nan=False,
+                        ),
                     )
 
                 LOGGER.info(

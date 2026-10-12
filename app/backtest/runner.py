@@ -748,7 +748,9 @@ class BacktestRunner:
         c1d_prefix: list = []
         c12_prefix: list = []
         c4_prefix: list = []
-        short_shadow_enabled = bool(getattr(self.settings, "backtest_short_shadow_enabled", False))
+        # LONG-only experiment: exclude SHORT shadow observations as well as live trades.
+        # The research code remains available for a future explicitly requested build.
+        short_shadow_enabled = False
         seen_shadow_structures: set[tuple[Any, ...]] = set()
 
         def inc(key: str, amount: int = 1) -> None:
@@ -978,6 +980,7 @@ class BacktestRunner:
                             cache=engine_cache,
                             btc_context=btc_context,
                             estimated_round_trip_cost_pct=qualification_cost_pct,
+                            allow_shorts=False,
                         )
                     except ValueError:
                         inc("OVERLAP_DIAGNOSTIC_DATA_QUALITY_ERRORS")
@@ -1021,6 +1024,7 @@ class BacktestRunner:
                     cache=engine_cache,
                     btc_context=btc_context,
                     estimated_round_trip_cost_pct=qualification_cost_pct,
+                    allow_shorts=False,
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -1123,11 +1127,15 @@ class BacktestRunner:
                 or analysis.get("setup_candidate")
                 or ""
             ).upper()
-            if side not in {"LONG", "SHORT"}:
-                inc("INVALID_ENGINE_SIDE")
+            if side != "LONG":
+                inc("LONG_ONLY_SIDE_BLOCKED")
+                LOGGER.warning(
+                    "BACKTEST LONG-ONLY GUARD | symbol=%s signal_close_ms=%s blocked_side=%s",
+                    history.symbol, signal_close_ms, side or "UNKNOWN",
+                )
                 continue
 
-            inc(f"FULL_ENGINE_ACCEPT_{side}")
+            inc("FULL_ENGINE_ACCEPT_LONG")
 
             structure_key = (
                 side,
@@ -1339,7 +1347,7 @@ class BacktestRunner:
     async def run(
         self,
         days: int,
-        tp_mode: str = "CONTROL",
+        tp_mode: str = "1.5R",
     ) -> BacktestSummary:
         """Run a complete causal paper backtest with an exit-only TP mode."""
 
@@ -1479,7 +1487,7 @@ class BacktestRunner:
                     )
                     _write_backtest_cost_diagnostics(
                         summary_payload["diagnostics"], self.settings,
-                        short_shadow_enabled=bool(getattr(self.settings, "backtest_short_shadow_enabled", False)),
+                        short_shadow_enabled=False,
                     )
                     params = inspect.signature(summarize).parameters
                     if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
@@ -1712,7 +1720,7 @@ class BacktestRunner:
                 )
                 _write_backtest_cost_diagnostics(
                     diagnostics, self.settings,
-                    short_shadow_enabled=bool(getattr(self.settings, "backtest_short_shadow_enabled", False)),
+                    short_shadow_enabled=False,
                 )
 
                 # Build the complete current summary payload.  The deployed

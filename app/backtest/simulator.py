@@ -460,7 +460,7 @@ def simulate_trade(
                 if current_mfe >= 1.0 and not mfe_1r_hit:
                     mfe_1r_hit = True
                     time_to_1r_minutes = _hold_minutes(fill_ts, close_time)
-                if current_mfe >= 1.5 and not mfe_1_5r_hit:
+                if current_mfe >= (1.5 - 1e-9) and not mfe_1_5r_hit:
                     mfe_1_5r_hit = True
                     time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
             previous_close = close
@@ -478,7 +478,7 @@ def simulate_trade(
                 if target_mfe >= 1.0 and not mfe_1r_hit:
                     mfe_1r_hit = True
                     time_to_1r_minutes = elapsed
-                if target_mfe >= 1.5 and not mfe_1_5r_hit:
+                if target_mfe >= (1.5 - 1e-9) and not mfe_1_5r_hit:
                     mfe_1_5r_hit = True
                     time_to_1_5r_minutes = elapsed
             final_exec = execute_exit(tp)

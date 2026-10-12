@@ -45,10 +45,72 @@ class BacktestSummary:
     engine_version: str = ""
     engine_config_fingerprint: str = ""
     engine_config: Mapping[str, Any] = field(default_factory=dict)
+    long_cohorts: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
     return [t for t in trades if t.outcome in {"TP", "SL", "EXPIRED"} and t.r_multiple is not None and math.isfinite(float(t.r_multiple))]
+
+
+def _finite_quality(trade: SimulatedTrade, key: str) -> float | None:
+    quality = getattr(trade, "quality", {}) or {}
+    if not isinstance(quality, Mapping) or key not in quality:
+        return None
+    try:
+        value = float(quality[key])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _long_cohort_stats(label: str, trades: Sequence[SimulatedTrade]) -> dict[str, Any] | None:
+    resolved = [
+        trade for trade in trades
+        if str(getattr(trade, "outcome", "")).upper() in {"TP", "SL", "EXPIRED"}
+        and getattr(trade, "r_multiple", None) is not None
+        and math.isfinite(float(trade.r_multiple))
+    ]
+    if not resolved:
+        return None
+    wins = sum(str(trade.outcome).upper() == "TP" for trade in resolved)
+    losses = sum(str(trade.outcome).upper() == "SL" for trade in resolved)
+    counted = wins + losses
+    values = [float(trade.r_multiple) for trade in resolved]
+    return {
+        "label": label,
+        "n": len(resolved),
+        "tp": wins,
+        "sl": losses,
+        "expired": sum(str(trade.outcome).upper() == "EXPIRED" for trade in resolved),
+        "win_rate": (100.0 * wins / counted) if counted else None,
+        "total_r": sum(values),
+        "expectancy_r": mean(values) if values else None,
+    }
+
+
+def _build_long_cohorts(trades: Sequence[SimulatedTrade]) -> tuple[Mapping[str, Any], ...]:
+    """Exploratory cohorts over completed LONG trades; does not alter signal selection."""
+    longs = [trade for trade in trades if str(getattr(trade, "side", "")).upper() == "LONG"]
+    definitions = (
+        ("Score <85", "score", lambda value: value < 85.0),
+        ("Score >=85", "score", lambda value: value >= 85.0),
+        ("RVOL <0.75", "rvol_1h", lambda value: value < 0.75),
+        ("RVOL >=0.75", "rvol_1h", lambda value: value >= 0.75),
+        ("Trigger <0.80", "trigger_quality_1h", lambda value: value < 0.80),
+        ("Trigger >=0.80", "trigger_quality_1h", lambda value: value >= 0.80),
+        ("Confirmations <=4/6", "confirmation_families_passed", lambda value: value <= 4.0),
+        ("Confirmations >=5/6", "confirmation_families_passed", lambda value: value >= 5.0),
+    )
+    rows: list[Mapping[str, Any]] = []
+    for label, key, predicate in definitions:
+        cohort = [
+            trade for trade in longs
+            if (value := _finite_quality(trade, key)) is not None and predicate(value)
+        ]
+        stats = _long_cohort_stats(label, cohort)
+        if stats is not None:
+            rows.append(stats)
+    return tuple(rows)
 
 
 def summarize(
@@ -162,6 +224,7 @@ def summarize(
         engine_version=str(engine_version or ""),
         engine_config_fingerprint=str(engine_config_fingerprint or ""),
         engine_config=dict(engine_config or {}),
+        long_cohorts=_build_long_cohorts(ordered),
     )
 
 
@@ -179,10 +242,17 @@ def format_report(summary: BacktestSummary) -> str:
     tp_mode_x100 = int(diagnostics.get("TP_MODE_X100", 0))
     tp_mode = "CONTROL" if tp_mode_x100 == 0 else f"{tp_mode_x100 / 100.0:.1f}R"
 
+    period_label = f"{summary.days}D"
+    duration_days = (int(summary.period_end_ms) - int(summary.period_start_ms)) / 86_400_000.0
+    if fixed_period and duration_days > 0 and abs(duration_days - summary.days) >= 0.5:
+        rounded_days = round(duration_days)
+        actual_label = f"{rounded_days}D" if abs(duration_days - rounded_days) < 0.05 else f"{duration_days:.1f}D"
+        period_label = f"{actual_label} actual (requested {summary.days}D)"
+
     lines = [
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Period: {summary.days}D ({start} → {end}) | {'FIXED' if fixed_period else 'ROLLING'}",
+        f"Period: {period_label} ({start} → {end}) | {'FIXED' if fixed_period else 'ROLLING'}",
         f"TP Mode: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
@@ -201,6 +271,18 @@ def format_report(summary: BacktestSummary) -> str:
         f"📉 Max Drawdown: {summary.max_drawdown_r:.2f}R",
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
         f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r, 2, 'R')} / {_fmt(summary.avg_mfe_r, 2, 'R')}",
+    ]
+    if summary.long_cohorts:
+        lines.extend(["", "🔎 LONG COHORT CHECKS (exploratory; same realized trades)"])
+        for cohort in summary.long_cohorts:
+            win_rate = _fmt(cohort.get("win_rate"), 1, "%")
+            expectancy = _fmt(cohort.get("expectancy_r"), 2, "R")
+            lines.append(
+                f"{cohort['label']}: n={cohort['n']} TP/SL={cohort['tp']}/{cohort['sl']} "
+                f"WR={win_rate} Exp={expectancy} Total={float(cohort['total_r']):+.2f}R"
+            )
+        lines.append("Cohorts are diagnostic only; they do not filter signals.")
+    lines.extend([
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
         f"⚠️ Data Errors: {summary.data_errors} | Execution Errors: {summary.execution_errors}",
@@ -208,5 +290,5 @@ def format_report(summary: BacktestSummary) -> str:
         "━━━━━━━━━━━━━━━━━━━━",
         "⚠️ PAPER BACKTEST — no real trades executed.",
         "Fees and slippage are simulated; funding is an estimate, not historical settlement data.",
-    ]
+    ])
     return "\n".join(lines)

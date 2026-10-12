@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     # Scanner switches
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
-    shorts_enabled: bool = Field(default=True, alias="SHORTS_ENABLED")
+    shorts_enabled: bool = Field(default=False, alias="SHORTS_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(default=3600, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")
@@ -105,18 +105,6 @@ class Settings(BaseSettings):
     # Research-only counterfactual evaluation of SHORT setups rejected solely
     # by the existing daily bearish-permission gate. Never changes live signals.
     backtest_short_shadow_enabled: bool = Field(default=False, alias="V11_BACKTEST_SHORT_SHADOW_ENABLED")
-
-    # Optional Gemini Vision review of already validated V11 candidates.
-    # Disabled by default; shadow mode never changes signal approval.
-    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-3.8-flash", alias="GEMINI_MODEL")
-    gemini_review_enabled: bool = Field(default=False, alias="GEMINI_REVIEW_ENABLED")
-    gemini_review_mode: str = Field(default="shadow", alias="GEMINI_REVIEW_MODE")
-    gemini_min_confidence: int = Field(default=65, alias="GEMINI_MIN_CONFIDENCE")
-    gemini_timeout_seconds: float = Field(default=45.0, alias="GEMINI_TIMEOUT_SECONDS")
-    gemini_chart_bars: int = Field(default=100, alias="GEMINI_CHART_BARS")
-    gemini_max_concurrency: int = Field(default=2, alias="GEMINI_MAX_CONCURRENCY")
-    gemini_cache_ttl_seconds: int = Field(default=900, alias="GEMINI_CACHE_TTL_SECONDS")
 
     # Additional live-trading kill switch
     allow_live_execution: bool = Field(default=False, alias="ALLOW_LIVE_EXECUTION")

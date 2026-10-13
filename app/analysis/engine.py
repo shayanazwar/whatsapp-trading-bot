@@ -12,11 +12,31 @@ causally synthesized from three completed 4H candles.
 import hashlib
 import json
 import math
+import os
 import time
 from bisect import bisect_right
 from typing import Any, Iterable, List, Optional, Tuple
 
 from .indicators import atr, ema, rsi, volume_status
+from .patterns import (
+    BREAKOUT_MAX_EXTENSION_ATR,
+    BREAKOUT_MIN_BODY_RATIO,
+    BREAKOUT_MIN_CLOSE_LOCATION,
+    BREAKOUT_MIN_RELATIVE_VOLUME,
+    BREAKOUT_RETEST_BARS_1H,
+    TRIANGLE_LOOKBACK_4H,
+    TRIANGLE_MAX_ANCHOR_AGE_4H,
+    TRIANGLE_MAX_APEX_DISTANCE_4H,
+    TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR,
+    TRIANGLE_MAX_CURRENT_WIDTH_RATIO,
+    TRIANGLE_MAX_HEIGHT_ATR,
+    TRIANGLE_MAX_SPAN_4H,
+    TRIANGLE_MIN_CURRENT_WIDTH_ATR,
+    TRIANGLE_MIN_HEIGHT_ATR,
+    TRIANGLE_MIN_SPAN_4H,
+    confirm_triangle_breakout,
+    detect_triangle_pattern,
+)
 
 TIMEFRAME_MS = {
     "1h": 3_600_000,
@@ -61,7 +81,9 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V11-balanced-value-pullback-liquidity-reclaim-config-guard-1"
+ENGINE_VERSION = "V12-trendline-triangle-breakout-1d-12h-4h-1h"
+SETUP_ARCHITECTURE = str(os.getenv("MEXC_SETUP_ARCHITECTURE", "TRIANGLE_BREAKOUT")).strip().upper()
+SUPPORTED_SETUP_ARCHITECTURES = ("TRIANGLE_BREAKOUT", "LEGACY_PULLBACK", "HYBRID")
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -469,27 +491,58 @@ V11_SHOCK_RANGE_ATR = 4.50
 # same module successfully and reports the active mode truthfully.
 V11_SL_MODE = "LIQUIDITY_SWEEP"
 
-def engine_config_snapshot() -> dict[str, Any]:
-    """Return the effective strategy configuration and a stable fingerprint.
+def _active_stop_loss_mode(signal_setup_type: str | None = None) -> str:
+    """Return the actual stop geometry for the selected architecture/setup."""
+    if signal_setup_type == "TRIANGLE_BREAKOUT":
+        return "OPPOSITE_TRIANGLE_BOUNDARY"
+    if signal_setup_type == "LEGACY_PULLBACK":
+        return str(V11_SL_MODE).upper()
+    if SETUP_ARCHITECTURE == "TRIANGLE_BREAKOUT":
+        return "OPPOSITE_TRIANGLE_BOUNDARY"
+    if SETUP_ARCHITECTURE == "LEGACY_PULLBACK":
+        return str(V11_SL_MODE).upper()
+    return "SETUP_SPECIFIC_STRUCTURAL"
 
-    The fingerprint is intentionally derived from the same module constants
-    used by the engine. Backtest reports can therefore prove which effective
-    settings produced their results instead of guessing from experiment labels.
+
+def engine_config_snapshot(signal_setup_type: str | None = None) -> dict[str, Any]:
+    """Return effective strategy settings with a stable, reproducible fingerprint.
+
+    Legacy V11 values are retained explicitly for baseline experiments, while
+    stop-loss mode and the pattern thresholds identify the active architecture.
     """
     config: dict[str, Any] = {
         "engine_version": ENGINE_VERSION,
+        "setup_architecture": SETUP_ARCHITECTURE,
         "timeframes": list(APPROVED_TIMEFRAMES),
         "min_rr": float(V11_MIN_RR),
         "min_impulse_atr": float(V11_MIN_IMPULSE_ATR),
         "setup_max_4h_bars": int(V11_SETUP_MAX_4H_BARS),
         "max_trigger_bars_1h": int(V11_MAX_TRIGGER_BARS),
         "short_range_relaxed": bool(V11_SHORT_RANGE_RELAXED),
-        "stop_loss_mode": str(V11_SL_MODE).upper(),
+        "stop_loss_mode": _active_stop_loss_mode(signal_setup_type),
+        "legacy_stop_loss_mode": str(V11_SL_MODE).upper(),
         "stop_buffer_atr_4h": float(V11_STOP_BUFFER_ATR_4H),
         "stop_buffer_atr_1h": float(V11_STOP_BUFFER_ATR_1H),
         "min_sl_atr_sanity": float(V11_MIN_SL_ATR_SANITY),
         "max_sl_atr_sanity": float(V11_MAX_SL_ATR_SANITY),
         "shock_range_atr": float(V11_SHOCK_RANGE_ATR),
+        "triangle_lookback_4h": int(TRIANGLE_LOOKBACK_4H),
+        "triangle_max_anchor_age_4h": int(TRIANGLE_MAX_ANCHOR_AGE_4H),
+        "triangle_min_span_4h": int(TRIANGLE_MIN_SPAN_4H),
+        "triangle_max_span_4h": int(TRIANGLE_MAX_SPAN_4H),
+        "triangle_min_height_atr": float(TRIANGLE_MIN_HEIGHT_ATR),
+        "triangle_max_height_atr": float(TRIANGLE_MAX_HEIGHT_ATR),
+        "triangle_min_current_width_atr": float(TRIANGLE_MIN_CURRENT_WIDTH_ATR),
+        "triangle_max_current_width_ratio": float(TRIANGLE_MAX_CURRENT_WIDTH_RATIO),
+        "triangle_max_apex_distance_4h": int(TRIANGLE_MAX_APEX_DISTANCE_4H),
+        "triangle_max_boundary_extension_atr": float(TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR),
+        "breakout_retest_bars_1h": int(BREAKOUT_RETEST_BARS_1H),
+        "breakout_min_relative_volume": float(BREAKOUT_MIN_RELATIVE_VOLUME),
+        "breakout_max_extension_atr": float(BREAKOUT_MAX_EXTENSION_ATR),
+        "breakout_min_body_ratio": float(BREAKOUT_MIN_BODY_RATIO),
+        "breakout_min_close_location": float(BREAKOUT_MIN_CLOSE_LOCATION),
+        "triangle_target_mode": "MEASURED_MOVE",
+        "triangle_stop_mode": "OPPOSITE_TRIANGLE_BOUNDARY",
     }
     canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False)
     config["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
@@ -518,6 +571,10 @@ def validate_engine_config() -> None:
         )
     if tuple(APPROVED_TIMEFRAMES) != ("1D", "12H", "4H", "1H"):
         raise RuntimeError("V11 timeframe contract changed; allowed frames are exactly 1D/12H/4H/1H.")
+    if SETUP_ARCHITECTURE not in SUPPORTED_SETUP_ARCHITECTURES:
+        raise ValueError(
+            f"Invalid MEXC_SETUP_ARCHITECTURE={SETUP_ARCHITECTURE!r}; expected one of {SUPPORTED_SETUP_ARCHITECTURES}."
+        )
 
 def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
     """Return a swing structure only when price pivots form a valid sequence.
@@ -925,6 +982,186 @@ def _v11_score(features: dict[str, float]) -> tuple[int, dict[str, int]]:
     return sum(groups.values()), groups
 
 
+def _triangle_analyze_side(
+    symbol: str,
+    side: str,
+    c1d: list[Candle],
+    c12: list[Candle],
+    c4: list[Candle],
+    c1: list[Candle],
+    daily: dict[str, Any],
+    cost_pct: float,
+    btc_context: dict[str, Any] | None,
+    cache: Optional[dict[str, Any]] = None,
+    *,
+    research_short_daily_gate_bypass: bool = False,
+) -> dict[str, Any]:
+    """Evaluate a causal 1D/12H/4H triangle-breakout setup for one direction."""
+    context = _memoized_frame_value(
+        cache, f"_triangle_context_12h_{side.lower()}", c12,
+        lambda: _v11_context_12h(c12, side),
+    )
+    direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+    bypass = bool(research_short_daily_gate_bypass and side == "SHORT" and not direction_ok)
+
+    def reject(reason: str) -> dict[str, Any]:
+        message = str(reason)
+        return {
+            "side": side, "setup_type": "TRIANGLE_BREAKOUT", "direction_ok": direction_ok,
+            "context": context, "candidate": False, "reason": message,
+            "primary_failure": message, "diagnostic_key": message.split("(", 1)[0].strip().upper(),
+            "technical_gate_failures": [message], "rejection_stage": "SETUP",
+        }
+
+    if research_short_daily_gate_bypass and side == "SHORT" and direction_ok:
+        return reject("SHORT shadow not applicable: strict 1D bearish permission is already available")
+    if not direction_ok and not bypass:
+        return reject(
+            f"{side}: 1D direction permission unavailable for triangle breakout "
+            f"(regime={daily.get('regime') or 'NEUTRAL'}, "
+            f"bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
+        )
+    if context.get("hostile"):
+        return reject(f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})")
+
+    atr4 = _memoized_frame_value(cache, "_triangle_atr_4h", c4, lambda: _safe_atr(c4))
+    atr1 = _memoized_frame_value(cache, "_triangle_atr_1h", c1, lambda: _safe_atr(c1))
+    if atr4 <= 0 or atr1 <= 0:
+        return reject("Triangle breakout: ATR unavailable")
+    pattern = _memoized_frame_value(
+        cache, "_triangle_pattern_4h", c4,
+        lambda: detect_triangle_pattern(c4, atr4),
+    )
+    if not pattern:
+        return reject("No mature converging 4H triangle with confirmed pivot touches")
+
+    trigger = confirm_triangle_breakout(c1, c4, pattern, side, atr1)
+    if not trigger:
+        return reject(f"{side}: no confirmed 1H triangle breakout or valid retest")
+
+    current = c1[-1]
+    entry = float(current["close"])
+    x = (int(current["time"]) - int(c4[0]["time"])) / TIMEFRAME_MS["4h"]
+    upper_line = float(pattern["upper_slope"]) * x + float(pattern["upper_intercept"])
+    lower_line = float(pattern["lower_slope"]) * x + float(pattern["lower_intercept"])
+    buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
+    if side == "LONG":
+        stop = lower_line - buffer
+        tp = float(trigger["boundary"]) + float(pattern["height"])
+    else:
+        stop = upper_line + buffer
+        tp = float(trigger["boundary"]) - float(pattern["height"])
+
+    risk = abs(entry - stop)
+    if risk <= 0 or not math.isfinite(risk):
+        return reject("Triangle breakout: invalid structural stop/risk")
+    sl_atr = risk / atr4
+    if sl_atr < V11_MIN_SL_ATR_SANITY or sl_atr > V11_MAX_SL_ATR_SANITY:
+        return reject(
+            f"Triangle breakout: stop distance {sl_atr:.2f} ATR outside "
+            f"{V11_MIN_SL_ATR_SANITY:.2f}-{V11_MAX_SL_ATR_SANITY:.2f} safety bounds"
+        )
+    if side == "LONG" and not (stop < entry < tp):
+        return reject("Triangle breakout: invalid geometry SL < Entry < measured-move TP")
+    if side == "SHORT" and not (tp < entry < stop):
+        return reject("Triangle breakout: invalid geometry measured-move TP < Entry < SL")
+
+    risk = abs(entry - stop)
+    reward = abs(tp - entry)
+    cost_price = entry * max(0.0, cost_pct)
+    rr_gross = reward / risk
+    rr_net = (reward - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
+    if rr_net < V11_MIN_RR:
+        return reject(
+            f"Triangle breakout: post-cost RR {rr_net:.2f} < required {V11_MIN_RR:.2f} "
+            f"(gross {rr_gross:.2f})"
+        )
+
+    last = c1[-1]
+    range1 = float(last["high"]) - float(last["low"])
+    if atr1 > 0 and range1 > V11_SHOCK_RANGE_ATR * atr1:
+        return reject(f"Triangle breakout: 1H shock candle exceeds {V11_SHOCK_RANGE_ATR:.2f} ATR")
+
+    target_path = _v11_target_path(c4, c12, c1d, entry, tp, side)
+    if not target_path.get("clear"):
+        return reject(f"Triangle breakout: measured-move target path blocked ({target_path.get('reason')})")
+
+    btc_ok, btc_reason = btc_filter_ok(side, btc_context or {}, is_btc=symbol.upper().startswith("BTC"))
+    if not btc_ok:
+        return {
+            "side": side, "setup_type": "TRIANGLE_BREAKOUT", "direction_ok": direction_ok,
+            "context": context, "candidate": False,
+            "reason": f"{side}: BTC context veto ({btc_reason})",
+            "primary_failure": f"{side}: BTC context veto ({btc_reason})",
+            "diagnostic_key": f"{side}: BTC context veto".upper(),
+            "technical_gate_failures": [f"{side}: BTC context veto ({btc_reason})"],
+            "rejection_stage": "BTC", "btc_filter_ok": False,
+        }
+
+    atr_rank = _memoized_frame_value(cache, "_triangle_atr_percentile_4h", c4, lambda: _atr_percentile(c4))
+    convergence = _clamp((float(pattern["start_width"]) - float(pattern["current_width"])) / max(float(pattern["start_width"]), 1e-12) / 0.50, 0.0, 1.0)
+    touch_quality = _clamp((int(pattern["touch_count"]) - 3) / 5.0, 0.0, 1.0)
+    structure_quality = 0.5 * convergence + 0.5 * touch_quality
+    context_quality = 1.0 if context.get("healthy") else 0.6
+    volatility_quality = 1.0 if 5 <= atr_rank <= 98 else 0.5
+    score_groups = {
+        "pattern_structure": int(round(30 * structure_quality)),
+        "breakout_confirmation": int(round(30 * _clamp(float(trigger["quality"]), 0.0, 1.0))),
+        "measured_move_geometry": int(round(20 * _clamp(rr_net / 2.5, 0.0, 1.0))),
+        "trend_context": int(round(15 * context_quality)),
+        "volatility": int(round(5 * volatility_quality)),
+    }
+    score = sum(score_groups.values())
+
+    high_points = list(pattern["high_points"])
+    low_points = list(pattern["low_points"])
+    high_idx = int(max(high_points, key=lambda point: point[1])[0])
+    low_idx = int(min(low_points, key=lambda point: point[1])[0])
+    high_time = int(c4[high_idx]["time"])
+    low_time = int(c4[low_idx]["time"])
+    pattern_height = float(pattern["height"])
+    synthetic_impulse = {
+        "side": side, "high_idx": high_idx, "low_idx": low_idx,
+        "high": float(pattern["pattern_high"]), "low": float(pattern["pattern_low"]),
+        "atr": atr4, "leg": pattern_height, "leg_atr": pattern_height / atr4,
+        "structure_label": str(pattern["kind"]), "high_time": high_time, "low_time": low_time,
+    }
+    value_zone = {
+        "ok": True, "low": lower_line, "high": upper_line,
+        "deep_low": lower_line, "deep_high": upper_line,
+        "retracement_mid": (lower_line + upper_line) / 2.0,
+    }
+    normalized_trigger = {
+        **trigger,
+        "sweep_idx": int(trigger["breakout_idx"]),
+        "reclaim_idx": int(trigger["trigger_idx"]),
+        "swept_level": float(trigger["boundary"]),
+        "sweep_time": int(trigger["breakout_time"]),
+        "trigger_time": int(trigger["trigger_time"]),
+    }
+    target = {
+        "ok": True, "price": tp, "timeframe": "MEASURED_MOVE",
+        "time": None, "reason": "triangle height projected from confirmed breakout boundary",
+    }
+    return {
+        "side": side, "candidate": True, "setup_type": "TRIANGLE_BREAKOUT",
+        "direction_ok": direction_ok, "daily_permission_bypassed": bypass,
+        "context": context, "impulse": synthetic_impulse, "pattern": pattern,
+        "value_zone": value_zone, "value_deep": bool(trigger.get("retest")),
+        "trigger": normalized_trigger, "entry": entry, "stop_loss": stop, "tp": tp,
+        "rr": rr_net, "rr_gross": rr_gross, "atr_4h": atr4, "atr_1h": atr1,
+        "sl_atr": sl_atr, "tp_distance_atr": reward / atr4 if atr4 > 0 else 0.0,
+        "target": target, "target_path": target_path, "score": score,
+        "score_groups": score_groups, "atr_percentile": atr_rank,
+        "shock_ok": True, "btc_filter_ok": btc_ok, "btc_filter_reason": btc_reason,
+        "pattern_kind": str(pattern["kind"]), "pattern_upper": upper_line,
+        "pattern_lower": lower_line, "pattern_height": pattern_height,
+        "pattern_breakout_level": float(trigger["boundary"]),
+        "pattern_retest": bool(trigger.get("retest")),
+        "rank_time": int(trigger["trigger_time"]),
+    }
+
+
 def _v11_analyze_side(
     symbol: str,
     side: str,
@@ -1129,7 +1366,7 @@ def _v11_analyze_side(
                 "btc_filter_ok": False,
             }
         return {
-            "side": side, "candidate": True, "direction_ok": direction_ok,
+            "side": side, "candidate": True, "setup_type": "LEGACY_PULLBACK", "direction_ok": direction_ok,
             "daily_permission_bypassed": daily_permission_bypassed, "context": context,
             "impulse": impulse, "value_zone": zone, "trigger": trigger,
             "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr_net, "rr_gross": rr_gross,
@@ -1152,6 +1389,15 @@ def _v11_analyze_side(
         "technical_gate_failures": [last_reason],
         "rejection_stage": "SETUP",
     }
+
+def _signal_basis_for_architecture(architecture: str, setup_type: str | None = None) -> str:
+    selected = str(setup_type or architecture).upper()
+    if selected == "TRIANGLE_BREAKOUT":
+        return "1D direction → 12H context → confirmed 4H triangle → 1H breakout/retest → measured-move target"
+    if selected == "LEGACY_PULLBACK":
+        return "1D macro vote → 12H health → 4H impulse/value pullback → 1H liquidity sweep/reclaim"
+    return "Hybrid: causal 1D/12H context with 4H triangle-breakout and legacy pullback candidates"
+
 
 def _v11_empty(
     symbol: str,
@@ -1180,13 +1426,9 @@ def _v11_empty(
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
-        "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
-        "engine_config": {
-            "min_impulse_atr": V11_MIN_IMPULSE_ATR,
-            "max_trigger_bars_1h": V11_MAX_TRIGGER_BARS,
-            "sl_mode": V11_SL_MODE,
-            "approved_timeframes": list(APPROVED_TIMEFRAMES),
-        },
+        "signal_engine_version": ENGINE_VERSION, "setup_architecture": SETUP_ARCHITECTURE,
+        "signal_basis": _signal_basis_for_architecture(SETUP_ARCHITECTURE),
+        "engine_config": engine_config_snapshot(),
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "technical_candidate": False, "signal_blocked": True, "rejection_stage": "SETUP",
         "side_diagnostics": list(side_diagnostics or []),
@@ -1223,11 +1465,11 @@ def analyze_candles(
     research_short_shadow: bool = False,
     allow_shorts: bool = True,
 ) -> dict[str, Any]:
-    """V11 deterministic Trend Pullback / Value Re-entry engine.
+    """Deterministic V12 1D/12H/4H/1H swing signal engine.
 
-    Decision point: completed 1H candle close.
-    Execution baseline: next 1H open.
-    Authoritative timeframes: 1D / 12H / 4H / 1H only.
+    Default architecture: confirmed 4H triangle + 1H breakout/retest.
+    Legacy pullback and hybrid modes remain available for matched experiments.
+    Decision point: completed 1H candle close; no lower timeframes are read.
     """
     validate_engine_config()
     now = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -1271,22 +1513,49 @@ def analyze_candles(
     candidates: list[dict[str, Any]] = []
     side_failures: list[str] = []
     side_diagnostics: list[dict[str, Any]] = []
-    # LONG-only deployments explicitly disable SHORT evaluation. The optional
-    # switch preserves existing research/tests, while live scanning and the
-    # backtest opt in to LONG-only behavior.
+    # LONG and SHORT are evaluated by default; callers may explicitly set
+    # allow_shorts=False for a controlled LONG-only experiment.
     sides_to_evaluate = (
         ("SHORT",) if research_short_shadow
         else (("LONG", "SHORT") if allow_shorts else ("LONG",))
     )
     for side in sides_to_evaluate:
-        result = _v11_analyze_side(
-            symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache,
-            research_short_daily_gate_bypass=research_short_shadow,
-        )
+        evaluations: list[dict[str, Any]] = []
+        # The short-shadow research remains anchored to the original pullback
+        # implementation so its historical counterfactual meaning is preserved.
+        if research_short_shadow or SETUP_ARCHITECTURE in {"LEGACY_PULLBACK", "HYBRID"}:
+            evaluations.append(_v11_analyze_side(
+                symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache,
+                research_short_daily_gate_bypass=research_short_shadow,
+            ))
+        if not research_short_shadow and SETUP_ARCHITECTURE in {"TRIANGLE_BREAKOUT", "HYBRID"}:
+            evaluations.append(_triangle_analyze_side(
+                symbol, side, c1d, c12, c4, c1, daily, cost_pct, btc_context, cache,
+            ))
+
+        valid_for_side = [item for item in evaluations if bool(item.get("candidate"))]
+        if valid_for_side:
+            result = max(
+                valid_for_side,
+                key=lambda item: (
+                    float(item.get("score", 0)),
+                    int(item.get("rank_time", 0)),
+                ),
+            )
+        else:
+            result = evaluations[0] if evaluations else {
+                "side": side, "candidate": False,
+                "reason": f"{side}: no setup architecture evaluated",
+                "primary_failure": f"{side}: no setup architecture evaluated",
+                "diagnostic_key": "NO_SETUP_ARCHITECTURE",
+                "rejection_stage": "SETUP",
+            }
+
         is_candidate = bool(result.get("candidate"))
         side_diagnostics.append({
             "side": side,
             "candidate": is_candidate,
+            "setup_type": result.get("setup_type"),
             "primary_failure": None if is_candidate else str(result.get("primary_failure") or result.get("reason") or f"{side}: rejected"),
             "diagnostic_key": str(result.get("diagnostic_key") or result.get("rejection_stage") or "UNKNOWN"),
             "rejection_stage": result.get("rejection_stage"),
@@ -1295,10 +1564,11 @@ def analyze_candles(
         if is_candidate:
             candidates.append(result)
         else:
-            failures = result.get("technical_gate_failures") or [result.get("reason") or f"{side}: rejected"]
-            side_failures.extend(str(x) for x in failures[:2])
+            for evaluation in evaluations:
+                failures = evaluation.get("technical_gate_failures") or [evaluation.get("reason") or f"{side}: rejected"]
+                side_failures.extend(str(x) for x in failures[:2])
     if not candidates:
-        reasons = side_failures or ["no active V11 value-pullback trigger"]
+        reasons = side_failures or ["no active setup for configured architecture"]
         empty = _v11_empty(
             symbol, c1d, c12, c4, c1, "; ".join(reasons), daily, btc_context,
             side_failures=reasons, side_diagnostics=side_diagnostics, cache=cache,
@@ -1312,7 +1582,7 @@ def analyze_candles(
         return empty
     # If both sides somehow qualify, rank by structural setup quality only; this is
     # not an accuracy score and is not used as a threshold.
-    chosen = max(candidates, key=lambda x: (float(x["score"]), int(x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"])))
+    chosen = max(candidates, key=lambda x: (float(x["score"]), int(x.get("rank_time", x["impulse"]["high_idx"] if x["side"] == "LONG" else x["impulse"]["low_idx"]))))
     side = str(chosen["side"])
     trigger = chosen["trigger"]
     impulse = chosen["impulse"]
@@ -1336,20 +1606,32 @@ def analyze_candles(
     confirmation_ok = True
     structure_ok = True
     setup_ok = True
-    families = {
-        "trend_context": "PASS" if context.get("healthy") else "SUPPORT",
-        "value_location": "PASS" if chosen.get("value_deep") else "SUPPORT",
-        "liquidity_reclaim": "PASS",
-        "relative_volume": "PASS" if _num(trigger.get("rvol")) >= 1.20 else "SUPPORT",
-        "volatility": "PASS" if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else "SUPPORT",
-        "target_geometry": "PASS",
-    }
+    setup_type = str(chosen.get("setup_type") or "LEGACY_PULLBACK")
+    is_triangle = setup_type == "TRIANGLE_BREAKOUT"
+    if is_triangle:
+        families = {
+            "trend_context": "PASS" if context.get("healthy") else "SUPPORT",
+            "triangle_geometry": "PASS" if int(chosen.get("pattern", {}).get("touch_count", 0)) >= 5 else "SUPPORT",
+            "breakout_strength": "PASS" if float(trigger.get("quality", 0.0)) >= 0.75 else "SUPPORT",
+            "relative_volume": "PASS" if _num(trigger.get("rvol")) >= 1.20 else "SUPPORT",
+            "volatility": "PASS" if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else "SUPPORT",
+            "measured_move_geometry": "PASS" if rr_gross >= 2.0 else "SUPPORT",
+        }
+    else:
+        families = {
+            "trend_context": "PASS" if context.get("healthy") else "SUPPORT",
+            "value_location": "PASS" if chosen.get("value_deep") else "SUPPORT",
+            "liquidity_reclaim": "PASS",
+            "relative_volume": "PASS" if _num(trigger.get("rvol")) >= 1.20 else "SUPPORT",
+            "volatility": "PASS" if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else "SUPPORT",
+            "target_geometry": "PASS",
+        }
     passed = sum(v == "PASS" for v in families.values())
     # liquidity_reclaim and target_geometry are PASS by construction: their hard
     # gates already ran upstream, so they cannot discriminate between candidates.
     # Expose the count over the families that can actually vary (diagnostic only;
     # it never feeds a gate, score or threshold).
-    constant_families = ("liquidity_reclaim", "target_geometry")
+    constant_families = () if is_triangle else ("liquidity_reclaim", "target_geometry")
     variable_families = {k: v for k, v in families.items() if k not in constant_families}
     variable_passed = sum(v == "PASS" for v in variable_families.values())
     score = int(chosen["score"])
@@ -1357,17 +1639,24 @@ def analyze_candles(
     target_reason = "nearest structural target; RR applied after target selection"
     reasons = [
         f"1D {daily.get('regime')} permission",
-        f"4H impulse {float(impulse['leg_atr']):.2f} ATR",
-        f"Value zone {float(chosen['value_zone']['low']):.6g}-{float(chosen['value_zone']['high']):.6g}",
-        "1H liquidity sweep + reclaim",
-        f"Structural TP {target_tf}; post-cost RR {rr:.2f}",
+        (f"4H {chosen.get('pattern_kind')} with {int(chosen.get('pattern', {}).get('touch_count', 0))} confirmed pivot touches" if is_triangle else f"4H impulse {float(impulse['leg_atr']):.2f} ATR"),
+        (f"1H {trigger.get('trigger_type', 'triangle breakout')} confirmation" if is_triangle else f"Value zone {float(chosen['value_zone']['low']):.6g}-{float(chosen['value_zone']['high']):.6g}"),
+        ("1H breakout/retest confirmed" if is_triangle else "1H liquidity sweep + reclaim"),
+        f"{('Measured-move' if is_triangle else 'Structural')} TP {target_tf}; post-cost RR {rr:.2f}",
     ]
     return {
         "symbol": symbol.upper(), "price": float(c1[-1]["close"]), "setup": side, "setup_candidate": side,
-        "regime_1d": daily.get("regime"), "trend_4h": "HH/HL" if side == "LONG" else "LH/LL",
+        "setup_type": setup_type, "setup_architecture": SETUP_ARCHITECTURE,
+        "pattern_kind": chosen.get("pattern_kind"),
+        "pattern_height": chosen.get("pattern_height"),
+        "pattern_upper_line": chosen.get("pattern_upper"),
+        "pattern_lower_line": chosen.get("pattern_lower"),
+        "pattern_breakout_level": chosen.get("pattern_breakout_level"),
+        "pattern_retest": bool(chosen.get("pattern_retest", False)),
+        "regime_1d": daily.get("regime"), "trend_4h": (str(chosen.get('pattern_kind')) if is_triangle else ("HH/HL" if side == "LONG" else "LH/LL")),
         "bias_12h": context.get("status"), "daily_structure_1d": daily.get("structure"),
         "structure_12h": context.get("structure"), "structure_4h": impulse.get("structure_label", "HH/HL" if side == "LONG" else "LH/LL"),
-        "protected_structure_4h": "BULLISH" if side == "LONG" else "BEARISH",
+        "protected_structure_4h": ("BULLISH_BREAKOUT" if side == "LONG" else "BEARISH_BREAKOUT") if is_triangle else ("BULLISH" if side == "LONG" else "BEARISH"),
         "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"),
         "ema21_12h": context.get("e21"), "ema50_12h": context.get("e50"),
         "ema21_4h": _safe_ema([float(c["close"]) for c in c4], 21), "ema50_4h": _safe_ema([float(c["close"]) for c in c4], 50),
@@ -1379,18 +1668,13 @@ def analyze_candles(
         "estimated_round_trip_cost_pct": cost_pct, "futures_context": {"status": "NOT_CHECKED", "execution_ok": None},
         "futures_ok": None, "futures_execution_ok": None, "data_fresh": None,
         "signal_engine_version": ENGINE_VERSION,
-        "engine_config": {
-            "min_impulse_atr": V11_MIN_IMPULSE_ATR,
-            "max_trigger_bars_1h": V11_MAX_TRIGGER_BARS,
-            "sl_mode": V11_SL_MODE,
-            "approved_timeframes": list(APPROVED_TIMEFRAMES),
-        },
+        "engine_config": engine_config_snapshot(setup_type),
         "side_diagnostics": side_diagnostics,
-        "signal_basis": "1D macro vote â†’ 12H health â†’ 4H impulse/pullback into value â†’ 1H liquidity sweep/reclaim â†’ next 1H open",
+        "signal_basis": _signal_basis_for_architecture(SETUP_ARCHITECTURE, setup_type),
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
         "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES, "trigger_side": side,
         "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),
-        "trigger_type": "LIQUIDITY_SWEEP_RECLAIM", "trigger_reason": trigger.get("reason"),
+        "trigger_type": str(trigger.get("trigger_type") or "LIQUIDITY_SWEEP_RECLAIM"), "trigger_reason": trigger.get("reason"),
         "trigger_close_location": float(trigger.get("close_location", 0.0)),
         "structure_quality_ok": True, "trade_geometry_ok": geometry_ok,
         "momentum_quality": 0.5, "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
@@ -1423,16 +1707,20 @@ def analyze_candles(
         "target_path_reason": (chosen.get("target_path") or {}).get("reason") or target_reason,
         "target_path_obstacles": (chosen.get("target_path") or {}).get("obstacles") or [],
         "target_timeframe": target_tf, "target_levels": [chosen["target"]],
-        "blocking_level": None, "stop_source": "liquidity-sweep structural invalidation + volatility buffer",
+        "blocking_level": None,
         "geometry_reason": "OK", "entry_limit_price": None, "limit_entry_expiry_minutes": 0,
+        "stop_source": ("opposite triangle boundary + ATR buffer" if is_triangle else "liquidity-sweep structural invalidation + volatility buffer"),
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "trigger_candle_open_time": trigger.get("trigger_time"),
         "setup_impulse_high_time": impulse.get("high_time"), "setup_impulse_low_time": impulse.get("low_time"),
-        "setup_pullback_touch_time": int(c1[int(trigger["sweep_idx"])]["time"]),
-        "setup_retest_time": trigger.get("trigger_time"), "setup_retest_1h_time": trigger.get("trigger_time"),
-        "setup_bos_time": None, "setup_departure_time": None,
+        "setup_pullback_touch_time": (int(c1[int(trigger["sweep_idx"])]["time"]) if not is_triangle or bool(trigger.get("retest")) else None),
+        "setup_retest_time": trigger.get("trigger_time") if (not is_triangle or bool(trigger.get("retest"))) else None,
+        "setup_retest_1h_time": trigger.get("trigger_time") if (not is_triangle or bool(trigger.get("retest"))) else None,
+        "setup_bos_time": int(trigger.get("breakout_time")) if is_triangle and trigger.get("breakout_time") is not None else None,
+        "bos_4h_level": float(chosen.get("pattern_breakout_level")) if is_triangle and chosen.get("pattern_breakout_level") is not None else None,
+        "setup_departure_time": None,
         "value_zone_low": float(chosen["value_zone"]["low"]), "value_zone_high": float(chosen["value_zone"]["high"]),
         "value_deep": bool(chosen.get("value_deep")), "swept_level_1h": float(trigger["swept_level"]),
         "sweep_time_1h": trigger.get("sweep_time"), "reclaim_time_1h": trigger.get("trigger_time"),
@@ -1545,4 +1833,4 @@ async def analyze_symbol(market, symbol: str) -> dict[str, Any]:
     c4 = await market.ohlcv(ref, "4H", 650)
     c1 = await market.ohlcv(ref, "1H", 250)
     c12 = synthesize_12h_from_4h(c4)
-    return analyze_candles(ref.symbol, c1d, c12, c4, c1, allow_shorts=False)
+    return analyze_candles(ref.symbol, c1d, c12, c4, c1, allow_shorts=True)

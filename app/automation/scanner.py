@@ -18,7 +18,6 @@ from ..config import Settings
 from .executor import MexcExecutor
 from .mexc_client import MexcAPIError, MexcClient
 from .signal_manager import SignalManager
-from .paper_trader import PaperTrader
 from .signal_validator import validate_signal
 from .universe import MexcUniverse
 
@@ -41,19 +40,12 @@ class MexcScanner:
         universe: MexcUniverse,
         signal_manager: SignalManager,
         executor: MexcExecutor | None = None,
-        paper_trader: PaperTrader | None = None,
-        gemini_reviewer: Any | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
         self.universe = universe
         self.signal_manager = signal_manager
         self.executor = executor
-        self.paper_trader = paper_trader
-        self.gemini_reviewer = gemini_reviewer
-        self._gemini_shadow_tasks: set[asyncio.Task] = set()
-        self._gemini_shadow_veto_suggestions = 0
-        self._gemini_shadow_errors = 0
         self._btc_context: dict[str, Any] = {"ok": False, "reason": "not loaded"}
         self._candle_cache: dict[tuple[str, str], tuple[int, list[Any]]] = {}
         self._candle_fetch_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -155,69 +147,6 @@ class MexcScanner:
         })
         return True, "OK"
 
-    def _gemini_mode(self) -> str:
-        mode = str(getattr(self.settings, "gemini_review_mode", "shadow") or "shadow").strip().lower()
-        return mode if mode in {"shadow", "gate"} else "gate"
-
-    @staticmethod
-    def _gemini_candles(c1d: list[Any], c12: list[Any], c4: list[Any], c1: list[Any]) -> dict[str, list[Any]]:
-        return {"1D": c1d, "12H": c12, "4H": c4, "1H": c1}
-
-    async def _run_gemini_review(
-        self, symbol: str, side: str, analysis: dict[str, Any], candles: dict[str, list[Any]]
-    ) -> dict[str, Any]:
-        if self.gemini_reviewer is None:
-            return {"symbol": symbol, "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                    "timeframe_alignment": "UNCERTAIN", "summary": "Gemini reviewer is not configured",
-                    "error": "reviewer_missing"}
-        try:
-            result = await self.gemini_reviewer.review(
-                symbol=symbol, side=side, analysis=dict(analysis), candles=candles
-            )
-            return result if isinstance(result, dict) else {
-                "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                "timeframe_alignment": "UNCERTAIN", "summary": "Invalid reviewer result", "error": "invalid_result"
-            }
-        except Exception as exc:
-            LOGGER.warning("Gemini review failed | symbol=%s error=%s", symbol, type(exc).__name__)
-            return {"symbol": symbol, "status": "ERROR", "verdict": "UNCERTAIN", "confidence": 0,
-                    "timeframe_alignment": "UNCERTAIN", "summary": "Gemini review failed",
-                    "error": f"review_error:{type(exc).__name__}"}
-
-    def _track_gemini_shadow(self, task: asyncio.Task) -> None:
-        self._gemini_shadow_tasks.add(task)
-        def completed(done: asyncio.Task) -> None:
-            self._gemini_shadow_tasks.discard(done)
-            if done.cancelled():
-                return
-            try:
-                result = done.result()
-                if result.get("status") == "OK" and result.get("verdict") == "VETO":
-                    self._gemini_shadow_veto_suggestions += 1
-                    LOGGER.info("GEMINI SHADOW SUGGESTION | symbol=%s verdict=VETO confidence=%s summary=%s",
-                                result.get("symbol", "unknown"), result.get("confidence"), result.get("summary", ""))
-                elif result.get("status") != "OK":
-                    self._gemini_shadow_errors += 1
-                    LOGGER.warning("GEMINI SHADOW REVIEW UNAVAILABLE | status=%s error=%s",
-                                   result.get("status"), result.get("error", ""))
-            except Exception:
-                self._gemini_shadow_errors += 1
-                LOGGER.exception("Gemini shadow review task failed")
-        task.add_done_callback(completed)
-
-    async def close_gemini_shadow_reviews(self, timeout_seconds: float = 5.0) -> None:
-        tasks = list(self._gemini_shadow_tasks)
-        if not tasks:
-            return
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),
-                                   timeout=max(0.0, float(timeout_seconds)))
-        except asyncio.TimeoutError:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
     async def scan_once(self) -> dict[str, int]:
         symbols = await self.universe.refresh()
         stats = self._empty_stats(len(symbols))
@@ -285,9 +214,6 @@ class MexcScanner:
             "rejected_btc": 0,
             "rejected_execution": 0,
             "rejected_final": 0,
-            "rejected_gemini": 0,
-            "gemini_queued": 0,
-            "gemini_veto_suggestions": 0,
             "duplicate": 0,
             "cache_hits": 0,
             "reason_counts": Counter(),
@@ -386,7 +312,6 @@ class MexcScanner:
                 symbol, c1d, c12, c4, c1,
                 btc_context=self._btc_context,
                 estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
-                allow_shorts=True,
             )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
@@ -408,8 +333,8 @@ class MexcScanner:
             # Reject at the first failed strategy gate while retaining all stage counters.
             ordered = [
                 ("DIRECTION", bool(analysis.get("direction_ok")), "1D/12H/4H direction"),
-                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H triangle/pullback setup"),
-                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H breakout/retest confirmation"),
+                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H impulse/value setup"),
+                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H liquidity sweep/reclaim"),
                 ("VOLATILITY", bool(analysis.get("volatility_ok")), "volatility sanity"),
                 ("CONFIRMATION_FAMILIES", bool(analysis.get("confirmation_family_diversity_ok")), "supporting evidence"),
                 ("TARGET_PATH", bool(analysis.get("location_ok") and analysis.get("target_path_structural") and analysis.get("target_path_clear")), "Clear HTF target path"),
@@ -423,53 +348,6 @@ class MexcScanner:
                 if not passed:
                     reasons = (analysis.get("stage_failures") or {}).get(stage) or [fallback]
                     return self._reject(symbol, reasons, stage, payload)
-
-            # Optional independent chart review. Shadow mode is non-blocking and cannot alter
-            # the technical signal; gate mode is opt-in and fails closed on uncertainty.
-            gemini_mode = self._gemini_mode()
-            if bool(getattr(self.settings, "gemini_review_enabled", False)):
-                review_candles = self._gemini_candles(c1d, c12, c4, c1)
-                if gemini_mode == "shadow":
-                    if self.gemini_reviewer is not None:
-                        task = asyncio.create_task(
-                            self._run_gemini_review(symbol, side, analysis, review_candles),
-                            name=f"gemini-shadow-{symbol}",
-                        )
-                        self._track_gemini_shadow(task)
-                        payload["gemini_queued"] = 1
-                        payload["gemini_veto_suggestions"] = 0
-                else:
-                    review = await self._run_gemini_review(symbol, side, analysis, review_candles)
-                    review["mode"] = "gate"
-                    analysis["gemini_review"] = review
-                    confidence = review.get("confidence")
-                    valid_confidence = isinstance(confidence, int) and not isinstance(confidence, bool)
-                    min_confidence = max(0, min(100, int(getattr(self.settings, "gemini_min_confidence", 70))))
-                    accepted = (
-                        review.get("status") == "OK"
-                        and review.get("verdict") == "SUPPORT"
-                        and review.get("timeframe_alignment") == "ALIGNED"
-                        and valid_confidence
-                        and confidence >= min_confidence
-                    )
-                    if not accepted:
-                        payload["rejected_gemini"] = 1
-                        payload["gemini_veto_suggestions"] = int(review.get("verdict") == "VETO")
-                        return self._reject(
-                            symbol,
-                            f"Gemini gate rejected candidate: status={review.get('status')} "
-                            f"verdict={review.get('verdict')} confidence={confidence} "
-                            f"alignment={review.get('timeframe_alignment')}",
-                            "GEMINI_REVIEW",
-                            payload,
-                        )
-                    payload["gemini_veto_suggestions"] = 0
-            elif gemini_mode == "gate":
-                payload["rejected_gemini"] = 1
-                return self._reject(
-                    symbol, "Gemini gate mode requires GEMINI_REVIEW_ENABLED=true",
-                    "GEMINI_REVIEW", payload,
-                )
 
             btc_ok, btc_reason = btc_filter_ok(side, self._btc_context, is_btc=symbol.upper().startswith("BTC"))
             payload["btc_would_block"] = int(not btc_ok)
@@ -545,29 +423,13 @@ class MexcScanner:
                 return self._reject(symbol, reasons, "FINAL", payload)
 
             payload["final_pass"] = 1
+            try:
+                sent = await self.signal_manager.publish(signal)
+            except Exception as exc:
+                LOGGER.exception("Signal dispatch failed for %s", symbol)
+                return self._error(symbol, f"dispatch exception: {exc}", payload)
 
-            # Paper trading consumes the same fully validated V11 signal, but
-            # is independent from outbound message delivery and live execution.
-            if self.paper_trader is not None and getattr(self.settings, "paper_trading_enabled", False):
-                try:
-                    self.paper_trader.open_from_signal(signal)
-                except Exception:
-                    LOGGER.exception("Paper trade opening failed for %s", symbol)
-
-            sent = False
-            if getattr(self.settings, "auto_signal_enabled", False):
-                try:
-                    sent = await self.signal_manager.publish(signal)
-                except Exception as exc:
-                    LOGGER.exception("Signal dispatch failed for %s", symbol)
-                    return self._error(symbol, f"dispatch exception: {exc}", payload)
-
-            # Live execution is explicitly suppressed whenever the virtual-money
-            # mode is enabled, even if environment flags are accidentally mixed.
-            if (sent and not getattr(self.settings, "paper_trading_enabled", False)
-                    and self.executor is not None
-                    and getattr(self.settings, "auto_trade_enabled", False)
-                    and getattr(self.settings, "allow_live_execution", False)):
+            if sent and self.executor is not None and getattr(self.settings, "auto_trade_enabled", False) and getattr(self.settings, "allow_live_execution", False):
                 try:
                     await self._execute_signal(signal)
                 except Exception:
@@ -580,7 +442,6 @@ class MexcScanner:
                 "analysis": analysis,
                 "candle_cache_hits": cache_hits,
                 "duplicate": 0,
-                **{k: v for k, v in payload.items() if k.startswith("gemini_")},
             }
         except MexcAPIError as exc:
             LOGGER.warning(

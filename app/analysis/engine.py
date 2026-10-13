@@ -1345,6 +1345,13 @@ def analyze_candles(
         "target_geometry": "PASS",
     }
     passed = sum(v == "PASS" for v in families.values())
+    # liquidity_reclaim and target_geometry are PASS by construction: their hard
+    # gates already ran upstream, so they cannot discriminate between candidates.
+    # Expose the count over the families that can actually vary (diagnostic only;
+    # it never feeds a gate, score or threshold).
+    constant_families = ("liquidity_reclaim", "target_geometry")
+    variable_families = {k: v for k, v in families.items() if k not in constant_families}
+    variable_passed = sum(v == "PASS" for v in variable_families.values())
     score = int(chosen["score"])
     target_tf = str(chosen["target"].get("timeframe") or "4H")
     target_reason = "nearest structural target; RR applied after target selection"
@@ -1393,6 +1400,8 @@ def analyze_candles(
         "shock_veto_ok": bool(chosen.get("shock_ok", True)), "shock_veto_reason": "OK",
         "score": score, "score_groups": chosen["score_groups"],
         "confirmation_families": families, "confirmation_families_passed": passed, "confirmation_families_available": len(families),
+        "confirmation_families_variable_passed": variable_passed, "confirmation_families_variable_available": len(variable_families),
+        "confirmation_families_constant_pass": list(constant_families),
         "confirmation_family_diversity_ok": True,
         "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok,
         "momentum_ok": True, "volume_ok": True, "location_ok": bool(target_ok and target_clear), "volatility_ok": True,

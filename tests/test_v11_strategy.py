@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, convert_candles
+from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_qualify_value_zone_trigger, _v11_direction_permission, _v11_target_path, _v11_regime_1d, convert_candles
 
 DAY = 86_400_000
 HOUR = 3_600_000
@@ -87,6 +87,9 @@ def test_v11_generates_causal_value_pullback_signal():
     assert result["stop_loss"] < result["entry"] < result["tp"]
     assert result["value_zone_low"] < result["value_zone_high"]
     assert result["swept_level_1h"] < result["entry"]
+    assert result["tp_front_run_buffer"] > 0
+    assert result["structural_target_price"] > result["tp"]
+    assert result["tp"] < result["structural_target_price"]
 
 
 def test_v11_12h_is_causally_synthesized():
@@ -143,6 +146,8 @@ def test_v11_short_analysis_is_supported_symmetrically():
     assert result["technical_candidate"] is True
     assert result["structure_4h"] == "LH/LL"
     assert result["stop_loss"] > result["entry"] > result["tp"]
+    assert result["tp_front_run_buffer"] > 0
+    assert result["structural_target_price"] < result["tp"]
 
 
 def test_v11_liquidity_trigger_accepts_wick_sweep_before_later_reclaim():
@@ -185,3 +190,48 @@ def test_v11_liquidity_trigger_reclaim_can_occur_four_bars_after_sweep():
     assert out["ready"] is True
     assert out["sweep_idx"] == 3
     assert out["reclaim_idx"] == 7
+
+
+def test_value_zone_trigger_rejects_sweep_outside_active_zone():
+    _, _, c1, _ = _build_fixture()
+    candles = convert_candles(c1)
+    trigger = _v11_liquidity_trigger(candles, 216, "LONG", max_bars=2)
+    # The sweep around 156-158 is not a valid entry confirmation for a distant zone.
+    ok, reason = _v11_qualify_value_zone_trigger(
+        trigger, candles, {"low": 164.0, "high": 165.0}, 216, "LONG", len(candles) - 1
+    )
+    assert not ok
+    assert "did not overlap" in reason
+
+
+def test_value_zone_trigger_rejects_weak_reclaim_candle():
+    _, _, c1, _ = _build_fixture()
+    candles = convert_candles(c1)
+    trigger = _v11_liquidity_trigger(candles, 216, "LONG", max_bars=2)
+    trigger["body_ratio"] = 0.10
+    ok, reason = _v11_qualify_value_zone_trigger(
+        trigger, candles, {"low": 156.0, "high": 159.0}, 216, "LONG", len(candles) - 1
+    )
+    assert not ok
+    assert "body too weak" in reason
+
+
+def test_countertrend_direction_requires_aligned_daily_and_12h_structure():
+    daily = {"regime": "BULLISH", "bull": True, "bear": False, "structure": "LH/LL", "bull_votes": 4, "bear_votes": 2}
+    bearish_12h = {"structure": "LH/LL", "hostile": False}
+    allowed, reason = _v11_direction_permission("SHORT", daily, bearish_12h)
+    assert allowed
+    assert "reversal" in reason
+
+    strong_bull_daily = {"regime": "BULLISH", "bull": True, "bear": False, "structure": "HH/HL", "bull_votes": 5, "bear_votes": 1}
+    bullish_12h = {"structure": "HH/HL", "hostile": False}
+    allowed, _ = _v11_direction_permission("SHORT", strong_bull_daily, bullish_12h)
+    assert not allowed
+
+
+def test_countertrend_permission_is_symmetric_for_longs():
+    daily = {"regime": "BEARISH", "bull": False, "bear": True, "structure": "HH/HL", "bull_votes": 2, "bear_votes": 4}
+    bullish_12h = {"structure": "HH/HL", "hostile": False}
+    allowed, reason = _v11_direction_permission("LONG", daily, bullish_12h)
+    assert allowed
+    assert "reversal" in reason

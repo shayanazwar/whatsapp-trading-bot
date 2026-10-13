@@ -126,3 +126,19 @@ def test_simulator_reports_signal_rr_and_actual_fill_rr_separately():
     assert summary.avg_actual_fill_rr == pytest.approx(8.0 / 7.0)
     assert "Avg Signal RR" in format_report(summary)
     assert "Avg Actual Fill RR" in format_report(summary)
+
+
+def test_backtest_report_shows_actual_duration_when_fixed_range_overrides_requested_days():
+    summary = summarize(
+        days=1,
+        period_start_ms=0,
+        period_end_ms=7 * 86_400_000,
+        coins_selected=1,
+        coins_tested=1,
+        data_errors=0,
+        execution_errors=0,
+        rejected_setups=0,
+        trades=[],
+    )
+    report = format_report(summary)
+    assert "1D requested / 7.00D actual" in report

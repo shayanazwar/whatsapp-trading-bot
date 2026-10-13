@@ -7,6 +7,8 @@ available until their right-side confirmation bars have closed.
 """
 
 import math
+from itertools import combinations
+from collections import Counter
 from typing import Any, Iterable
 
 FOUR_HOURS_MS = 14_400_000
@@ -29,6 +31,10 @@ TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR = 1.5
 # normal shallow triangle boundaries while still rejecting effectively flat
 # channels; the prior 0.05 ATR/bar threshold rejected many valid formations.
 TRIANGLE_FLAT_SLOPE_ATR_PER_BAR = 0.015
+TRIANGLE_MAX_PIVOTS_PER_SIDE = 6
+TRIANGLE_MIN_TOUCHES_PER_BOUNDARY = 3
+TRIANGLE_TOUCH_TOLERANCE_ATR = 0.35
+TRIANGLE_MAX_BOUNDARY_VIOLATION_ATR = 0.45
 BREAKOUT_RETEST_BARS_1H = 6
 BREAKOUT_MIN_RELATIVE_VOLUME = 0.70
 BREAKOUT_MAX_EXTENSION_ATR = 0.85
@@ -38,6 +44,10 @@ BREAKOUT_BOUNDARY_BUFFER_ATR = 0.05
 BREAKOUT_CROSS_TOLERANCE_ATR = 0.10
 BREAKOUT_RETEST_TOLERANCE_ATR = 0.20
 BREAKOUT_VOLUME_LOOKBACK_1H = 20
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -98,12 +108,17 @@ def detect_triangle_pattern(
     lookback: int = TRIANGLE_LOOKBACK_4H,
     diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Find the latest mature, converging triangle from confirmed 4H pivots.
+    """Detect a confirmed triangle using multiple candidate pivot pairs.
 
-    Supported formations are symmetrical, ascending and descending triangles.
-    The output trendlines are linear projections indexed from the first 4H bar.
-    A breakout that is still fresh (within 1.5 ATR of a boundary) is retained so
-    the 1H layer can confirm it after the next 4H candle has closed.
+    The previous implementation fitted one line through only the last three
+    highs and one through the last three lows. In noisy markets, a single newer
+    swing from an adjacent structure could reverse either fitted slope and
+    reject the entire window before breakout confirmation. This implementation
+    tests multiple confirmed pivot pairs and accepts only pairs that independently
+    satisfy convergence, touch, containment, width, apex and recency checks.
+
+    All pivots use right-side confirmation bars; no unfinished/future candles are
+    used. Only completed 4H candles should be supplied by the caller.
     """
     rows = list(candles_4h or [])
     atr = _finite(atr_4h)
@@ -130,112 +145,210 @@ def detect_triangle_pattern(
     if len(highs) < 2 or len(lows) < 2:
         return reject("INSUFFICIENT_CONFIRMED_PIVOTS")
 
-    # Keep a small, recent set of confirmed touches so old trendlines cannot
-    # dominate the current formation.
-    hp = highs[-3:]
-    lp = lows[-3:]
-    latest_anchor = max(hp[-1][0], lp[-1][0])
-    if len(rows) - 1 - latest_anchor > TRIANGLE_MAX_ANCHOR_AGE_4H:
-        return reject("STALE_PIVOT_ANCHORS")
+    # Use multiple recent confirmed swings. Candidate boundaries must be
+    # supported by two real pivots; other pivots are used as fit/containment
+    # evidence rather than blindly forcing the newest three into one line.
+    recent_highs = highs[-TRIANGLE_MAX_PIVOTS_PER_SIDE:]
+    recent_lows = lows[-TRIANGLE_MAX_PIVOTS_PER_SIDE:]
+    upper_pairs = [pair for pair in combinations(recent_highs, 2) if pair[1][0] - pair[0][0] >= 3]
+    lower_pairs = [pair for pair in combinations(recent_lows, 2) if pair[1][0] - pair[0][0] >= 3]
+    if not upper_pairs or not lower_pairs:
+        return reject("INSUFFICIENT_SEPARATED_PIVOT_PAIRS")
 
-    pattern_start = max(hp[0][0], lp[0][0])
-    pattern_span = latest_anchor - pattern_start
-    if pattern_span < TRIANGLE_MIN_SPAN_4H or pattern_span > TRIANGLE_MAX_SPAN_4H:
-        return reject("PATTERN_SPAN_OUT_OF_RANGE")
-
-    try:
-        upper_slope, upper_intercept = _fit_line(hp)
-        lower_slope, lower_intercept = _fit_line(lp)
-    except ValueError:
-        return reject("INVALID_TRENDLINE_PIVOTS")
-
-    # A triangle must narrow from left to right, rather than being a parallel
-    # channel or a widening wedge.
     flat_threshold = max(
         TRIANGLE_FLAT_SLOPE_ATR_PER_BAR * atr,
         abs(_finite(rows[-1].get("close"))) * 1e-5,
     )
-    if upper_slope >= lower_slope:
-        return reject("BOUNDARIES_NOT_CONVERGING")
-
-    if upper_slope < -flat_threshold and lower_slope > flat_threshold:
-        kind = "SYMMETRICAL_TRIANGLE"
-    elif upper_slope < -flat_threshold and abs(lower_slope) <= 1.8 * flat_threshold:
-        kind = "DESCENDING_TRIANGLE"
-    elif lower_slope > flat_threshold and abs(upper_slope) <= 1.8 * flat_threshold:
-        kind = "ASCENDING_TRIANGLE"
-    else:
-        return reject("UNSUPPORTED_TRIANGLE_SLOPES")
-
-    def upper_at(index: float) -> float:
-        return upper_slope * index + upper_intercept
-
-    def lower_at(index: float) -> float:
-        return lower_slope * index + lower_intercept
-
-    upper_start = upper_at(pattern_start)
-    lower_start = lower_at(pattern_start)
-    upper_now = upper_at(len(rows) - 1)
-    lower_now = lower_at(len(rows) - 1)
-    start_width = upper_start - lower_start
-    current_width = upper_now - lower_now
-    if start_width <= 0 or current_width <= 0:
-        return reject("INVALID_PROJECTED_WIDTH")
-    if not (TRIANGLE_MIN_HEIGHT_ATR * atr <= start_width <= TRIANGLE_MAX_HEIGHT_ATR * atr):
-        return reject("START_HEIGHT_OUTSIDE_ATR_RANGE")
-    if (
-        current_width < TRIANGLE_MIN_CURRENT_WIDTH_ATR * atr
-        or current_width >= TRIANGLE_MAX_CURRENT_WIDTH_RATIO * start_width
-    ):
-        return reject("CURRENT_WIDTH_FILTER")
-
-    # Reject stale triangles whose apex has already passed, or formations that
-    # are too far from completion to offer a useful measured-move setup.
-    slope_gap = upper_slope - lower_slope
-    if abs(slope_gap) <= 1e-12:
-        return reject("PARALLEL_TRENDLINES")
-    apex = (lower_intercept - upper_intercept) / slope_gap
     current_idx = len(rows) - 1
-    if not (current_idx + 1 <= apex <= current_idx + TRIANGLE_MAX_APEX_DISTANCE_4H):
-        return reject("APEX_OUTSIDE_VALID_WINDOW")
+    tolerance = TRIANGLE_TOUCH_TOLERANCE_ATR * atr
+    max_violation = TRIANGLE_MAX_BOUNDARY_VIOLATION_ATR * atr
+    rejection_counts: Counter[str] = Counter()
+    candidates: list[dict[str, Any]] = []
 
-    last_close = _finite(rows[-1].get("close"))
-    if (
-        last_close > upper_now + TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR * atr
-        or last_close < lower_now - TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR * atr
-    ):
-        return reject("PRICE_TOO_FAR_OUTSIDE_PATTERN")
+    for upper_pair in upper_pairs:
+        try:
+            upper_slope, upper_intercept = _fit_line(list(upper_pair))
+        except ValueError:
+            rejection_counts["INVALID_TRENDLINE_PIVOTS"] += 1
+            continue
+        for lower_pair in lower_pairs:
+            try:
+                lower_slope, lower_intercept = _fit_line(list(lower_pair))
+            except ValueError:
+                rejection_counts["INVALID_TRENDLINE_PIVOTS"] += 1
+                continue
 
-    pattern_high = max(value for _, value in hp)
-    pattern_low = min(value for _, value in lp)
-    measured_height = pattern_high - pattern_low
-    if measured_height < TRIANGLE_MIN_HEIGHT_ATR * atr or measured_height > TRIANGLE_MAX_HEIGHT_ATR * atr:
-        return reject("PIVOT_HEIGHT_OUTSIDE_ATR_RANGE")
+            anchor_points = [upper_pair[0], upper_pair[1], lower_pair[0], lower_pair[1]]
+            pattern_start = min(point[0] for point in anchor_points)
+            latest_anchor = max(point[0] for point in anchor_points)
+            pattern_span = latest_anchor - pattern_start
+            if pattern_span < TRIANGLE_MIN_SPAN_4H or pattern_span > TRIANGLE_MAX_SPAN_4H:
+                rejection_counts["PATTERN_SPAN_OUT_OF_RANGE"] += 1
+                continue
+            if current_idx - latest_anchor > TRIANGLE_MAX_ANCHOR_AGE_4H:
+                rejection_counts["STALE_PIVOT_ANCHORS"] += 1
+                continue
 
-    return {
-        "kind": kind,
-        "upper_slope": upper_slope,
-        "upper_intercept": upper_intercept,
-        "lower_slope": lower_slope,
-        "lower_intercept": lower_intercept,
-        "base_time_ms": int(rows[0].get("time", 0)),
-        "start_idx": int(pattern_start),
-        "end_idx": int(latest_anchor),
-        "start_time": int(rows[pattern_start].get("time", 0)),
-        "end_time": int(rows[latest_anchor].get("time", 0)),
-        "upper_now": upper_now,
-        "lower_now": lower_now,
-        "height": measured_height,
-        "start_width": start_width,
-        "current_width": current_width,
-        "apex_idx": apex,
-        "high_points": hp,
-        "low_points": lp,
-        "pattern_high": pattern_high,
-        "pattern_low": pattern_low,
-        "touch_count": len(hp) + len(lp),
-        "atr_4h": atr,
-    }
+            # A triangle narrows from left to right: the upper boundary must
+            # fall faster (or rise more slowly) than the lower boundary.
+            if upper_slope >= lower_slope:
+                rejection_counts["BOUNDARIES_NOT_CONVERGING"] += 1
+                continue
+
+            if upper_slope < -flat_threshold and lower_slope > flat_threshold:
+                kind = "SYMMETRICAL_TRIANGLE"
+            elif upper_slope < -flat_threshold and abs(lower_slope) <= 1.8 * flat_threshold:
+                kind = "DESCENDING_TRIANGLE"
+            elif lower_slope > flat_threshold and abs(upper_slope) <= 1.8 * flat_threshold:
+                kind = "ASCENDING_TRIANGLE"
+            else:
+                rejection_counts["UNSUPPORTED_TRIANGLE_SLOPES"] += 1
+                continue
+
+            def upper_at(index: float) -> float:
+                return upper_slope * index + upper_intercept
+
+            def lower_at(index: float) -> float:
+                return lower_slope * index + lower_intercept
+
+            upper_start = upper_at(pattern_start)
+            lower_start = lower_at(pattern_start)
+            upper_now = upper_at(current_idx)
+            lower_now = lower_at(current_idx)
+            start_width = upper_start - lower_start
+            current_width = upper_now - lower_now
+            if start_width <= 0 or current_width <= 0:
+                rejection_counts["INVALID_PROJECTED_WIDTH"] += 1
+                continue
+            if not (TRIANGLE_MIN_HEIGHT_ATR * atr <= start_width <= TRIANGLE_MAX_HEIGHT_ATR * atr):
+                rejection_counts["START_HEIGHT_OUTSIDE_ATR_RANGE"] += 1
+                continue
+            if current_width < TRIANGLE_MIN_CURRENT_WIDTH_ATR * atr or current_width >= TRIANGLE_MAX_CURRENT_WIDTH_RATIO * start_width:
+                rejection_counts["CURRENT_WIDTH_FILTER"] += 1
+                continue
+
+            slope_gap = upper_slope - lower_slope
+            if abs(slope_gap) <= 1e-12:
+                rejection_counts["PARALLEL_TRENDLINES"] += 1
+                continue
+            apex = (lower_intercept - upper_intercept) / slope_gap
+            if not (current_idx + 1 <= apex <= current_idx + TRIANGLE_MAX_APEX_DISTANCE_4H):
+                rejection_counts["APEX_OUTSIDE_VALID_WINDOW"] += 1
+                continue
+
+            # Validate that intermediate confirmed swings broadly respect the
+            # proposed boundaries. Wicks may overshoot slightly, but a line that
+            # cuts through several pivots is not accepted as a triangle.
+            interval_highs = [(idx, price) for idx, price in highs if pattern_start <= idx <= latest_anchor]
+            interval_lows = [(idx, price) for idx, price in lows if pattern_start <= idx <= latest_anchor]
+            if not interval_highs or not interval_lows:
+                rejection_counts["INSUFFICIENT_BOUNDARY_TOUCHES"] += 1
+                continue
+            upper_violations = [max(0.0, price - upper_at(idx)) for idx, price in interval_highs]
+            lower_violations = [max(0.0, lower_at(idx) - price) for idx, price in interval_lows]
+            upper_violation = max(upper_violations, default=0.0)
+            lower_violation = max(lower_violations, default=0.0)
+            if upper_violation > max_violation or lower_violation > max_violation:
+                rejection_counts["BOUNDARY_PENETRATION_TOO_LARGE"] += 1
+                continue
+
+            upper_touches = [
+                (idx, price) for idx, price in interval_highs
+                if -tolerance <= upper_at(idx) - price <= tolerance
+            ]
+            lower_touches = [
+                (idx, price) for idx, price in interval_lows
+                if -tolerance <= price - lower_at(idx) <= tolerance
+            ]
+            # Pair anchors define each line, but a third independent confirmed
+            # touch is required on each boundary to reduce random-walk false
+            # positives. The two fitted anchors alone are not sufficient evidence.
+            if len(upper_touches) < TRIANGLE_MIN_TOUCHES_PER_BOUNDARY or len(lower_touches) < TRIANGLE_MIN_TOUCHES_PER_BOUNDARY:
+                rejection_counts["INSUFFICIENT_BOUNDARY_TOUCHES"] += 1
+                continue
+
+            last_close = _finite(rows[-1].get("close"))
+            if last_close > upper_now + TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR * atr or last_close < lower_now - TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR * atr:
+                rejection_counts["PRICE_TOO_FAR_OUTSIDE_PATTERN"] += 1
+                continue
+
+            pattern_high = max(price for _, price in interval_highs)
+            pattern_low = min(price for _, price in interval_lows)
+            measured_height = pattern_high - pattern_low
+            if measured_height < TRIANGLE_MIN_HEIGHT_ATR * atr or measured_height > TRIANGLE_MAX_HEIGHT_ATR * atr:
+                rejection_counts["PIVOT_HEIGHT_OUTSIDE_ATR_RANGE"] += 1
+                continue
+
+            touches = len(upper_touches) + len(lower_touches)
+            compression = (start_width - current_width) / max(start_width, 1e-12)
+            age = current_idx - latest_anchor
+            fit_penalty = (upper_violation + lower_violation) / atr
+            # Rank valid alternatives using independent evidence: touch count,
+            # compression, low boundary penetration, span and recency.
+            quality = (
+                10.0 * touches
+                + 5.0 * _clamp(compression, 0.0, 1.0)
+                + min(pattern_span, 32) / 16.0
+                - 8.0 * fit_penalty
+                - 0.25 * age
+            )
+            candidates.append({
+                "kind": kind,
+                "detector_type": "TRIANGLE",
+                "allowed_sides": ["LONG", "SHORT"],
+                "upper_slope": upper_slope,
+                "upper_intercept": upper_intercept,
+                "lower_slope": lower_slope,
+                "lower_intercept": lower_intercept,
+                "base_time_ms": int(rows[0].get("time", 0)),
+                "start_idx": int(pattern_start),
+                "end_idx": int(latest_anchor),
+                "start_time": int(rows[pattern_start].get("time", 0)),
+                "end_time": int(rows[latest_anchor].get("time", 0)),
+                "upper_now": upper_now,
+                "lower_now": lower_now,
+                "height": measured_height,
+                "start_width": start_width,
+                "current_width": current_width,
+                "apex_idx": apex,
+                "high_points": upper_touches,
+                "low_points": lower_touches,
+                "pattern_high": pattern_high,
+                "pattern_low": pattern_low,
+                "touch_count": touches,
+                "atr_4h": atr,
+                "pattern_span_4h": pattern_span,
+                "boundary_penetration_atr": fit_penalty,
+                "quality": quality,
+            })
+
+    if candidates:
+        best = max(
+            candidates,
+            key=lambda item: (
+                float(item["quality"]),
+                int(item["end_idx"]),
+                int(item["touch_count"]),
+            ),
+        )
+        if diagnostics is not None:
+            diagnostics.update({
+                "reason": "PATTERN_ACCEPTED",
+                "candidate_count": len(candidates),
+                "selected_kind": best["kind"],
+                "selected_touch_count": best["touch_count"],
+            })
+        return best
+
+    if diagnostics is not None:
+        diagnostics["candidate_count"] = 0
+        diagnostics["rejection_counts"] = dict(rejection_counts)
+    if rejection_counts:
+        # Most frequent specific failure is more actionable than a generic
+        # final slope failure from a single arbitrary line fit.
+        reason = rejection_counts.most_common(1)[0][0]
+        return reject(reason)
+    return reject("NO_VALID_TRIANGLE_CANDIDATE")
 
 
 def _relative_volume(

@@ -29,6 +29,10 @@ from .patterns import (
     TRIANGLE_MAX_APEX_DISTANCE_4H,
     TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR,
     TRIANGLE_FLAT_SLOPE_ATR_PER_BAR,
+    TRIANGLE_MAX_PIVOTS_PER_SIDE,
+    TRIANGLE_MIN_TOUCHES_PER_BOUNDARY,
+    TRIANGLE_TOUCH_TOLERANCE_ATR,
+    TRIANGLE_MAX_BOUNDARY_VIOLATION_ATR,
     TRIANGLE_MAX_CURRENT_WIDTH_RATIO,
     TRIANGLE_MAX_HEIGHT_ATR,
     TRIANGLE_MAX_SPAN_4H,
@@ -82,7 +86,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V12-triangle-context-breakout-r2-1d-12h-4h-1h"
+ENGINE_VERSION = "V12-triangle-context-breakout-r3-multipivot-1d-12h-4h-1h"
 SETUP_ARCHITECTURE = str(os.getenv("MEXC_SETUP_ARCHITECTURE", "TRIANGLE_BREAKOUT")).strip().upper()
 SUPPORTED_SETUP_ARCHITECTURES = ("TRIANGLE_BREAKOUT", "LEGACY_PULLBACK", "HYBRID")
 
@@ -546,6 +550,11 @@ def engine_config_snapshot(signal_setup_type: str | None = None) -> dict[str, An
         "triangle_max_apex_distance_4h": int(TRIANGLE_MAX_APEX_DISTANCE_4H),
         "triangle_max_boundary_extension_atr": float(TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR),
         "triangle_flat_slope_atr_per_4h_bar": float(TRIANGLE_FLAT_SLOPE_ATR_PER_BAR),
+        "triangle_pattern_fit_method": "MULTI_PIVOT_PAIR_WITH_THREE_TOUCHES_PER_BOUNDARY",
+        "triangle_max_pivots_per_side": int(TRIANGLE_MAX_PIVOTS_PER_SIDE),
+        "triangle_min_touches_per_boundary": int(TRIANGLE_MIN_TOUCHES_PER_BOUNDARY),
+        "triangle_touch_tolerance_atr": float(TRIANGLE_TOUCH_TOLERANCE_ATR),
+        "triangle_max_boundary_violation_atr": float(TRIANGLE_MAX_BOUNDARY_VIOLATION_ATR),
         "breakout_retest_bars_1h": int(BREAKOUT_RETEST_BARS_1H),
         "breakout_min_relative_volume": float(BREAKOUT_MIN_RELATIVE_VOLUME),
         "breakout_max_extension_atr": float(BREAKOUT_MAX_EXTENSION_ATR),

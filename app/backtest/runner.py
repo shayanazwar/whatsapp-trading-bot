@@ -117,6 +117,8 @@ ENGINE_CONFIG_DIAGNOSTIC_KEYS = frozenset({
     "V11_MAX_TRIGGER_BARS",
     "V11_SL_MODE_4H_ORIGIN",
     "V11_SL_MODE_LIQUIDITY_SWEEP",
+    "TRIANGLE_OPPOSITE_BOUNDARY_STOP_MODE",
+    "HYBRID_SETUP_SPECIFIC_STOP_MODE",
     "V11_SHORT_RANGE_RELAXED",
     "FIXED_BACKTEST_PERIOD_ENABLED",
     "SHORT_SHADOW_MODE_ENABLED",
@@ -141,8 +143,13 @@ def _write_engine_config_diagnostics(
     """Write exact run-level config values after all per-symbol aggregation."""
     diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(config["min_impulse_atr"]) * 100))
     diagnostics["V11_MAX_TRIGGER_BARS"] = int(config["max_trigger_bars_1h"])
-    diagnostics["V11_SL_MODE_4H_ORIGIN"] = int(str(config["stop_loss_mode"]).upper() == "4H_ORIGIN")
-    diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = int(str(config["stop_loss_mode"]).upper() == "LIQUIDITY_SWEEP")
+    # Preserve V11 baseline diagnostics separately from the active architecture.
+    legacy_stop_mode = str(config.get("legacy_stop_loss_mode", config["stop_loss_mode"])).upper()
+    active_stop_mode = str(config["stop_loss_mode"]).upper()
+    diagnostics["V11_SL_MODE_4H_ORIGIN"] = int(legacy_stop_mode == "4H_ORIGIN")
+    diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = int(legacy_stop_mode == "LIQUIDITY_SWEEP")
+    diagnostics["TRIANGLE_OPPOSITE_BOUNDARY_STOP_MODE"] = int(active_stop_mode == "OPPOSITE_TRIANGLE_BOUNDARY")
+    diagnostics["HYBRID_SETUP_SPECIFIC_STOP_MODE"] = int(active_stop_mode == "SETUP_SPECIFIC_STRUCTURAL")
     diagnostics["V11_SHORT_RANGE_RELAXED"] = int(bool(config["short_range_relaxed"]))
     diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(fixed_period_enabled))
 
@@ -748,8 +755,8 @@ class BacktestRunner:
         c1d_prefix: list = []
         c12_prefix: list = []
         c4_prefix: list = []
-        # LONG-only experiment: exclude SHORT shadow observations as well as live trades.
-        # The research code remains available for a future explicitly requested build.
+        # Optional SHORT-shadow research remains disabled unless explicitly requested.
+        # The primary portfolio backtest evaluates both LONG and SHORT candidates.
         short_shadow_enabled = False
         seen_shadow_structures: set[tuple[Any, ...]] = set()
 
@@ -980,7 +987,7 @@ class BacktestRunner:
                             cache=engine_cache,
                             btc_context=btc_context,
                             estimated_round_trip_cost_pct=qualification_cost_pct,
-                            allow_shorts=False,
+                            allow_shorts=True,
                         )
                     except ValueError:
                         inc("OVERLAP_DIAGNOSTIC_DATA_QUALITY_ERRORS")
@@ -1024,7 +1031,7 @@ class BacktestRunner:
                     cache=engine_cache,
                     btc_context=btc_context,
                     estimated_round_trip_cost_pct=qualification_cost_pct,
-                    allow_shorts=False,
+                    allow_shorts=True,
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -1347,7 +1354,7 @@ class BacktestRunner:
     async def run(
         self,
         days: int,
-        tp_mode: str = "1.5R",
+        tp_mode: str = "CONTROL",
     ) -> BacktestSummary:
         """Run a complete causal paper backtest with an exit-only TP mode."""
 
@@ -1510,12 +1517,13 @@ class BacktestRunner:
 
                 LOGGER.info(
                     "BACKTEST START | days=%d symbols=%d start=%d end=%d "
-                    "strategy=1D>12H>4H>1H engine_version=%s config_fingerprint=%s impulse_min_atr=%.2f "
-                    "trigger_bars_1h=%d sl_mode=%s fixed_period=%s",
+                    "strategy=1D>12H>4H>1H architecture=%s engine_version=%s config_fingerprint=%s "
+                    "legacy_impulse_min_atr=%.2f legacy_trigger_bars_1h=%d active_sl_mode=%s fixed_period=%s",
                     days,
                     len(symbols),
                     start_ms,
                     end_ms,
+                    active_engine_config["setup_architecture"],
                     active_engine_config["engine_version"],
                     active_engine_config["fingerprint"],
                     float(active_engine_config["min_impulse_atr"]),

@@ -229,18 +229,25 @@ def summarize(
     )
 
 
+def format_utc_iso(value: Any) -> str:
+    """Format Unix milliseconds as UTC ISO-8601; return a safe sentinel on bad input."""
+    try:
+        timestamp_ms = float(value)
+        if not math.isfinite(timestamp_ms):
+            return "invalid-timestamp"
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "invalid-timestamp"
+
+
 def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return "N/A" if value is None else f"{value:.{digits}f}{suffix}"
 
 
 def format_report(summary: BacktestSummary) -> str:
     """Render a concise user-facing report; keep internal diagnostics out of WhatsApp."""
-    start_utc = datetime.fromtimestamp(
-        int(summary.period_start_ms) / 1000, tz=timezone.utc
-    ).isoformat()
-    end_utc = datetime.fromtimestamp(
-        int(summary.period_end_ms) / 1000, tz=timezone.utc
-    ).isoformat()
+    start_utc = format_utc_iso(summary.period_start_ms)
+    end_utc = format_utc_iso(summary.period_end_ms)
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
     diagnostics = summary.diagnostics or {}
     fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
@@ -258,7 +265,8 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {period_label} | {'FIXED' if fixed_period else 'ROLLING'}",
-        f"UTC: {start_utc} → {end_utc} | elapsed: {duration_days:.6f} days",
+        f"UTC: {start_utc} → {end_utc}",
+        f"Elapsed: {duration_days:.2f}D (UTC) | elapsed: {duration_days:.6f} days",
         f"TP Mode: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",

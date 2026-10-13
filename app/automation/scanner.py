@@ -386,7 +386,7 @@ class MexcScanner:
                 symbol, c1d, c12, c4, c1,
                 btc_context=self._btc_context,
                 estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
-                allow_shorts=False,
+                allow_shorts=True,
             )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}
@@ -404,19 +404,12 @@ class MexcScanner:
                 stage = str(analysis.get("rejection_stage") or "SETUP")
                 return self._reject(symbol, failures, stage, payload)
 
-            # This release is a strict LONG-only test: block SHORT at the
-            # execution/signal boundary even if a stale environment variable
-            # tries to re-enable it.
-            if side == "SHORT":
-                payload["short_analysis_detected"] = 1
-                return self._reject(symbol, "SHORT signals disabled for LONG-only accuracy test", "SIDE_DISABLED", payload)
-
             # Check all strategy stages for diagnostics; reject at the first failed gate.
             # Reject at the first failed strategy gate while retaining all stage counters.
             ordered = [
                 ("DIRECTION", bool(analysis.get("direction_ok")), "1D/12H/4H direction"),
-                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H impulse/value setup"),
-                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H liquidity sweep/reclaim"),
+                ("4H_SETUP", bool(analysis.get("structure_ok") and analysis.get("setup_ok")), "4H triangle/pullback setup"),
+                ("1H_TRIGGER", bool(analysis.get("confirmation_ok")), "1H breakout/retest confirmation"),
                 ("VOLATILITY", bool(analysis.get("volatility_ok")), "volatility sanity"),
                 ("CONFIRMATION_FAMILIES", bool(analysis.get("confirmation_family_diversity_ok")), "supporting evidence"),
                 ("TARGET_PATH", bool(analysis.get("location_ok") and analysis.get("target_path_structural") and analysis.get("target_path_clear")), "Clear HTF target path"),

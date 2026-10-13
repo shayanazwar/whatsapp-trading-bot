@@ -6,6 +6,7 @@ import time
 from collections import Counter
 from typing import Any
 
+from ..analysis.smc_engine import analyze_candles as analyze_smc_candles
 from ..analysis.engine import (
     APPROVED_TIMEFRAMES,
     analyze_candles,
@@ -308,7 +309,11 @@ class MexcScanner:
                 payload[f"pass_{tf.lower()}"] = 1
             payload["data_valid"] = 1
 
-            analysis = analyze_candles(
+            selected_engine = str(getattr(self.settings, "analysis_engine", "V11") or "V11").upper()
+            analyzer = analyze_smc_candles if selected_engine == "SMC" else analyze_candles
+            if selected_engine not in {"V11", "SMC"}:
+                return self._reject(symbol, f"Unsupported ANALYSIS_ENGINE={selected_engine}; choose V11 or SMC", "CONFIG", payload)
+            analysis = analyzer(
                 symbol, c1d, c12, c4, c1,
                 btc_context=self._btc_context,
                 estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),

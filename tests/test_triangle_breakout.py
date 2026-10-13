@@ -398,3 +398,37 @@ def test_public_engine_emits_countertrend_short_breakout_end_to_end(monkeypatch)
     assert result["daily_bias_alignment"] == "OPPOSED"
     assert result["daily_direction_permission"] is False
     assert result["tp"] < result["entry"] < result["stop_loss"]
+
+
+def test_detector_recovers_noisy_triangle_from_alternative_confirmed_pivots():
+    """A noisy adjacent swing must not hide an otherwise valid converging triangle."""
+    import random
+
+    rng = random.Random(23)
+    base = 1_760_000_000_000
+    rows = []
+    for i in range(64):
+        upper = 120.0 - 0.24 * i
+        lower = 80.0 + 0.24 * i
+        if i % 8 in (3, 4):
+            close = upper - rng.uniform(2.0, 8.0)
+        elif i % 8 in (7, 0):
+            close = lower + rng.uniform(2.0, 8.0)
+        else:
+            close = rng.uniform(lower + 5.0, upper - 5.0)
+        open_ = close + rng.uniform(-1.2, 1.2)
+        high = max(open_, close) + rng.uniform(0.1, 2.0)
+        low = min(open_, close) - rng.uniform(0.1, 2.0)
+        if i % 8 == 4:
+            high = max(high, upper - rng.uniform(0.0, 0.3))
+        if i % 8 == 0:
+            low = min(low, lower + rng.uniform(0.0, 0.3))
+        rows.append(candle(base + i * FOUR_HOURS, open_, high, low, close, 1_000.0))
+
+    diagnostics = {}
+    pattern = detect_triangle_pattern(rows, atr_4h=3.0, diagnostics=diagnostics)
+    assert pattern is not None, diagnostics
+    assert pattern["kind"] == "SYMMETRICAL_TRIANGLE"
+    assert pattern["touch_count"] >= 6
+    assert pattern["detector_type"] == "TRIANGLE"
+    assert diagnostics["candidate_count"] >= 1

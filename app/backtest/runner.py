@@ -1399,16 +1399,15 @@ class BacktestRunner:
 
             try:
                 start_ms, end_ms = self._period(days)
+                elapsed_days = (int(end_ms) - int(start_ms)) / ONE_DAY_MS
                 LOGGER.info(
-                    "BACKTEST EFFECTIVE WINDOW | start_utc=%s end_utc=%s elapsed_days=%.4f "
-                    "requested_days=%s fixed=%s start_ms=%d end_ms=%d",
-                    datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    (end_ms - start_ms) / ONE_DAY_MS,
-                    days,
-                    bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")),
-                    start_ms,
-                    end_ms,
+                    "BACKTEST EFFECTIVE WINDOW | requested_days=%d fixed=%s "
+                    "start_utc=%s end_utc=%s elapsed_days=%.6f",
+                    int(days),
+                    fixed_period_enabled,
+                    _utc_iso(start_ms),
+                    _utc_iso(end_ms),
+                    elapsed_days,
                 )
                 snapshot_parent = os.getenv("V11_BACKTEST_SNAPSHOT_DIR", "").strip()
                 replay_path = os.getenv("V11_BACKTEST_REPLAY_DIR", "").strip()

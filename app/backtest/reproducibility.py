@@ -64,6 +64,7 @@ def _source_fingerprint(project_root: Path) -> tuple[str, dict[str, str]]:
         "app/backtest/simulator.py",
         "app/backtest/report.py",
         "app/analysis/engine.py",
+        "app/analysis/indicators.py",
         "app/automation/universe.py",
         "app/automation/mexc_client.py",
         "app/config.py",

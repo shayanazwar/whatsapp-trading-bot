@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from statistics import mean
 from typing import Any, Mapping, Sequence
 
@@ -229,23 +229,18 @@ def summarize(
     )
 
 
-def format_utc_iso(timestamp_ms: int | float) -> str:
-    """Render a millisecond Unix timestamp as an unambiguous UTC ISO-8601 string."""
-    try:
-        dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
-    except (OverflowError, OSError, ValueError, TypeError):
-        return "invalid-timestamp"
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return "N/A" if value is None else f"{value:.{digits}f}{suffix}"
 
 
 def format_report(summary: BacktestSummary) -> str:
     """Render a concise user-facing report; keep internal diagnostics out of WhatsApp."""
-    start = format_utc_iso(summary.period_start_ms)
-    end = format_utc_iso(summary.period_end_ms)
+    start_utc = datetime.fromtimestamp(
+        int(summary.period_start_ms) / 1000, tz=timezone.utc
+    ).isoformat()
+    end_utc = datetime.fromtimestamp(
+        int(summary.period_end_ms) / 1000, tz=timezone.utc
+    ).isoformat()
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
     diagnostics = summary.diagnostics or {}
     fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
@@ -262,8 +257,8 @@ def format_report(summary: BacktestSummary) -> str:
     lines = [
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Period: {period_label} ({start} → {end}) | {'FIXED' if fixed_period else 'ROLLING'}",
-        f"Elapsed: {duration_days:.2f}D (UTC)",
+        f"Period: {period_label} | {'FIXED' if fixed_period else 'ROLLING'}",
+        f"UTC: {start_utc} → {end_utc} | elapsed: {duration_days:.6f} days",
         f"TP Mode: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",

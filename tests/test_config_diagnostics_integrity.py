@@ -33,6 +33,10 @@ def test_config_metadata_is_not_summed_per_symbol():
     assert config["legacy_stop_loss_mode"] == "LIQUIDITY_SWEEP"
     assert config["triangle_target_mode"] == "MEASURED_MOVE"
     assert config["triangle_lookback_4h"] == 64
+    assert config["daily_bias_mode"] == "CONTEXT_SCORE_NOT_DIRECTIONAL_VETO"
+    assert config["triangle_flat_slope_atr_per_4h_bar"] == pytest.approx(0.015)
+    assert engine.engine_config_snapshot("LEGACY_PULLBACK")["daily_bias_mode"] == "LEGACY_DIRECTIONAL_PERMISSION"
+    assert engine.engine_config_snapshot("HYBRID")["daily_bias_mode"] == "SETUP_SPECIFIC_MIXED_MODE"
     _write_engine_config_diagnostics(totals, config, fixed_period_enabled=True)
     assert totals["V11_MIN_IMPULSE_ATR_X100"] == 250
     assert totals["V11_MAX_TRIGGER_BARS"] == 6

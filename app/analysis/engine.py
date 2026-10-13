@@ -60,7 +60,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V11-balanced-value-pullback-liquidity-reclaim"
+ENGINE_VERSION = "V11-3.0-value-localized-reclaim-front-run-target"
 
 CONFIRMATION_FAMILY_NAMES = (
     "momentum",
@@ -419,6 +419,18 @@ V11_STOP_BUFFER_ATR_1H = 0.15
 V11_MIN_SL_ATR_SANITY = 0.20
 V11_MAX_SL_ATR_SANITY = 3.00
 V11_SHOCK_RANGE_ATR = 4.50
+# Entry-quality controls: reject a reclaim unless the actual sweep occurs back
+# inside the active 4H value zone, the reclaim candle has directional intent,
+# and the entry close has not drifted materially away from that zone.
+V11_MIN_TRIGGER_QUALITY = 0.62
+V11_MIN_TRIGGER_BODY_RATIO = 0.25
+V11_MIN_TRIGGER_CLOSE_LOCATION = 0.60
+V11_MAX_ZONE_SWEEP_DELAY_1H = 2
+# Take profit slightly ahead of the selected structural liquidity level so a
+# wick that falls just short of the exact swing price is less likely to miss.
+V11_TP_FRONT_RUN_ATR_1H = 0.10
+V11_TP_FRONT_RUN_ATR_4H = 0.05
+V11_TP_FRONT_RUN_MAX_FRACTION = 0.10
 
 def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
     highs, lows = _swing_points(candles, left=left, right=right)
@@ -492,6 +504,90 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
         "bull_votes": bull_votes,
         "bear_votes": bear_votes,
     }
+
+
+def _v11_direction_permission(
+    side: str,
+    daily: dict[str, Any],
+    context: dict[str, Any],
+) -> tuple[bool, str]:
+    """Allow with-regime setups, plus tightly qualified HTF reversals.
+
+    A countertrend setup is permitted only when the latest confirmed daily
+    structure and the 12H structure both point in the trade direction, there
+    are at least two directional daily votes, and the daily vote imbalance is
+    no more than two. The downstream 4H impulse and 1H sweep/reclaim gates still
+    apply. This avoids suppressing every reversal while refusing weak
+    countertrend guesses in a strongly opposed daily regime.
+    """
+    side = str(side).upper()
+    if side not in {"LONG", "SHORT"}:
+        return False, "unsupported side"
+
+    primary_permission = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+    if primary_permission:
+        return True, "1D trend permission"
+
+    expected_structure = "HH/HL" if side == "LONG" else "LH/LL"
+    side_votes = int(daily.get("bull_votes", 0) or 0) if side == "LONG" else int(daily.get("bear_votes", 0) or 0)
+    opposing_votes = int(daily.get("bear_votes", 0) or 0) if side == "LONG" else int(daily.get("bull_votes", 0) or 0)
+    reversal_ok = (
+        daily.get("structure") == expected_structure
+        and context.get("structure") == expected_structure
+        and not bool(context.get("hostile"))
+        and side_votes >= 2
+        and opposing_votes - side_votes <= 2
+    )
+    if reversal_ok:
+        return True, "qualified 1D/12H structural reversal permission"
+
+    return False, (
+        f"{side}: 1D trend permission unavailable "
+        f"(regime={daily.get('regime') or 'NEUTRAL'}, "
+        f"structure={daily.get('structure') or 'UNKNOWN'}, "
+        f"bull_votes={daily.get('bull_votes', 0)}, "
+        f"bear_votes={daily.get('bear_votes', 0)}; no aligned 1D/12H reversal)"
+    )
+
+
+def _v11_qualify_value_zone_trigger(
+    trigger: dict[str, Any],
+    candles: list[Candle],
+    zone: dict[str, Any],
+    touch_idx: int,
+    side: str,
+    decision_idx: int,
+) -> tuple[bool, str]:
+    """Validate that a reclaim is fresh, localized, and directionally strong."""
+    if not trigger.get("ready"):
+        return False, "no sweep/reclaim trigger"
+    try:
+        sweep_idx = int(trigger["sweep_idx"])
+        reclaim_idx = int(trigger["reclaim_idx"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, "trigger indices are invalid"
+    if not (0 <= sweep_idx < len(candles) and 0 <= reclaim_idx < len(candles)):
+        return False, "trigger indices are outside the closed-candle history"
+    if reclaim_idx != decision_idx:
+        return False, "reclaim is not the latest completed 1H candle"
+    if sweep_idx < int(touch_idx) or sweep_idx - int(touch_idx) > V11_MAX_ZONE_SWEEP_DELAY_1H:
+        return False, "liquidity sweep occurred too long after the value-zone touch"
+
+    sweep = candles[sweep_idx]
+    zlow, zhigh = _num(zone.get("low")), _num(zone.get("high"))
+    if not (float(sweep["low"]) <= zhigh and float(sweep["high"]) >= zlow):
+        return False, "liquidity sweep candle did not overlap the active 4H value zone"
+
+    body_ratio = _num(trigger.get("body_ratio"))
+    close_location = _num(trigger.get("close_location"))
+    quality = _num(trigger.get("quality"))
+    if body_ratio < V11_MIN_TRIGGER_BODY_RATIO:
+        return False, f"reclaim candle body too weak ({body_ratio:.2f})"
+    if close_location < V11_MIN_TRIGGER_CLOSE_LOCATION:
+        return False, f"reclaim close location too weak ({close_location:.2f})"
+    if quality < V11_MIN_TRIGGER_QUALITY:
+        return False, f"reclaim quality too low ({quality:.2f})"
+    return True, "localized high-quality value-zone sweep/reclaim"
 
 
 def _v11_context_12h(candles: list[Candle], side: str) -> dict[str, Any]:
@@ -810,7 +906,7 @@ def _v11_analyze_side(
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
     context = _v11_context_12h(c12, side)
-    direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
+    direction_ok, direction_permission_reason = _v11_direction_permission(side, daily, context)
 
     def reject(reason: str) -> dict[str, Any]:
         return {
@@ -825,9 +921,7 @@ def _v11_analyze_side(
         }
 
     if not direction_ok:
-        return reject(
-            f"{side}: 1D trend permission unavailable (regime={daily.get('regime') or 'NEUTRAL'}, structure={daily.get('structure') or 'UNKNOWN'}, bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
-        )
+        return reject(str(direction_permission_reason))
     if context.get("hostile"):
         return reject(
             f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})"
@@ -875,6 +969,7 @@ def _v11_analyze_side(
         zlow, zhigh = _num(zone.get("low")), _num(zone.get("high"))
         trigger = None
         touched_value = False
+        trigger_rejection: str | None = None
         for touch_idx, touch_candle in enumerate(c1):
             if int(touch_candle["time"]) <= start_time:
                 continue
@@ -882,16 +977,32 @@ def _v11_analyze_side(
                 touched_value = True
                 candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side)
                 if candidate_trigger.get("ready") and int(candidate_trigger.get("reclaim_idx", -1)) == len(c1) - 1:
-                    trigger = candidate_trigger
-                    break
+                    qualified, qualification_reason = _v11_qualify_value_zone_trigger(
+                        candidate_trigger, c1, zone, touch_idx, side, len(c1) - 1
+                    )
+                    if qualified:
+                        trigger = candidate_trigger
+                        break
+                    trigger_rejection = qualification_reason
         if not trigger:
-            last_reason = f"{side}: value zone touched={touched_value}, but no 1H sweep -> later reclaim completed on current candle"
+            detail = f"; last trigger rejection={trigger_rejection}" if trigger_rejection else ""
+            last_reason = f"{side}: value zone touched={touched_value}, but no qualified localized 1H sweep/reclaim on current candle{detail}"
             continue
 
         trigger_idx = int(trigger["reclaim_idx"])
         entry = float(c1[-1]["close"])
         atr4 = max(_safe_atr(c4), float(impulse["atr"]))
         atr1 = _safe_atr(c1)
+        if atr1 <= 0:
+            last_reason = f"{side}: invalid 1H ATR for entry-distance validation"
+            continue
+        zone_distance = max(0.0, zlow - entry, entry - zhigh) / atr1
+        if zone_distance > MAX_ENTRY_DISTANCE_ATR:
+            last_reason = (
+                f"{side}: reclaim close extended {zone_distance:.2f} ATR from value zone "
+                f"> {MAX_ENTRY_DISTANCE_ATR:.2f} ATR"
+            )
+            continue
         sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
@@ -922,7 +1033,15 @@ def _v11_analyze_side(
         if not target.get("ok"):
             last_reason = f"{side}: no structural target beyond entry"
             continue
-        tp = float(target["price"])
+        structural_target = float(target["price"])
+        target_distance = abs(structural_target - entry)
+        front_run_buffer = min(
+            max(V11_TP_FRONT_RUN_ATR_1H * atr1, V11_TP_FRONT_RUN_ATR_4H * atr4),
+            V11_TP_FRONT_RUN_MAX_FRACTION * target_distance,
+        )
+        tp = structural_target - front_run_buffer if side == "LONG" else structural_target + front_run_buffer
+        target["structural_price"] = structural_target
+        target["front_run_buffer"] = front_run_buffer
         target_path = _v11_target_path(
             c4, c12, c1d, entry, tp, side,
             target_time=int(target.get("time")) if target.get("time") is not None else None,
@@ -978,9 +1097,11 @@ def _v11_analyze_side(
                 "btc_filter_ok": False,
             }
         return {
-            "side": side, "candidate": True, "direction_ok": True, "context": context,
+            "side": side, "candidate": True, "direction_ok": True,
+            "direction_permission_reason": direction_permission_reason, "context": context,
             "impulse": impulse, "value_zone": zone, "trigger": trigger,
             "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr_net, "rr_gross": rr_gross,
+            "tp_front_run_buffer": front_run_buffer, "structural_target_price": structural_target,
             "atr_4h": atr4, "atr_1h": atr1, "sl_atr": sl_atr,
             "tp_distance_atr": abs(tp - entry) / atr4 if atr4 > 0 else 0.0,
             "target": target, "target_path": target_path, "score": score, "score_groups": score_groups,
@@ -1124,7 +1245,7 @@ def analyze_candles(
     target_tf = str(chosen["target"].get("timeframe") or "4H")
     target_reason = "nearest structural target; RR applied after target selection"
     reasons = [
-        f"1D {daily.get('regime')} permission",
+        str(chosen.get("direction_permission_reason") or f"1D {daily.get('regime')} permission"),
         f"4H impulse {float(impulse['leg_atr']):.2f} ATR",
         f"Value zone {float(chosen['value_zone']['low']):.6g}-{float(chosen['value_zone']['high']):.6g}",
         "1H liquidity sweep + reclaim",
@@ -1170,6 +1291,9 @@ def analyze_candles(
         "side_diagnostics": side_diagnostics, "primary_rejection_reason": None,
         "reasons": reasons,
         "entry": entry, "stop_loss": stop, "tp": tp, "rr": rr, "rr_gross": rr_gross,
+        "structural_target_price": float(chosen.get("structural_target_price", tp)),
+        "tp_front_run_buffer": float(chosen.get("tp_front_run_buffer", 0.0)),
+        "direction_permission_reason": chosen.get("direction_permission_reason"),
         "sl_atr": risk / float(chosen["atr_4h"]) if chosen["atr_4h"] > 0 else 0.0,
         "sl_atr_1h": risk / float(chosen["atr_1h"]) if chosen["atr_1h"] > 0 else 0.0,
         "sl_atr_4h": risk / float(chosen["atr_4h"]) if chosen["atr_4h"] > 0 else 0.0,

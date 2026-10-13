@@ -22,6 +22,7 @@ def _candles(count: int, interval_ms: int, now_ms: int):
 
 
 def test_engine_can_evaluate_long_only_without_calling_short_side(monkeypatch):
+    monkeypatch.setattr(engine, "SETUP_ARCHITECTURE", "LEGACY_PULLBACK")
     day = 86_400_000
     twelve_hours = 12 * 3_600_000
     four_hours = 4 * 3_600_000
@@ -63,10 +64,12 @@ def test_engine_can_evaluate_long_only_without_calling_short_side(monkeypatch):
     assert [item["side"] for item in result["side_diagnostics"]] == ["LONG"]
 
 
-def test_backtest_defaults_to_fixed_15r_and_rejects_other_targets():
-    assert bot_module.parse_backtest_args("7D") == ("7D", 7, "1.5R")
+def test_backtest_defaults_to_control_target_and_supports_counterfactuals():
+    assert bot_module.parse_backtest_args("7D") == ("7D", 7, "CONTROL")
+    assert bot_module.parse_backtest_args("7D TP=CONTROL") == ("7D", 7, "CONTROL")
     assert bot_module.parse_backtest_args("7D TP=1.5R") == ("7D", 7, "1.5R")
-    with pytest.raises(ValueError, match="fixed at 1.5R"):
-        bot_module.parse_backtest_args("7D TP=CONTROL")
-    with pytest.raises(ValueError, match="fixed at 1.5R"):
-        bot_module.parse_backtest_args("7D TP=2.0R")
+    assert bot_module.parse_backtest_args("7D TP=2.0R") == ("7D", 7, "2.0R")
+    assert bot_module.parse_backtest_args("7D TP=2.5R") == ("7D", 7, "2.5R")
+    with pytest.raises(ValueError, match="Invalid TP mode"):
+        bot_module.parse_backtest_args("7D TP=2.25R")
+

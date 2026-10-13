@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import app.analysis.engine as engine
 from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, _v11_structure, convert_candles
 
 DAY = 86_400_000
@@ -72,11 +73,12 @@ def _build_fixture():
     return daily, c4, c1[: trigger_idx + 1], decision_now
 
 
-def test_v11_generates_causal_value_pullback_signal():
+def test_v11_generates_causal_value_pullback_signal(monkeypatch):
+    monkeypatch.setattr(engine, "SETUP_ARCHITECTURE", "LEGACY_PULLBACK")
     daily, c4, c1, now = _build_fixture()
     result = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
 
-    assert result["signal_engine_version"].startswith("V11-")
+    assert result["signal_engine_version"].startswith("V12-")
     assert result["setup"] == "LONG"
     assert result["technical_candidate"] is True
     assert result["trigger_type"] == "LIQUIDITY_SWEEP_RECLAIM"
@@ -131,7 +133,8 @@ def test_v11_target_path_reports_obstacle_truthfully():
     assert "clear" in result and "obstacles" in result and "reason" in result
 
 
-def test_v11_short_analysis_is_supported_symmetrically():
+def test_v11_short_analysis_is_supported_symmetrically(monkeypatch):
+    monkeypatch.setattr(engine, "SETUP_ARCHITECTURE", "LEGACY_PULLBACK")
     daily, c4, c1, now = _build_fixture()
     # Mirror around the actual LONG entry so RR/cost geometry remains scale-symmetric.
     k = 316.8
@@ -146,6 +149,7 @@ def test_v11_short_analysis_is_supported_symmetrically():
 
 
 def test_short_shadow_bypasses_only_the_daily_permission_gate(monkeypatch):
+    monkeypatch.setattr(engine, "SETUP_ARCHITECTURE", "LEGACY_PULLBACK")
     daily, c4, c1, now = _build_fixture()
     k = 316.8
     daily_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in daily]

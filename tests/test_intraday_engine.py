@@ -118,7 +118,8 @@ def test_v11_target_path_is_a_real_diagnostic():
     assert isinstance(result["obstacles"], list)
 
 
-def test_v11_analysis_exposes_next_open_market_entry():
+def test_v11_analysis_exposes_next_open_market_entry(monkeypatch):
+    monkeypatch.setattr(engine, "SETUP_ARCHITECTURE", "LEGACY_PULLBACK")
     daily, c4, c1, now = _v11_fixture()
     result = engine.analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
     assert result["setup"] == "LONG"

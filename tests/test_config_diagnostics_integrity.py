@@ -28,10 +28,17 @@ def test_config_metadata_is_not_summed_per_symbol():
     assert "FIXED_BACKTEST_PERIOD_ENABLED" not in totals
 
     config = engine.engine_config_snapshot()
+    assert config["setup_architecture"] == "TRIANGLE_BREAKOUT"
+    assert config["stop_loss_mode"] == "OPPOSITE_TRIANGLE_BOUNDARY"
+    assert config["legacy_stop_loss_mode"] == "LIQUIDITY_SWEEP"
+    assert config["triangle_target_mode"] == "MEASURED_MOVE"
+    assert config["triangle_lookback_4h"] == 64
     _write_engine_config_diagnostics(totals, config, fixed_period_enabled=True)
     assert totals["V11_MIN_IMPULSE_ATR_X100"] == 250
     assert totals["V11_MAX_TRIGGER_BARS"] == 6
     assert totals["V11_SL_MODE_LIQUIDITY_SWEEP"] == 1
+    assert totals["TRIANGLE_OPPOSITE_BOUNDARY_STOP_MODE"] == 1
+    assert totals["HYBRID_SETUP_SPECIFIC_STOP_MODE"] == 0
     assert totals["FIXED_BACKTEST_PERIOD_ENABLED"] == 1
 
 

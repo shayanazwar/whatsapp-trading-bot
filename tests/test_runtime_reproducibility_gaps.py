@@ -81,7 +81,7 @@ def test_report_prints_exact_utc_bounds_and_actual_elapsed_duration():
         trades=[],
         diagnostics={"FIXED_BACKTEST_PERIOD_ENABLED": 1},
     ))
-    assert "2026-09-29T16:00:00+00:00" in report
-    assert "2026-10-06T16:00:00+00:00" in report
+    assert "2026-09-29T16:00:00Z" in report
+    assert "2026-10-06T16:00:00Z" in report
     assert "elapsed: 7.000000 days" in report
     assert "requested 1D" in report

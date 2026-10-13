@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .alerts import AlertEngine
 from .automation.executor import MexcExecutor
+from .automation.gemini_reviewer import GeminiChartReviewer
 from .automation.mexc_client import MexcClient
 from .automation.paper_trader import PaperTrader
 from .automation.scanner import MexcScanner
@@ -29,6 +30,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("whatsapp_bot")
 
 settings = get_settings()
+
+
+def _build_gemini_reviewer(runtime_settings):
+    """Construct the optional reviewer only when explicitly enabled."""
+    if not bool(getattr(runtime_settings, "gemini_review_enabled", False)):
+        return None
+    return GeminiChartReviewer(runtime_settings)
 
 
 @asynccontextmanager
@@ -59,6 +67,7 @@ mexc_universe = MexcUniverse(mexc_client, max_symbols=settings.max_symbols, test
 signal_manager = SignalManager(db=db, whatsapp=whatsapp, recipients=settings.auto_signal_recipient_set, expiry_minutes=settings.signal_expiry_minutes)
 mexc_executor = MexcExecutor(mexc_client, settings)
 paper_trader = PaperTrader(db=db, client=mexc_client, settings=settings)
+gemini_reviewer = _build_gemini_reviewer(settings)
 bot.set_paper_trader(paper_trader)
 mexc_scanner = MexcScanner(
     client=mexc_client,
@@ -67,6 +76,7 @@ mexc_scanner = MexcScanner(
     signal_manager=signal_manager,
     executor=mexc_executor,
     paper_trader=paper_trader,
+    gemini_reviewer=gemini_reviewer,
 )
 scanner_scheduler = ScannerScheduler(mexc_scanner, interval_seconds=settings.scan_interval_seconds)
 
@@ -299,8 +309,9 @@ async def shutdown_event() -> None:
         await alert_engine.stop()
     with suppress(Exception):
         await market.close()
-    with suppress(Exception):
-        await gemini_reviewer.aclose()
+    if gemini_reviewer is not None:
+        with suppress(Exception):
+            await gemini_reviewer.aclose()
     with suppress(Exception):
         await mexc_client.close()
     with suppress(Exception):

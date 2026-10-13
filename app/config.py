@@ -44,31 +44,9 @@ class Settings(BaseSettings):
     max_open_trades: int = Field(default=3, alias="MAX_OPEN_TRADES")
     max_daily_loss: float = Field(default=0.05, alias="MAX_DAILY_LOSS")
 
-    # Separate virtual-money paper trading. This never submits exchange orders.
-    paper_trading_enabled: bool = Field(default=False, alias="PAPER_TRADING_ENABLED")
-    paper_initial_balance: float = Field(default=100.0, alias="PAPER_INITIAL_BALANCE")
-    paper_margin_percent: float = Field(default=1.0, alias="PAPER_MARGIN_PERCENT")
-    paper_leverage: int = Field(default=20, alias="PAPER_LEVERAGE")
-    paper_max_open_trades: int = Field(default=3, alias="PAPER_MAX_OPEN_TRADES")
-    paper_poll_seconds: int = Field(default=15, alias="PAPER_POLL_SECONDS")
-    paper_fee_rate: float = Field(default=0.0006, alias="PAPER_FEE_RATE")
-    paper_slippage_bps: float = Field(default=2.0, alias="PAPER_SLIPPAGE_BPS")
-
-    # Optional Gemini chart review. Shadow mode is deliberately the default and never gates signals.
-    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-3.8-flash", alias="GEMINI_MODEL")
-    gemini_review_enabled: bool = Field(default=False, alias="GEMINI_REVIEW_ENABLED")
-    gemini_review_mode: str = Field(default="shadow", alias="GEMINI_REVIEW_MODE")
-    gemini_min_confidence: int = Field(default=70, alias="GEMINI_MIN_CONFIDENCE")
-    gemini_timeout_seconds: float = Field(default=45.0, alias="GEMINI_TIMEOUT_SECONDS")
-    gemini_chart_bars: int = Field(default=100, alias="GEMINI_CHART_BARS")
-    gemini_max_concurrency: int = Field(default=2, alias="GEMINI_MAX_CONCURRENCY")
-    gemini_cache_ttl_seconds: int = Field(default=900, alias="GEMINI_CACHE_TTL_SECONDS")
-
     # Scanner switches
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
-    shorts_enabled: bool = Field(default=False, alias="SHORTS_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(default=3600, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")
@@ -113,9 +91,6 @@ class Settings(BaseSettings):
     backtest_total_open_risk_r: float = Field(default=3.0, alias="BACKTEST_TOTAL_OPEN_RISK_R")
     backtest_fee_rate: float = Field(default=0.0006, alias="BACKTEST_FEE_RATE")
     backtest_slippage_bps: float = Field(default=2.0, alias="BACKTEST_SLIPPAGE_BPS")
-    # Research-only counterfactual evaluation of SHORT setups rejected solely
-    # by the existing daily bearish-permission gate. Never changes live signals.
-    backtest_short_shadow_enabled: bool = Field(default=False, alias="V11_BACKTEST_SHORT_SHADOW_ENABLED")
 
     # Additional live-trading kill switch
     allow_live_execution: bool = Field(default=False, alias="ALLOW_LIVE_EXECUTION")

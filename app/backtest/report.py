@@ -244,6 +244,27 @@ def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return "N/A" if value is None else f"{value:.{digits}f}{suffix}"
 
 
+def _top_rejection_reasons(diagnostics: Mapping[str, int], side: str, limit: int = 3) -> list[tuple[str, int]]:
+    """Return stable per-side first-failure reasons, excluding aggregate totals."""
+    prefix = f"FIRST_FAILURE_{side}_"
+    totals: dict[str, int] = {}
+    for key, raw_count in diagnostics.items():
+        if not str(key).startswith(prefix):
+            continue
+        reason = str(key)[len(prefix):]
+        if not reason or reason == "TOTAL":
+            continue
+        if reason.startswith(f"{side}_"):
+            reason = reason[len(side) + 1:]
+        try:
+            count = max(0, int(raw_count))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count:
+            totals[reason] = totals.get(reason, 0) + count
+    return sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:max(1, int(limit))]
+
+
 def format_report(summary: BacktestSummary) -> str:
     """Render a concise user-facing report; keep internal diagnostics out of WhatsApp."""
     start_utc = format_utc_iso(summary.period_start_ms)
@@ -269,6 +290,7 @@ def format_report(summary: BacktestSummary) -> str:
         f"Elapsed: {duration_days:.2f}D (UTC) | elapsed: {duration_days:.6f} days",
         f"TP Mode: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
+        f"Setup Architecture: {str(summary.engine_config.get('setup_architecture') or 'UNKNOWN')}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",
         f"📡 Signals: {summary.signals} (LONG {summary.long_signals} / SHORT {summary.short_signals})",
@@ -286,6 +308,26 @@ def format_report(summary: BacktestSummary) -> str:
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
         f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r, 2, 'R')} / {_fmt(summary.avg_mfe_r, 2, 'R')}",
     ]
+    if summary.signals == 0:
+        diagnostic_reasons = {
+            side: _top_rejection_reasons(diagnostics, side)
+            for side in ("LONG", "SHORT")
+        }
+        lines.extend(["", "🔍 TOP REJECTION CAUSES (per-side first failure)"])
+        found_reason = False
+        for side in ("LONG", "SHORT"):
+            reasons = diagnostic_reasons[side]
+            if not reasons:
+                continue
+            found_reason = True
+            lines.append(f"{side}:")
+            for reason, count in reasons:
+                label = reason.replace("_", " ").strip().title()
+                if len(label) > 68:
+                    label = label[:65] + "..."
+                lines.append(f"  {label}: {count}")
+        if not found_reason:
+            lines.append("No per-side rejection diagnostics were recorded.")
     if summary.long_cohorts:
         lines.extend(["", "🔎 LONG COHORT CHECKS (exploratory; same realized trades)"])
         for cohort in summary.long_cohorts:

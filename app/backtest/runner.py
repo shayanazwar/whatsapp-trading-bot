@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Causal MEXC Futures backtest runner for the V11 swing engine.
+"""Causal MEXC Futures backtest runner for the active swing engine.
 
 Authoritative analysis timeframes:
     1D -> 12H -> 4H -> 1H
@@ -8,7 +8,7 @@ Authoritative analysis timeframes:
 This runner deliberately does not fetch, build, analyze, or simulate with:
     any lower timeframe beyond the four authoritative frames.
 
-The runner is designed to match V11 value-pullback engine:
+The runner is designed to match the active configured setup architecture:
 - 12H is synthesized once from completed 4H candles using the engine helper.
 - MEXC timestamps are canonicalized to milliseconds at ingestion.
 - 1H candle closes are the only decision points.
@@ -55,6 +55,12 @@ from .simulator import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _validated_candidate_side(analysis: dict[str, Any]) -> str | None:
+    """Return LONG/SHORT candidates; reject only missing or malformed sides."""
+    side = str(analysis.get("setup") or analysis.get("setup_candidate") or "").upper()
+    return side if side in {"LONG", "SHORT"} else None
 
 
 def _normalize_failure_diagnostic_key(value: str) -> str:
@@ -1129,26 +1135,24 @@ class BacktestRunner:
                             seen_first_failures.add(unique_key)
                             inc(f"UNIQUE_FIRST_FAILURE_{side_name}_{normalized_first}")
 
-            side = str(
-                analysis.get("setup")
-                or analysis.get("setup_candidate")
-                or ""
-            ).upper()
-            if side != "LONG":
-                inc("LONG_ONLY_SIDE_BLOCKED")
-                LOGGER.warning(
-                    "BACKTEST LONG-ONLY GUARD | symbol=%s signal_close_ms=%s blocked_side=%s",
-                    history.symbol, signal_close_ms, side or "UNKNOWN",
+            side = _validated_candidate_side(analysis)
+            if side is None:
+                inc("INVALID_CANDIDATE_SIDE")
+                LOGGER.error(
+                    "BACKTEST INVALID CANDIDATE SIDE | symbol=%s signal_close_ms=%s setup=%s setup_candidate=%s",
+                    history.symbol, signal_close_ms,
+                    analysis.get("setup"), analysis.get("setup_candidate"),
                 )
                 continue
 
-            inc("FULL_ENGINE_ACCEPT_LONG")
+            inc(f"FULL_ENGINE_ACCEPT_{side}")
 
             structure_key = (
                 side,
+                analysis.get("setup_type"),
                 analysis.get("setup_impulse_high_time"),
                 analysis.get("setup_impulse_low_time"),
-                analysis.get("swept_level_1h"),
+                analysis.get("pattern_breakout_level") or analysis.get("swept_level_1h"),
                 analysis.get("reclaim_time_1h") or analysis.get("setup_retest_1h_time"),
             )
             if structure_key in seen_structures:

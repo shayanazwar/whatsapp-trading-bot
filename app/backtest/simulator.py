@@ -54,8 +54,6 @@ class SimulatedTrade:
     gross_pnl: float = 0.0
     entry_fee: float = 0.0
     exit_fees: float = 0.0
-    funding_cost: float = 0.0
-    funding_r: float = 0.0
     position_contract_size: float = 1.0
     same_bar_rule: str = DEFAULT_SAME_BAR_RULE
     state: str = "FINALIZED"
@@ -67,7 +65,6 @@ class SimulatedTrade:
     mfe_1_5r_hit: bool = False
     time_to_1r_minutes: float | None = None
     time_to_1_5r_minutes: float | None = None
-    counterfactual_tp_r: float | None = None
 
     @property
     def tp(self) -> float:
@@ -100,9 +97,7 @@ def _candle_values(candle: Any) -> tuple[int, float, float, float, float] | None
         return None
     if timestamp <= 0 or not all(isfinite(v) for v in (open_price, high, low, close)):
         return None
-    # OHLC bars must contain their own open and close; reject corrupt rows
-    # rather than allowing impossible gap/stop behavior into the simulation.
-    if low > high or open_price < low or open_price > high or close < low or close > high:
+    if low > high or close < low or close > high:
         return None
     return timestamp, open_price, high, low, close
 
@@ -196,10 +191,8 @@ def simulate_trade(
     signal_close_time_ms: int,
     fee_rate: float = DEFAULT_FEE_RATE,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
-    funding_cost_pct: float = 0.0,
     max_holding_minutes: float | None = None,
     same_bar_rule: str | None = None,
-    counterfactual_tp_r: float | None = None,
 ) -> SimulatedTrade | None:
     """Simulate a deterministic single-TP / single-SL trade.
 
@@ -229,22 +222,10 @@ def simulate_trade(
     planned_risk = abs(entry - stop)
     if planned_risk <= 0 or not isfinite(planned_risk):
         return None
-    # The engine's original TP is the control target and is always validated here.
-    # A counterfactual TP, when supplied, is applied only after the entry fill so
-    # that the accepted entry/SL population is unchanged.
-    original_tp = tp
-    if side == "LONG" and not (stop < entry < original_tp):
+    if side == "LONG" and not (stop < entry < tp):
         return None
-    if side == "SHORT" and not (original_tp < entry < stop):
+    if side == "SHORT" and not (tp < entry < stop):
         return None
-    counterfactual_r = None
-    if counterfactual_tp_r is not None:
-        try:
-            candidate_r = float(counterfactual_tp_r)
-        except (TypeError, ValueError, OverflowError):
-            candidate_r = 0.0
-        if isfinite(candidate_r) and candidate_r > 0:
-            counterfactual_r = candidate_r
 
     size_data = _position_size(signal)
     if size_data is None:
@@ -259,12 +240,11 @@ def simulate_trade(
         )
         fee_rate = max(0.0, float(fee_rate))
         slippage_bps = max(0.0, float(slippage_bps))
-        funding_cost_pct = max(0.0, float(funding_cost_pct))
     except (TypeError, ValueError, OverflowError):
         return None
     if not isfinite(max_hold) or max_hold <= 0:
         max_hold = DEFAULT_MAX_HOLDING_MINUTES
-    if not all(isfinite(value) for value in (fee_rate, slippage_bps, funding_cost_pct)):
+    if not isfinite(fee_rate) or not isfinite(slippage_bps):
         return None
 
     rule = _same_bar_rule(same_bar_rule if same_bar_rule is not None else signal.get("same_bar_rule"))
@@ -277,7 +257,6 @@ def simulate_trade(
     risk_exec = 0.0
     initial_risk_cash = 0.0
     entry_fee = 0.0
-    funding_cost_cash = 0.0
     realized_pnl = 0.0
     gross_pnl = 0.0
     exit_fees = 0.0
@@ -319,7 +298,7 @@ def simulate_trade(
         denominator = initial_risk_cash if initial_risk_cash > 0 else 0.0
         fees_r = (entry_fee + exit_fees) / denominator if denominator else 0.0
         slip_r = slippage_cash / denominator if denominator else 0.0
-        signal_rr = abs(original_tp - entry) / planned_risk if planned_risk > 0 else 0.0
+        signal_rr = abs(tp - entry) / planned_risk if planned_risk > 0 else 0.0
         actual_fill_rr = None
         if entry_exec is not None:
             actual_fill_risk = abs(entry_exec - stop)
@@ -340,14 +319,11 @@ def simulate_trade(
             tp1_execution=final_exec if tp_hit else None, breakeven_execution=None,
             final_exit_execution=final_exec if close_position else None, realized_pnl=realized_pnl,
             gross_pnl=gross_pnl, entry_fee=entry_fee, exit_fees=exit_fees,
-            funding_cost=funding_cost_cash,
-            funding_r=(funding_cost_cash / denominator) if denominator else 0.0,
             position_contract_size=contract_size, same_bar_rule=rule,
             state="FINALIZED" if close_position else "OPEN", entry_filled_time_ms=fill_ts, entry_mode=entry_mode,
             mae_r=mae_r if fill_ts is not None else None, mfe_r=mfe_r if fill_ts is not None else None,
             mfe_1r_hit=mfe_1r_hit, mfe_1_5r_hit=mfe_1_5r_hit,
             time_to_1r_minutes=time_to_1r_minutes, time_to_1_5r_minutes=time_to_1_5r_minutes,
-            counterfactual_tp_r=counterfactual_r,
         )
 
     expiry_ts = int(signal_time + max_hold * 60_000)
@@ -357,7 +333,7 @@ def simulate_trade(
         parsed = _candle_values(candle)
         if parsed is None:
             continue
-        timestamp, open_price, high, low, close = parsed
+        timestamp, _open_price, high, low, close = parsed
         close_time = timestamp + ONE_HOUR_MS
         if close_time <= signal_time:
             continue
@@ -379,36 +355,23 @@ def simulate_trade(
             else:
                 # Signal is produced at the completed 1H close; market execution
                 # occurs at the next 1H open, then receives adverse slippage.
-                base_entry = open_price if timestamp >= signal_close_time_ms else entry
+                base_entry = _open_price if timestamp >= signal_close_time_ms else entry
                 entry_exec = _adverse_slippage(base_entry, side, is_entry=True, slippage_bps=slippage_bps)
                 fill_ts = timestamp
 
             if not isfinite(entry_exec) or entry_exec <= 0:
                 return None
-            risk_exec = abs(entry_exec - stop)
-            if counterfactual_r is not None:
-                tp = (
-                    entry_exec + counterfactual_r * risk_exec
-                    if side == "LONG"
-                    else entry_exec - counterfactual_r * risk_exec
-                )
             if side == "LONG" and not (stop < entry_exec < tp):
                 return None
             if side == "SHORT" and not (tp < entry_exec < stop):
                 return None
+            risk_exec = abs(entry_exec - stop)
             initial_risk_cash = risk_exec * initial_size * contract_size
             if risk_exec <= 0 or initial_risk_cash <= 0 or not isfinite(initial_risk_cash):
                 return None
             entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
-            # Flat conservative reserve per trade, matching the configured
-            # admission-cost allowance. This is not historical settlement-level
-            # funding; that requires timestamped funding-rate data.
-            funding_cost_cash = abs(entry_exec) * initial_size * contract_size * funding_cost_pct
-            realized_pnl = -entry_fee - funding_cost_cash
-            # Attribute only execution slippage here. The signal-close-to-next-open
-            # move is a market gap, not slippage; realized P&L still uses the actual fill.
-            entry_reference_price = entry if entry_mode == "LIMIT" else base_entry
-            slippage_cash = abs(entry_exec - entry_reference_price) * initial_size * contract_size
+            realized_pnl = -entry_fee
+            slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
             # A passive limit can fill at an unknown point inside the candle.
             # Do not evaluate that same candle's full high/low after the fill,
             # because its pre-fill movement is unknowable without tick data.
@@ -426,12 +389,22 @@ def simulate_trade(
                 return None
             return build_trade("EXPIRED", previous_close_time, expired=True)
 
-        # Resolve exit touches before updating excursions. A 1H OHLC candle does
-        # not reveal whether its high occurred before or after its low. Counting
-        # the entire exit candle first can falsely claim that a stopped trade had
-        # reached +1R/+1.5R, or that it experienced adverse movement beyond its
-        # stop while it was still open. For non-exit candles, the full range is
-        # observable while the trade remains open and is recorded normally.
+        # Track normalized adverse/favorable excursion before resolving the bar.
+        if risk_exec > 0 and entry_exec is not None:
+            if side == "LONG":
+                mae_r = max(mae_r, max(0.0, entry_exec - low) / risk_exec)
+                current_mfe = max(0.0, high - entry_exec) / risk_exec
+            else:
+                mae_r = max(mae_r, max(0.0, high - entry_exec) / risk_exec)
+                current_mfe = max(0.0, entry_exec - low) / risk_exec
+            mfe_r = max(mfe_r, current_mfe)
+            if current_mfe >= 1.0 and not mfe_1r_hit:
+                mfe_1r_hit = True
+                time_to_1r_minutes = _hold_minutes(fill_ts, close_time)
+            if current_mfe >= 1.5 and not mfe_1_5r_hit:
+                mfe_1_5r_hit = True
+                time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
+
         if side == "LONG":
             sl_touched = low <= stop
             tp_touched = high >= tp
@@ -448,39 +421,7 @@ def simulate_trade(
         else:
             first = None
 
-        if first is None:
-            if risk_exec > 0 and entry_exec is not None:
-                if side == "LONG":
-                    mae_r = max(mae_r, max(0.0, entry_exec - low) / risk_exec)
-                    current_mfe = max(0.0, high - entry_exec) / risk_exec
-                else:
-                    mae_r = max(mae_r, max(0.0, high - entry_exec) / risk_exec)
-                    current_mfe = max(0.0, entry_exec - low) / risk_exec
-                mfe_r = max(mfe_r, current_mfe)
-                if current_mfe >= 1.0 and not mfe_1r_hit:
-                    mfe_1r_hit = True
-                    time_to_1r_minutes = _hold_minutes(fill_ts, close_time)
-                if current_mfe >= (1.5 - 1e-9) and not mfe_1_5r_hit:
-                    mfe_1_5r_hit = True
-                    time_to_1_5r_minutes = _hold_minutes(fill_ts, close_time)
-            previous_close = close
-            previous_close_time = close_time
-            continue
-
         if first == "TP":
-            # The target level itself is a known favorable excursion. Ignore the
-            # remainder of this candle (which may have printed after exit), and
-            # do not infer the ordering of this candle's adverse extreme.
-            if risk_exec > 0 and entry_exec is not None:
-                target_mfe = abs(tp - entry_exec) / risk_exec
-                mfe_r = max(mfe_r, target_mfe)
-                elapsed = _hold_minutes(fill_ts, close_time)
-                if target_mfe >= 1.0 and not mfe_1r_hit:
-                    mfe_1r_hit = True
-                    time_to_1r_minutes = elapsed
-                if target_mfe >= (1.5 - 1e-9) and not mfe_1_5r_hit:
-                    mfe_1_5r_hit = True
-                    time_to_1_5r_minutes = elapsed
             final_exec = execute_exit(tp)
             if final_exec is None:
                 return None
@@ -488,31 +429,14 @@ def simulate_trade(
             final_ts = close_time
             return build_trade("TP", final_ts)
         if first == "SL":
-            # Stop-market orders can gap through the stop. Fill at the worse bar
-            # open when the open has already crossed the stop, then apply slippage.
-            if side == "LONG" and open_price <= stop:
-                stop_fill_base = min(stop, open_price)
-            elif side == "SHORT" and open_price >= stop:
-                stop_fill_base = max(stop, open_price)
-            else:
-                stop_fill_base = stop
-
-            # The stop/gap execution level is known; the exit candle's opposite
-            # extreme is not known to have occurred before the stop. Record only
-            # this known adverse path point, and keep execution slippage separate.
-            if risk_exec > 0 and entry_exec is not None:
-                stop_mae = (
-                    max(0.0, entry_exec - stop_fill_base) / risk_exec
-                    if side == "LONG"
-                    else max(0.0, stop_fill_base - entry_exec) / risk_exec
-                )
-                mae_r = max(mae_r, stop_mae)
-            final_exec = execute_exit(stop_fill_base)
+            final_exec = execute_exit(stop)
             if final_exec is None:
                 return None
             sl_hit = True
             final_ts = close_time
             return build_trade("SL", final_ts)
+
+        previous_close = close
         previous_close_time = close_time
 
     if entry_exec is None:

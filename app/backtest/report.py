@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from statistics import mean
 from typing import Any, Mapping, Sequence
@@ -43,125 +42,27 @@ class BacktestSummary:
     market_entries: int = 0
     limit_entries: int = 0
     diagnostics: Mapping[str, int] = field(default_factory=dict)
-    engine_version: str = ""
-    engine_config_fingerprint: str = ""
-    engine_config: Mapping[str, Any] = field(default_factory=dict)
-    long_cohorts: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
     return [t for t in trades if t.outcome in {"TP", "SL", "EXPIRED"} and t.r_multiple is not None and math.isfinite(float(t.r_multiple))]
 
 
-def _finite_quality(trade: SimulatedTrade, key: str) -> float | None:
-    quality = getattr(trade, "quality", {}) or {}
-    if not isinstance(quality, Mapping) or key not in quality:
-        return None
-    try:
-        value = float(quality[key])
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return value if math.isfinite(value) else None
-
-
-def _long_cohort_stats(label: str, trades: Sequence[SimulatedTrade]) -> dict[str, Any] | None:
-    resolved = [
-        trade for trade in trades
-        if str(getattr(trade, "outcome", "")).upper() in {"TP", "SL", "EXPIRED"}
-        and getattr(trade, "r_multiple", None) is not None
-        and math.isfinite(float(trade.r_multiple))
-    ]
-    if not resolved:
-        return None
-    wins = sum(str(trade.outcome).upper() == "TP" for trade in resolved)
-    losses = sum(str(trade.outcome).upper() == "SL" for trade in resolved)
-    counted = wins + losses
-    values = [float(trade.r_multiple) for trade in resolved]
-    return {
-        "label": label,
-        "n": len(resolved),
-        "tp": wins,
-        "sl": losses,
-        "expired": sum(str(trade.outcome).upper() == "EXPIRED" for trade in resolved),
-        "win_rate": (100.0 * wins / counted) if counted else None,
-        "total_r": sum(values),
-        "expectancy_r": mean(values) if values else None,
-    }
-
-
-def _build_long_cohorts(trades: Sequence[SimulatedTrade]) -> tuple[Mapping[str, Any], ...]:
-    """Exploratory cohorts over completed LONG trades; does not alter signal selection."""
-    longs = [trade for trade in trades if str(getattr(trade, "side", "")).upper() == "LONG"]
-    definitions = (
-        ("Score <85", "score", lambda value: value < 85.0),
-        ("Score >=85", "score", lambda value: value >= 85.0),
-        ("RVOL <0.75", "rvol_1h", lambda value: value < 0.75),
-        ("RVOL >=0.75", "rvol_1h", lambda value: value >= 0.75),
-        ("Trigger <0.80", "trigger_quality_1h", lambda value: value < 0.80),
-        ("Trigger >=0.80", "trigger_quality_1h", lambda value: value >= 0.80),
-        ("Confirmations <=4/6", "confirmation_families_passed", lambda value: value <= 4.0),
-        ("Confirmations >=5/6", "confirmation_families_passed", lambda value: value >= 5.0),
-    )
-    rows: list[Mapping[str, Any]] = []
-    for label, key, predicate in definitions:
-        cohort = [
-            trade for trade in longs
-            if (value := _finite_quality(trade, key)) is not None and predicate(value)
-        ]
-        stats = _long_cohort_stats(label, cohort)
-        if stats is not None:
-            rows.append(stats)
-    return tuple(rows)
-
-
-def summarize(
-    *,
-    days: int,
-    period_start_ms: int,
-    period_end_ms: int,
-    coins_selected: int,
-    coins_tested: int,
-    data_errors: int,
-    execution_errors: int,
-    rejected_setups: int,
-    trades: Sequence[SimulatedTrade],
-    diagnostics: Mapping[str, int] | None = None,
-    engine_version: str = "",
-    engine_config_fingerprint: str = "",
-    engine_config: Mapping[str, Any] | None = None,
-) -> BacktestSummary:
+def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_selected: int, coins_tested: int, data_errors: int, execution_errors: int, rejected_setups: int, trades: Sequence[SimulatedTrade], diagnostics: Mapping[str, int] | None = None) -> BacktestSummary:
     ordered = sorted(trades, key=lambda t: (int(t.signal_time_ms), t.symbol, t.side))
     resolved = _resolved(ordered)
     values = [float(t.r_multiple) for t in resolved]
     wins = sum(t.outcome == "TP" for t in resolved)
     losses = sum(t.outcome == "SL" for t in resolved)
     expired = sum(t.outcome == "EXPIRED" for t in resolved)
-    # Trade outcomes become realized at EXIT, not at signal time. The previous
-    # signal-time ordering could report an incorrect portfolio drawdown/streak
-    # when trades overlapped across symbols or exited in a different order.
-    realized_chronological = sorted(
-        resolved,
-        key=lambda t: (
-            int(t.exit_time_ms) if t.exit_time_ms is not None else int(t.signal_time_ms),
-            int(t.signal_time_ms),
-            str(t.symbol),
-            str(t.side),
-        ),
-    )
-    exit_pnl: dict[int, float] = {}
-    for trade in realized_chronological:
-        exit_time = int(trade.exit_time_ms) if trade.exit_time_ms is not None else int(trade.signal_time_ms)
-        exit_pnl[exit_time] = exit_pnl.get(exit_time, 0.0) + float(trade.r_multiple)
-
     running = peak = 0.0
     drawdown = 0.0
-    for exit_time in sorted(exit_pnl):
-        running += exit_pnl[exit_time]
+    losing_streak = max_streak = 0
+    for t in resolved:
+        value = float(t.r_multiple)
+        running += value
         peak = max(peak, running)
         drawdown = max(drawdown, peak - running)
-
-    losing_streak = max_streak = 0
-    for t in realized_chronological:
         if t.outcome == "SL":
             losing_streak += 1
             max_streak = max(max_streak, losing_streak)
@@ -222,129 +123,52 @@ def summarize(
         market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
         limit_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() == "LIMIT"),
         diagnostics=diagnostics_out,
-        engine_version=str(engine_version or ""),
-        engine_config_fingerprint=str(engine_config_fingerprint or ""),
-        engine_config=dict(engine_config or {}),
-        long_cohorts=_build_long_cohorts(ordered),
     )
-
-
-def format_utc_iso(value: Any) -> str:
-    """Format Unix milliseconds as UTC ISO-8601; return a safe sentinel on bad input."""
-    try:
-        timestamp_ms = float(value)
-        if not math.isfinite(timestamp_ms):
-            return "invalid-timestamp"
-        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError, ValueError, OverflowError, OSError):
-        return "invalid-timestamp"
 
 
 def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return "N/A" if value is None else f"{value:.{digits}f}{suffix}"
 
 
-def _top_rejection_reasons(diagnostics: Mapping[str, int], side: str, limit: int = 3) -> list[tuple[str, int]]:
-    """Return stable per-side first-failure reasons, excluding aggregate totals."""
-    prefix = f"FIRST_FAILURE_{side}_"
-    totals: dict[str, int] = {}
-    for key, raw_count in diagnostics.items():
-        if not str(key).startswith(prefix):
-            continue
-        reason = str(key)[len(prefix):]
-        if not reason or reason == "TOTAL":
-            continue
-        if reason.startswith(f"{side}_"):
-            reason = reason[len(side) + 1:]
-        try:
-            count = max(0, int(raw_count))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if count:
-            totals[reason] = totals.get(reason, 0) + count
-    return sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:max(1, int(limit))]
-
-
 def format_report(summary: BacktestSummary) -> str:
-    """Render a concise user-facing report; keep internal diagnostics out of WhatsApp."""
-    start_utc = format_utc_iso(summary.period_start_ms)
-    end_utc = format_utc_iso(summary.period_end_ms)
+    start = summary.period_start_ms // 1000
+    end = summary.period_end_ms // 1000
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
-    diagnostics = summary.diagnostics or {}
-    fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
-    tp_mode_x100 = int(diagnostics.get("TP_MODE_X100", 0))
-    tp_mode = "CONTROL" if tp_mode_x100 == 0 else f"{tp_mode_x100 / 100.0:.1f}R"
-
-    period_label = f"{summary.days}D"
-    duration_days = (int(summary.period_end_ms) - int(summary.period_start_ms)) / 86_400_000.0
-    if fixed_period and duration_days > 0 and abs(duration_days - summary.days) >= 0.5:
-        rounded_days = round(duration_days)
-        actual_label = f"{rounded_days}D" if abs(duration_days - rounded_days) < 0.05 else f"{duration_days:.1f}D"
-        period_label = f"{actual_label} actual (requested {summary.days}D)"
-
     lines = [
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Period: {period_label} | {'FIXED' if fixed_period else 'ROLLING'}",
-        f"UTC: {start_utc} → {end_utc}",
-        f"Elapsed: {duration_days:.2f}D (UTC) | elapsed: {duration_days:.6f} days",
-        f"TP Mode: {tp_mode}",
+        f"Period: {summary.days}D ({start} → {end})",
         f"Timeframes: {' / '.join(summary.timeframes)}",
-        f"Setup Architecture: {str(summary.engine_config.get('setup_architecture') or 'UNKNOWN')}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",
-        f"📡 Signals: {summary.signals} (LONG {summary.long_signals} / SHORT {summary.short_signals})",
-        f"✅ Resolved: {summary.resolved} | ⏳ Open: {summary.unresolved}",
-        f"🎯 TP: {summary.tp_hits} | 🛑 SL: {summary.sl_hits} | ⌛ Expired: {summary.expired}",
+        f"📡 Signals: {summary.signals}",
+        f"🟢 LONG: {summary.long_signals}",
+        f"🔴 SHORT: {summary.short_signals}",
+        f"✅ Resolved: {summary.resolved}",
+        f"⏳ Open/Unresolved: {summary.unresolved}",
+        f"🎯 TP: {summary.tp_hits}",
+        f"🛑 SL: {summary.sl_hits}",
+        f"⌛ Expired: {summary.expired}",
         "",
         f"📈 Win Rate: {_fmt(summary.win_rate, 1, '%')}",
         f"⚖️ Avg Signal RR: {_fmt(summary.avg_signal_rr)}",
         f"🎯 Avg Actual Fill RR: {_fmt(summary.avg_actual_fill_rr)}",
-        f"💰 Avg Realized R: {_fmt(summary.avg_realized_r, 2, 'R')}",
+        f"💰 Avg Realized R: {_fmt(summary.avg_realized_r)}R",
         f"💰 Total R: {summary.total_r:+.2f}R",
-        f"📊 Expectancy: {_fmt(summary.expectancy_r, 2, 'R/trade')}",
+        f"📊 Expectancy: {_fmt(summary.expectancy_r)}R/trade",
         f"📐 Profit Factor: {pf}",
         f"📉 Max Drawdown: {summary.max_drawdown_r:.2f}R",
         f"📉 Max Losing Streak: {summary.max_losing_streak}",
-        f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r, 2, 'R')} / {_fmt(summary.avg_mfe_r, 2, 'R')}",
-    ]
-    if summary.signals == 0:
-        diagnostic_reasons = {
-            side: _top_rejection_reasons(diagnostics, side)
-            for side in ("LONG", "SHORT")
-        }
-        lines.extend(["", "🔍 TOP REJECTION CAUSES (per-side first failure)"])
-        found_reason = False
-        for side in ("LONG", "SHORT"):
-            reasons = diagnostic_reasons[side]
-            if not reasons:
-                continue
-            found_reason = True
-            lines.append(f"{side}:")
-            for reason, count in reasons:
-                label = reason.replace("_", " ").strip().title()
-                if len(label) > 68:
-                    label = label[:65] + "..."
-                lines.append(f"  {label}: {count}")
-        if not found_reason:
-            lines.append("No per-side rejection diagnostics were recorded.")
-    if summary.long_cohorts:
-        lines.extend(["", "🔎 LONG COHORT CHECKS (exploratory; same realized trades)"])
-        for cohort in summary.long_cohorts:
-            win_rate = _fmt(cohort.get("win_rate"), 1, "%")
-            expectancy = _fmt(cohort.get("expectancy_r"), 2, "R")
-            lines.append(
-                f"{cohort['label']}: n={cohort['n']} TP/SL={cohort['tp']}/{cohort['sl']} "
-                f"WR={win_rate} Exp={expectancy} Total={float(cohort['total_r']):+.2f}R"
-            )
-        lines.append("Cohorts are diagnostic only; they do not filter signals.")
-    lines.extend([
+        f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r)}R / {_fmt(summary.avg_mfe_r)}R",
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
-        f"⚠️ Data Errors: {summary.data_errors} | Execution Errors: {summary.execution_errors}",
+        f"⚠️ Data Errors: {summary.data_errors}",
+        f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ PAPER BACKTEST — no real trades executed.",
-        "Fees and slippage are simulated; funding is an estimate, not historical settlement data.",
-    ])
+    ]
+    if summary.diagnostics:
+        lines.extend(("", "GATE DIAGNOSTICS"))
+        important = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))
+        lines.extend(f"{key}: {value}" for key, value in important[:20])
+    lines.extend(("━━━━━━━━━━━━━━━━━━━━", "⚠️ PAPER BACKTEST", "Decisions use only completed 1D / 12H / 4H / 1H candles.", "12H is a causal aggregation of three contiguous completed 4H candles.", "No real trades executed. Fees/slippage are simulated conservatively."))
     return "\n".join(lines)

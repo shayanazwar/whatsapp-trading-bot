@@ -92,6 +92,7 @@ def detect_triangle_pattern(
     atr_4h: float,
     *,
     lookback: int = TRIANGLE_LOOKBACK_4H,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Find the latest mature, converging triangle from confirmed 4H pivots.
 
@@ -102,8 +103,20 @@ def detect_triangle_pattern(
     """
     rows = list(candles_4h or [])
     atr = _finite(atr_4h)
-    if len(rows) < 32 or atr <= 0 or lookback < 24:
+
+    def reject(reason: str):
+        if diagnostics is not None:
+            diagnostics["reason"] = reason
         return None
+
+    if diagnostics is not None:
+        diagnostics["reason"] = "PATTERN_ACCEPTED"
+    if len(rows) < 32:
+        return reject("INSUFFICIENT_4H_CANDLES")
+    if atr <= 0:
+        return reject("INVALID_4H_ATR")
+    if lookback < 24:
+        return reject("LOOKBACK_TOO_SHORT")
 
     start = max(0, len(rows) - min(int(lookback), len(rows)))
     window = rows[start:]
@@ -111,7 +124,7 @@ def detect_triangle_pattern(
     highs = [(idx + start, value) for idx, value in local_highs]
     lows = [(idx + start, value) for idx, value in local_lows]
     if len(highs) < 2 or len(lows) < 2:
-        return None
+        return reject("INSUFFICIENT_CONFIRMED_PIVOTS")
 
     # Keep a small, recent set of confirmed touches so old trendlines cannot
     # dominate the current formation.
@@ -119,24 +132,24 @@ def detect_triangle_pattern(
     lp = lows[-3:]
     latest_anchor = max(hp[-1][0], lp[-1][0])
     if len(rows) - 1 - latest_anchor > TRIANGLE_MAX_ANCHOR_AGE_4H:
-        return None
+        return reject("STALE_PIVOT_ANCHORS")
 
     pattern_start = max(hp[0][0], lp[0][0])
     pattern_span = latest_anchor - pattern_start
     if pattern_span < TRIANGLE_MIN_SPAN_4H or pattern_span > TRIANGLE_MAX_SPAN_4H:
-        return None
+        return reject("PATTERN_SPAN_OUT_OF_RANGE")
 
     try:
         upper_slope, upper_intercept = _fit_line(hp)
         lower_slope, lower_intercept = _fit_line(lp)
     except ValueError:
-        return None
+        return reject("INVALID_TRENDLINE_PIVOTS")
 
     # A triangle must narrow from left to right, rather than being a parallel
     # channel or a widening wedge.
     flat_threshold = max(0.05 * atr, abs(_finite(rows[-1].get("close"))) * 1e-5)
     if upper_slope >= lower_slope:
-        return None
+        return reject("BOUNDARIES_NOT_CONVERGING")
 
     if upper_slope < -flat_threshold and lower_slope > flat_threshold:
         kind = "SYMMETRICAL_TRIANGLE"
@@ -145,7 +158,7 @@ def detect_triangle_pattern(
     elif lower_slope > flat_threshold and abs(upper_slope) <= 1.8 * flat_threshold:
         kind = "ASCENDING_TRIANGLE"
     else:
-        return None
+        return reject("UNSUPPORTED_TRIANGLE_SLOPES")
 
     def upper_at(index: float) -> float:
         return upper_slope * index + upper_intercept
@@ -160,37 +173,37 @@ def detect_triangle_pattern(
     start_width = upper_start - lower_start
     current_width = upper_now - lower_now
     if start_width <= 0 or current_width <= 0:
-        return None
+        return reject("INVALID_PROJECTED_WIDTH")
     if not (TRIANGLE_MIN_HEIGHT_ATR * atr <= start_width <= TRIANGLE_MAX_HEIGHT_ATR * atr):
-        return None
+        return reject("START_HEIGHT_OUTSIDE_ATR_RANGE")
     if (
         current_width < TRIANGLE_MIN_CURRENT_WIDTH_ATR * atr
         or current_width >= TRIANGLE_MAX_CURRENT_WIDTH_RATIO * start_width
     ):
-        return None
+        return reject("CURRENT_WIDTH_FILTER")
 
     # Reject stale triangles whose apex has already passed, or formations that
     # are too far from completion to offer a useful measured-move setup.
     slope_gap = upper_slope - lower_slope
     if abs(slope_gap) <= 1e-12:
-        return None
+        return reject("PARALLEL_TRENDLINES")
     apex = (lower_intercept - upper_intercept) / slope_gap
     current_idx = len(rows) - 1
     if not (current_idx + 1 <= apex <= current_idx + TRIANGLE_MAX_APEX_DISTANCE_4H):
-        return None
+        return reject("APEX_OUTSIDE_VALID_WINDOW")
 
     last_close = _finite(rows[-1].get("close"))
     if (
         last_close > upper_now + TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR * atr
         or last_close < lower_now - TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR * atr
     ):
-        return None
+        return reject("PRICE_TOO_FAR_OUTSIDE_PATTERN")
 
     pattern_high = max(value for _, value in hp)
     pattern_low = min(value for _, value in lp)
     measured_height = pattern_high - pattern_low
     if measured_height < TRIANGLE_MIN_HEIGHT_ATR * atr or measured_height > TRIANGLE_MAX_HEIGHT_ATR * atr:
-        return None
+        return reject("PIVOT_HEIGHT_OUTSIDE_ATR_RANGE")
 
     return {
         "kind": kind,
@@ -241,6 +254,7 @@ def confirm_triangle_breakout(
     max_retest_bars: int = BREAKOUT_RETEST_BARS_1H,
     min_relative_volume: float = BREAKOUT_MIN_RELATIVE_VOLUME,
     max_extension_atr: float = BREAKOUT_MAX_EXTENSION_ATR,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Confirm a fresh 1H close outside a 4H boundary, or its 1H retest.
 
@@ -251,8 +265,22 @@ def confirm_triangle_breakout(
     c4 = list(candles_4h or [])
     side = str(side).upper()
     atr = _finite(atr_1h)
-    if len(rows) < 22 or not c4 or atr <= 0 or side not in {"LONG", "SHORT"}:
+
+    def reject(reason: str):
+        if diagnostics is not None:
+            diagnostics["reason"] = reason
         return None
+
+    if diagnostics is not None:
+        diagnostics["reason"] = "TRIGGER_ACCEPTED"
+    if len(rows) < 22:
+        return reject("INSUFFICIENT_1H_TRIGGER_HISTORY")
+    if not c4:
+        return reject("MISSING_4H_PATTERN_CONTEXT")
+    if atr <= 0:
+        return reject("INVALID_1H_ATR")
+    if side not in {"LONG", "SHORT"}:
+        return reject("INVALID_SIDE")
 
     current = len(rows) - 1
     current_candle = rows[current]
@@ -278,11 +306,17 @@ def confirm_triangle_breakout(
         and (entry > open_price if side == "LONG" else entry < open_price)
     )
     if not strong:
-        return None
+        if body_ratio < BREAKOUT_MIN_BODY_RATIO:
+            return reject("BREAKOUT_BODY_TOO_WEAK")
+        if location < BREAKOUT_MIN_CLOSE_LOCATION:
+            return reject("BREAKOUT_CLOSE_LOCATION_TOO_WEAK")
+        if current_rvol < min_relative_volume:
+            return reject("BREAKOUT_RELATIVE_VOLUME_TOO_LOW")
+        return reject("BREAKOUT_CANDLE_DIRECTION_MISMATCH")
 
     distance_atr = abs(entry - boundary_now) / atr
     if distance_atr > max_extension_atr:
-        return None
+        return reject("BREAKOUT_TOO_EXTENDED_FROM_BOUNDARY")
 
     # Case 1: a fresh breakout on the decision candle.
     if current >= 1:
@@ -316,6 +350,7 @@ def confirm_triangle_breakout(
     # Case 2: breakout occurred recently and the current candle retests then
     # closes back outside the same projected boundary.
     first = max(1, current - max(1, int(max_retest_bars)))
+    recent_cross_found = False
     for breakout_idx in range(current - 1, first - 1, -1):
         breakout = rows[breakout_idx]
         prior = rows[breakout_idx - 1]
@@ -332,6 +367,7 @@ def confirm_triangle_breakout(
         )
         if not crossed:
             continue
+        recent_cross_found = True
         if side == "LONG":
             retested = low <= boundary_now + BREAKOUT_RETEST_TOLERANCE_ATR * atr and entry > boundary_now + buffer
         else:
@@ -355,4 +391,4 @@ def confirm_triangle_breakout(
             "distance_atr": distance_atr,
             "reason": f"1H breakout retest held {pattern.get('kind')} resistance" if side == "LONG" else f"1H breakout retest held {pattern.get('kind')} support",
         }
-    return None
+    return reject("BREAKOUT_RETEST_NOT_HELD" if recent_cross_found else "NO_RECENT_BOUNDARY_CROSS")

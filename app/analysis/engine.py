@@ -1004,12 +1004,13 @@ def _triangle_analyze_side(
     direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
     bypass = bool(research_short_daily_gate_bypass and side == "SHORT" and not direction_ok)
 
-    def reject(reason: str) -> dict[str, Any]:
+    def reject(reason: str, diagnostic_key: str | None = None) -> dict[str, Any]:
         message = str(reason)
         return {
             "side": side, "setup_type": "TRIANGLE_BREAKOUT", "direction_ok": direction_ok,
             "context": context, "candidate": False, "reason": message,
-            "primary_failure": message, "diagnostic_key": message.split("(", 1)[0].strip().upper(),
+            "primary_failure": message,
+            "diagnostic_key": str(diagnostic_key or message.split("(", 1)[0].strip().upper()),
             "technical_gate_failures": [message], "rejection_stage": "SETUP",
         }
 
@@ -1028,16 +1029,30 @@ def _triangle_analyze_side(
     atr1 = _memoized_frame_value(cache, "_triangle_atr_1h", c1, lambda: _safe_atr(c1))
     if atr4 <= 0 or atr1 <= 0:
         return reject("Triangle breakout: ATR unavailable")
-    pattern = _memoized_frame_value(
-        cache, "_triangle_pattern_4h", c4,
-        lambda: detect_triangle_pattern(c4, atr4),
-    )
-    if not pattern:
-        return reject("No mature converging 4H triangle with confirmed pivot touches")
+    def compute_pattern_result() -> dict[str, Any]:
+        detector_diagnostics: dict[str, Any] = {}
+        detected = detect_triangle_pattern(c4, atr4, diagnostics=detector_diagnostics)
+        return {"pattern": detected, "reason": str(detector_diagnostics.get("reason") or "UNKNOWN")}
 
-    trigger = confirm_triangle_breakout(c1, c4, pattern, side, atr1)
+    pattern_result = _memoized_frame_value(
+        cache, "_triangle_pattern_4h", c4, compute_pattern_result,
+    )
+    pattern = pattern_result.get("pattern") if isinstance(pattern_result, dict) else pattern_result
+    if not pattern:
+        pattern_reason = str(pattern_result.get("reason") or "UNKNOWN") if isinstance(pattern_result, dict) else "UNKNOWN"
+        return reject(
+            f"{side}: triangle detector rejected: {pattern_reason}",
+            diagnostic_key=f"TRIANGLE_PATTERN_{pattern_reason}",
+        )
+
+    trigger_diagnostics: dict[str, Any] = {}
+    trigger = confirm_triangle_breakout(c1, c4, pattern, side, atr1, diagnostics=trigger_diagnostics)
     if not trigger:
-        return reject(f"{side}: no confirmed 1H triangle breakout or valid retest")
+        trigger_reason = str(trigger_diagnostics.get("reason") or "UNKNOWN")
+        return reject(
+            f"{side}: 1H breakout rejected: {trigger_reason}",
+            diagnostic_key=f"BREAKOUT_TRIGGER_{trigger_reason}",
+        )
 
     current = c1[-1]
     entry = float(current["close"])

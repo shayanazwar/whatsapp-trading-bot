@@ -40,7 +40,8 @@ SEARCH PEPE
 🧪 BACKTEST
 BACKTEST 1D
 BACKTEST 7D
-BACKTEST 7D TP=1.5R
+BACKTEST 7D TP=CONTROL (triangle measured-move target)
+BACKTEST 7D TP=1.5R / 2.0R / 2.5R (counterfactual exits)
 BACKTEST 30D
 BACKTEST 60D
 BACKTEST 90D
@@ -78,37 +79,25 @@ BACKTEST_PERIODS = {
 
 
 def parse_backtest_args(args: str) -> tuple[str, int, str]:
-    """Parse BACKTEST period and optional TP mode without mutating shared state."""
+    """Parse backtest period and TP mode; CONTROL preserves the engine's measured target."""
     tokens = str(args or "").strip().upper().split()
-
-    if (
-        not tokens
-        or tokens[0] not in BACKTEST_PERIODS
-        or len(tokens) > 2
-    ):
+    if not tokens or tokens[0] not in BACKTEST_PERIODS or len(tokens) > 2:
         raise ValueError(
             "Usage: BACKTEST 1D, 7D, 30D, 60D, 90D, 180D, or 365D "
-            "[TP=1.5R] (fixed for this LONG-only test)"
+            "[TP=CONTROL|1.5R|2.0R|2.5R]"
         )
 
     period = tokens[0]
-    tp_mode = "1.5R"
-
+    tp_mode = "CONTROL"
+    allowed_modes = {"CONTROL", "1.5R", "2.0R", "2.5R"}
     if len(tokens) == 2:
         token = tokens[1]
-
         if not token.startswith("TP="):
-            raise ValueError(
-                "Invalid BACKTEST option. TP is fixed at 1.5R for this LONG-only test."
-            )
-
+            raise ValueError("Invalid BACKTEST option. Use TP=CONTROL, TP=1.5R, TP=2.0R, or TP=2.5R.")
         raw_tp = token[3:].strip().upper()
-        if raw_tp != "1.5R":
-            raise ValueError(
-                "TP is fixed at 1.5R for this LONG-only test. Use BACKTEST 7D or BACKTEST 7D TP=1.5R."
-            )
-        tp_mode = "1.5R"
-
+        if raw_tp not in allowed_modes:
+            raise ValueError("Invalid TP mode. Use CONTROL, 1.5R, 2.0R, or 2.5R.")
+        tp_mode = raw_tp
     return period, BACKTEST_PERIODS[period], tp_mode
 
 

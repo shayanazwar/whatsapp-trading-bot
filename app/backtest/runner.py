@@ -26,10 +26,12 @@ import logging
 import os
 import time
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from ..analysis.smc_engine import analyze_candles as analyze_smc_candles
+from ..analysis.control_engine import analyze_candles as analyze_control_candles
 from ..analysis.engine import (
     build_btc_context,
     convert_candles,
@@ -72,7 +74,7 @@ WARMUP_1H = 20 * ONE_DAY_MS
 FETCH_TIMEOUT_SECONDS = 180
 HEARTBEAT_INTERVAL_SECONDS = 30
 
-SUPPORTED_BACKTEST_DAYS = {1, 7, 30, 60, 90, 180, 365}
+SUPPORTED_BACKTEST_DAYS = {1, 3, 7, 30, 60, 90, 180, 365}
 
 
 # ============================================================
@@ -212,6 +214,39 @@ def _future_candles(
     return rows[start_index:]
 
 
+def _simulation_safe_future(rows: list, *, as_of_ms: int) -> list:
+    """Keep completed 1H bars intact; replace the current partial bar with open-only data.
+
+    The partial bar can establish an entry at its known open, but its incomplete
+    high/low/close must never resolve TP or SL. That trade remains unresolved.
+    """
+    safe: list = []
+    cutoff = int(as_of_ms)
+    for row in rows:
+        try:
+            ts = _candle_time(row)
+            if ts + ONE_HOUR_MS <= cutoff:
+                safe.append(row)
+                continue
+            if ts <= cutoff < ts + ONE_HOUR_MS:
+                if isinstance(row, dict):
+                    partial = dict(row)
+                    open_price = float(partial["open"])
+                    partial.update(high=open_price, low=open_price, close=open_price)
+                else:
+                    values = list(row)
+                    open_price = float(values[1])
+                    values[2] = values[3] = values[4] = open_price
+                    partial = values
+                safe.append(partial)
+                break
+            if ts > cutoff:
+                break
+        except (TypeError, ValueError, KeyError, IndexError, OverflowError):
+            continue
+    return safe
+
+
 def _utc_hour(timestamp_ms: int) -> int:
     return datetime.fromtimestamp(
         int(timestamp_ms) / 1000,
@@ -222,30 +257,28 @@ def _utc_hour(timestamp_ms: int) -> int:
 def _period(days: int) -> tuple[int, int]:
     """Calculate a causal historical window, optionally frozen by environment.
 
-    Default behavior is unchanged. For controlled A/B tests, set
-    V11_BACKTEST_END_MS, or set both V11_BACKTEST_START_MS and
-    V11_BACKTEST_END_MS. This lets two strategy variants use the exact same
-    historical window without changing the WhatsApp command interface.
+    BACKTEST_START_MS / BACKTEST_END_MS are the canonical A/B comparison
+    variables. Legacy V11_BACKTEST_* aliases remain supported.
     """
-    raw_start = os.getenv("V11_BACKTEST_START_MS")
-    raw_end = os.getenv("V11_BACKTEST_END_MS")
+    raw_start = os.getenv("BACKTEST_START_MS") or os.getenv("V11_BACKTEST_START_MS")
+    raw_end = os.getenv("BACKTEST_END_MS") or os.getenv("V11_BACKTEST_END_MS")
 
     if raw_start or raw_end:
         if not raw_end:
-            raise ValueError("V11_BACKTEST_END_MS is required when freezing a backtest period")
+            raise ValueError("BACKTEST_END_MS is required when freezing a backtest period")
         try:
             end_ms = int(raw_end)
         except ValueError as exc:
-            raise ValueError("V11_BACKTEST_END_MS must be an integer Unix timestamp in milliseconds") from exc
+            raise ValueError("BACKTEST_END_MS must be an integer Unix timestamp in milliseconds") from exc
         if raw_start:
             try:
                 start_ms = int(raw_start)
             except ValueError as exc:
-                raise ValueError("V11_BACKTEST_START_MS must be an integer Unix timestamp in milliseconds") from exc
+                raise ValueError("BACKTEST_START_MS must be an integer Unix timestamp in milliseconds") from exc
         else:
             start_ms = end_ms - int(days) * ONE_DAY_MS
         if start_ms >= end_ms:
-            raise ValueError("V11_BACKTEST_START_MS must be earlier than V11_BACKTEST_END_MS")
+            raise ValueError("BACKTEST_START_MS must be earlier than BACKTEST_END_MS")
         return start_ms, end_ms
 
     end_dt = datetime.now(timezone.utc).replace(
@@ -253,7 +286,10 @@ def _period(days: int) -> tuple[int, int]:
         second=0,
         microsecond=0,
     )
-    end_ms = int(end_dt.timestamp() * 1000) - MAX_HOLD_MINUTES * 60_000
+    # Evaluation window ends at the latest UTC hour boundary. The holding horizon
+    # is fetched separately for trade resolution; it must not shift the requested
+    # evaluation window back by three days. Recent trades can remain unresolved.
+    end_ms = int(end_dt.timestamp() * 1000)
     start_ms = end_ms - int(days) * ONE_DAY_MS
     return start_ms, end_ms
 
@@ -625,7 +661,16 @@ class BacktestRunner:
             )
 
             try:
-                analysis = analyze_candles(
+                selected_engine = str(
+                    getattr(self.settings, "backtest_engine", "")
+                    or getattr(self.settings, "analysis_engine", "V11")
+                    or "V11"
+                ).upper()
+                analyzers = {"V11": analyze_candles, "SMC": analyze_smc_candles, "CONTROL": analyze_control_candles}
+                analyzer = analyzers.get(selected_engine)
+                if analyzer is None:
+                    raise ValueError(f"Unsupported ANALYSIS_ENGINE={selected_engine}; choose V11, SMC, or CONTROL")
+                analysis = analyzer(
                     history.symbol,
                     c1d,
                     c12,
@@ -752,6 +797,9 @@ class BacktestRunner:
                 history.times_1h,
                 signal_close_ms,
             )
+            as_of_ms = int(time.time() * 1000)
+            future = _simulation_safe_future(future, as_of_ms=as_of_ms)
+            partial_tail = bool(future and _candle_time(future[-1]) + ONE_HOUR_MS > as_of_ms)
             if not future:
                 inc("NO_FUTURE_CANDLES")
                 continue
@@ -817,6 +865,14 @@ class BacktestRunner:
                     inc("SIMULATION_LIMIT_NOT_FILLED")
                 continue
 
+            if partial_tail and str(getattr(trade, "state", "")).upper() == "OPEN":
+                fill_ms = int(getattr(trade, "entry_filled_time_ms", 0) or signal_close_ms)
+                trade = replace(
+                    trade,
+                    exit_time_ms=as_of_ms,
+                    hold_minutes=max(0.0, (as_of_ms - fill_ms) / 60_000.0),
+                )
+                inc("UNRESOLVED_AT_AS_OF")
             trades.append(trade)
             inc("SIMULATION_ACCEPT")
             inc(f"OUTCOME_{trade.outcome}")
@@ -921,12 +977,12 @@ class BacktestRunner:
             )
 
     async def run(self, days: int) -> BacktestSummary:
-        """Run a complete 1D/7D/30D/60D/90D/180D/365D causal paper backtest."""
+        """Run a causal paper backtest over the requested rolling evaluation window."""
 
         days = int(days)
         if days not in SUPPORTED_BACKTEST_DAYS:
             raise ValueError(
-                "Supported backtests: 1D, 7D, 30D, 60D, 90D, 180D, 365D"
+                "Supported backtests: 1D, 3D, 7D, 30D, 60D, 90D, 180D, 365D"
             )
 
         if self._running or self._run_lock.locked():

@@ -28,6 +28,7 @@ from .patterns import (
     TRIANGLE_MAX_ANCHOR_AGE_4H,
     TRIANGLE_MAX_APEX_DISTANCE_4H,
     TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR,
+    TRIANGLE_FLAT_SLOPE_ATR_PER_BAR,
     TRIANGLE_MAX_CURRENT_WIDTH_RATIO,
     TRIANGLE_MAX_HEIGHT_ATR,
     TRIANGLE_MAX_SPAN_4H,
@@ -81,7 +82,7 @@ MIN_TRIGGER_CLOSE_LOCATION = 0.58
 MIN_TRIGGER_RVOL = 0.70
 MAX_TRIGGER_BARS_1H = 2
 DEFAULT_MAX_HOLD_MINUTES = 72 * 60
-ENGINE_VERSION = "V12-trendline-triangle-breakout-1d-12h-4h-1h"
+ENGINE_VERSION = "V12-triangle-context-breakout-r2-1d-12h-4h-1h"
 SETUP_ARCHITECTURE = str(os.getenv("MEXC_SETUP_ARCHITECTURE", "TRIANGLE_BREAKOUT")).strip().upper()
 SUPPORTED_SETUP_ARCHITECTURES = ("TRIANGLE_BREAKOUT", "LEGACY_PULLBACK", "HYBRID")
 
@@ -510,9 +511,17 @@ def engine_config_snapshot(signal_setup_type: str | None = None) -> dict[str, An
     Legacy V11 values are retained explicitly for baseline experiments, while
     stop-loss mode and the pattern thresholds identify the active architecture.
     """
+    effective_setup = str(signal_setup_type or SETUP_ARCHITECTURE).upper()
+    if effective_setup == "TRIANGLE_BREAKOUT":
+        daily_bias_mode = "CONTEXT_SCORE_NOT_DIRECTIONAL_VETO"
+    elif effective_setup == "LEGACY_PULLBACK":
+        daily_bias_mode = "LEGACY_DIRECTIONAL_PERMISSION"
+    else:
+        daily_bias_mode = "SETUP_SPECIFIC_MIXED_MODE"
     config: dict[str, Any] = {
         "engine_version": ENGINE_VERSION,
         "setup_architecture": SETUP_ARCHITECTURE,
+        "daily_bias_mode": daily_bias_mode,
         "timeframes": list(APPROVED_TIMEFRAMES),
         "min_rr": float(V11_MIN_RR),
         "min_impulse_atr": float(V11_MIN_IMPULSE_ATR),
@@ -536,6 +545,7 @@ def engine_config_snapshot(signal_setup_type: str | None = None) -> dict[str, An
         "triangle_max_current_width_ratio": float(TRIANGLE_MAX_CURRENT_WIDTH_RATIO),
         "triangle_max_apex_distance_4h": int(TRIANGLE_MAX_APEX_DISTANCE_4H),
         "triangle_max_boundary_extension_atr": float(TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR),
+        "triangle_flat_slope_atr_per_4h_bar": float(TRIANGLE_FLAT_SLOPE_ATR_PER_BAR),
         "breakout_retest_bars_1h": int(BREAKOUT_RETEST_BARS_1H),
         "breakout_min_relative_volume": float(BREAKOUT_MIN_RELATIVE_VOLUME),
         "breakout_max_extension_atr": float(BREAKOUT_MAX_EXTENSION_ATR),
@@ -993,37 +1003,39 @@ def _triangle_analyze_side(
     cost_pct: float,
     btc_context: dict[str, Any] | None,
     cache: Optional[dict[str, Any]] = None,
-    *,
-    research_short_daily_gate_bypass: bool = False,
 ) -> dict[str, Any]:
     """Evaluate a causal 1D/12H/4H triangle-breakout setup for one direction."""
     context = _memoized_frame_value(
         cache, f"_triangle_context_12h_{side.lower()}", c12,
         lambda: _v11_context_12h(c12, side),
     )
+    # A triangle's confirmed 1H boundary break determines the trade side. The
+    # 1D regime is contextual evidence, not a hard directional permission gate:
+    # gating here discarded every neutral-day setup and all countertrend breaks
+    # before their 4H geometry/1H trigger could be evaluated. Keep 12H hostile
+    # context as the hard higher-timeframe veto; use daily alignment in ranking.
     direction_ok = bool(daily.get("bull")) if side == "LONG" else bool(daily.get("bear"))
-    bypass = bool(research_short_daily_gate_bypass and side == "SHORT" and not direction_ok)
+    daily_opposed = bool(daily.get("bear")) if side == "LONG" else bool(daily.get("bull"))
+    daily_bias_alignment = "ALIGNED" if direction_ok else ("OPPOSED" if daily_opposed else "NEUTRAL")
+    bypass = False  # Research-only daily-gate bypass belongs to legacy pullbacks.
 
     def reject(reason: str, diagnostic_key: str | None = None) -> dict[str, Any]:
         message = str(reason)
         return {
             "side": side, "setup_type": "TRIANGLE_BREAKOUT", "direction_ok": direction_ok,
+            "daily_bias_alignment": daily_bias_alignment,
+            "daily_direction_permission": direction_ok,
             "context": context, "candidate": False, "reason": message,
             "primary_failure": message,
             "diagnostic_key": str(diagnostic_key or message.split("(", 1)[0].strip().upper()),
             "technical_gate_failures": [message], "rejection_stage": "SETUP",
         }
 
-    if research_short_daily_gate_bypass and side == "SHORT" and direction_ok:
-        return reject("SHORT shadow not applicable: strict 1D bearish permission is already available")
-    if not direction_ok and not bypass:
-        return reject(
-            f"{side}: 1D direction permission unavailable for triangle breakout "
-            f"(regime={daily.get('regime') or 'NEUTRAL'}, "
-            f"bull_votes={daily.get('bull_votes', 0)}, bear_votes={daily.get('bear_votes', 0)})"
-        )
     if context.get("hostile"):
-        return reject(f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'})")
+        return reject(
+            f"{side}: hostile 12H context (structure={context.get('structure') or 'UNKNOWN'}; "
+            f"1D bias={daily_bias_alignment})"
+        )
 
     atr4 = _memoized_frame_value(cache, "_triangle_atr_4h", c4, lambda: _safe_atr(c4))
     atr1 = _memoized_frame_value(cache, "_triangle_atr_1h", c1, lambda: _safe_atr(c1))
@@ -1117,7 +1129,11 @@ def _triangle_analyze_side(
     convergence = _clamp((float(pattern["start_width"]) - float(pattern["current_width"])) / max(float(pattern["start_width"]), 1e-12) / 0.50, 0.0, 1.0)
     touch_quality = _clamp((int(pattern["touch_count"]) - 3) / 5.0, 0.0, 1.0)
     structure_quality = 0.5 * convergence + 0.5 * touch_quality
-    context_quality = 1.0 if context.get("healthy") else 0.6
+    context_12h_quality = 1.0 if context.get("healthy") else 0.6
+    daily_quality = 1.0 if daily_bias_alignment == "ALIGNED" else (0.65 if daily_bias_alignment == "NEUTRAL" else 0.40)
+    # Preserve a measurable 1D influence without letting a single macro label
+    # veto a confirmed 4H/1H breakout. 12H context carries the larger weight.
+    context_quality = 0.70 * context_12h_quality + 0.30 * daily_quality
     volatility_quality = 1.0 if 5 <= atr_rank <= 98 else 0.5
     score_groups = {
         "pattern_structure": int(round(30 * structure_quality)),
@@ -1160,7 +1176,9 @@ def _triangle_analyze_side(
     }
     return {
         "side": side, "candidate": True, "setup_type": "TRIANGLE_BREAKOUT",
-        "direction_ok": direction_ok, "daily_permission_bypassed": bypass,
+        "direction_ok": direction_ok, "daily_direction_permission": direction_ok,
+        "daily_bias_alignment": daily_bias_alignment,
+        "daily_permission_bypassed": bypass,
         "context": context, "impulse": synthetic_impulse, "pattern": pattern,
         "value_zone": value_zone, "value_deep": bool(trigger.get("retest")),
         "trigger": normalized_trigger, "entry": entry, "stop_loss": stop, "tp": tp,
@@ -1408,7 +1426,7 @@ def _v11_analyze_side(
 def _signal_basis_for_architecture(architecture: str, setup_type: str | None = None) -> str:
     selected = str(setup_type or architecture).upper()
     if selected == "TRIANGLE_BREAKOUT":
-        return "1D direction → 12H context → confirmed 4H triangle → 1H breakout/retest → measured-move target"
+        return "1D directional context → 12H opposition veto → confirmed 4H triangle → 1H breakout/retest → measured-move target"
     if selected == "LEGACY_PULLBACK":
         return "1D macro vote → 12H health → 4H impulse/value pullback → 1H liquidity sweep/reclaim"
     return "Hybrid: causal 1D/12H context with 4H triangle-breakout and legacy pullback candidates"
@@ -1575,6 +1593,8 @@ def analyze_candles(
             "diagnostic_key": str(result.get("diagnostic_key") or result.get("rejection_stage") or "UNKNOWN"),
             "rejection_stage": result.get("rejection_stage"),
             "direction_ok": bool(result.get("direction_ok")),
+            "daily_direction_permission": bool(result.get("daily_direction_permission", result.get("direction_ok", False))),
+            "daily_bias_alignment": result.get("daily_bias_alignment"),
         })
         if is_candidate:
             candidates.append(result)
@@ -1653,7 +1673,7 @@ def analyze_candles(
     target_tf = str(chosen["target"].get("timeframe") or "4H")
     target_reason = "nearest structural target; RR applied after target selection"
     reasons = [
-        f"1D {daily.get('regime')} permission",
+        f"1D {daily.get('regime')} context ({chosen.get('daily_bias_alignment', 'UNKNOWN').lower()})",
         (f"4H {chosen.get('pattern_kind')} with {int(chosen.get('pattern', {}).get('touch_count', 0))} confirmed pivot touches" if is_triangle else f"4H impulse {float(impulse['leg_atr']):.2f} ATR"),
         (f"1H {trigger.get('trigger_type', 'triangle breakout')} confirmation" if is_triangle else f"Value zone {float(chosen['value_zone']['low']):.6g}-{float(chosen['value_zone']['high']):.6g}"),
         ("1H breakout/retest confirmed" if is_triangle else "1H liquidity sweep + reclaim"),
@@ -1668,7 +1688,7 @@ def analyze_candles(
         "pattern_lower_line": chosen.get("pattern_lower"),
         "pattern_breakout_level": chosen.get("pattern_breakout_level"),
         "pattern_retest": bool(chosen.get("pattern_retest", False)),
-        "regime_1d": daily.get("regime"), "trend_4h": (str(chosen.get('pattern_kind')) if is_triangle else ("HH/HL" if side == "LONG" else "LH/LL")),
+        "regime_1d": daily.get("regime"), "daily_bias_alignment": chosen.get("daily_bias_alignment", "ALIGNED" if chosen.get("direction_ok") else "UNKNOWN"), "daily_direction_permission": bool(chosen.get("daily_direction_permission", chosen.get("direction_ok", False))), "trend_4h": (str(chosen.get('pattern_kind')) if is_triangle else ("HH/HL" if side == "LONG" else "LH/LL")),
         "bias_12h": context.get("status"), "daily_structure_1d": daily.get("structure"),
         "structure_12h": context.get("structure"), "structure_4h": impulse.get("structure_label", "HH/HL" if side == "LONG" else "LH/LL"),
         "protected_structure_4h": ("BULLISH_BREAKOUT" if side == "LONG" else "BEARISH_BREAKOUT") if is_triangle else ("BULLISH" if side == "LONG" else "BEARISH"),

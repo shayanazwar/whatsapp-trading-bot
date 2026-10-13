@@ -25,6 +25,10 @@ TRIANGLE_MIN_CURRENT_WIDTH_ATR = 0.25
 TRIANGLE_MAX_CURRENT_WIDTH_RATIO = 0.90
 TRIANGLE_MAX_APEX_DISTANCE_4H = 48
 TRIANGLE_MAX_BOUNDARY_EXTENSION_ATR = 1.5
+# Trendline slope is measured in price per 4H bar. 0.015 ATR/bar allows
+# normal shallow triangle boundaries while still rejecting effectively flat
+# channels; the prior 0.05 ATR/bar threshold rejected many valid formations.
+TRIANGLE_FLAT_SLOPE_ATR_PER_BAR = 0.015
 BREAKOUT_RETEST_BARS_1H = 6
 BREAKOUT_MIN_RELATIVE_VOLUME = 0.70
 BREAKOUT_MAX_EXTENSION_ATR = 0.85
@@ -147,7 +151,10 @@ def detect_triangle_pattern(
 
     # A triangle must narrow from left to right, rather than being a parallel
     # channel or a widening wedge.
-    flat_threshold = max(0.05 * atr, abs(_finite(rows[-1].get("close"))) * 1e-5)
+    flat_threshold = max(
+        TRIANGLE_FLAT_SLOPE_ATR_PER_BAR * atr,
+        abs(_finite(rows[-1].get("close"))) * 1e-5,
+    )
     if upper_slope >= lower_slope:
         return reject("BOUNDARIES_NOT_CONVERGING")
 

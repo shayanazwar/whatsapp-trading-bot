@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from statistics import mean
 from typing import Any, Mapping, Sequence
 
@@ -228,14 +229,23 @@ def summarize(
     )
 
 
+def format_utc_iso(timestamp_ms: int | float) -> str:
+    """Render a millisecond Unix timestamp as an unambiguous UTC ISO-8601 string."""
+    try:
+        dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "invalid-timestamp"
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return "N/A" if value is None else f"{value:.{digits}f}{suffix}"
 
 
 def format_report(summary: BacktestSummary) -> str:
     """Render a concise user-facing report; keep internal diagnostics out of WhatsApp."""
-    start = summary.period_start_ms // 1000
-    end = summary.period_end_ms // 1000
+    start = format_utc_iso(summary.period_start_ms)
+    end = format_utc_iso(summary.period_end_ms)
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
     diagnostics = summary.diagnostics or {}
     fixed_period = int(diagnostics.get("FIXED_BACKTEST_PERIOD_ENABLED", 0)) > 0
@@ -253,6 +263,7 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {period_label} ({start} → {end}) | {'FIXED' if fixed_period else 'ROLLING'}",
+        f"Elapsed: {duration_days:.2f}D (UTC)",
         f"TP Mode: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",

@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
     auto_trade_enabled: bool = Field(default=False, alias="AUTO_TRADE_ENABLED")
+    # Runtime scanner strategy: V11 remains default; SMC is paper-evaluation only.
+    analysis_engine: str = Field(default="V11", alias="ANALYSIS_ENGINE")
+    # Optional backtest-only override; never changes the scanner's selected engine.
+    backtest_engine: str = Field(default="", alias="BACKTEST_ENGINE")
     scan_interval_seconds: int = Field(default=3600, alias="SCAN_INTERVAL_SECONDS")
     max_symbols: int = Field(default=300, alias="MAX_SYMBOLS")
     scan_concurrency: int = Field(default=4, alias="SCAN_CONCURRENCY")

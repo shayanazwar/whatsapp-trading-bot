@@ -613,6 +613,7 @@ class Bot:
         period = args.strip().upper()
         periods = {
             "1D": 1,
+            "3D": 3,
             "7D": 7,
             "30D": 30,
             "60D": 60,
@@ -623,7 +624,7 @@ class Bot:
 
         if period not in periods:
             raise ValueError(
-                "Usage: BACKTEST 1D, 7D, 30D, 60D, 90D, 180D, or 365D"
+                "Usage: BACKTEST 1D, 3D, 7D, 30D, 60D, 90D, 180D, or 365D"
             )
 
         if self.backtest_runner.is_running:

@@ -133,11 +133,18 @@ def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
 def format_report(summary: BacktestSummary) -> str:
     start = summary.period_start_ms // 1000
     end = summary.period_end_ms // 1000
+    actual_days = max(0.0, (summary.period_end_ms - summary.period_start_ms) / 86_400_000.0)
+    requested_label = f"{summary.days}D"
+    if not math.isclose(actual_days, float(summary.days), rel_tol=0.0, abs_tol=1e-6):
+        # Explicit BACKTEST_START_MS/BACKTEST_END_MS overrides are useful for
+        # A/B comparisons, but must never make a 7D window appear to be a 1D run.
+        actual_label = f"{actual_days:.2f}D actual"
+        requested_label = f"{summary.days}D requested / {actual_label}"
     pf = "∞" if summary.profit_factor == float("inf") else _fmt(summary.profit_factor)
     lines = [
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Period: {summary.days}D ({start} → {end})",
+        f"Period: {requested_label} ({start} → {end})",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
         f"🪙 Coins Tested: {summary.coins_tested}",

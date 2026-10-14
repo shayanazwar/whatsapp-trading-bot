@@ -314,7 +314,7 @@ class MexcScanner:
             analysis = analyze_candles(
                 symbol, c1d, c12, c4, c1,
                 btc_context=self._btc_context,
-                estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+                estimated_round_trip_cost_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015))),
             )
             payload["analysis"] = analysis
             stages = analysis.get("stage_status") or {}

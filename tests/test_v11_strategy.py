@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.analysis import engine
 from app.analysis.engine import analyze_candles, synthesize_12h_from_4h, _v11_find_impulses, _v11_liquidity_trigger, _v11_target_path, _v11_regime_1d, convert_candles
 
 DAY = 86_400_000
@@ -67,7 +68,7 @@ def _build_fixture():
     sweep_idx = 216
     c1[sweep_idx] = {"time": base1 + sweep_idx * HOUR, "open": 157.5, "high": 157.8, "low": 156.0, "close": 157.4, "volume": 2000}
     trigger_idx = 217
-    c1[trigger_idx] = {"time": base1 + trigger_idx * HOUR, "open": 156.6, "high": 158.7, "low": 156.4, "close": 158.4, "volume": 2500}
+    c1[trigger_idx] = {"time": base1 + trigger_idx * HOUR, "open": 156.6, "high": 158.4, "low": 156.4, "close": 158.0, "volume": 2500}
     decision_now = c1[trigger_idx]["time"] + HOUR
     return daily, c4, c1[: trigger_idx + 1], decision_now
 
@@ -134,7 +135,7 @@ def test_v11_target_path_reports_obstacle_truthfully():
 def test_v11_short_analysis_is_supported_symmetrically():
     daily, c4, c1, now = _build_fixture()
     # Mirror around the actual LONG entry so RR/cost geometry remains scale-symmetric.
-    k = 316.8
+    k = 2.0 * float(c1[-1]["close"])
     daily_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in daily]
     c4_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in c4]
     c1_s = [{"time": x["time"], "open": k-x["open"], "high": k-x["low"], "low": k-x["high"], "close": k-x["close"], "volume": x["volume"]} for x in c1]
@@ -173,15 +174,19 @@ def test_v11_balanced_1d_macro_permission_uses_three_of_five_votes(monkeypatch):
     assert out["bull_votes"] == 4
 
 
-def test_v11_liquidity_trigger_reclaim_can_occur_four_bars_after_sweep():
+def test_v11_liquidity_trigger_requires_current_quality_reclaim_within_window():
     rows = []
     base = 1_800_000_000_000
     for i in range(10):
         rows.append({"time": base + i * HOUR, "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.0, "volume": 1000.0})
     rows[3] = {"time": base + 3 * HOUR, "open": 100.0, "high": 100.5, "low": 98.0, "close": 99.0, "volume": 1200.0}
-    rows[7] = {"time": base + 7 * HOUR, "open": 99.0, "high": 102.0, "low": 98.8, "close": 101.5, "volume": 1500.0}
+    # A weak/partial earlier reclaim must not mask the current quality reclaim.
+    rows[4] = {"time": base + 4 * HOUR, "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.1, "volume": 1000.0}
+    rows[9] = {"time": base + 9 * HOUR, "open": 99.0, "high": 102.0, "low": 98.8, "close": 101.5, "volume": 1500.0}
     candles = convert_candles(rows)
     out = _v11_liquidity_trigger(candles, 3, "LONG", max_bars=6)
     assert out["ready"] is True
     assert out["sweep_idx"] == 3
-    assert out["reclaim_idx"] == 7
+    assert out["reclaim_idx"] == 9
+    assert out["body_ratio"] >= engine.MIN_TRIGGER_BODY
+    assert out["close_location"] >= engine.MIN_TRIGGER_CLOSE_LOCATION

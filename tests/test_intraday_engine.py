@@ -60,7 +60,7 @@ def _v11_fixture():
 
     c1[215] = candle(base1 + 215 * hour, 158.0, 158.4, 157.2, 157.6, 1000)
     c1[216] = candle(base1 + 216 * hour, 157.5, 157.8, 156.0, 156.6, 2000)
-    c1[217] = candle(base1 + 217 * hour, 156.6, 158.7, 156.4, 158.4, 2500)
+    c1[217] = candle(base1 + 217 * hour, 156.6, 158.4, 156.4, 158.0, 2500)
     decision_now = c1[217][0] + hour
     return daily, c4, c1[:218], decision_now
 

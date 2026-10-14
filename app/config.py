@@ -92,6 +92,9 @@ class Settings(BaseSettings):
 
     # Backtest resource controls
     backtest_max_symbols: int = Field(default=200, alias="BACKTEST_MAX_SYMBOLS")
+    backtest_start_ms: int | None = Field(default=None, alias="BACKTEST_START_MS")
+    backtest_end_ms: int | None = Field(default=None, alias="BACKTEST_END_MS")
+    backtest_symbols: str = Field(default="", alias="V11_BACKTEST_SYMBOLS")
     backtest_symbol_concurrency: int = Field(default=2, alias="BACKTEST_SYMBOL_CONCURRENCY")
     backtest_analysis_timeout_seconds: float = Field(default=120.0, alias="BACKTEST_ANALYSIS_TIMEOUT_SECONDS")
     backtest_child_boot_timeout_seconds: float = Field(default=30.0, alias="BACKTEST_CHILD_BOOT_TIMEOUT_SECONDS")

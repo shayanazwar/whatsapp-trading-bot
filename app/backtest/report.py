@@ -140,6 +140,7 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
+        f"Period MS: V11_BACKTEST_START_MS={int(summary.period_start_ms)} | V11_BACKTEST_END_MS={int(summary.period_end_ms)}",
         f"TP MODE: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
@@ -168,7 +169,11 @@ def format_report(summary: BacktestSummary) -> str:
         f"⚠️ Data Errors: {summary.data_errors}",
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
+        f"🧱 Portfolio Skipped: {int(summary.diagnostics.get('PORTFOLIO_SKIPPED', 0)) if summary.diagnostics else 0}",
     ]
+    if summary.diagnostics:
+        universe_mode = "FIXED SYMBOL LIST" if int(summary.diagnostics.get("FIXED_BACKTEST_SYMBOLS_ENABLED", 0)) else "CURRENT UNIVERSE SNAPSHOT"
+        lines.insert(4, f"Universe: {universe_mode} ({int(summary.diagnostics.get('V11_BACKTEST_SYMBOL_COUNT', summary.coins_selected))} symbols)")
     cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
     if cf is not None:
         lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")

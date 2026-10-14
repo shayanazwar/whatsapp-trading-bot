@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping
 
 
 ONE_HOUR_MS = 3_600_000
-DEFAULT_FEE_RATE = 0.0004
+DEFAULT_FEE_RATE = 0.0006
 DEFAULT_SLIPPAGE_BPS = 2.0
 DEFAULT_MAX_HOLDING_MINUTES = 72 * 60
 DEFAULT_SAME_BAR_RULE = "SL_FIRST"
@@ -66,6 +66,8 @@ class SimulatedTrade:
     time_to_1r_minutes: float | None = None
     time_to_1_5r_minutes: float | None = None
     counterfactual_tp_r: float | None = None
+    # Control-mode exit is retained to make portfolio acceptance invariant across TP experiments.
+    control_exit_time_ms: int | None = None
 
     @property
     def tp(self) -> float:

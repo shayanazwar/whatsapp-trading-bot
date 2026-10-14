@@ -26,7 +26,7 @@ import logging
 import os
 import time
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -248,47 +248,38 @@ def _utc_hour(timestamp_ms: int) -> int:
     ).hour
 
 
-def _period(days: int) -> tuple[int, int]:
-    """Calculate a causal historical window, optionally frozen by environment.
+def _epoch_ms(value: Any, name: str) -> int:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be an integer Unix timestamp in seconds or milliseconds") from exc
+    if abs(timestamp) < 100_000_000_000:
+        timestamp *= 1000
+    return timestamp
 
-    Default behavior is unchanged. For controlled A/B tests, set
-    V11_BACKTEST_END_MS, or set both V11_BACKTEST_START_MS and
-    V11_BACKTEST_END_MS. This lets two strategy variants use the exact same
-    historical window without changing the WhatsApp command interface.
-    """
+
+def _period(days: int, settings: Settings | None = None) -> tuple[int, int]:
+    """Resolve a reproducible window; supports explicit env or Settings timestamps."""
     raw_start = os.getenv("V11_BACKTEST_START_MS")
     raw_end = os.getenv("V11_BACKTEST_END_MS")
+    if raw_start is None and settings is not None:
+        raw_start = getattr(settings, "backtest_start_ms", None)
+    if raw_end is None and settings is not None:
+        raw_end = getattr(settings, "backtest_end_ms", None)
 
-    if raw_start or raw_end:
-        if not raw_end:
+    if raw_start not in (None, "") or raw_end not in (None, ""):
+        if raw_end in (None, ""):
             raise ValueError("V11_BACKTEST_END_MS is required when freezing a backtest period")
-        try:
-            end_ms = int(raw_end)
-        except ValueError as exc:
-            raise ValueError("V11_BACKTEST_END_MS must be an integer Unix timestamp in seconds or milliseconds") from exc
-        if abs(end_ms) < 100_000_000_000:
-            end_ms *= 1000
-        if raw_start:
-            try:
-                start_ms = int(raw_start)
-            except ValueError as exc:
-                raise ValueError("V11_BACKTEST_START_MS must be an integer Unix timestamp in seconds or milliseconds") from exc
-            if abs(start_ms) < 100_000_000_000:
-                start_ms *= 1000
-        else:
-            start_ms = end_ms - int(days) * ONE_DAY_MS
+        end_ms = _epoch_ms(raw_end, "V11_BACKTEST_END_MS")
+        start_ms = (_epoch_ms(raw_start, "V11_BACKTEST_START_MS")
+                    if raw_start not in (None, "") else end_ms - int(days) * ONE_DAY_MS)
         if start_ms >= end_ms:
             raise ValueError("V11_BACKTEST_START_MS must be earlier than V11_BACKTEST_END_MS")
         return start_ms, end_ms
 
-    end_dt = datetime.now(timezone.utc).replace(
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     end_ms = int(end_dt.timestamp() * 1000) - MAX_HOLD_MINUTES * 60_000
-    start_ms = end_ms - int(days) * ONE_DAY_MS
-    return start_ms, end_ms
+    return end_ms - int(days) * ONE_DAY_MS, end_ms
 
 
 # ============================================================
@@ -449,6 +440,45 @@ def simulate_trade_1h(
 # BACKTEST RUNNER
 # ============================================================
 
+def _apply_portfolio_caps(
+    trades: list[SimulatedTrade], settings: Settings,
+) -> tuple[list[SimulatedTrade], int]:
+    """Apply deterministic position/direction/risk caps using CONTROL exit times."""
+    max_open = max(0, int(getattr(settings, "backtest_max_open_positions", 4)))
+    max_direction = max(0, int(getattr(settings, "backtest_max_same_direction", 2)))
+    max_risk_r = max(0.0, float(getattr(settings, "backtest_total_open_risk_r", 3.0)))
+    accepted: list[SimulatedTrade] = []
+    active: list[SimulatedTrade] = []
+    skipped = 0
+
+    for candidate in sorted(trades, key=lambda t: (int(t.signal_time_ms), str(t.symbol), str(t.side))):
+        at_ms = int(candidate.signal_time_ms)
+        still_active: list[SimulatedTrade] = []
+        for position in active:
+            control_exit = getattr(position, "control_exit_time_ms", None)
+            if control_exit is None:
+                control_exit = position.exit_time_ms
+            # Match per-symbol cooldown semantics: an exit at the same timestamp
+            # still blocks a new entry at that timestamp.
+            if control_exit is None or int(control_exit) >= at_ms:
+                still_active.append(position)
+        active = still_active
+
+        same_direction = sum(str(p.side).upper() == str(candidate.side).upper() for p in active)
+        # The simulator normalizes trade results in R; portfolio risk is 1.0R per position.
+        active_risk_r = float(len(active))
+        if (
+            len(active) >= max_open
+            or same_direction >= max_direction
+            or active_risk_r + 1.0 > max_risk_r + 1e-12
+        ):
+            skipped += 1
+            continue
+        accepted.append(candidate)
+        active.append(candidate)
+    return accepted, skipped
+
+
 class BacktestRunner:
     """Causal paper backtester for the V11 1D/12H/4H/1H engine."""
 
@@ -470,9 +500,8 @@ class BacktestRunner:
     def is_running(self) -> bool:
         return self._running
 
-    @staticmethod
-    def _period(days: int) -> tuple[int, int]:
-        return _period(days)
+    def _period(self, days: int) -> tuple[int, int]:
+        return _period(days, self.settings)
 
     async def _fetch_history(
         self,
@@ -616,8 +645,6 @@ class BacktestRunner:
 
         if counterfactual_tp_r is not None:
             counterfactual_tp_r = float(counterfactual_tp_r)
-            inc("TP_COUNTERFACTUAL_ENABLED")
-            inc("TP_COUNTERFACTUAL_R_X100", int(round(counterfactual_tp_r * 100)))
         else:
             inc("TP_COUNTERFACTUAL_CONTROL")
 
@@ -715,7 +742,7 @@ class BacktestRunner:
                     now_ms=signal_close_ms,
                     cache=engine_cache,
                     btc_context=btc_context,
-                    estimated_round_trip_cost_pct=float(getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015)),
+                    estimated_round_trip_cost_pct=float(getattr(self.settings, "effective_round_trip_cost_pct", getattr(self.settings, "estimated_round_trip_cost_pct", 0.0015))),
                 )
                 inc("ENGINE_CALLS")
                 inc("CANDLES_EVALUATED")
@@ -854,16 +881,30 @@ class BacktestRunner:
                 _safe_number(analysis.get("intraday_max_hold_minutes"))
                 or max_hold
             )
+            control_trade: SimulatedTrade | None = None
             try:
-                trade = simulate_trade_1h(
-                    analysis,
-                    future,
-                    signal_close_time_ms=signal_close_ms,
-                    fee_rate=fee_rate,
-                    slippage_bps=slippage_bps,
-                    max_holding_minutes=effective_max_hold,
-                    counterfactual_tp_r=counterfactual_tp_r,
+                # CONTROL exit governs eligibility/cooldown in every TP experiment.
+                control_trade = simulate_trade_1h(
+                    analysis, future, signal_close_time_ms=signal_close_ms,
+                    fee_rate=fee_rate, slippage_bps=slippage_bps,
+                    max_holding_minutes=effective_max_hold, counterfactual_tp_r=None,
                 )
+                if control_trade is None:
+                    trade = None
+                elif counterfactual_tp_r is None:
+                    trade = control_trade
+                else:
+                    trade = simulate_trade_1h(
+                        analysis, future, signal_close_time_ms=signal_close_ms,
+                        fee_rate=fee_rate, slippage_bps=slippage_bps,
+                        max_holding_minutes=effective_max_hold,
+                        counterfactual_tp_r=counterfactual_tp_r,
+                    )
+                if trade is not None:
+                    control_exit = (int(control_trade.exit_time_ms)
+                                    if control_trade is not None and control_trade.exit_time_ms is not None
+                                    else None)
+                    trade = replace(trade, control_exit_time_ms=control_exit)
             except Exception as exc:
                 simulation_errors += 1
                 inc("SIMULATION_ERRORS")
@@ -874,6 +915,10 @@ class BacktestRunner:
                     exc,
                 )
                 continue
+
+            control_exit_ms = control_trade.exit_time_ms if control_trade is not None else None
+            if control_exit_ms is not None:
+                active_until_ms = max(active_until_ms, int(control_exit_ms))
 
             if trade is None:
                 inc("SIMULATION_NO_TRADE")
@@ -894,11 +939,6 @@ class BacktestRunner:
             if trade.expired:
                 inc("EXPIRY")
 
-            if trade.exit_time_ms is not None:
-                active_until_ms = max(
-                    active_until_ms,
-                    int(trade.exit_time_ms),
-                )
 
         diagnostics["CANDIDATES_ENGINE_EVALUATED"] = diagnostics.get(
             "ENGINE_CALLS",
@@ -914,13 +954,6 @@ class BacktestRunner:
         diagnostics["ANALYSIS_TOTAL_TIME_MS"] = int(
             (time.monotonic() - symbol_started) * 1000
         )
-        diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
-        diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
-        diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
-        diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = 1 if str(V11_SL_MODE).upper() == "LIQUIDITY_SWEEP" else 0
-        diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
-        diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(bool(os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")))
-
         reject_items = [
             (key, int(value))
             for key, value in diagnostics.items()
@@ -994,6 +1027,9 @@ class BacktestRunner:
         self,
         days: int,
         tp_mode: str = "CONTROL",
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
     ) -> BacktestSummary:
         """Run a complete causal paper backtest with an exit-only TP mode."""
 
@@ -1042,15 +1078,32 @@ class BacktestRunner:
                 diagnostics[key] = diagnostics.get(key, 0) + int(amount)
 
             try:
-                start_ms, end_ms = self._period(days)
+                fixed_period_configured = bool(
+                    start_ms is not None or end_ms is not None
+                    or os.getenv("V11_BACKTEST_START_MS") or os.getenv("V11_BACKTEST_END_MS")
+                    or getattr(self.settings, "backtest_start_ms", None) is not None
+                    or getattr(self.settings, "backtest_end_ms", None) is not None
+                )
+                if start_ms is not None or end_ms is not None:
+                    if start_ms is None or end_ms is None:
+                        raise ValueError("Pass both start_ms and end_ms to run a fixed backtest window")
+                    start_ms, end_ms = _epoch_ms(start_ms, "start_ms"), _epoch_ms(end_ms, "end_ms")
+                    if start_ms >= end_ms:
+                        raise ValueError("start_ms must be earlier than end_ms")
+                else:
+                    start_ms, end_ms = self._period(days)
                 state["phase"] = "UNIVERSE"
 
-                all_symbols = list(
-                    await asyncio.wait_for(
-                        self.universe.refresh(),
-                        timeout=FETCH_TIMEOUT_SECONDS,
+                fixed_symbols = (os.getenv("V11_BACKTEST_SYMBOLS", "") or getattr(self.settings, "backtest_symbols", "")).strip()
+                if fixed_symbols:
+                    all_symbols = [x.strip().upper() for x in fixed_symbols.split(",") if x.strip()]
+                else:
+                    all_symbols = list(
+                        await asyncio.wait_for(
+                            self.universe.refresh(),
+                            timeout=FETCH_TIMEOUT_SECONDS,
+                        )
                     )
-                )
                 max_symbols = max(1, min(
                     int(getattr(self.settings, "backtest_max_symbols", MAX_BACKTEST_SYMBOLS)),
                     MAX_BACKTEST_SYMBOLS,
@@ -1305,7 +1358,29 @@ class BacktestRunner:
                 await asyncio.gather(*workers)
 
                 state["phase"] = "FINALIZING"
-                trades.sort(key=lambda trade: trade.signal_time_ms)
+                trades.sort(key=lambda trade: (int(trade.signal_time_ms), str(trade.symbol), str(trade.side)))
+
+                # Portfolio acceptance is controlled by CONTROL-mode exit times,
+                # so exit-only TP experiments make identical acceptance decisions.
+                trades, portfolio_skipped = _apply_portfolio_caps(trades, self.settings)
+                diagnostics["PORTFOLIO_SKIPPED"] = int(portfolio_skipped)
+                diagnostics["PORTFOLIO_ACCEPTED"] = int(len(trades))
+
+                # Run-level/static diagnostics are assigned exactly once, never summed per symbol.
+                diagnostics["V11_MIN_IMPULSE_ATR_X100"] = int(round(float(V11_MIN_IMPULSE_ATR) * 100))
+                diagnostics["V11_MAX_TRIGGER_BARS"] = int(V11_MAX_TRIGGER_BARS)
+                diagnostics["V11_SL_MODE_4H_ORIGIN"] = int(str(V11_SL_MODE).upper() == "4H_ORIGIN")
+                diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = int(str(V11_SL_MODE).upper() == "LIQUIDITY_SWEEP")
+                diagnostics["V11_SHORT_RANGE_RELAXED"] = int(bool(V11_SHORT_RANGE_RELAXED))
+                diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(fixed_period_configured)
+                diagnostics["V11_BACKTEST_SYMBOL_COUNT"] = int(len(symbols))
+                diagnostics["FIXED_BACKTEST_SYMBOLS_ENABLED"] = int(bool(fixed_symbols))
+                diagnostics["TP_MODE_X100"] = int(round((tp_config.risk_multiple or 0.0) * 100))
+                diagnostics["TP_COUNTERFACTUAL_ENABLED"] = int(tp_config.risk_multiple is not None)
+                if tp_config.risk_multiple is not None:
+                    diagnostics["TP_COUNTERFACTUAL_R_X100"] = int(round(tp_config.risk_multiple * 100))
+                else:
+                    diagnostics.pop("TP_COUNTERFACTUAL_R_X100", None)
 
                 # Build the complete current summary payload.  The deployed
                 # report.py may be one of two compatible schema generations:
@@ -1313,14 +1388,6 @@ class BacktestRunner:
                 # while newer builds require them.  Detect the active callable
                 # signature rather than allowing an avoidable TypeError to abort
                 # an otherwise completed backtest.
-                diagnostics["TP_MODE_X100"] = int(
-                    round((tp_config.risk_multiple or 0.0) * 100)
-                )
-                if tp_config.risk_multiple is not None:
-                    diagnostics["TP_COUNTERFACTUAL_R_X100"] = int(
-                        round(tp_config.risk_multiple * 100)
-                    )
-
                 rejected_setups = int(
                     diagnostics.get("TECHNICAL_REJECT", 0)
                 )

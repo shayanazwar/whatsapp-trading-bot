@@ -46,6 +46,7 @@ class BacktestSummary:
     market_entries: int = 0
     limit_entries: int = 0
     diagnostics: Mapping[str, int] = field(default_factory=dict)
+    entry_quality_by_outcome: Mapping[str, Mapping[str, float | int]] = field(default_factory=dict)
 
 
 def _resolved(trades: Sequence[SimulatedTrade]) -> list[SimulatedTrade]:
@@ -110,6 +111,28 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
     diagnostics_out.setdefault("PORTFOLIO_SKIPPED", 0)
     mae_values = [float(t.mae_r) for t in ordered if t.mae_r is not None and math.isfinite(float(t.mae_r))]
     mfe_values = [float(t.mfe_r) for t in ordered if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
+    quality_fields = (
+        "impulse_age_4h_bars", "retest_depth_ratio", "reclaim_bars_after_sweep",
+        "reclaim_age_1h_bars", "entry_extension_atr", "actual_entry_extension_atr", "reclaim_body_ratio",
+        "reclaim_close_location", "reclaim_rvol",
+    )
+    quality_by_outcome: dict[str, dict[str, float | int]] = {}
+    for outcome in ("TP", "SL"):
+        group = [t for t in resolved if str(t.outcome).upper() == outcome]
+        stats: dict[str, float | int] = {"sample_count": len(group)}
+        for field_name in quality_fields:
+            field_values: list[float] = []
+            for trade in group:
+                raw = (getattr(trade, "quality", None) or {}).get(field_name)
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value):
+                    field_values.append(value)
+            if field_values:
+                stats[f"mean_{field_name}"] = mean(field_values)
+        quality_by_outcome[outcome] = stats
     return BacktestSummary(
         days=days,
         period_start_ms=period_start_ms,
@@ -147,6 +170,7 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
         limit_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() == "LIMIT"),
         diagnostics=diagnostics_out,
+        entry_quality_by_outcome=quality_by_outcome,
     )
 
 
@@ -194,11 +218,36 @@ def format_report(summary: BacktestSummary) -> str:
         f"🧭 Avg MAE / MFE: {_fmt(summary.avg_mae_r)}R / {_fmt(summary.avg_mfe_r)}R",
         f"⚙️ Entry Mode: MARKET {summary.market_entries} / LIMIT {summary.limit_entries}",
         "",
+        "ENTRY QUALITY BY OUTCOME (diagnostic averages; not proof of prediction)",
+    ]
+    quality_labels = (
+        ("reclaim_body_ratio", "reclaim_body"),
+        ("reclaim_close_location", "reclaim_close_location"),
+        ("reclaim_rvol", "reclaim_RVOL"),
+        ("entry_extension_atr", "signal_extension_ATR"),
+        ("actual_entry_extension_atr", "actual_fill_extension_ATR"),
+        ("retest_depth_ratio", "retest_depth"),
+        ("impulse_age_4h_bars", "impulse_age_4H_bars"),
+        ("reclaim_bars_after_sweep", "sweep_to_reclaim_bars"),
+    )
+    for outcome in ("TP", "SL"):
+        outcome_stats = summary.entry_quality_by_outcome.get(outcome, {})
+        rendered = []
+        for field_name, label in quality_labels:
+            value = outcome_stats.get(f"mean_{field_name}")
+            if value is not None:
+                rendered.append(f"{label}={float(value):.2f}")
+        if rendered:
+            lines.append(f"{outcome} sample={int(outcome_stats.get('sample_count', 0))}: " + " | ".join(rendered))
+        else:
+            lines.append(f"{outcome} sample={int(outcome_stats.get('sample_count', 0))}: N/A (no trade quality metadata)")
+    lines.extend([
+        "",
         f"⚠️ Data Errors: {summary.data_errors}",
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
         f"🧱 Portfolio Skipped: {int((summary.diagnostics or {}).get('PORTFOLIO_SKIPPED', 0))}",
-    ]
+    ])
     cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
     if cf is not None:
         lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
@@ -216,6 +265,13 @@ def format_report(summary: BacktestSummary) -> str:
             active_experiments.append(f"SWEEP_RECLAIM_WINDOW={trigger_bars}B")
         if short_relaxed:
             active_experiments.append("SHORT_RANGE_RELAXED=ON")
+        if int(summary.diagnostics.get("V11_ACCURACY_MODE", 0)):
+            max_reclaim = int(summary.diagnostics.get("V11_ACCURACY_MAX_RECLAIM_BARS", 3))
+            max_extension = int(summary.diagnostics.get("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_X100", 75)) / 100.0
+            max_depth = int(summary.diagnostics.get("V11_ACCURACY_MAX_RETEST_DEPTH_X100", 70)) / 100.0
+            active_experiments.append(f"ACCURACY_MODE=ON (reclaim<={max_reclaim}B, extension<={max_extension:.2f}ATR, retest<={max_depth:.0%})")
+        else:
+            lines.insert(4, "🧪 Accuracy filters: OFF (diagnostics only; strategy baseline preserved)")
         if active_experiments:
             lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
         lines.extend(("", "GATE DIAGNOSTICS"))

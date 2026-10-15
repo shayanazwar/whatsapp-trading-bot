@@ -37,6 +37,7 @@ from ..analysis.engine import (
     ENGINE_VERSION,
     V11_SL_MODE,
     validate_engine_config,
+    v11_accuracy_config,
     analyze_candles,
     build_btc_context,
     convert_candles,
@@ -1468,6 +1469,11 @@ class BacktestRunner:
                 diagnostics["V11_SL_MODE_4H_ORIGIN"] = 1 if str(V11_SL_MODE).upper() == "4H_ORIGIN" else 0
                 diagnostics["V11_SL_MODE_LIQUIDITY_SWEEP"] = 1 if str(V11_SL_MODE).upper() == "LIQUIDITY_SWEEP" else 0
                 diagnostics["V11_SHORT_RANGE_RELAXED"] = 1 if bool(V11_SHORT_RANGE_RELAXED) else 0
+                accuracy_cfg = v11_accuracy_config()
+                diagnostics["V11_ACCURACY_MODE"] = int(bool(accuracy_cfg["enabled"]))
+                diagnostics["V11_ACCURACY_MAX_RECLAIM_BARS"] = int(accuracy_cfg["max_reclaim_bars"])
+                diagnostics["V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_X100"] = int(round(float(accuracy_cfg["max_entry_extension_atr"]) * 100))
+                diagnostics["V11_ACCURACY_MAX_RETEST_DEPTH_X100"] = int(round(float(accuracy_cfg["max_retest_depth"]) * 100))
                 diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(
                     bool(
                         start_ms is not None

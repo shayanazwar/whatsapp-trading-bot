@@ -170,6 +170,16 @@ def _quality_snapshot(signal: Mapping[str, Any]) -> dict[str, float]:
         "one_hour_long_votes",
         "one_hour_short_votes",
         "macd_hist_delta",
+        "impulse_age_4h_bars",
+        "retest_depth_ratio",
+        "reclaim_bars_after_sweep",
+        "reclaim_age_1h_bars",
+        "entry_extension_atr",
+        "reclaim_body_ratio",
+        "reclaim_close_location",
+        "reclaim_rvol",
+        "swept_level_1h",
+        "atr_1h",
     ):
         value = signal.get(key)
         if value is None:
@@ -344,6 +354,15 @@ def simulate_trade(
             actual_fill_risk = abs(entry_exec - stop)
             if actual_fill_risk > 0 and isfinite(actual_fill_risk):
                 actual_fill_rr = abs(tp - entry_exec) / actual_fill_risk
+        quality_snapshot = _quality_snapshot(signal)
+        if entry_exec is not None:
+            swept_level = quality_snapshot.get("swept_level_1h")
+            atr_1h = quality_snapshot.get("atr_1h")
+            if swept_level is not None and atr_1h is not None and atr_1h > 0:
+                if side == "LONG":
+                    quality_snapshot["actual_entry_extension_atr"] = max(0.0, entry_exec - swept_level) / atr_1h
+                else:
+                    quality_snapshot["actual_entry_extension_atr"] = max(0.0, swept_level - entry_exec) / atr_1h
         return SimulatedTrade(
             symbol=symbol, side=side, signal_time_ms=signal_time, entry=entry,
             stop_loss=stop, tp1=tp, tp2=tp, planned_rr=signal_rr,
@@ -352,7 +371,7 @@ def simulate_trade(
             r_multiple=net_r, exit_time_ms=ts, hold_minutes=hold, fees_r=fees_r,
             slippage_r=slip_r, entry_execution=entry_exec, exit_execution=final_exec,
             expired=expired, regime=str(signal.get("regime") or signal.get("trend_4h") or "UNKNOWN"),
-            quality=_quality_snapshot(signal), initial_position_size=initial_size,
+            quality=quality_snapshot, initial_position_size=initial_size,
             tp1_close_size=0.0, final_close_size=initial_size if close_position else 0.0,
             remaining_position_size=0.0 if close_position else initial_size,
             breakeven_hit=False, original_stop_loss=stop, breakeven_stop=None,

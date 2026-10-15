@@ -447,6 +447,7 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
 
 # V11 strategy constants. Score is diagnostic only; it is never an acceptance gate.
 V11_MIN_RR = 1.60
+V11_MAX_TARGET_RR = 2.50
 V11_MIN_IMPULSE_ATR = 2.50
 V11_SETUP_MAX_4H_BARS = 30
 V11_MAX_TRIGGER_BARS = 6
@@ -517,22 +518,26 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
             "bull_votes": 0, "bear_votes": 0,
         }
 
-    bull_votes = sum((
+    bull_directional = sum((
         price > e200,
         e50 > e200,
         structure == "HH/HL",
         slope > 0,
     ))
-    bear_votes = sum((
+    bear_directional = sum((
         price < e200,
         e50 < e200,
         structure == "LH/LL",
         slope < 0,
     ))
-    # ADX measures trend strength, not direction. Counting it for both sides
-    # allowed a side with only two directional inputs to reach a 3-vote gate.
-    bull = bull_votes >= 3 and bull_votes > bear_votes
-    bear = bear_votes >= 3 and bear_votes > bull_votes
+    # ADX measures trend strength, not direction. It may only support a side
+    # that already has active directional structure/momentum and a directional lead.
+    bull_adx = int(adx >= ADX_TREND_MIN and bull_directional > bear_directional and (structure == "HH/HL" or (price > e200 and slope > 0)))
+    bear_adx = int(adx >= ADX_TREND_MIN and bear_directional > bull_directional and (structure == "LH/LL" or (price < e200 and slope < 0)))
+    bull_votes = bull_directional + bull_adx
+    bear_votes = bear_directional + bear_adx
+    bull = bull_directional >= 3 and bull_votes > bear_votes
+    bear = bear_directional >= 3 and bear_votes > bull_votes
     return {
         "regime": "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
         "bull": bull,
@@ -731,6 +736,7 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
         # Reclaim may occur on any subsequent candle within the full V11.2
         # trigger window. The previous implementation unintentionally limited
         # this to only the next 1â€“2 candles despite max_bars=6.
+        best_match = None
         for j in range(i + 1, end + 1):
             r = candles[j]
             ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
@@ -745,26 +751,50 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
                 close_loc = 1.0 - loc
             if not reclaimed:
                 continue
+            if body + 1e-12 < MIN_TRIGGER_BODY or close_loc + 1e-12 < MIN_TRIGGER_CLOSE_LOCATION:
+                continue
             rvol = _relative_volume(candles[:j + 1], 20)
             quality = _clamp(0.45 + 0.20 * _clamp(body / 0.50, 0, 1) + 0.20 * _clamp(rvol / 1.20, 0, 1) + 0.15 * _clamp(close_loc / 0.70, 0, 1), 0, 1)
-            return {
+            candidate = {
                 "ready": True, "sweep_idx": i, "reclaim_idx": j, "swept_level": level,
                 "rvol": rvol, "body_ratio": body, "close_location": close_loc,
                 "quality": quality, "reason": "liquidity sweep absorbed and reclaimed",
                 "trigger_time": int(r["time"]), "sweep_time": int(c["time"]),
             }
+            if best_match is None or j == len(candles) - 1:
+                best_match = candidate
+        if best_match is not None:
+            return best_match
     return empty
 
 
-def _v11_target(c4: list[Candle], c12: list[Candle], c1d: list[Candle], entry: float, side: str, impulse: dict[str, Any]) -> dict[str, Any]:
+def _v11_target(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Select the nearest meaningful structural target before applying RR.
 
-    Target selection is structural-first. If the nearest valid magnet does not
-    clear the post-cost RR floor, the setup is rejected rather than choosing a
-    farther level solely to manufacture RR.
+    Supports both the standard 6-arg engine call `(c4, c12, c1d, entry, side, impulse)`
+    and the extended 9-arg audit signature `(c1, c4, c12, c1d, entry, risk, side, impulse, cost_pct)`.
     """
+    if len(args) == 6:
+        c1 = []
+        c4, c12, c1d, entry, side, impulse = args
+        risk = None
+        cost_pct = 0.0
+        include_1h = False
+    elif len(args) >= 8:
+        c1, c4, c12, c1d, entry, risk, side, impulse = args[:8]
+        cost_pct = float(args[8]) if len(args) >= 9 else float(kwargs.get("cost_pct", 0.0))
+        include_1h = True
+    else:
+        raise TypeError(f"_v11_target expected 6 or 8-9 arguments, got {len(args)}")
+
+    entry = float(entry)
+    side = str(side).upper()
     levels: list[tuple[float, str, int]] = []
-    for candles, tf, left, right in ((c4, "4H", 3, 3), (c12, "12H", 3, 3), (c1d, "1D", 3, 3)):
+    frame_specs = []
+    if include_1h and c1:
+        frame_specs.append((c1, "1H", 3, 3))
+    frame_specs.extend(((c4, "4H", 3, 3), (c12, "12H", 3, 3), (c1d, "1D", 3, 3)))
+    for candles, tf, left, right in frame_specs:
         highs, lows = _swing_points(candles, left, right)
         if side == "LONG":
             for idx, price in highs:
@@ -780,13 +810,30 @@ def _v11_target(c4: list[Candle], c12: list[Candle], c1d: list[Candle], entry: f
         levels.append((impulse_target, "4H_IMPULSE", int(impulse["high_time"] if side == "LONG" else impulse["low_time"])))
     if not levels:
         return {"ok": False, "reason": "no structural target beyond entry"}
-    if side == "LONG":
-        price, tf, ts = min(levels, key=lambda x: x[0] - entry)
-    else:
-        # For SHORTs, the closest lower structural level is the smallest
-        # positive distance below entry. Using max(distance) would select the
-        # farthest downside target and could manufacture a blocked path.
-        price, tf, ts = min(levels, key=lambda x: entry - x[0])
+    ordered = sorted(levels, key=lambda x: (x[0] - entry) if side == "LONG" else (entry - x[0]))
+    if risk is not None and float(risk) > 0:
+        risk_f = float(risk)
+        cost_price = entry * max(0.0, float(cost_pct))
+        for price, tf, ts in ordered:
+            reward = abs(price - entry)
+            rr_gross = reward / risk_f
+            rr_net = (reward - cost_price) / (risk_f + cost_price) if (risk_f + cost_price) > 0 else 0.0
+            if rr_net + 1e-12 >= V11_MIN_RR and rr_gross <= V11_MAX_TARGET_RR + 1e-12:
+                return {
+                    "ok": True, "price": price, "timeframe": tf, "time": ts,
+                    "rr_gross": rr_gross, "rr_net": rr_net,
+                    "reason": "nearest structural target",
+                }
+        price, tf, ts = ordered[0]
+        reward = abs(price - entry)
+        rr_gross = reward / risk_f
+        rr_net = (reward - cost_price) / (risk_f + cost_price) if (risk_f + cost_price) > 0 else 0.0
+        return {
+            "ok": False, "price": price, "timeframe": tf, "time": ts,
+            "rr_gross": rr_gross, "rr_net": rr_net,
+            "reason": "no structural target within post-cost RR bounds",
+        }
+    price, tf, ts = ordered[0]
     return {"ok": True, "price": price, "timeframe": tf, "time": ts, "reason": "nearest structural target"}
 
 

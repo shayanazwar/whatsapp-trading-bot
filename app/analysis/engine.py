@@ -10,6 +10,7 @@ causally synthesized from three completed 4H candles.
 """
 
 import math
+import os
 import time
 from bisect import bisect_right
 from typing import Any, Iterable, List, Optional, Tuple
@@ -457,12 +458,55 @@ V11_STOP_BUFFER_ATR_1H = 0.15
 V11_MIN_SL_ATR_SANITY = 0.20
 V11_MAX_SL_ATR_SANITY = 3.00
 V11_SHOCK_RANGE_ATR = 4.50
+# Experimental quality controls are deliberately OFF by default. They implement
+# the research hypotheses documented in V11_ACCURACY_RESEARCH.md without
+# silently changing the established V11 signal population.
+V11_ACCURACY_MODE_DEFAULT = False
+V11_ACCURACY_MAX_RECLAIM_BARS_DEFAULT = 3
+V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT = 0.75
+V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT = 0.70
 # Explicitly declare the stop geometry used below so the runner imports the
 # same module successfully and reports the active mode truthfully.
 V11_SL_MODE = "LIQUIDITY_SWEEP"
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return bool(default)
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean environment value {name}={raw!r}")
+
+
+def v11_accuracy_config() -> dict[str, Any]:
+    """Return validated accuracy-experiment settings read at decision/run time."""
+    try:
+        max_reclaim_bars = int(os.getenv("V11_ACCURACY_MAX_RECLAIM_BARS", str(V11_ACCURACY_MAX_RECLAIM_BARS_DEFAULT)))
+        max_extension_atr = float(os.getenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", str(V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT)))
+        max_retest_depth = float(os.getenv("V11_ACCURACY_MAX_RETEST_DEPTH", str(V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Invalid V11 accuracy experiment configuration") from exc
+    if not 1 <= max_reclaim_bars <= V11_MAX_TRIGGER_BARS:
+        raise ValueError(f"V11_ACCURACY_MAX_RECLAIM_BARS must be between 1 and {V11_MAX_TRIGGER_BARS}")
+    if not math.isfinite(max_extension_atr) or not 0.0 < max_extension_atr <= 5.0:
+        raise ValueError("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR must be in (0, 5.0]")
+    if not math.isfinite(max_retest_depth) or not 0.0 < max_retest_depth <= 1.0:
+        raise ValueError("V11_ACCURACY_MAX_RETEST_DEPTH must be in (0, 1.0]")
+    return {
+        "enabled": _env_bool("V11_ACCURACY_MODE", V11_ACCURACY_MODE_DEFAULT),
+        "max_reclaim_bars": max_reclaim_bars,
+        "max_entry_extension_atr": max_extension_atr,
+        "max_retest_depth": max_retest_depth,
+    }
+
+
 def validate_engine_config() -> None:
-    """Fail fast on malformed experiment values instead of silent zero-signal runs."""
+    """Fail fast on malformed strategy/experiment values instead of silent zero-signal runs."""
+    v11_accuracy_config()
     impulse_atr = float(V11_MIN_IMPULSE_ATR)
     if not math.isfinite(impulse_atr) or not 0.25 <= impulse_atr <= 10.0:
         raise ValueError(
@@ -530,14 +574,12 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
         structure == "LH/LL",
         slope < 0,
     ))
-    # ADX measures trend strength, not direction. It may only support a side
-    # that already has active directional structure/momentum and a directional lead.
-    bull_adx = int(adx >= ADX_TREND_MIN and bull_directional > bear_directional and (structure == "HH/HL" or (price > e200 and slope > 0)))
-    bear_adx = int(adx >= ADX_TREND_MIN and bear_directional > bull_directional and (structure == "LH/LL" or (price < e200 and slope < 0)))
-    bull_votes = bull_directional + bull_adx
-    bear_votes = bear_directional + bear_adx
-    bull = bull_directional >= 3 and bull_votes > bear_votes
-    bear = bear_directional >= 3 and bear_votes > bull_votes
+    # ADX is trend strength, not direction, so it must never be counted as a
+    # directional vote. Permission uses only the four directional observations.
+    bull_votes = int(bull_directional)
+    bear_votes = int(bear_directional)
+    bull = bull_votes >= 3 and bull_votes > bear_votes
+    bear = bear_votes >= 3 and bear_votes > bull_votes
     return {
         "regime": "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
         "bull": bull,
@@ -701,71 +743,85 @@ def _v11_value_touched(candles_1h: list[Candle], start_time: int, zone: dict[str
 
 
 def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max_bars: int = V11_MAX_TRIGGER_BARS) -> dict[str, Any]:
-    """Causal sweep + reclaim trigger.
+    """Find a causal sweep and its later reclaim, with the bar limit measured
+    from the sweep candle (not from the earlier value-zone touch).
 
-    The swept level is derived only from the three candles immediately before
-    the sweep candle. The reclaim candle must close back through that level.
-    No centered pivot is used for the trigger.
+    The supplied candle list is the completed history at decision time. The
+    current-candle reclaim is preferred, so an older reclaim cannot mask a
+    more recent valid sweep/reclaim sequence. No future bars or centered pivots
+    are used by this trigger.
     """
     empty = {
         "ready": False, "sweep_idx": None, "reclaim_idx": None, "swept_level": None,
         "rvol": 0.0, "body_ratio": 0.0, "close_location": 0.0,
         "quality": 0.0, "reason": "no causal liquidity sweep + reclaim",
     }
-    if start_idx < 3 or start_idx >= len(candles):
+    if side not in {"LONG", "SHORT"} or start_idx < 3 or start_idx >= len(candles):
         return empty
-    end = min(len(candles) - 1, start_idx + max_bars)
-    for i in range(start_idx, end + 1):
+    try:
+        window = int(max_bars)
+    except (TypeError, ValueError, OverflowError):
+        return empty
+    if window < 1:
+        return empty
+
+    best_current: dict[str, Any] | None = None
+    best_historical: dict[str, Any] | None = None
+    final_idx = len(candles) - 1
+    # Sweep can happen any time after the first value-zone touch. Each individual
+    # sweep is valid only if a later reclaim occurs within `window` completed bars.
+    for i in range(start_idx, final_idx):
         prior = candles[max(0, i - 3):i]
         if len(prior) < 3:
             continue
-        c = candles[i]
+        sweep = candles[i]
         if side == "LONG":
             level = min(float(x["low"]) for x in prior)
-            # A liquidity sweep is a wick through the prior liquidity pool.
-            # The documented V11 sequence is sweep -> subsequent reclaim, so
-            # the sweep candle must breach the level but does not need to close
-            # beyond it. Requiring a close below/above the level turns many
-            # ordinary stop-runs into breakouts and suppresses valid setups.
-            swept = float(c["low"]) < level
+            swept = float(sweep["low"]) < level
         else:
             level = max(float(x["high"]) for x in prior)
-            swept = float(c["high"]) > level
+            swept = float(sweep["high"]) > level
         if not swept:
             continue
-        # Reclaim may occur on any subsequent candle within the full V11.2
-        # trigger window. The previous implementation unintentionally limited
-        # this to only the next 1â€“2 candles despite max_bars=6.
-        best_match = None
-        for j in range(i + 1, end + 1):
-            r = candles[j]
-            ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
-            rrng = max(rhigh - rlow, 1e-12)
-            body = abs(rclose - ropen) / rrng
-            loc = (rclose - rlow) / rrng
+
+        last_reclaim_idx = min(final_idx, i + window)
+        for j in range(i + 1, last_reclaim_idx + 1):
+            reclaim = candles[j]
+            ropen, rhigh, rlow, rclose = map(float, (reclaim["open"], reclaim["high"], reclaim["low"], reclaim["close"]))
+            candle_range = max(rhigh - rlow, 1e-12)
+            body = abs(rclose - ropen) / candle_range
+            location = (rclose - rlow) / candle_range
             if side == "LONG":
                 reclaimed = rclose > level and rclose > ropen
-                close_loc = loc
+                close_location = location
             else:
                 reclaimed = rclose < level and rclose < ropen
-                close_loc = 1.0 - loc
-            if not reclaimed:
+                close_location = 1.0 - location
+            if not reclaimed or body + 1e-12 < MIN_TRIGGER_BODY or close_location + 1e-12 < MIN_TRIGGER_CLOSE_LOCATION:
                 continue
-            if body + 1e-12 < MIN_TRIGGER_BODY or close_loc + 1e-12 < MIN_TRIGGER_CLOSE_LOCATION:
-                continue
+
             rvol = _relative_volume(candles[:j + 1], 20)
-            quality = _clamp(0.45 + 0.20 * _clamp(body / 0.50, 0, 1) + 0.20 * _clamp(rvol / 1.20, 0, 1) + 0.15 * _clamp(close_loc / 0.70, 0, 1), 0, 1)
+            quality = _clamp(
+                0.45
+                + 0.20 * _clamp(body / 0.50, 0, 1)
+                + 0.20 * _clamp(rvol / 1.20, 0, 1)
+                + 0.15 * _clamp(close_location / 0.70, 0, 1),
+                0, 1,
+            )
             candidate = {
                 "ready": True, "sweep_idx": i, "reclaim_idx": j, "swept_level": level,
-                "rvol": rvol, "body_ratio": body, "close_location": close_loc,
+                "rvol": rvol, "body_ratio": body, "close_location": close_location,
                 "quality": quality, "reason": "liquidity sweep absorbed and reclaimed",
-                "trigger_time": int(r["time"]), "sweep_time": int(c["time"]),
+                "trigger_time": int(reclaim["time"]), "sweep_time": int(sweep["time"]),
+                "bars_sweep_to_reclaim": j - i,
             }
-            if best_match is None or j == len(candles) - 1:
-                best_match = candidate
-        if best_match is not None:
-            return best_match
-    return empty
+            if j == final_idx:
+                if best_current is None or i > int(best_current["sweep_idx"]):
+                    best_current = candidate
+            elif best_historical is None or (j, i) > (int(best_historical["reclaim_idx"]), int(best_historical["sweep_idx"])):
+                best_historical = candidate
+
+    return best_current or best_historical or empty
 
 
 def _v11_target(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -912,6 +968,7 @@ def _v11_analyze_side(
     cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Evaluate one V11 side and retain the first failing gate for diagnostics."""
+    accuracy_cfg = v11_accuracy_config()
     context = _memoized_frame_value(
         cache, f"_v11_context_12h_{side.lower()}", c12,
         lambda: _v11_context_12h(c12, side),
@@ -993,15 +1050,17 @@ def _v11_analyze_side(
 
         zlow, zhigh = _num(zone.get("low")), _num(zone.get("high"))
         trigger = None
+        value_touch_idx: int | None = None
         touched_value = False
         for touch_idx, touch_candle in enumerate(c1):
             if int(touch_candle["time"]) <= start_time:
                 continue
             if float(touch_candle["low"]) <= zhigh and float(touch_candle["high"]) >= zlow:
                 touched_value = True
-                candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side)
+                candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side, max_bars=(accuracy_cfg["max_reclaim_bars"] if accuracy_cfg["enabled"] else V11_MAX_TRIGGER_BARS))
                 if candidate_trigger.get("ready") and int(candidate_trigger.get("reclaim_idx", -1)) == len(c1) - 1:
                     trigger = candidate_trigger
+                    value_touch_idx = touch_idx
                     break
         if not trigger:
             last_reason = f"{side}: value zone touched={touched_value}, but no 1H sweep -> later reclaim completed on current candle"
@@ -1016,7 +1075,31 @@ def _v11_analyze_side(
         atr1 = _memoized_frame_value(
             cache, "_v11_atr_1h", c1, lambda: _safe_atr(c1)
         )
-        sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
+        sweep_idx = int(trigger["sweep_idx"])
+        swept_level = float(trigger["swept_level"])
+        entry_extension_atr = (
+            max(0.0, entry - swept_level) / atr1 if side == "LONG" and atr1 > 0
+            else max(0.0, swept_level - entry) / atr1 if side == "SHORT" and atr1 > 0
+            else 0.0
+        )
+        pullback_candles = [c for c in c1 if start_time < int(c["time"]) <= int(c1[sweep_idx]["time"])]
+        impulse_leg = max(float(impulse.get("leg", 0.0)), 1e-12)
+        if pullback_candles:
+            if side == "LONG":
+                retest_depth_ratio = (float(impulse["high"]) - min(float(c["low"]) for c in pullback_candles)) / impulse_leg
+            else:
+                retest_depth_ratio = (max(float(c["high"]) for c in pullback_candles) - float(impulse["low"])) / impulse_leg
+        else:
+            retest_depth_ratio = 0.0
+        reclaim_bars = int(trigger.get("bars_sweep_to_reclaim", trigger_idx - sweep_idx))
+        if accuracy_cfg["enabled"]:
+            if entry_extension_atr > float(accuracy_cfg["max_entry_extension_atr"]):
+                last_reason = f"{side}: entry extension {entry_extension_atr:.2f} ATR exceeds accuracy-mode cap {float(accuracy_cfg['max_entry_extension_atr']):.2f} ATR"
+                continue
+            if retest_depth_ratio > float(accuracy_cfg["max_retest_depth"]):
+                last_reason = f"{side}: retest depth {retest_depth_ratio:.1%} exceeds accuracy-mode cap {float(accuracy_cfg['max_retest_depth']):.1%}"
+                continue
+        sweep_low = min(float(c["low"]) for c in c1[sweep_idx:trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
         if side == "LONG":
@@ -1104,6 +1187,18 @@ def _v11_analyze_side(
             "target": target, "target_path": target_path, "score": score, "score_groups": score_groups,
             "atr_percentile": atr_rank, "btc_filter_ok": True, "btc_filter_reason": btc_reason,
             "value_deep": deep, "value_quality": value_quality, "shock_ok": shock_ok,
+            "impulse_age_4h_bars": setup_age,
+            "retest_depth_ratio": max(0.0, retest_depth_ratio),
+            "reclaim_bars_after_sweep": reclaim_bars,
+            "reclaim_age_1h_bars": max(0, len(c1) - 1 - trigger_idx),
+            "entry_extension_atr": entry_extension_atr,
+            "reclaim_body_ratio": float(trigger.get("body_ratio", 0.0)),
+            "reclaim_close_location": float(trigger.get("close_location", 0.0)),
+            "reclaim_rvol": float(trigger.get("rvol", 0.0)),
+            "value_touch_idx": value_touch_idx,
+            "sweep_idx": sweep_idx,
+            "trigger": trigger,
+            "accuracy_config": accuracy_cfg,
             "setup_state": "TRIGGERED", "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
             "technical_gate_failures": [], "rejection_stage": None,
         }
@@ -1151,6 +1246,10 @@ def _v11_empty(
             "min_impulse_atr": V11_MIN_IMPULSE_ATR,
             "max_trigger_bars_1h": V11_MAX_TRIGGER_BARS,
             "sl_mode": V11_SL_MODE,
+            "accuracy_mode": bool(v11_accuracy_config()["enabled"]),
+            "accuracy_max_reclaim_bars": int(v11_accuracy_config()["max_reclaim_bars"]),
+            "accuracy_max_entry_extension_atr": float(v11_accuracy_config()["max_entry_extension_atr"]),
+            "accuracy_max_retest_depth": float(v11_accuracy_config()["max_retest_depth"]),
             "approved_timeframes": list(APPROVED_TIMEFRAMES),
         },
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
@@ -1160,7 +1259,7 @@ def _v11_empty(
         "diagnostic_failures": list(side_failures or [reason]),
         "reasons": list(side_failures or [reason]),
         "direction_ok": False, "structure_ok": False, "setup_ok": False, "confirmation_ok": False,
-        "entry_distance_ok": False, "volatility_ok": True, "confirmation_family_diversity_ok": True,
+        "entry_distance_ok": False, "entry_extension_ok": False, "volatility_ok": True, "confirmation_family_diversity_ok": True,
         "location_ok": False, "target_path_ok": False, "target_path_structural": False, "target_path_clear": False,
         "risk_ok": False, "trade_geometry_ok": False, "rr_ok": False, "shock_veto_ok": True,
         "btc_filter_ok": True, "btc_filter_reason": "not evaluated", "score": 0, "score_groups": {},
@@ -1300,6 +1399,10 @@ def analyze_candles(
             "min_impulse_atr": V11_MIN_IMPULSE_ATR,
             "max_trigger_bars_1h": V11_MAX_TRIGGER_BARS,
             "sl_mode": V11_SL_MODE,
+            "accuracy_mode": bool(v11_accuracy_config()["enabled"]),
+            "accuracy_max_reclaim_bars": int(v11_accuracy_config()["max_reclaim_bars"]),
+            "accuracy_max_entry_extension_atr": float(v11_accuracy_config()["max_entry_extension_atr"]),
+            "accuracy_max_retest_depth": float(v11_accuracy_config()["max_retest_depth"]),
             "approved_timeframes": list(APPROVED_TIMEFRAMES),
         },
         "side_diagnostics": side_diagnostics,
@@ -1309,18 +1412,40 @@ def analyze_candles(
         "trigger_quality": float(trigger.get("quality", 0.0)), "trigger_quality_1h": float(trigger.get("quality", 0.0)),
         "trigger_type": "LIQUIDITY_SWEEP_RECLAIM", "trigger_reason": trigger.get("reason"),
         "trigger_close_location": float(trigger.get("close_location", 0.0)),
+        "reclaim_body_ratio": float(chosen.get("reclaim_body_ratio", 0.0)),
+        "reclaim_close_location": float(chosen.get("reclaim_close_location", 0.0)),
+        "reclaim_rvol": float(chosen.get("reclaim_rvol", 0.0)),
+        "reclaim_bars_after_sweep": int(chosen.get("reclaim_bars_after_sweep", 0)),
+        "reclaim_age_1h_bars": int(chosen.get("reclaim_age_1h_bars", 0)),
+        "entry_extension_atr": float(chosen.get("entry_extension_atr", 0.0)),
+        "retest_depth_ratio": float(chosen.get("retest_depth_ratio", 0.0)),
+        "impulse_age_4h_bars": int(chosen.get("impulse_age_4h_bars", 0)),
+        "accuracy_mode": bool(chosen.get("accuracy_config", {}).get("enabled", False)),
+        "accuracy_mode_filters_passed": bool(
+            int(chosen.get("reclaim_bars_after_sweep", 0)) <= int(chosen.get("accuracy_config", {}).get("max_reclaim_bars", V11_ACCURACY_MAX_RECLAIM_BARS_DEFAULT))
+            and float(chosen.get("entry_extension_atr", 0.0)) <= float(chosen.get("accuracy_config", {}).get("max_entry_extension_atr", V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT))
+            and float(chosen.get("retest_depth_ratio", 0.0)) <= float(chosen.get("accuracy_config", {}).get("max_retest_depth", V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT))
+        ),
         "structure_quality_ok": True, "trade_geometry_ok": geometry_ok,
-        "momentum_quality": 0.5, "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
+        "momentum_quality": _clamp(float(trigger.get("body_ratio", 0.0)), 0.0, 1.0),
+        "volume_quality": _clamp(float(trigger.get("rvol", 0.0)) / 1.20, 0, 1),
         "volatility_quality": 1.0 if 5 <= float(chosen.get("atr_percentile", 50)) <= 98 else 0.5,
-        "entry_efficiency": 1.0, "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
+        "entry_efficiency": 1.0 / (1.0 + max(0.0, float(chosen.get("entry_extension_atr", 0.0)))),
+        "twelve_h_context_quality": 1.0 if context.get("healthy") else 0.6,
         "entry_mode": "MARKET", "limit_price": None, "entry_1h_ready": True,
         "shock_veto_ok": bool(chosen.get("shock_ok", True)), "shock_veto_reason": "OK",
         "score": score, "score_groups": chosen["score_groups"],
         "confirmation_families": families, "confirmation_families_passed": passed, "confirmation_families_available": len(families),
         "confirmation_family_diversity_ok": True,
         "direction_ok": direction_ok, "structure_ok": structure_ok, "setup_ok": setup_ok, "confirmation_ok": confirmation_ok,
-        "momentum_ok": True, "volume_ok": True, "location_ok": bool(target_ok and target_clear), "volatility_ok": True,
-        "risk_ok": geometry_ok, "rr_ok": rr >= V11_MIN_RR, "entry_distance_ok": True,
+        "momentum_ok": bool(float(trigger.get("body_ratio", 0.0)) >= MIN_TRIGGER_BODY and float(trigger.get("close_location", 0.0)) >= MIN_TRIGGER_CLOSE_LOCATION),
+        "volume_ok": bool(float(trigger.get("rvol", 0.0)) >= 1.20),
+        "location_ok": bool(target_ok and target_clear), "volatility_ok": True,
+        "risk_ok": geometry_ok, "rr_ok": rr >= V11_MIN_RR,
+        # Keep entry_distance_ok for the existing next-open validation contract;
+        # signal-close extension is exposed separately as entry_extension_ok.
+        "entry_distance_ok": True,
+        "entry_extension_ok": bool(float(chosen.get("entry_extension_atr", 0.0)) <= float(chosen.get("accuracy_config", {}).get("max_entry_extension_atr", V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT))),
         "stage_status": stage_status, "stage_failures": stage_failures, "technical_candidate": bool(geometry_ok and rr >= V11_MIN_RR and btc_ok),
         "signal_blocked": False, "rejection_stage": None, "technical_gate_failures": [], "diagnostic_failures": [],
         "reasons": reasons,
@@ -1345,7 +1470,7 @@ def analyze_candles(
         "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "trigger_candle_open_time": trigger.get("trigger_time"),
         "setup_impulse_high_time": impulse.get("high_time"), "setup_impulse_low_time": impulse.get("low_time"),
-        "setup_pullback_touch_time": int(c1[int(trigger["sweep_idx"])]["time"]),
+        "setup_pullback_touch_time": int(c1[int(chosen.get("value_touch_idx") if chosen.get("value_touch_idx") is not None else trigger["sweep_idx"])]["time"]),
         "setup_retest_time": trigger.get("trigger_time"), "setup_retest_1h_time": trigger.get("trigger_time"),
         "setup_bos_time": None, "setup_departure_time": None,
         "value_zone_low": float(chosen["value_zone"]["low"]), "value_zone_high": float(chosen["value_zone"]["high"]),

@@ -140,6 +140,7 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
+        f"Window MS: V11_BACKTEST_START_MS={summary.period_start_ms} V11_BACKTEST_END_MS={summary.period_end_ms}",
         f"TP MODE: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",

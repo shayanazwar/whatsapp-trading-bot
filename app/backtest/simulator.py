@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping
 
 
 ONE_HOUR_MS = 3_600_000
-DEFAULT_FEE_RATE = 0.0004
+DEFAULT_FEE_RATE = 0.0006
 DEFAULT_SLIPPAGE_BPS = 2.0
 DEFAULT_MAX_HOLDING_MINUTES = 72 * 60
 DEFAULT_SAME_BAR_RULE = "SL_FIRST"
@@ -67,6 +67,7 @@ class SimulatedTrade:
     time_to_1_5r_minutes: float | None = None
     counterfactual_tp_r: float | None = None
     reservation_minutes: float | None = None
+    control_exit_time_ms: int | None = None
 
     @property
     def tp(self) -> float:
@@ -229,6 +230,25 @@ def simulate_trade(
     planned_risk = abs(entry - stop)
     if planned_risk <= 0 or not isfinite(planned_risk):
         return None
+    control_exit_ts: int | None = None
+    if counterfactual_tp_r is not None:
+        control_ref = simulate_trade(
+            signal,
+            future_candles,
+            signal_close_time_ms=signal_close_time_ms,
+            fee_rate=fee_rate,
+            slippage_bps=slippage_bps,
+            max_holding_minutes=max_holding_minutes,
+            same_bar_rule=same_bar_rule,
+            counterfactual_tp_r=None,
+            max_entry_gap_pct=max_entry_gap_pct,
+            min_post_cost_rr=min_post_cost_rr,
+            estimated_round_trip_cost_pct=estimated_round_trip_cost_pct,
+            rejection_reasons=None,
+        )
+        if control_ref is not None:
+            control_exit_ts = control_ref.exit_time_ms
+
     # The engine's original TP is the control target and is always validated here.
     # A counterfactual TP, when supplied, is applied only after the entry fill so
     # that the accepted entry/SL population is unchanged.
@@ -346,6 +366,7 @@ def simulate_trade(
             time_to_1r_minutes=time_to_1r_minutes, time_to_1_5r_minutes=time_to_1_5r_minutes,
             counterfactual_tp_r=counterfactual_r,
             reservation_minutes=max_hold,
+            control_exit_time_ms=(control_exit_ts if counterfactual_r is not None and control_exit_ts is not None else ts),
         )
 
     expiry_ts = int(signal_time + max_hold * 60_000)

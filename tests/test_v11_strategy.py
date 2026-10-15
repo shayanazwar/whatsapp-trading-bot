@@ -158,7 +158,7 @@ def test_v11_liquidity_trigger_accepts_wick_sweep_before_later_reclaim():
     assert out["reclaim_idx"] == 217
 
 
-def test_v11_balanced_1d_macro_permission_uses_three_of_five_votes(monkeypatch):
+def test_v11_balanced_1d_macro_permission_uses_three_of_four_directional_votes(monkeypatch):
     rows = [{"time": i * DAY, "open": 109.5, "high": 110.5, "low": 108.5, "close": 110.0, "volume": 1000.0} for i in range(220)]
 
     def fake_ema(values, period):
@@ -171,7 +171,8 @@ def test_v11_balanced_1d_macro_permission_uses_three_of_five_votes(monkeypatch):
     out = _v11_regime_1d(convert_candles(rows))
     assert out["bull"] is True
     assert out["bear"] is False
-    assert out["bull_votes"] == 4
+    assert out["bull_votes"] == 3
+    assert out["adx"] == 20.0  # ADX is context, never a directional vote.
 
 
 def test_v11_liquidity_trigger_requires_current_quality_reclaim_within_window():
@@ -190,3 +191,87 @@ def test_v11_liquidity_trigger_requires_current_quality_reclaim_within_window():
     assert out["reclaim_idx"] == 9
     assert out["body_ratio"] >= engine.MIN_TRIGGER_BODY
     assert out["close_location"] >= engine.MIN_TRIGGER_CLOSE_LOCATION
+
+
+def test_sweep_reclaim_window_is_measured_from_sweep_not_value_touch():
+    base = 1_800_000_000_000
+    rows = [
+        {"time": base + i * HOUR, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0}
+        for i in range(13)
+    ]
+    # An older sweep/reclaim occurs shortly after the initial value-touch index.
+    rows[4] = {"time": base + 4 * HOUR, "open": 99.5, "high": 100.2, "low": 98.0, "close": 99.6, "volume": 1100.0}
+    rows[5] = {"time": base + 5 * HOUR, "open": 99.2, "high": 100.5, "low": 99.1, "close": 100.0, "volume": 1300.0}
+    # A newer sweep followed by the current-bar reclaim must take precedence.
+    rows[10] = {"time": base + 10 * HOUR, "open": 99.5, "high": 100.2, "low": 98.5, "close": 99.4, "volume": 1200.0}
+    rows[12] = {"time": base + 12 * HOUR, "open": 99.2, "high": 100.0, "low": 99.0, "close": 99.8, "volume": 1500.0}
+    result = _v11_liquidity_trigger(convert_candles(rows), 3, "LONG", max_bars=3)
+    assert result["ready"] is True
+    assert result["sweep_idx"] == 10
+    assert result["reclaim_idx"] == 12
+    assert result["bars_sweep_to_reclaim"] == 2
+
+
+def test_accuracy_experiment_defaults_off_and_config_is_validated(monkeypatch):
+    monkeypatch.delenv("V11_ACCURACY_MODE", raising=False)
+    monkeypatch.delenv("V11_ACCURACY_MAX_RECLAIM_BARS", raising=False)
+    monkeypatch.delenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", raising=False)
+    monkeypatch.delenv("V11_ACCURACY_MAX_RETEST_DEPTH", raising=False)
+    cfg = engine.v11_accuracy_config()
+    assert cfg["enabled"] is False
+    assert cfg["max_reclaim_bars"] == 3
+    assert cfg["max_entry_extension_atr"] == 0.75
+    assert cfg["max_retest_depth"] == 0.70
+    monkeypatch.setenv("V11_ACCURACY_MODE", "true")
+    assert engine.v11_accuracy_config()["enabled"] is True
+    monkeypatch.setenv("V11_ACCURACY_MAX_RECLAIM_BARS", "99")
+    try:
+        engine.validate_engine_config()
+    except ValueError as exc:
+        assert "MAX_RECLAIM_BARS" in str(exc)
+    else:
+        raise AssertionError("invalid accuracy experiment config must fail fast")
+
+
+def test_signal_exposes_measured_entry_quality_not_hardcoded_quality_metadata(monkeypatch):
+    monkeypatch.delenv("V11_ACCURACY_MODE", raising=False)
+    daily, c4, c1, now = _build_fixture()
+    result = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert result["technical_candidate"] is True
+    for key in (
+        "impulse_age_4h_bars", "retest_depth_ratio", "reclaim_bars_after_sweep",
+        "reclaim_age_1h_bars", "entry_extension_atr", "reclaim_body_ratio",
+        "reclaim_close_location", "reclaim_rvol",
+    ):
+        assert key in result
+        assert isinstance(result[key], (int, float))
+    assert result["reclaim_age_1h_bars"] == 0
+    assert result["setup_pullback_touch_time"] <= result["sweep_time_1h"]
+
+
+def test_accuracy_mode_can_reject_extended_entry_only_when_explicitly_enabled(monkeypatch):
+    daily, c4, c1, now = _build_fixture()
+    monkeypatch.setenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", "0.30")
+    monkeypatch.setenv("V11_ACCURACY_MAX_RETEST_DEPTH", "1.0")
+    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
+    baseline = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert baseline["technical_candidate"] is True
+    assert baseline["entry_extension_atr"] > 0.30
+    monkeypatch.setenv("V11_ACCURACY_MODE", "true")
+    experimental = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert experimental["technical_candidate"] is False
+    assert any("entry extension" in reason.lower() for reason in experimental["technical_gate_failures"])
+
+
+def test_accuracy_mode_can_reject_deep_retest_only_when_enabled(monkeypatch):
+    daily, c4, c1, now = _build_fixture()
+    monkeypatch.setenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", "5.0")
+    monkeypatch.setenv("V11_ACCURACY_MAX_RETEST_DEPTH", "0.50")
+    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
+    baseline = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert baseline["technical_candidate"] is True
+    assert baseline["retest_depth_ratio"] > 0.50
+    monkeypatch.setenv("V11_ACCURACY_MODE", "true")
+    experimental = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert experimental["technical_candidate"] is False
+    assert any("retest depth" in reason.lower() for reason in experimental["technical_gate_failures"])

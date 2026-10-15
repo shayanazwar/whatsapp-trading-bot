@@ -193,3 +193,44 @@ def test_side_tp_sl_breakdown_excludes_open_and_expired_trades():
     assert summary.long_sl_hits == summary.short_sl_hits == 0
     assert "LONG TPs: 0" in format_report(summary)
     assert "SHORT Trade SLs: 0" in format_report(summary)
+
+
+def test_backtest_report_compares_measured_entry_quality_for_tp_and_sl():
+    from app.backtest.simulator import SimulatedTrade
+
+    common = dict(
+        entry=100.0, stop_loss=95.0, tp1=110.0, tp2=110.0, planned_rr=2.0,
+        signal_rr=2.0, actual_fill_rr=2.0, tp1_hit=False, tp2_hit=False,
+        sl_hit=False, exit_time_ms=3_600_000, quality={
+            "reclaim_body_ratio": 0.6, "reclaim_close_location": 0.8,
+            "reclaim_rvol": 1.4, "entry_extension_atr": 0.3, "actual_entry_extension_atr": 0.4,
+            "retest_depth_ratio": 0.5, "impulse_age_4h_bars": 4,
+            "reclaim_bars_after_sweep": 2,
+        },
+    )
+    tp_trade = SimulatedTrade(symbol="TP_USDT", side="LONG", signal_time_ms=0,
+                              outcome="TP", r_multiple=1.8, **common)
+    sl_trade = SimulatedTrade(symbol="SL_USDT", side="SHORT", signal_time_ms=1,
+                              outcome="SL", r_multiple=-1.0, **{**common, "quality": {**common["quality"], "entry_extension_atr": 1.1}})
+    summary = summarize(days=1, period_start_ms=0, period_end_ms=86_400_000,
+                        coins_selected=2, coins_tested=2, data_errors=0,
+                        execution_errors=0, rejected_setups=0, trades=[tp_trade, sl_trade])
+    report = format_report(summary)
+    assert summary.entry_quality_by_outcome["TP"]["sample_count"] == 1
+    assert summary.entry_quality_by_outcome["SL"]["mean_entry_extension_atr"] == pytest.approx(1.1)
+    assert "ENTRY QUALITY BY OUTCOME" in report
+    assert "TP sample=1" in report
+    assert "SL sample=1" in report
+    assert "actual_fill_extension_ATR=0.40" in report
+
+
+def test_simulator_records_actual_fill_extension_from_swept_liquidity():
+    signal = {
+        "symbol": "ABC_USDT", "setup": "LONG", "entry": 100.0,
+        "stop_loss": 95.0, "tp": 115.0, "swept_level_1h": 99.0,
+        "atr_1h": 2.0, "entry_mode": "MARKET",
+    }
+    trade = simulate_trade(signal, [candle(3_600_000, 102.0, 116.0, 101.0, 114.0)],
+                           signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0)
+    assert trade is not None
+    assert trade.quality["actual_entry_extension_atr"] == pytest.approx(1.5)

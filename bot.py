@@ -51,6 +51,11 @@ BACKTEST 90D
 BACKTEST 180D
 BACKTEST 365D
 
+🧪 LIVE PAPER TRADING (FAKE MONEY ONLY)
+PAPER          - Wallet/equity summary
+PAPER OPEN     - Current virtual positions
+PAPER HISTORY  - Recent closed virtual trades
+
 ⏱ SIGNAL: 1D • 12H • 4H • 1H
 CHART: 1H / 4H / 12H / 1D only
 """
@@ -131,6 +136,7 @@ class Bot:
         self.telegram = telegram
         self.charts = charts
         self.backtest_runner: BacktestRunner | None = None
+        self.paper_trader = None
         self._last_inbound_phone: str | None = None
 
     @staticmethod
@@ -189,6 +195,9 @@ class Bot:
         runner: BacktestRunner,
     ) -> None:
         self.backtest_runner = runner
+
+    def set_paper_trader(self, paper_trader) -> None:
+        self.paper_trader = paper_trader
 
     async def handle(
         self,
@@ -283,6 +292,12 @@ class Bot:
 
             elif command == "BACKTEST":
                 await self._backtest(
+                    phone,
+                    args,
+                )
+
+            elif command == "PAPER":
+                await self._paper(
                     phone,
                     args,
                 )
@@ -818,6 +833,68 @@ class Bot:
                     f"TP={tp_mode} failed: {exc}"
                 ),
             )
+
+    async def _paper(self, phone: str, args: str) -> None:
+        if self.paper_trader is None:
+            raise RuntimeError("Paper trading service is not configured.")
+
+        mode = str(args or "STATUS").strip().upper()
+        if mode not in {"STATUS", "OPEN", "HISTORY"}:
+            raise ValueError("Usage: PAPER, PAPER OPEN, or PAPER HISTORY")
+
+        status = self.paper_trader.get_status()
+        if mode == "HISTORY":
+            trades = self.db.list_paper_trades(status="CLOSED", limit=10)
+            if not trades:
+                await self._send_text(phone, "🧪 PAPER HISTORY\n\nNo closed virtual trades yet.")
+                return
+            lines = ["🧪 RECENT PAPER TRADES", ""]
+            for trade in trades:
+                pnl = float(trade["net_pnl"])
+                sign = "+" if pnl >= 0 else ""
+                lines.append(
+                    f"{trade['symbol']} {trade['side']} | {trade['exit_reason']} | {sign}{pnl:.4f} USDT"
+                )
+            await self._send_text(phone, "\n".join(lines))
+            return
+
+        open_trades = status["open_trades"]
+        if mode == "OPEN":
+            if not open_trades:
+                await self._send_text(phone, "🧪 PAPER OPEN\n\nNo open virtual positions.")
+                return
+            lines = ["🧪 OPEN VIRTUAL POSITIONS", ""]
+            for trade in open_trades[:15]:
+                direction = 1.0 if trade["side"] == "LONG" else -1.0
+                pnl = (float(trade["mark_price"]) - float(trade["entry_price"])) * float(trade["quantity"]) * direction
+                sign = "+" if pnl >= 0 else ""
+                lines.append(
+                    f"#{trade['id']} {trade['symbol']} {trade['side']}\n"
+                    f"Entry ${fmt_price(trade['entry_price'])} | Mark ${fmt_price(trade['mark_price'])}\n"
+                    f"SL ${fmt_price(trade['stop_loss'])} | TP ${fmt_price(trade['take_profit'])}\n"
+                    f"Margin ${float(trade['margin']):.2f} | Notional ${float(trade['notional']):.2f} | Unrealized {sign}{pnl:.4f} USDT"
+                )
+            await self._send_text(phone, "\n\n".join(lines))
+            return
+
+        sign = "+" if float(status["unrealized_pnl"]) >= 0 else ""
+        pnl = float(status["unrealized_pnl"])
+        await self._send_text(
+            phone,
+            "🧪 V11 PAPER TRADING WALLET\n\n"
+            f"Mode: {'RUNNING' if status['enabled'] else 'DISABLED'}\n"
+            "Real orders: DISABLED\n"
+            f"Initial balance: ${float(status['initial_balance']):.2f} USDT\n"
+            f"Cash balance: ${float(status['balance']):.4f} USDT\n"
+            f"Equity estimate: ${float(status['equity']):.4f} USDT\n"
+            f"Unrealized P/L: {sign}{pnl:.4f} USDT\n"
+            f"Realized P/L (recent ledger): {float(status['realized_pnl']):+.4f} USDT\n"
+            f"Open positions: {len(open_trades)}\n"
+            f"Margin in use: ${float(status['open_margin']):.4f} USDT\n"
+            f"Available margin: ${float(status['available_margin']):.4f} USDT\n"
+            f"Position sizing: {float(status['margin_percent']):g}% balance × {int(status['leverage'])}x leverage\n\n"
+            "Commands: PAPER OPEN | PAPER HISTORY"
+        )
 
     async def _shortcut(
         self,

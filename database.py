@@ -97,6 +97,43 @@ class Database:
                 ON signals(symbol, candle_time);
                 CREATE INDEX IF NOT EXISTS idx_signals_status
                 ON signals(status);
+
+                CREATE TABLE IF NOT EXISTS paper_wallet (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    initial_balance REAL NOT NULL,
+                    balance REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS paper_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_key TEXT NOT NULL UNIQUE,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK (side IN ('LONG', 'SHORT')),
+                    entry_price REAL NOT NULL,
+                    mark_price REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
+                    leverage INTEGER NOT NULL,
+                    margin REAL NOT NULL,
+                    notional REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    entry_fee REAL NOT NULL DEFAULT 0,
+                    exit_fee REAL NOT NULL DEFAULT 0,
+                    gross_pnl REAL NOT NULL DEFAULT 0,
+                    net_pnl REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+                    exit_price REAL,
+                    exit_reason TEXT,
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_trades_status
+                ON paper_trades(status, opened_at);
+                CREATE INDEX IF NOT EXISTS idx_paper_trades_symbol
+                ON paper_trades(symbol, status);
                 """
             )
 
@@ -280,3 +317,157 @@ class Database:
             expires_at=str(row["expires_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+
+    # ------------------------------------------------------------------
+    # Persistent virtual-money paper trading
+    # ------------------------------------------------------------------
+
+    def ensure_paper_wallet(self, initial_balance: float) -> dict:
+        """Create the paper wallet once; never reset it during a deploy/restart."""
+        now = datetime.now(timezone.utc).isoformat()
+        initial = float(initial_balance)
+        if initial <= 0:
+            raise ValueError("Paper initial balance must be positive")
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO paper_wallet(id, initial_balance, balance, created_at, updated_at)
+                   VALUES (1, ?, ?, ?, ?)""",
+                (initial, initial, now, now),
+            )
+            row = conn.execute("SELECT * FROM paper_wallet WHERE id = 1").fetchone()
+        return dict(row)
+
+    def get_paper_wallet(self) -> dict | None:
+        with self.lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM paper_wallet WHERE id = 1").fetchone()
+        return dict(row) if row else None
+
+    def create_paper_trade(
+        self,
+        *,
+        signal_key: str,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        leverage: int,
+        margin: float,
+        notional: float,
+        quantity: float,
+        entry_fee: float,
+        max_open_trades: int,
+        opened_at: str,
+    ) -> tuple[str, dict | None]:
+        """Atomically open a virtual trade and charge its entry fee."""
+        side = str(side).upper()
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError("Paper trade side must be LONG or SHORT")
+        values = (entry_price, stop_loss, take_profit, margin, notional, quantity)
+        if not all(float(value) > 0 for value in values):
+            raise ValueError("Paper trade prices and sizes must be positive")
+        if (side == "LONG" and not stop_loss < entry_price < take_profit) or (
+            side == "SHORT" and not take_profit < entry_price < stop_loss
+        ):
+            raise ValueError("Paper trade entry/SL/TP geometry is invalid")
+        with self.lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM paper_trades WHERE signal_key = ?", (signal_key,)
+            ).fetchone()
+            if existing:
+                return "DUPLICATE", dict(existing)
+            wallet = conn.execute("SELECT * FROM paper_wallet WHERE id = 1").fetchone()
+            if not wallet:
+                raise RuntimeError("Paper wallet is not initialized")
+            open_rows = conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(margin), 0) AS used FROM paper_trades WHERE status = 'OPEN'"
+            ).fetchone()
+            if int(open_rows["n"]) >= max(1, int(max_open_trades)):
+                return "MAX_OPEN_TRADES", None
+            available = float(wallet["balance"]) - float(open_rows["used"])
+            if margin > available + 1e-9 or float(wallet["balance"]) <= 0:
+                return "INSUFFICIENT_BALANCE", None
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = conn.execute(
+                """INSERT INTO paper_trades(
+                    signal_key, symbol, side, entry_price, mark_price, stop_loss, take_profit,
+                    leverage, margin, notional, quantity, entry_fee, status, opened_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)""",
+                (signal_key, symbol.upper(), side, float(entry_price), float(entry_price),
+                 float(stop_loss), float(take_profit), int(leverage), float(margin),
+                 float(notional), float(quantity), max(0.0, float(entry_fee)), opened_at, now),
+            )
+            conn.execute(
+                "UPDATE paper_wallet SET balance = balance - ?, updated_at = ? WHERE id = 1",
+                (max(0.0, float(entry_fee)), now),
+            )
+            row = conn.execute("SELECT * FROM paper_trades WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return "OPENED", dict(row)
+
+    def list_paper_trades(self, status: str | None = None, limit: int = 20) -> list[dict]:
+        limit = max(1, min(int(limit), 200))
+        sql = "SELECT * FROM paper_trades"
+        params: list[object] = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(str(status).upper())
+        sql += " ORDER BY opened_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self.lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_paper_realized_pnl(self) -> float:
+        """Return realized net PnL for the full paper ledger, not only recent rows."""
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(net_pnl), 0) AS pnl FROM paper_trades WHERE status = 'CLOSED'"
+            ).fetchone()
+        return float(row["pnl"] or 0.0)
+
+    def update_paper_mark(self, trade_id: int, mark_price: float) -> bool:
+        if float(mark_price) <= 0:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE paper_trades SET mark_price = ?, updated_at = ? WHERE id = ? AND status = 'OPEN'",
+                (float(mark_price), now, int(trade_id)),
+            )
+        return cursor.rowcount == 1
+
+    def close_paper_trade(
+        self,
+        *,
+        trade_id: int,
+        exit_price: float,
+        exit_reason: str,
+        gross_pnl: float,
+        exit_fee: float,
+        net_pnl: float,
+        closed_at: str,
+    ) -> dict | None:
+        """Close once and settle gross PnL less the exit fee into virtual cash."""
+        if float(exit_price) <= 0:
+            raise ValueError("Paper exit price must be positive")
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM paper_trades WHERE id = ? AND status = 'OPEN'", (int(trade_id),)
+            ).fetchone()
+            if not row:
+                return None
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """UPDATE paper_trades SET mark_price = ?, exit_price = ?, exit_reason = ?,
+                   gross_pnl = ?, exit_fee = ?, net_pnl = ?, status = 'CLOSED', closed_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'OPEN'""",
+                (float(exit_price), float(exit_price), str(exit_reason), float(gross_pnl),
+                 max(0.0, float(exit_fee)), float(net_pnl), closed_at, now, int(trade_id)),
+            )
+            conn.execute(
+                "UPDATE paper_wallet SET balance = balance + ?, updated_at = ? WHERE id = 1",
+                (float(gross_pnl) - max(0.0, float(exit_fee)), now),
+            )
+            updated = conn.execute("SELECT * FROM paper_trades WHERE id = ?", (int(trade_id),)).fetchone()
+        return dict(updated)

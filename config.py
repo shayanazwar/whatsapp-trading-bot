@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     max_open_trades: int = Field(default=3, alias="MAX_OPEN_TRADES")
     max_daily_loss: float = Field(default=0.05, alias="MAX_DAILY_LOSS")
 
+    # Separate virtual-money paper trading. This never submits exchange orders.
+    paper_trading_enabled: bool = Field(default=False, alias="PAPER_TRADING_ENABLED")
+    paper_initial_balance: float = Field(default=100.0, alias="PAPER_INITIAL_BALANCE")
+    paper_margin_percent: float = Field(default=1.0, alias="PAPER_MARGIN_PERCENT")
+    paper_leverage: int = Field(default=20, alias="PAPER_LEVERAGE")
+    paper_max_open_trades: int = Field(default=3, alias="PAPER_MAX_OPEN_TRADES")
+    paper_poll_seconds: int = Field(default=15, alias="PAPER_POLL_SECONDS")
+    paper_fee_rate: float = Field(default=0.0006, alias="PAPER_FEE_RATE")
+    paper_slippage_bps: float = Field(default=2.0, alias="PAPER_SLIPPAGE_BPS")
+
     # Scanner switches
     scanner_enabled: bool = Field(default=False, alias="SCANNER_ENABLED")
     auto_signal_enabled: bool = Field(default=False, alias="AUTO_SIGNAL_ENABLED")
@@ -82,6 +92,9 @@ class Settings(BaseSettings):
 
     # Backtest resource controls
     backtest_max_symbols: int = Field(default=200, alias="BACKTEST_MAX_SYMBOLS")
+    backtest_start_ms: int | None = Field(default=None, alias="BACKTEST_START_MS")
+    backtest_end_ms: int | None = Field(default=None, alias="BACKTEST_END_MS")
+    backtest_symbols: str = Field(default="", alias="V11_BACKTEST_SYMBOLS")
     backtest_symbol_concurrency: int = Field(default=2, alias="BACKTEST_SYMBOL_CONCURRENCY")
     backtest_analysis_timeout_seconds: float = Field(default=120.0, alias="BACKTEST_ANALYSIS_TIMEOUT_SECONDS")
     backtest_child_boot_timeout_seconds: float = Field(default=30.0, alias="BACKTEST_CHILD_BOOT_TIMEOUT_SECONDS")

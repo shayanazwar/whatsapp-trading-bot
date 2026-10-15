@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from .alerts import AlertEngine
 from .automation.executor import MexcExecutor
 from .automation.mexc_client import MexcClient
+from .automation.paper_trader import PaperTrader
 from .automation.scanner import MexcScanner
 from .automation.scheduler import ScannerScheduler
 from .automation.signal_manager import SignalManager
@@ -57,7 +58,16 @@ alert_engine = AlertEngine(db=db, market=market, settings=settings, on_trigger=b
 mexc_universe = MexcUniverse(mexc_client, max_symbols=settings.max_symbols, test_symbols=settings.test_symbol_list)
 signal_manager = SignalManager(db=db, whatsapp=whatsapp, recipients=settings.auto_signal_recipient_set, expiry_minutes=settings.signal_expiry_minutes)
 mexc_executor = MexcExecutor(mexc_client, settings)
-mexc_scanner = MexcScanner(client=mexc_client, settings=settings, universe=mexc_universe, signal_manager=signal_manager, executor=mexc_executor)
+paper_trader = PaperTrader(db=db, client=mexc_client, settings=settings)
+bot.set_paper_trader(paper_trader)
+mexc_scanner = MexcScanner(
+    client=mexc_client,
+    settings=settings,
+    universe=mexc_universe,
+    signal_manager=signal_manager,
+    executor=mexc_executor,
+    paper_trader=paper_trader,
+)
 scanner_scheduler = ScannerScheduler(mexc_scanner, interval_seconds=settings.scan_interval_seconds)
 
 # Share the process-wide MEXC client with live scanning so public API
@@ -103,7 +113,32 @@ async def root() -> dict[str, object]:
         "auto_signal_enabled": settings.auto_signal_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
         "live_execution_allowed": settings.allow_live_execution,
+        "paper_trading_enabled": settings.paper_trading_enabled,
+        "paper_initial_balance": settings.paper_initial_balance,
+        "paper_margin_percent": settings.paper_margin_percent,
+        "paper_leverage": settings.paper_leverage,
         "analysis_timeframes": ["1D", "12H", "4H", "1H"],
+    }
+
+
+@app.get("/paper")
+async def paper_status() -> dict[str, object]:
+    """Read-only status for the virtual-money wallet and paper positions."""
+    status = paper_trader.get_status()
+    return {
+        "mode": "PAPER_ONLY",
+        "live_orders_submitted": False,
+        "enabled": status["enabled"],
+        "initial_balance": status["initial_balance"],
+        "balance": status["balance"],
+        "equity": status["equity"],
+        "available_margin": status["available_margin"],
+        "open_margin": status["open_margin"],
+        "unrealized_pnl": status["unrealized_pnl"],
+        "realized_pnl": status["realized_pnl"],
+        "leverage": status["leverage"],
+        "margin_percent": status["margin_percent"],
+        "open_trades": status["open_trades"],
     }
 
 
@@ -237,10 +272,12 @@ async def startup_event() -> None:
     logger.info("Graph API version=%s", settings.meta_graph_version)
     logger.info("MEXC API base=%s", settings.mexc_api_base_url)
     logger.info("Analysis timeframes=1D,12H,4H,1H")
-    logger.info("Scanner enabled=%s auto_signals=%s auto_trade=%s live_execution=%s", settings.scanner_enabled, settings.auto_signal_enabled, settings.auto_trade_enabled, settings.allow_live_execution)
+    logger.info("Scanner enabled=%s auto_signals=%s auto_trade=%s live_execution=%s paper_trading=%s", settings.scanner_enabled, settings.auto_signal_enabled, settings.auto_trade_enabled, settings.allow_live_execution, settings.paper_trading_enabled)
     await market.start()
     await alert_engine.start()
-    if settings.scanner_enabled and settings.auto_signal_enabled:
+    if settings.paper_trading_enabled:
+        await paper_trader.start()
+    if settings.scanner_enabled and (settings.auto_signal_enabled or settings.paper_trading_enabled):
         await scanner_scheduler.start()
     logger.info("Bot startup complete")
 
@@ -249,6 +286,8 @@ async def shutdown_event() -> None:
     logger.info("Shutting down Pak Trading Academy WhatsApp Trading Bot")
     with suppress(Exception):
         await scanner_scheduler.stop()
+    with suppress(Exception):
+        await paper_trader.stop()
     with suppress(Exception):
         await alert_engine.stop()
     with suppress(Exception):

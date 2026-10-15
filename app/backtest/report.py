@@ -140,7 +140,6 @@ def format_report(summary: BacktestSummary) -> str:
         "📊 MEXC SWING ENGINE BACKTEST",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Period: {summary.days}D ({start} → {end})",
-        f"Period MS: V11_BACKTEST_START_MS={int(summary.period_start_ms)} | V11_BACKTEST_END_MS={int(summary.period_end_ms)}",
         f"TP MODE: {tp_mode}",
         f"Timeframes: {' / '.join(summary.timeframes)}",
         "",
@@ -169,11 +168,8 @@ def format_report(summary: BacktestSummary) -> str:
         f"⚠️ Data Errors: {summary.data_errors}",
         f"⚠️ Execution Errors: {summary.execution_errors}",
         f"🚫 Rejected Setups: {summary.rejected_setups}",
-        f"🧱 Portfolio Skipped: {int(summary.diagnostics.get('PORTFOLIO_SKIPPED', 0)) if summary.diagnostics else 0}",
+        f"🧱 Portfolio Skipped: {int((summary.diagnostics or {}).get('PORTFOLIO_SKIPPED', 0))}",
     ]
-    if summary.diagnostics:
-        universe_mode = "FIXED SYMBOL LIST" if int(summary.diagnostics.get("FIXED_BACKTEST_SYMBOLS_ENABLED", 0)) else "CURRENT UNIVERSE SNAPSHOT"
-        lines.insert(4, f"Universe: {universe_mode} ({int(summary.diagnostics.get('V11_BACKTEST_SYMBOL_COUNT', summary.coins_selected))} symbols)")
     cf = summary.diagnostics.get("TP_COUNTERFACTUAL_R_X100") if summary.diagnostics else None
     if cf is not None:
         lines.insert(3, f"🧪 TP Counterfactual: {float(cf) / 100.0:.2f}R (exit-only; entries/SL unchanged)")
@@ -194,7 +190,26 @@ def format_report(summary: BacktestSummary) -> str:
         if active_experiments:
             lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
         lines.extend(("", "GATE DIAGNOSTICS"))
+        # Always show reconciliation counters even when they fall outside the
+        # top-N diagnostic list. These explain why evaluations and rejects differ.
+        for key in (
+            "ENGINE_CALLS", "TECHNICAL_ACCEPT", "TECHNICAL_REJECT",
+            "TECHNICAL_ACCOUNTING_GAP", "ENGINE_OUTCOME_UNKNOWN_CALLS", "PORTFOLIO_CANDIDATES",
+            "PORTFOLIO_SELECTED", "PORTFOLIO_SKIPPED",
+            "SIMULATION_REJECT_ENTRY_GAP", "SIMULATION_REJECT_POST_COST_RR",
+            "SIMULATION_REJECT_ENTRY_GEOMETRY",
+        ):
+            if key in summary.diagnostics:
+                lines.append(f"{key}: {summary.diagnostics[key]}")
         important = sorted(summary.diagnostics.items(), key=lambda item: (-int(item[1]), item[0]))
         lines.extend(f"{key}: {value}" for key, value in important[:20])
+        lines.extend((
+            "DIAGNOSTIC SEMANTICS",
+            "ENGINE_CALLS / TECHNICAL_ACCEPT / TECHNICAL_REJECT count per-symbol, per-hour engine invocations.",
+            "FIRST_FAILURE_* counts repeated side evaluations; LONG and SHORT failures can overlap on the same invocation.",
+            "REJECT_* counts reason occurrences across scans; reason counters may overlap and must not be summed as unique setups.",
+            "SYMBOLS_WITH_FIRST_FAILURE_* counts symbols with that reason at least once, not unique trade setups.",
+            "TP counterfactuals retain the original signal/stop and use target-independent portfolio reservations.",
+        ))
     lines.extend(("━━━━━━━━━━━━━━━━━━━━", "⚠️ PAPER BACKTEST", "Decisions use only completed 1D / 12H / 4H / 1H candles.", "12H is a causal aggregation of three contiguous completed 4H candles.", "No real trades executed. Fees/slippage are simulated conservatively."))
     return "\n".join(lines)

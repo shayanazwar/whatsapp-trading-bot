@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping
 
 
 ONE_HOUR_MS = 3_600_000
-DEFAULT_FEE_RATE = 0.0006
+DEFAULT_FEE_RATE = 0.0004
 DEFAULT_SLIPPAGE_BPS = 2.0
 DEFAULT_MAX_HOLDING_MINUTES = 72 * 60
 DEFAULT_SAME_BAR_RULE = "SL_FIRST"
@@ -66,8 +66,7 @@ class SimulatedTrade:
     time_to_1r_minutes: float | None = None
     time_to_1_5r_minutes: float | None = None
     counterfactual_tp_r: float | None = None
-    # Control-mode exit is retained to make portfolio acceptance invariant across TP experiments.
-    control_exit_time_ms: int | None = None
+    reservation_minutes: float | None = None
 
     @property
     def tp(self) -> float:
@@ -197,6 +196,10 @@ def simulate_trade(
     max_holding_minutes: float | None = None,
     same_bar_rule: str | None = None,
     counterfactual_tp_r: float | None = None,
+    max_entry_gap_pct: float | None = None,
+    min_post_cost_rr: float | None = None,
+    estimated_round_trip_cost_pct: float | None = None,
+    rejection_reasons: list[str] | None = None,
 ) -> SimulatedTrade | None:
     """Simulate a deterministic single-TP / single-SL trade.
 
@@ -234,6 +237,7 @@ def simulate_trade(
         return None
     if side == "SHORT" and not (original_tp < entry < stop):
         return None
+    reference_entry = entry
     counterfactual_r = None
     if counterfactual_tp_r is not None:
         try:
@@ -341,6 +345,7 @@ def simulate_trade(
             mfe_1r_hit=mfe_1r_hit, mfe_1_5r_hit=mfe_1_5r_hit,
             time_to_1r_minutes=time_to_1r_minutes, time_to_1_5r_minutes=time_to_1_5r_minutes,
             counterfactual_tp_r=counterfactual_r,
+            reservation_minutes=max_hold,
         )
 
     expiry_ts = int(signal_time + max_hold * 60_000)
@@ -367,6 +372,7 @@ def simulate_trade(
                 if not fills:
                     continue
                 entry = float(limit_price)
+                base_entry = entry
                 entry_exec = entry  # passive fill: no adverse market-order slippage
                 fill_ts = timestamp
             else:
@@ -378,7 +384,57 @@ def simulate_trade(
 
             if not isfinite(entry_exec) or entry_exec <= 0:
                 return None
+
+            # Match live next-open admission rules before applying any TP
+            # counterfactual. The original structural target controls whether
+            # this signal can be entered; a counterfactual changes exits only.
+            if max_entry_gap_pct is not None and entry_mode != "LIMIT":
+                try:
+                    gap_limit_pct = max(0.0, float(max_entry_gap_pct))
+                except (TypeError, ValueError, OverflowError):
+                    gap_limit_pct = 0.0
+                # Settings stores 0.002 for a 0.2% gap; accept either a ratio
+                # (<= 1) or an explicit percentage for direct simulator callers.
+                if gap_limit_pct <= 1.0:
+                    gap_limit_pct *= 100.0
+                opening_gap_pct = abs(base_entry - reference_entry) / reference_entry * 100.0 if reference_entry > 0 else float("inf")
+                if opening_gap_pct > gap_limit_pct + 1e-12:
+                    if rejection_reasons is not None:
+                        rejection_reasons.append("ENTRY_GAP")
+                    return None
+
             risk_exec = abs(entry_exec - stop)
+            if risk_exec <= 0 or not isfinite(risk_exec):
+                if rejection_reasons is not None:
+                    rejection_reasons.append("ENTRY_GEOMETRY")
+                return None
+            original_geometry_ok = (
+                stop < entry_exec < original_tp
+                if side == "LONG"
+                else original_tp < entry_exec < stop
+            )
+            if not original_geometry_ok:
+                if rejection_reasons is not None:
+                    rejection_reasons.append("ENTRY_GEOMETRY")
+                return None
+
+            if min_post_cost_rr is not None:
+                try:
+                    required_rr = max(0.0, float(min_post_cost_rr))
+                    cost_pct = max(0.0, float(estimated_round_trip_cost_pct or 0.0))
+                except (TypeError, ValueError, OverflowError):
+                    required_rr = 0.0
+                    cost_pct = 0.0
+                control_reward = abs(original_tp - entry_exec)
+                cost_price = entry_exec * cost_pct
+                rr_net = (control_reward - cost_price) / (risk_exec + cost_price) if risk_exec + cost_price > 0 else 0.0
+                if rr_net + 1e-12 < required_rr:
+                    if rejection_reasons is not None:
+                        rejection_reasons.append("POST_COST_RR")
+                    return None
+
+            # The counterfactual target is now applied only after the original
+            # signal passes the same entry/stop/target admission checks.
             if counterfactual_r is not None:
                 tp = (
                     entry_exec + counterfactual_r * risk_exec
@@ -394,7 +450,11 @@ def simulate_trade(
                 return None
             entry_fee = abs(entry_exec) * initial_size * contract_size * fee_rate
             realized_pnl = -entry_fee
-            slippage_cash = abs(entry_exec - entry) * initial_size * contract_size
+            # Count execution slippage only against the executable next-open
+            # reference, not the prior signal-close price. The open gap is market
+            # movement and is already reflected in fill-to-stop/target geometry.
+            entry_slippage_reference = base_entry if entry_mode != "LIMIT" else entry_exec
+            slippage_cash = abs(entry_exec - entry_slippage_reference) * initial_size * contract_size
             # A passive limit can fill at an unknown point inside the candle.
             # Do not evaluate that same candle's full high/low after the fill,
             # because its pre-fill movement is unknowable without tick data.

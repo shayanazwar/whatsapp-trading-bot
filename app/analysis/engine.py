@@ -456,8 +456,6 @@ V11_STOP_BUFFER_ATR_1H = 0.15
 V11_MIN_SL_ATR_SANITY = 0.20
 V11_MAX_SL_ATR_SANITY = 3.00
 V11_SHOCK_RANGE_ATR = 4.50
-V11_MAX_TARGET_RR = 2.50
-V11_MAX_SWEEP_EXTENSION_ATR_1H = 0.85
 # Explicitly declare the stop geometry used below so the runner imports the
 # same module successfully and reports the active mode truthfully.
 V11_SL_MODE = "LIQUIDITY_SWEEP"
@@ -489,7 +487,19 @@ def _v11_structure(candles: list[Candle], left: int = 3, right: int = 3) -> str:
 
 
 def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
-    """Use symmetric directional votes; ADX qualifies slope instead of voting both ways."""
+    """Build a directional 1D permission from independent macro votes.
+
+    The original V11 implementation required every bullish/bearish component
+    to agree (EMA placement + price location + exact HH/HL or LH/LL). That made
+    the macro layer behave like a hard all-or-nothing structure gate and produced
+    large neutral regions even when the broader trend evidence was aligned.
+
+    The 1D layer uses four directional inputs: price vs EMA200, EMA50 vs EMA200,
+    confirmed structure, and EMA50 slope. ADX is direction-neutral and is exposed
+    as context only; it must never cast a bullish or bearish vote. A side needs at
+    least three of the four directional inputs, with more votes than the other side.
+    The 4H setup still supplies the strict trend-continuation structure requirement.
+    """
     closes = [float(c["close"]) for c in candles]
     e21 = _safe_ema(closes, 21)
     e50 = _safe_ema(closes, 50)
@@ -509,30 +519,33 @@ def _v11_regime_1d(candles: list[Candle]) -> dict[str, Any]:
 
     bull_votes = sum((
         price > e200,
-        price > e50,
         e50 > e200,
         structure == "HH/HL",
-        slope > 0 and adx >= ADX_TREND_MIN,
+        slope > 0,
     ))
     bear_votes = sum((
         price < e200,
-        price < e50,
         e50 < e200,
         structure == "LH/LL",
-        slope < 0 and adx >= ADX_TREND_MIN,
+        slope < 0,
     ))
-
-    # Require live structural/momentum support as well as 3-of-5 votes.
-    bull_active = structure == "HH/HL" or (price > e50 and slope > 0)
-    bear_active = structure == "LH/LL" or (price < e50 and slope < 0)
-    bull = bull_votes >= 3 and bull_votes > bear_votes and bull_active and structure != "LH/LL"
-    bear = bear_votes >= 3 and bear_votes > bull_votes and bear_active and structure != "HH/HL"
+    # ADX measures trend strength, not direction. Counting it for both sides
+    # allowed a side with only two directional inputs to reach a 3-vote gate.
+    bull = bull_votes >= 3 and bull_votes > bear_votes
+    bear = bear_votes >= 3 and bear_votes > bull_votes
     return {
         "regime": "BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
-        "bull": bull, "bear": bear,
-        "e21": e21, "e50": e50, "e200": e200,
-        "slope": slope, "adx": adx, "structure": structure, "price": price,
-        "bull_votes": bull_votes, "bear_votes": bear_votes,
+        "bull": bull,
+        "bear": bear,
+        "e21": e21,
+        "e50": e50,
+        "e200": e200,
+        "slope": slope,
+        "adx": adx,
+        "structure": structure,
+        "price": price,
+        "bull_votes": bull_votes,
+        "bear_votes": bear_votes,
     }
 
 
@@ -682,159 +695,99 @@ def _v11_value_touched(candles_1h: list[Candle], start_time: int, zone: dict[str
     return False, None, None, None
 
 
-def _v11_liquidity_trigger(
-    candles: list[Candle],
-    start_idx: int,
-    side: str,
-    max_bars: int = V11_MAX_TRIGGER_BARS,
-) -> dict[str, Any]:
-    """Require a sweep followed by a quality reclaim on the current closed 1H candle."""
+def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max_bars: int = V11_MAX_TRIGGER_BARS) -> dict[str, Any]:
+    """Causal sweep + reclaim trigger.
+
+    The swept level is derived only from the three candles immediately before
+    the sweep candle. The reclaim candle must close back through that level.
+    No centered pivot is used for the trigger.
+    """
     empty = {
         "ready": False, "sweep_idx": None, "reclaim_idx": None, "swept_level": None,
         "rvol": 0.0, "body_ratio": 0.0, "close_location": 0.0,
-        "quality": 0.0, "reason": "no causal liquidity sweep + current-bar reclaim",
+        "quality": 0.0, "reason": "no causal liquidity sweep + reclaim",
     }
-    side = str(side).upper()
-    last_idx = len(candles) - 1
-    if side not in {"LONG", "SHORT"} or start_idx < 3 or start_idx >= last_idx:
+    if start_idx < 3 or start_idx >= len(candles):
         return empty
-    if max_bars < 1 or last_idx - start_idx > max_bars:
-        return empty
-
-    reclaim = candles[last_idx]
-    ropen, rhigh, rlow, rclose = map(float, (reclaim["open"], reclaim["high"], reclaim["low"], reclaim["close"]))
-    candle_range = max(rhigh - rlow, 1e-12)
-    body_ratio = abs(rclose - ropen) / candle_range
-    raw_close_location = (rclose - rlow) / candle_range
-    close_location = raw_close_location if side == "LONG" else 1.0 - raw_close_location
-    if body_ratio < MIN_TRIGGER_BODY or close_location < MIN_TRIGGER_CLOSE_LOCATION:
-        return {**empty, "reason": "current reclaim candle quality below body/close-location minimum",
-                "body_ratio": body_ratio, "close_location": close_location}
-
-    first_sweep = max(start_idx, last_idx - int(max_bars))
-    # Search newest-first. A reclaim on an older candle cannot mask a valid
-    # sweep/reclaim pair that actually completes on the current decision candle.
-    for sweep_idx in range(last_idx - 1, max(2, first_sweep) - 1, -1):
-        prior = candles[sweep_idx - 3:sweep_idx]
-        if len(prior) != 3:
+    end = min(len(candles) - 1, start_idx + max_bars)
+    for i in range(start_idx, end + 1):
+        prior = candles[max(0, i - 3):i]
+        if len(prior) < 3:
             continue
-        sweep = candles[sweep_idx]
+        c = candles[i]
         if side == "LONG":
-            level = min(float(c["low"]) for c in prior)
-            swept = float(sweep["low"]) < level
-            reclaimed_now = rclose > level and rclose > ropen
+            level = min(float(x["low"]) for x in prior)
+            # A liquidity sweep is a wick through the prior liquidity pool.
+            # The documented V11 sequence is sweep -> subsequent reclaim, so
+            # the sweep candle must breach the level but does not need to close
+            # beyond it. Requiring a close below/above the level turns many
+            # ordinary stop-runs into breakouts and suppresses valid setups.
+            swept = float(c["low"]) < level
         else:
-            level = max(float(c["high"]) for c in prior)
-            swept = float(sweep["high"]) > level
-            reclaimed_now = rclose < level and rclose < ropen
-        if not swept or not reclaimed_now:
+            level = max(float(x["high"]) for x in prior)
+            swept = float(c["high"]) > level
+        if not swept:
             continue
-
-        # If this level was already reclaimed before the current candle, it is
-        # stale; a newer sweep must form a fresh setup.
-        stale = False
-        for k in range(sweep_idx + 1, last_idx):
-            c = candles[k]
-            ko, kh, kl, kc = map(float, (c["open"], c["high"], c["low"], c["close"]))
-            krange = max(kh - kl, 1e-12)
-            kbody = abs(kc - ko) / krange
-            kloc_raw = (kc - kl) / krange
-            kloc = kloc_raw if side == "LONG" else 1.0 - kloc_raw
-            earlier_quality_reclaim = (
-                kc > level and kc > ko if side == "LONG"
-                else kc < level and kc < ko
-            ) and kbody >= MIN_TRIGGER_BODY and kloc >= MIN_TRIGGER_CLOSE_LOCATION
-            if earlier_quality_reclaim:
-                stale = True
-                break
-        if stale:
-            continue
-
-        rvol = _relative_volume(candles[:last_idx + 1], 20)
-        quality = _clamp(
-            0.45 + 0.20 * _clamp(body_ratio / 0.50, 0, 1)
-            + 0.20 * _clamp(rvol / 1.20, 0, 1)
-            + 0.15 * _clamp(close_location / 0.70, 0, 1), 0, 1,
-        )
-        return {
-            "ready": True, "sweep_idx": sweep_idx, "reclaim_idx": last_idx,
-            "swept_level": float(level), "rvol": rvol, "body_ratio": body_ratio,
-            "close_location": close_location, "quality": quality,
-            "reason": "liquidity sweep absorbed and reclaimed on current 1H candle",
-            "trigger_time": int(reclaim["time"]), "sweep_time": int(sweep["time"]),
-        }
+        # Reclaim may occur on any subsequent candle within the full V11.2
+        # trigger window. The previous implementation unintentionally limited
+        # this to only the next 1â€“2 candles despite max_bars=6.
+        for j in range(i + 1, end + 1):
+            r = candles[j]
+            ropen, rhigh, rlow, rclose = map(float, (r["open"], r["high"], r["low"], r["close"]))
+            rrng = max(rhigh - rlow, 1e-12)
+            body = abs(rclose - ropen) / rrng
+            loc = (rclose - rlow) / rrng
+            if side == "LONG":
+                reclaimed = rclose > level and rclose > ropen
+                close_loc = loc
+            else:
+                reclaimed = rclose < level and rclose < ropen
+                close_loc = 1.0 - loc
+            if not reclaimed:
+                continue
+            rvol = _relative_volume(candles[:j + 1], 20)
+            quality = _clamp(0.45 + 0.20 * _clamp(body / 0.50, 0, 1) + 0.20 * _clamp(rvol / 1.20, 0, 1) + 0.15 * _clamp(close_loc / 0.70, 0, 1), 0, 1)
+            return {
+                "ready": True, "sweep_idx": i, "reclaim_idx": j, "swept_level": level,
+                "rvol": rvol, "body_ratio": body, "close_location": close_loc,
+                "quality": quality, "reason": "liquidity sweep absorbed and reclaimed",
+                "trigger_time": int(r["time"]), "sweep_time": int(c["time"]),
+            }
     return empty
 
 
-def _v11_target(
-    c1: list[Candle],
-    c4: list[Candle],
-    c12: list[Candle],
-    c1d: list[Candle],
-    entry: float,
-    risk: float,
-    side: str,
-    impulse: dict[str, Any],
-    cost_pct: float = 0.0015,
-) -> dict[str, Any]:
-    """Pick the nearest real structural/impulse target meeting post-cost RR, capped at 2.50R.
+def _v11_target(c4: list[Candle], c12: list[Candle], c1d: list[Candle], entry: float, side: str, impulse: dict[str, Any]) -> dict[str, Any]:
+    """Select the nearest meaningful structural target before applying RR.
 
-    No synthetic target price is invented to satisfy the cap: if every real level
-    is too close or farther than the realism ceiling, the setup is rejected.
+    Target selection is structural-first. If the nearest valid magnet does not
+    clear the post-cost RR floor, the setup is rejected rather than choosing a
+    farther level solely to manufacture RR.
     """
-    side = str(side).upper()
-    if side not in {"LONG", "SHORT"} or entry <= 0 or risk <= 0:
-        return {"ok": False, "reason": "invalid target inputs"}
-
     levels: list[tuple[float, str, int]] = []
-    for candles, tf in ((c1, "1H"), (c4, "4H"), (c12, "12H"), (c1d, "1D")):
-        highs, lows = _swing_points(candles, 3, 3)
-        points = highs if side == "LONG" else lows
-        for idx, price in points:
-            price = float(price)
-            if (side == "LONG" and price > entry) or (side == "SHORT" and price < entry):
-                levels.append((price, tf, int(candles[idx]["time"])))
-
-    low = float(impulse["low"])
-    high = float(impulse["high"])
-    leg = high - low
-    if leg > 0:
-        # Measured continuation levels derived from the confirmed 4H impulse.
-        # These are real impulse-relative price levels, not a risk-multiple target.
-        ratios = (0.618, 0.786, 1.0)
-        for ratio in ratios:
-            price = low + ratio * leg if side == "LONG" else high - ratio * leg
-            if (side == "LONG" and price > entry) or (side == "SHORT" and price < entry):
-                ts = int(impulse["high_time"] if side == "LONG" else impulse["low_time"])
-                levels.append((float(price), f"4H_IMPULSE_{ratio:.3f}", ts))
-
+    for candles, tf, left, right in ((c4, "4H", 3, 3), (c12, "12H", 3, 3), (c1d, "1D", 3, 3)):
+        highs, lows = _swing_points(candles, left, right)
+        if side == "LONG":
+            for idx, price in highs:
+                if price > entry:
+                    levels.append((float(price), tf, int(candles[idx]["time"])))
+        else:
+            for idx, price in lows:
+                if price < entry:
+                    levels.append((float(price), tf, int(candles[idx]["time"])))
+    # The impulse extreme is always a legitimate first structural magnet.
+    impulse_target = float(impulse["high"] if side == "LONG" else impulse["low"])
+    if (side == "LONG" and impulse_target > entry) or (side == "SHORT" and impulse_target < entry):
+        levels.append((impulse_target, "4H_IMPULSE", int(impulse["high_time"] if side == "LONG" else impulse["low_time"])))
     if not levels:
         return {"ok": False, "reason": "no structural target beyond entry"}
-
-    # Stable deduplication of identical price levels across frames/sources.
-    unique: dict[tuple[int, int], tuple[float, str, int]] = {}
-    for item in levels:
-        price, tf, ts = item
-        unique.setdefault((round(price * 1e8), round(entry * 1e8)), item)
-    ordered = sorted(
-        unique.values(),
-        key=lambda x: (x[0] - entry) if side == "LONG" else (entry - x[0]),
-    )
-    cost_price = entry * max(0.0, float(cost_pct))
-    for price, tf, ts in ordered:
-        reward = abs(price - entry)
-        rr_gross = reward / risk
-        rr_net = (reward - cost_price) / (risk + cost_price) if risk + cost_price > 0 else 0.0
-        if rr_gross <= V11_MAX_TARGET_RR and rr_net >= V11_MIN_RR:
-            return {
-                "ok": True, "price": float(price), "timeframe": tf, "time": ts,
-                "rr_gross": rr_gross, "rr_net": rr_net,
-                "reason": "nearest real structural target clears RR and realism cap",
-            }
-    return {
-        "ok": False,
-        "reason": f"no real structural target clears {V11_MIN_RR:.2f}R post-cost RR within {V11_MAX_TARGET_RR:.2f}R",
-    }
+    if side == "LONG":
+        price, tf, ts = min(levels, key=lambda x: x[0] - entry)
+    else:
+        # For SHORTs, the closest lower structural level is the smallest
+        # positive distance below entry. Using max(distance) would select the
+        # farthest downside target and could manufacture a blocked path.
+        price, tf, ts = min(levels, key=lambda x: entry - x[0])
+    return {"ok": True, "price": price, "timeframe": tf, "time": ts, "reason": "nearest structural target"}
 
 
 def _v11_target_path(
@@ -1016,24 +969,6 @@ def _v11_analyze_side(
         atr1 = _memoized_frame_value(
             cache, "_v11_atr_1h", c1, lambda: _safe_atr(c1)
         )
-        swept_level = float(trigger["swept_level"])
-        extension = abs(entry - swept_level)
-        if atr1 > 0 and extension > V11_MAX_SWEEP_EXTENSION_ATR_1H * atr1:
-            last_reason = (
-                f"{side}: reclaim entry extended {extension / atr1:.2f} ATR(1H) "
-                f"> {V11_MAX_SWEEP_EXTENSION_ATR_1H:.2f} ATR(1H) from swept level"
-            )
-            continue
-        impulse_low, impulse_high = float(impulse["low"]), float(impulse["high"])
-        impulse_leg = max(0.0, impulse_high - impulse_low)
-        # Keep the reclaim in the impulse's value corridor (<=61.8% for LONG,
-        # >=38.2% for SHORT) without imposing an overly strict 50% midpoint gate.
-        value_boundary_long = impulse_low + 0.618 * impulse_leg
-        value_boundary_short = impulse_high - 0.618 * impulse_leg
-        if (side == "LONG" and entry > value_boundary_long) or (side == "SHORT" and entry < value_boundary_short):
-            last_reason = f"{side}: reclaim entry is beyond the impulse value corridor"
-            continue
-
         sweep_low = min(float(c["low"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
@@ -1050,9 +985,9 @@ def _v11_analyze_side(
             last_reason = f"{side}: SL distance {sl_atr:.2f} ATR outside {V11_MIN_SL_ATR_SANITY:.2f}-{V11_MAX_SL_ATR_SANITY:.2f} safety bounds"
             continue
 
-        target = _v11_target(c1, c4, c12, c1d, entry, risk, side, impulse, cost_pct)
+        target = _v11_target(c4, c12, c1d, entry, side, impulse)
         if not target.get("ok"):
-            last_reason = f"{side}: {target.get('reason') or 'no viable structural target'}"
+            last_reason = f"{side}: no structural target beyond entry"
             continue
         tp = float(target["price"])
         target_path = _v11_target_path(

@@ -37,6 +37,10 @@ class BacktestSummary:
     profit_factor: float | None
     max_drawdown_r: float
     max_losing_streak: int
+    long_tp_hits: int = 0
+    short_tp_hits: int = 0
+    long_sl_hits: int = 0
+    short_sl_hits: int = 0
     avg_mae_r: float | None = None
     avg_mfe_r: float | None = None
     market_entries: int = 0
@@ -52,9 +56,25 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
     ordered = sorted(trades, key=lambda t: (int(t.signal_time_ms), t.symbol, t.side))
     resolved = _resolved(ordered)
     values = [float(t.r_multiple) for t in resolved]
-    wins = sum(t.outcome == "TP" for t in resolved)
-    losses = sum(t.outcome == "SL" for t in resolved)
-    expired = sum(t.outcome == "EXPIRED" for t in resolved)
+    wins = sum(str(t.outcome).upper() == "TP" for t in resolved)
+    losses = sum(str(t.outcome).upper() == "SL" for t in resolved)
+    expired = sum(str(t.outcome).upper() == "EXPIRED" for t in resolved)
+    long_tp_hits = sum(
+        str(t.side).upper() == "LONG" and str(t.outcome).upper() == "TP"
+        for t in resolved
+    )
+    short_tp_hits = sum(
+        str(t.side).upper() == "SHORT" and str(t.outcome).upper() == "TP"
+        for t in resolved
+    )
+    long_sl_hits = sum(
+        str(t.side).upper() == "LONG" and str(t.outcome).upper() == "SL"
+        for t in resolved
+    )
+    short_sl_hits = sum(
+        str(t.side).upper() == "SHORT" and str(t.outcome).upper() == "SL"
+        for t in resolved
+    )
     running = peak = 0.0
     drawdown = 0.0
     losing_streak = max_streak = 0
@@ -118,6 +138,10 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         profit_factor=pf,
         max_drawdown_r=drawdown,
         max_losing_streak=max_streak,
+        long_tp_hits=long_tp_hits,
+        short_tp_hits=short_tp_hits,
+        long_sl_hits=long_sl_hits,
+        short_sl_hits=short_sl_hits,
         avg_mae_r=mean(mae_values) if mae_values else None,
         avg_mfe_r=mean(mfe_values) if mfe_values else None,
         market_entries=sum(1 for t in ordered if str(getattr(t, "entry_mode", "MARKET")).upper() != "LIMIT"),
@@ -150,8 +174,12 @@ def format_report(summary: BacktestSummary) -> str:
         f"🔴 SHORT: {summary.short_signals}",
         f"✅ Resolved: {summary.resolved}",
         f"⏳ Open/Unresolved: {summary.unresolved}",
-        f"🎯 TP: {summary.tp_hits}",
-        f"🛑 SL: {summary.sl_hits}",
+        f"🎯 Total TP: {summary.tp_hits}",
+        f"   🟢 LONG TPs: {summary.long_tp_hits}",
+        f"   🔴 SHORT TPs: {summary.short_tp_hits}",
+        f"🛑 Total SL: {summary.sl_hits}",
+        f"   🟢 LONG Trade SLs: {summary.long_sl_hits}",
+        f"   🔴 SHORT Trade SLs: {summary.short_sl_hits}",
         f"⌛ Expired: {summary.expired}",
         "",
         f"📈 Win Rate: {_fmt(summary.win_rate, 1, '%')}",

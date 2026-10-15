@@ -342,7 +342,7 @@ class MexcScanner:
                 ("CONFIRMATION_FAMILIES", bool(analysis.get("confirmation_family_diversity_ok")), "supporting evidence"),
                 ("TARGET_PATH", bool(analysis.get("location_ok") and analysis.get("target_path_structural") and analysis.get("target_path_clear")), "Clear HTF target path"),
                 ("RISK", bool(stages.get("RISK", analysis.get("risk_ok", False))), "Structural risk model"),
-                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 1.6)))), f"Post-cost RR {float(analysis.get('rr', 0) or 0):.2f} < {float(getattr(self.settings, "min_rr", 1.6)):.2f}"),
+                ("RR", bool(stages.get("RR", float(analysis.get("rr", 0) or 0) >= float(getattr(self.settings, "min_rr", 1.6)))), f"Post-cost RR {float(analysis.get('rr', 0) or 0):.2f} < {float(getattr(self.settings, 'min_rr', 1.6)):.2f}"),
                 ("BTC", bool(analysis.get("btc_filter_ok")), str(analysis.get("btc_filter_reason") or "BTC filter")),
                 ("QUALITY", bool(stages.get("QUALITY", float(analysis.get("score", 0) or 0) >= int(getattr(self.settings, "min_confluence", 65)))), f"V11 score gate"),
                 ("TECHNICAL_CANDIDATE", bool(analysis.get("technical_candidate")), "Engine technical candidate gate"),

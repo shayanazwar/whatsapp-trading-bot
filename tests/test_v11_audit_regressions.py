@@ -125,3 +125,66 @@ def test_config_metadata_is_run_level_not_symbol_aggregated():
     assert 'diagnostics["V11_MIN_IMPULSE_ATR_X100"]' not in per_symbol_block
     assert 'diagnostics["V11_MAX_TRIGGER_BARS"]' not in per_symbol_block
     assert 'diagnostics["V11_MIN_IMPULSE_ATR_X100"]' in source[source.index('state["phase"] = "FINALIZING"'):]
+
+
+def test_200_symbol_backtest_does_not_inflate_config_diagnostics():
+    class Fixed200Universe:
+        async def refresh(self):
+            return [f"COIN{i}_USDT" for i in range(200)]
+
+    runner = BacktestRunner(client=None, universe=Fixed200Universe(), settings=Settings(), max_concurrency=4)
+
+    async def fake_fetch(symbol, start_ms, end_ms):
+        from app.backtest.runner import SymbolHistory
+        return SymbolHistory(symbol=symbol, candles_1d=[], candles_12h=[], candles_4h=[], candles_1h=[])
+
+    runner._fetch_history = fake_fetch
+    runner._fetch_btc_history = lambda s, e: fake_fetch("BTC_USDT", s, e)
+    summary = asyncio.run(runner.run(1, start_ms=1_791_727_200, end_ms=1_791_813_600))
+    assert summary.coins_tested == 200
+    assert summary.diagnostics["V11_MIN_IMPULSE_ATR_X100"] == 250
+    assert summary.diagnostics["V11_MAX_TRIGGER_BARS"] == 6
+    report = format_report(summary)
+    assert "500.00ATR" not in report
+    assert "1200B" not in report
+
+
+def test_configured_backtest_symbols_override_dynamic_universe():
+    class FailingUniverse:
+        async def refresh(self):
+            raise AssertionError("Dynamic universe refresh must not be called when backtest_symbols is configured")
+
+    settings = Settings(backtest_symbols="BTC_USDT,ETH_USDT")
+    runner = BacktestRunner(client=None, universe=FailingUniverse(), settings=settings, max_concurrency=1)
+
+    async def fake_fetch(symbol, start_ms, end_ms):
+        from app.backtest.runner import SymbolHistory
+        return SymbolHistory(symbol=symbol, candles_1d=[], candles_12h=[], candles_4h=[], candles_1h=[])
+
+    runner._fetch_history = fake_fetch
+    runner._fetch_btc_history = lambda s, e: fake_fetch("BTC_USDT", s, e)
+    summary = asyncio.run(runner.run(7, start_ms=1_791_208_800, end_ms=1_791_813_600))
+    assert summary.coins_selected == 2
+    assert summary.coins_tested == 2
+
+
+def test_counterfactual_trade_preserves_control_exit_timestamp():
+    from app.backtest.simulator import simulate_trade
+    signal = {
+        "symbol": "SOL_USDT",
+        "setup": "LONG",
+        "entry": 100.0,
+        "stop_loss": 95.0,
+        "tp": 115.0,
+        "entry_mode": "MARKET",
+    }
+    future = [
+        [1_000 * HOUR, 100.0, 108.5, 99.0, 108.0, 1000.0],  # Hits 1.5R (107.5), not 3.0R (115.0)
+        [1_001 * HOUR, 108.0, 116.0, 107.0, 115.5, 1000.0],  # Hits CONTROL TP (115.0)
+    ]
+    ctrl = simulate_trade(signal, future, signal_close_time_ms=1_000 * HOUR, fee_rate=0.0, slippage_bps=0.0)
+    cf15 = simulate_trade(signal, future, signal_close_time_ms=1_000 * HOUR, fee_rate=0.0, slippage_bps=0.0, counterfactual_tp_r=1.5)
+    assert ctrl is not None and cf15 is not None
+    assert cf15.exit_time_ms == 1_001 * HOUR
+    assert ctrl.exit_time_ms == 1_002 * HOUR
+    assert cf15.control_exit_time_ms == ctrl.exit_time_ms

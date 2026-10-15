@@ -28,7 +28,7 @@ No 5M, 15M, 30M or hidden lower-timeframe aggregation.
 V10's breakout → mandatory departure → retest → reclaim architecture is no longer the production strategy layer. V10 remains the conceptual control/baseline for future comparisons.
 
 ## V11-balanced revision
-The 1D macro gate uses a causal 3-of-5 vote model (price/EMA200, EMA50/EMA200, structure, EMA50 slope, ADX) to avoid all-component neutral lockout. The 4H setup remains strict HH/HL or LH/LL with the V11 structural rules. Pullback invalidation is based on completed 4H closes, and 1H reclaim may occur anywhere within the six-candle sweep window.
+The 1D macro gate uses three of four directional votes (price/EMA200, EMA50/EMA200, confirmed structure, EMA50 slope); ADX is context only. The 4H setup remains strict HH/HL or LH/LL. Pullback invalidation is based on completed 4H closes. The 1H sweep-to-reclaim window is measured from the actual sweep, not from the first value-touch candle.
 
 ## Research policy
 AI-projected win-rate/PF/expectancy ranges are not treated as expected results. V11 must prove itself with 30D/90D+ and then longer walk-forward tests.

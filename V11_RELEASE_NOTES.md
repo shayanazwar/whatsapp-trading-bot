@@ -14,7 +14,7 @@ Decision = completed 1H close. Paper fill = next 1H open. Live path = MARKET ord
 
 ## Applied forensic fixes
 ### V11-balanced over-filtering corrections
-- 1D macro permission uses a directional 3-of-5 vote model (price/EMA200, EMA50/EMA200, 3/3 structure, EMA50 slope, ADX) instead of an all-component hard gate.
+- 1D macro permission uses three of four directional observations (price/EMA200, EMA50/EMA200, confirmed structure, EMA50 slope); ADX is context only and never votes on direction.
 - 1H wick probes no longer invalidate a 4H impulse; only completed 4H closes through the impulse origin invalidate it.
 - 1H reclaim can occur anywhere within the full six-candle window after the sweep.
 

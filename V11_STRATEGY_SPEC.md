@@ -33,26 +33,16 @@ No 5M, 15M, 30M, or hidden lower-timeframe aggregation.
 Multiple candidate 4H impulses may remain eligible. The engine does not rely on V10's latest-only BOS selection.
 
 ## 5. 1D regime
-V11-balanced uses a directional 3-of-5 macro vote rather than an all-components
-hard gate. This restores the more practical V10 macro permission model without
-restoring V10's late BOS/departure/retest entry state machine.
+V11-balanced uses a directional 3-of-4 macro vote. The four vote inputs are:
+- close > EMA200 (bearish inverse: close < EMA200)
+- EMA50 > EMA200 (bearish inverse: EMA50 < EMA200)
+- confirmed 3/3 swing structure = HH/HL (bearish inverse: LH/LL)
+- EMA50 slope > 0 (bearish inverse: slope < 0)
 
-LONG permission requires at least 3 bullish votes:
-- close > EMA200
-- EMA50 > EMA200
-- confirmed 3/3 swing structure = HH/HL
-- EMA50 slope > 0
-- ADX >= 14
-
-SHORT permission requires at least 3 bearish votes:
-- close < EMA200
-- EMA50 < EMA200
-- confirmed 3/3 swing structure = LH/LL
-- EMA50 slope < 0
-- ADX >= 14
-
-The selected side must have more macro votes than the opposite side. Exact HH/HL
-or LH/LL structure remains mandatory for the 4H trend-continuation impulse.
+ADX >= 14 is recorded as trend-strength context but never casts a directional
+vote. The selected side must have at least three directional votes and more
+votes than the opposite side. Exact HH/HL or LH/LL structure remains mandatory
+for the 4H trend-continuation impulse.
 
 ## 6. 12H context
 
@@ -111,7 +101,11 @@ For SHORT:
 2. Subsequent candle closes back below the swept level and closes bearish.
 3. Reclaim within six 1H bars.
 
-RVOL ≥ 1.20, body quality and close-location are supporting evidence, not independent hard gates. This directly addresses the audits' warning about stacked correlated gates.
+Body quality and close-location are required reclaim-shape checks; RVOL ≥ 1.20 is supporting evidence, not an independent hard gate. This directly addresses the audits' warning about stacked correlated gates.
+
+The sweep-to-reclaim bar limit is measured from the sweep candle, not from the
+first value-zone touch. This allows a valid sweep/reclaim to occur later in the
+life of an otherwise active pullback while still requiring a fresh trigger.
 
 ## 11. Entry
 

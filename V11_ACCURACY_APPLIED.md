@@ -1,43 +1,27 @@
-# V11 Accuracy-First Applied Changes
+# V11 Accuracy Research Controls — Implemented Status
 
-Applied to the supplied current codebase.
+The controls below are available in code but are **disabled by default** because no controlled historical test yet proves they increase expectancy. Do not treat these thresholds as a proven edge.
 
-## Frozen architecture
-- Only 1D / 12H / 4H / 1H.
-- Completed candles only.
-- Causal 12H aggregation from contiguous completed 4H candles.
-- Breakout + retest / value re-entry framework retained.
-- No lower timeframes added.
+## Preserved baseline
+- Only 1D / 12H / 4H / 1H analysis; completed candles only.
+- 12H synthesized from exactly three contiguous completed 4H bars.
+- Existing structural target selection, liquidity-sweep stop, costs, and portfolio controls unchanged.
+- Live trading and order execution defaults remain disabled.
 
-## Accuracy-first controls now available and enabled by default
-- `V11_ACCURACY_MODE=true`
-- Structural 4H-origin stop option enabled by default.
-- Fresh 1H reclaim: max 3 bars from sweep to reclaim and reclaim must be no more than 2 bars old at entry.
-- Maximum entry extension: 0.75 ATR(1H) from swept liquidity level.
-- Structural target realism cap: reject structural targets requiring >2.50R before costs.
-- Maximum retest depth: 70% of the impulse.
-- Breakout quality is measured/tagged but NOT a hard gate by default to avoid unverified filter stacking.
+## Correctness fixes
+- ADX is trend strength and is no longer counted as a directional vote. Daily permission uses three of four directional observations.
+- Liquidity sweeps may occur any time after value is touched while the 4H setup is active. The reclaim window is measured from each actual sweep and an eligible current-candle reclaim takes priority over stale historical triggers.
+- The previously misleading `setup_pullback_touch_time` now records the first value-zone touch associated with the selected trigger, not the sweep time.
+- Signal metadata records impulse age, pullback depth, sweep-to-reclaim bars, reclaim body ratio, close-location, relative volume, and entry extension in ATR.
+- Backtest report compares measured quality averages for TP and SL samples. These are diagnostics, not causal claims or acceptance gates.
 
-## Implementation integrity
-- V11 config is read at decision time, avoiding stale module-import configuration.
-- Runtime config fingerprint is included in backtest reports/logs.
-- Rejection messages use the actual runtime impulse threshold.
-- 500 ATR can now be supplied for plumbing tests without being silently clamped by the engine.
+## Optional accuracy experiment
+Set `V11_ACCURACY_MODE=true` in an isolated paper/research deployment to activate additional rejection rules:
+- `V11_ACCURACY_MAX_RECLAIM_BARS=3` (allowed 1–6; max bars from actual sweep to reclaim)
+- `V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR=0.75` (allowed >0–5 ATR)
+- `V11_ACCURACY_MAX_RETEST_DEPTH=0.70` (allowed >0–1.0 of the impulse leg)
 
-## Trade diagnostics added
-Each accepted signal records:
-- breakout time
-- breakout candle body/range metrics
-- retest depth
-- reclaim recency
-- entry extension
-These features can be analyzed against winners/losers later.
+Defaults are false / 3 / 0.75 / 0.70. The filters are not proven profitable. Run baseline and experiment on the exact same frozen candles, universe, period, and execution assumptions. Do not enable in a live deployment based solely on this patch.
 
-## Backtest diagnostics added
-- MFE reach rates for 1R / 1.5R / 2R / 2.5R.
-- Runtime V11 accuracy configuration in the report.
-
-## Validation
-Full test suite: 79 passed.
-
-A live MEXC historical backtest was not executed from this archive because that requires the external MEXC data/API environment.
+## Research rationale
+The controls convert common discretionary concepts—fresh reclaim, avoiding extended entries, limiting very deep retracements—into explicit testable variables. Academic work on backtest overfitting and cryptocurrency momentum risk supports out-of-sample validation and volatility/risk diagnostics, not assuming that any fixed threshold improves returns. See `V11_ACCURACY_RESEARCH.md`.

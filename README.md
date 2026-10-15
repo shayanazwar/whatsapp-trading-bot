@@ -9,7 +9,7 @@ V11-balanced replaces the V10 breakout → departure → retest → reclaim thes
 Authoritative timeframes are **1D / 12H / 4H / 1H only**. No 5M, 15M, 30M, or hidden lower-timeframe aggregation is used. 12H is causally synthesized from three contiguous completed 4H candles.
 
 ### Key V11-balanced principles
-- 1D direction uses a causal 3-of-5 macro vote; this avoids the previous all-component neutral lockout.
+- 1D direction uses a causal 3-of-4 directional vote; ADX is trend-strength context and is not a directional vote.
 - 12H is a veto/context layer, not an indicator-count gate.
 - 4H requires strict HH/HL or LH/LL structure and a meaningful impulse (2.5 ATR minimum), followed by a controlled pullback into value.
 - Value combines the 38.2–78.6% retracement area with the 4H EMA21/EMA50 corridor; 50%+ depth is preferred, not a score gate.

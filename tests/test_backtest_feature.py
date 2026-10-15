@@ -126,3 +126,70 @@ def test_simulator_reports_signal_rr_and_actual_fill_rr_separately():
     assert summary.avg_actual_fill_rr == pytest.approx(8.0 / 7.0)
     assert "Avg Signal RR" in format_report(summary)
     assert "Avg Actual Fill RR" in format_report(summary)
+
+
+def test_backtest_report_splits_take_profits_and_stop_losses_by_side():
+    # Four independently simulated trades make every side/outcome bucket explicit.
+    cases = [
+        ({"symbol": "LONG_TP", "setup": "LONG", "entry": 100.0, "stop_loss": 95.0, "tp": 110.0}, candle(3_600_000, 100.0, 111.0, 99.0, 109.0), "TP"),
+        ({"symbol": "LONG_SL", "setup": "LONG", "entry": 100.0, "stop_loss": 95.0, "tp": 110.0}, candle(3_600_000, 100.0, 101.0, 94.0, 96.0), "SL"),
+        ({"symbol": "SHORT_TP", "setup": "SHORT", "entry": 100.0, "stop_loss": 105.0, "tp": 90.0}, candle(3_600_000, 100.0, 101.0, 89.0, 91.0), "TP"),
+        ({"symbol": "SHORT_SL", "setup": "SHORT", "entry": 100.0, "stop_loss": 105.0, "tp": 90.0}, candle(3_600_000, 100.0, 106.0, 99.0, 104.0), "SL"),
+    ]
+    trades = []
+    for signal, future, expected_outcome in cases:
+        trade = simulate_trade(
+            signal, [future], signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0
+        )
+        assert trade is not None
+        assert trade.outcome == expected_outcome
+        trades.append(trade)
+
+    summary = summarize(
+        days=1, period_start_ms=0, period_end_ms=86_400_000,
+        coins_selected=4, coins_tested=4, data_errors=0, execution_errors=0,
+        rejected_setups=0, trades=trades,
+    )
+    assert summary.tp_hits == 2
+    assert summary.long_tp_hits == 1
+    assert summary.short_tp_hits == 1
+    assert summary.sl_hits == 2
+    assert summary.long_sl_hits == 1
+    assert summary.short_sl_hits == 1
+
+    report = format_report(summary)
+    assert "🎯 Total TP: 2" in report
+    assert "LONG TPs: 1" in report
+    assert "SHORT TPs: 1" in report
+    assert "🛑 Total SL: 2" in report
+    assert "LONG Trade SLs: 1" in report
+    assert "SHORT Trade SLs: 1" in report
+
+
+def test_side_tp_sl_breakdown_excludes_open_and_expired_trades():
+    open_trade = simulate_trade(
+        {"symbol": "OPEN_LONG", "setup": "LONG", "entry": 100.0, "stop_loss": 95.0, "tp": 110.0},
+        [candle(3_600_000, 100.0, 102.0, 99.0, 101.0)],
+        signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0,
+    )
+    expired_trade = simulate_trade(
+        {"symbol": "EXPIRED_SHORT", "setup": "SHORT", "entry": 100.0, "stop_loss": 105.0, "tp": 90.0},
+        [candle(3_600_000, 100.0, 102.0, 98.0, 101.0)],
+        signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0,
+        max_holding_minutes=30.0,
+    )
+    assert open_trade is not None and open_trade.outcome == "OPEN"
+    assert expired_trade is not None and expired_trade.outcome == "EXPIRED"
+
+    summary = summarize(
+        days=1, period_start_ms=0, period_end_ms=86_400_000,
+        coins_selected=2, coins_tested=2, data_errors=0, execution_errors=0,
+        rejected_setups=0, trades=[open_trade, expired_trade],
+    )
+    assert summary.unresolved == 1
+    assert summary.expired == 1
+    assert summary.tp_hits == summary.sl_hits == 0
+    assert summary.long_tp_hits == summary.short_tp_hits == 0
+    assert summary.long_sl_hits == summary.short_sl_hits == 0
+    assert "LONG TPs: 0" in format_report(summary)
+    assert "SHORT Trade SLs: 0" in format_report(summary)

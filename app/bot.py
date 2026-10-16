@@ -427,7 +427,7 @@ class Bot:
             f"1D Regime: {data.get('regime_1d', 'N/A')}\n"
             f"12H Context: {data.get('bias_12h', 'N/A')}\n"
             f"4H Structure: {data.get('trend_4h', 'N/A')}\n"
-            f"Value Zone: "
+            f"{'Latest 4H Value Zone (diagnostic)' if str(data.get('setup') or 'NONE').upper() not in {'LONG', 'SHORT'} else 'Value Zone'}: "
             f"{fmt_optional(data.get('value_zone_low'))} "
             f"→ "
             f"{fmt_optional(data.get('value_zone_high'))}\n"
@@ -438,10 +438,17 @@ class Bot:
             f"RSI: {fmt_number(data.get('rsi'))}\n"
             f"Volume: {data.get('volume', 'N/A')}\n"
             f"Diagnostic Score: "
-            f"{data.get('score', 'N/A')}/100\n\n"
+            f"{(f"{float(data['score']):.0f}/100" if data.get('score') is not None else 'N/A (no qualified setup)')}\n\n"
             f"Potential Setup: "
             f"{data.get('setup', 'NO TRADE')}\n"
         )
+
+        if str(data.get("setup") or "NONE").upper() not in {"LONG", "SHORT"}:
+            reasons = data.get("diagnostic_failures") or data.get("reasons") or []
+            reason_text = "; ".join(str(item) for item in reasons[:2]) if isinstance(reasons, list) else str(reasons)
+            if not reason_text:
+                reason_text = str(data.get("diagnostic_reason") or "No setup passed all V11 gates.")
+            body += f"\nWhy no signal: {reason_text[:700]}\n"
 
         entry = data.get("entry")
 

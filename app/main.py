@@ -273,6 +273,12 @@ async def startup_event() -> None:
     logger.info("MEXC API base=%s", settings.mexc_api_base_url)
     logger.info("Analysis timeframes=1D,12H,4H,1H")
     logger.info("Scanner enabled=%s auto_signals=%s auto_trade=%s live_execution=%s paper_trading=%s", settings.scanner_enabled, settings.auto_signal_enabled, settings.auto_trade_enabled, settings.allow_live_execution, settings.paper_trading_enabled)
+    if not settings.scanner_enabled and settings.auto_signal_enabled:
+        logger.warning("AUTO_SIGNAL_ENABLED=true but SCANNER_ENABLED=false; automatic signal scanning is disabled.")
+    if settings.scanner_enabled and not settings.auto_signal_enabled and not settings.paper_trading_enabled:
+        logger.warning("SCANNER_ENABLED=true but both AUTO_SIGNAL_ENABLED and PAPER_TRADING_ENABLED are false; scheduler will not start and no signals will be scanned.")
+    if settings.scanner_enabled and settings.auto_signal_enabled and not (settings.auto_signal_recipients.strip() or settings.auto_signal_telegram_recipients.strip()):
+        logger.warning("Automatic signal scanning is enabled but no signal recipients are configured; valid signals cannot be delivered.")
     await market.start()
     await alert_engine.start()
     if settings.paper_trading_enabled:

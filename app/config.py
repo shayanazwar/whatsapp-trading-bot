@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     require_increasing_volume: bool = Field(default=False, alias="REQUIRE_INCREASING_VOLUME")
     signal_expiry_minutes: int = Field(default=30, alias="SIGNAL_EXPIRY_MINUTES")
     # Signal freshness is measured from the CLOSE of the completed 1H entry candle.
-    max_signal_age_seconds: float = Field(default=120.0, alias="MAX_SIGNAL_AGE_SECONDS")
+    max_signal_age_seconds: float = Field(default=300.0, alias="MAX_SIGNAL_AGE_SECONDS")
     auto_signal_recipients: str = Field(default="", alias="AUTO_SIGNAL_RECIPIENTS")
     auto_signal_telegram_recipients: str = Field(
         default="",

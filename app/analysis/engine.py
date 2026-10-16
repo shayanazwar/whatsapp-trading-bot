@@ -449,7 +449,12 @@ def _data_quality(candles: list[Candle], timeframe: str, minimum: int) -> tuple[
 # V11 strategy constants. Score is diagnostic only; it is never an acceptance gate.
 V11_MIN_RR = 1.60
 V11_MAX_TARGET_RR = 2.50
-V11_MIN_IMPULSE_ATR = 2.50
+# Environment-overridable for controlled PAPER experiments. Keep the research baseline
+# at 2.50 ATR unless a fixed-window out-of-sample comparison supports changing it.
+try:
+    V11_MIN_IMPULSE_ATR = float(os.getenv("V11_MIN_IMPULSE_ATR", "2.50"))
+except (TypeError, ValueError, OverflowError):
+    V11_MIN_IMPULSE_ATR = float("nan")
 V11_SETUP_MAX_4H_BARS = 30
 V11_MAX_TRIGGER_BARS = 6
 V11_SHORT_RANGE_RELAXED = False
@@ -1238,9 +1243,90 @@ def _v11_empty(
     atr_percentile = _memoized_frame_value(
         cache, "_v11_atr_percentile_4h", c4, lambda: _atr_percentile(c4)
     )
+    # A rejected/no-trade analysis must still expose the market context. Previously
+    # this branch omitted 12H/4H/indicator fields, so WhatsApp rendered N/A despite
+    # valid candles and a computed daily regime. This is diagnostic enrichment only;
+    # it does not alter setup eligibility or emit a trade signal.
+    closes_1d = [float(c["close"]) for c in c1d]
+    closes_12h = [float(c["close"]) for c in c12]
+    closes_4h = [float(c["close"]) for c in c4]
+    closes_1h = [float(c["close"]) for c in c1]
+    structure_12h = _v11_structure(c12) if c12 else "UNKNOWN"
+    structure_4h = _v11_structure(c4) if c4 else "UNKNOWN"
+    e50_12h = _safe_ema(closes_12h, 50)
+    slope_12h = _ema_slope(closes_12h, 50, lookback=5)
+    price_12h = closes_12h[-1] if closes_12h else None
+    if structure_12h == "HH/HL":
+        bias_12h = "BULLISH (HH/HL)"
+    elif structure_12h == "LH/LL":
+        bias_12h = "BEARISH (LH/LL)"
+    elif e50_12h is not None and price_12h is not None and price_12h > e50_12h and slope_12h > 0:
+        bias_12h = "BULLISH BIAS (range structure)"
+    elif e50_12h is not None and price_12h is not None and price_12h < e50_12h and slope_12h < 0:
+        bias_12h = "BEARISH BIAS (range structure)"
+    else:
+        bias_12h = "RANGE / NEUTRAL"
+    context_long = _v11_context_12h(c12, "LONG") if c12 else {"status": "UNAVAILABLE", "hostile": False}
+    context_short = _v11_context_12h(c12, "SHORT") if c12 else {"status": "UNAVAILABLE", "hostile": False}
+
+    # Show the latest still-valid 4H value zone even when no 1H trigger qualifies.
+    # This is context for manual diagnosis only and does not turn a no-trade state
+    # into a candidate. Keep the freshest available impulse across both sides.
+    diagnostic_zone: dict[str, Any] | None = None
+    if c4:
+        e21_4h = _safe_ema(closes_4h, 21)
+        e50_4h = _safe_ema(closes_4h, 50)
+        possible_zones: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
+        for candidate_side in ("LONG", "SHORT"):
+            try:
+                impulses = _v11_find_impulses(c4, candidate_side)
+            except (ValueError, TypeError, IndexError):
+                impulses = []
+            for impulse in reversed(impulses):
+                endpoint_idx = int(impulse["high_idx"] if candidate_side == "LONG" else impulse["low_idx"])
+                age = len(c4) - 1 - endpoint_idx
+                if age < 0 or age > V11_SETUP_MAX_4H_BARS:
+                    continue
+                invalidated = (
+                    any(float(c["close"]) < float(impulse["low"]) for c in c4[endpoint_idx + 1:])
+                    if candidate_side == "LONG"
+                    else any(float(c["close"]) > float(impulse["high"]) for c in c4[endpoint_idx + 1:])
+                )
+                if invalidated:
+                    continue
+                zone = _v11_value_zone(impulse, e21_4h, e50_4h)
+                if zone.get("ok"):
+                    possible_zones.append((endpoint_idx, age, candidate_side, impulse, zone))
+                    break
+        if possible_zones:
+            _, zone_age, zone_side, zone_impulse, zone = max(possible_zones, key=lambda item: item[0])
+            diagnostic_zone = {
+                "side": zone_side, "low": float(zone["low"]), "high": float(zone["high"]),
+                "impulse_age_4h_bars": int(zone_age),
+                "impulse_high_time": zone_impulse.get("high_time"),
+                "impulse_low_time": zone_impulse.get("low_time"),
+            }
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
+        "bias_12h": bias_12h, "structure_12h": structure_12h,
+        "trend_4h": structure_4h, "structure_4h": structure_4h,
+        "context_12h_long": context_long.get("status", "UNAVAILABLE"),
+        "context_12h_short": context_short.get("status", "UNAVAILABLE"),
+        "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"),
+        "ema21_12h": _safe_ema(closes_12h, 21), "ema50_12h": e50_12h,
+        "ema21_4h": _safe_ema(closes_4h, 21), "ema50_4h": _safe_ema(closes_4h, 50),
+        "ema21_1h": _safe_ema(closes_1h, 21), "ema50_1h": _safe_ema(closes_1h, 50),
+        "rsi": _safe_rsi(closes_1h), "rsi_1h_entry": _safe_rsi(closes_1h),
+        "volume": volume_status(c1), "rvol_1h": _relative_volume(c1, 20),
+        "trigger_type": "NONE (no qualified current 1H trigger)", "swept_level_1h": None,
+        "value_zone_low": diagnostic_zone.get("low") if diagnostic_zone else None,
+        "value_zone_high": diagnostic_zone.get("high") if diagnostic_zone else None,
+        "diagnostic_value_zone_side": diagnostic_zone.get("side") if diagnostic_zone else None,
+        "diagnostic_impulse_age_4h_bars": diagnostic_zone.get("impulse_age_4h_bars") if diagnostic_zone else None,
+        "setup_impulse_high_time": diagnostic_zone.get("impulse_high_time") if diagnostic_zone else None,
+        "setup_impulse_low_time": diagnostic_zone.get("impulse_low_time") if diagnostic_zone else None,
+        "diagnostic_reason": str(reason),
         "signal_engine_version": ENGINE_VERSION, "signal_basis": "V11.2 Balanced Trend Pullback + Value Re-entry + 1H Liquidity Sweep/Reclaim",
         "engine_config": {
             "min_impulse_atr": V11_MIN_IMPULSE_ATR,
@@ -1262,11 +1348,19 @@ def _v11_empty(
         "entry_distance_ok": False, "entry_extension_ok": False, "volatility_ok": True, "confirmation_family_diversity_ok": True,
         "location_ok": False, "target_path_ok": False, "target_path_structural": False, "target_path_clear": False,
         "risk_ok": False, "trade_geometry_ok": False, "rr_ok": False, "shock_veto_ok": True,
-        "btc_filter_ok": True, "btc_filter_reason": "not evaluated", "score": 0, "score_groups": {},
-        "stage_status": {"1D_REGIME": False, "12H_BIAS": False, "4H_SETUP": False, "1H_TRIGGER": False, "RISK": False, "RR": False, "QUALITY": True, "BTC": True, "SHOCK": True},
+        "btc_filter_ok": True, "btc_filter_reason": "not evaluated", "score": None, "score_groups": {},
+        "stage_status": {
+            "1D_REGIME": daily.get("regime") in {"BULLISH", "BEARISH"},
+            "12H_BIAS": bias_12h not in {"RANGE / NEUTRAL", "UNAVAILABLE"},
+            "4H_SETUP": False, "1H_TRIGGER": False, "RISK": False, "RR": False,
+            "QUALITY": False, "BTC": True, "SHOCK": True,
+        },
         "stage_failures": {"SETUP": [reason]}, "entry": None, "stop_loss": None, "tp": None, "rr": None,
         "atr_4h": atr_4h, "atr_1h": atr_1h, "atr": atr_1h,
-        "atr_percentile": atr_percentile, "rvol_1h": _relative_volume(c1, 20),
+        "atr_percentile": atr_percentile,
+        "closed_1d_candles": len(c1d), "closed_12h_candles": len(c12),
+        "closed_4h_candles": len(c4), "closed_1h_candles": len(c1),
+        "rvol_1h": _relative_volume(c1, 20),
         "entry_mode": "MARKET", "limit_price": None, "intraday_max_hold_minutes": DEFAULT_MAX_HOLD_MINUTES,
         "candle_open_time": int(c1[-1]["time"]), "candle_close_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],
         "candle_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"], "entry_time": int(c1[-1]["time"]) + TIMEFRAME_MS["1h"],

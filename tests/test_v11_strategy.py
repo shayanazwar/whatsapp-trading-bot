@@ -275,3 +275,49 @@ def test_accuracy_mode_can_reject_deep_retest_only_when_enabled(monkeypatch):
     experimental = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
     assert experimental["technical_candidate"] is False
     assert any("retest depth" in reason.lower() for reason in experimental["technical_gate_failures"])
+
+
+def test_no_setup_analysis_still_returns_market_context_and_rejection_reason(monkeypatch):
+    """ANALYZE must not show N/A for valid HTF candles just because no trade passed."""
+    monkeypatch.delenv("V11_ACCURACY_MODE", raising=False)
+    daily, c4, c1, now = _build_fixture()
+    c1 = [dict(c) for c in c1]
+    # Suppress the final bullish reclaim. Data remain valid and closed, but no LONG trigger qualifies.
+    last = c1[-1]
+    c1[-1] = {
+        "time": last["time"], "open": 158.5, "high": 158.7,
+        "low": 157.1, "close": 157.4, "volume": last["volume"],
+    }
+    result = analyze_candles("DIAG_TEST_USDT", daily, None, c4, c1, now_ms=now)
+
+    assert result["setup"] == "NONE"
+    assert result["regime_1d"] in {"BULLISH", "BEARISH", "NEUTRAL"}
+    assert result["bias_12h"]
+    assert result["structure_12h"] in {"HH/HL", "LH/LL", "RANGE", "UNKNOWN"}
+    assert result["trend_4h"] in {"HH/HL", "LH/LL", "RANGE", "UNKNOWN"}
+    assert result["rsi"] is not None
+    assert result["volume"] is not None
+    assert result["trigger_type"].startswith("NONE")
+    assert result["score"] is None
+    assert result["diagnostic_reason"]
+    # If a current valid impulse exists, the no-trade report should still expose its zone.
+    if result.get("value_zone_low") is not None:
+        assert result["value_zone_low"] < result["value_zone_high"]
+        assert result["diagnostic_value_zone_side"] in {"LONG", "SHORT"}
+
+
+def test_minimum_impulse_setting_can_be_tuned_for_paper_experiments(monkeypatch):
+    baseline = engine.V11_MIN_IMPULSE_ATR
+    try:
+        monkeypatch.setattr(engine, "V11_MIN_IMPULSE_ATR", 2.0)
+        engine.validate_engine_config()
+        assert engine.V11_MIN_IMPULSE_ATR == 2.0
+        monkeypatch.setattr(engine, "V11_MIN_IMPULSE_ATR", 500.0)
+        try:
+            engine.validate_engine_config()
+        except ValueError as exc:
+            assert "0.25..10.0 ATR" in str(exc)
+        else:
+            raise AssertionError("out-of-range impulse threshold must fail fast")
+    finally:
+        monkeypatch.setattr(engine, "V11_MIN_IMPULSE_ATR", baseline)

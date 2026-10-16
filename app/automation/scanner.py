@@ -53,6 +53,23 @@ class MexcScanner:
         self._candle_cache: dict[tuple[str, str], tuple[int, list[Any]]] = {}
         self._candle_fetch_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._cache_limit = max(180, int(getattr(settings, "candle_limit", 650)))
+        if bool(getattr(settings, "scanner_enabled", False)) and not bool(getattr(settings, "auto_signal_enabled", False)):
+            paper_enabled = bool(getattr(settings, "paper_trading_enabled", False))
+            if paper_enabled:
+                LOGGER.warning(
+                    "AUTO_SIGNAL_ENABLED=false: paper scanning may run, but no outbound trading-signal messages will be sent."
+                )
+            else:
+                LOGGER.warning(
+                    "Scanner scheduler will not start: AUTO_SIGNAL_ENABLED=false and PAPER_TRADING_ENABLED=false."
+                )
+        if bool(getattr(settings, "auto_signal_enabled", False)) and not (
+            str(getattr(settings, "auto_signal_recipients", "") or "").strip()
+            or str(getattr(settings, "auto_signal_telegram_recipients", "") or "").strip()
+        ):
+            LOGGER.warning(
+                "AUTO_SIGNAL_ENABLED=true but no AUTO_SIGNAL_RECIPIENTS or AUTO_SIGNAL_TELEGRAM_RECIPIENTS are configured."
+            )
 
     @staticmethod
     def _reprice_for_next_1h_open(

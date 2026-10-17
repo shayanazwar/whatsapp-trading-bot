@@ -1431,10 +1431,27 @@ def analyze_candles(
     """
     validate_engine_config()
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    c1d = closed_candle_rows(candles_1d or [], "1D", now)
-    c4 = closed_candle_rows(candles_4h or [], "4H", now)
-    c1 = closed_candle_rows(candles_1h or [], "1H", now)
-    c12 = closed_candle_rows(candles_12h, "12H", now) if candles_12h is not None else synthesize_12h_from_4h(c4, now_ms=now)
+
+    # BacktestRunner passes immutable, already-closed Candle prefixes at each
+    # decision timestamp. Re-filtering every prefix here scans all historical
+    # candles on every 1H decision (hundreds of thousands of redundant checks
+    # across a 200-symbol run). Trust that explicit private contract only when
+    # the runner's opt-in marker is present and the inputs are normalized
+    # Candle lists. All other callers retain the original close-time filtering.
+    preclosed = isinstance(cache, dict) and cache.get("_preclosed_candles") is True
+
+    def _analysis_frame(rows, timeframe):
+        if preclosed and isinstance(rows, list) and (not rows or isinstance(rows[0], Candle)):
+            return rows
+        return closed_candle_rows(rows or [], timeframe, now)
+
+    c1d = _analysis_frame(candles_1d, "1D")
+    c4 = _analysis_frame(candles_4h, "4H")
+    c1 = _analysis_frame(candles_1h, "1H")
+    if candles_12h is not None:
+        c12 = _analysis_frame(candles_12h, "12H")
+    else:
+        c12 = synthesize_12h_from_4h(c4, now_ms=now)
     for c, tf, minimum in ((c1d, "1d", 210), (c12, "12h", 60), (c4, "4h", 180), (c1, "1h", 180)):
         ok, reason = _data_quality(c, tf, minimum)
         if not ok:

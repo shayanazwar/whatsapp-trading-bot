@@ -76,15 +76,32 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
         str(t.side).upper() == "SHORT" and str(t.outcome).upper() == "SL"
         for t in resolved
     )
+    # Equity drawdown follows realised exit events, not signal creation order.
+    # Aggregate trades closing at the same timestamp into one equity event so
+    # arbitrary symbol ordering cannot create an artificial intra-bar drawdown.
+    exit_events: dict[int, float] = {}
+    for trade in resolved:
+        event_time = int(trade.exit_time_ms if trade.exit_time_ms is not None else trade.signal_time_ms)
+        exit_events[event_time] = exit_events.get(event_time, 0.0) + float(trade.r_multiple)
     running = peak = 0.0
     drawdown = 0.0
-    losing_streak = max_streak = 0
-    for t in resolved:
-        value = float(t.r_multiple)
-        running += value
+    for event_time in sorted(exit_events):
+        running += exit_events[event_time]
         peak = max(peak, running)
         drawdown = max(drawdown, peak - running)
-        if t.outcome == "SL":
+
+    # Losing streaks are ordered by realised exit time and count actual negative
+    # realised R outcomes, including a negative expiry (not just labelled SLs).
+    exit_ordered = sorted(
+        resolved,
+        key=lambda t: (
+            int(t.exit_time_ms if t.exit_time_ms is not None else t.signal_time_ms),
+            int(t.signal_time_ms), str(t.symbol), str(t.side),
+        ),
+    )
+    losing_streak = max_streak = 0
+    for trade in exit_ordered:
+        if float(trade.r_multiple) < 0.0:
             losing_streak += 1
             max_streak = max(max_streak, losing_streak)
         else:
@@ -109,11 +126,14 @@ def summarize(*, days: int, period_start_ms: int, period_end_ms: int, coins_sele
     diagnostics_out.setdefault("SL_HIT", losses)
     diagnostics_out.setdefault("EXPIRED", expired)
     diagnostics_out.setdefault("PORTFOLIO_SKIPPED", 0)
-    mae_values = [float(t.mae_r) for t in ordered if t.mae_r is not None and math.isfinite(float(t.mae_r))]
-    mfe_values = [float(t.mfe_r) for t in ordered if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
+    # Do not mix partially observed OPEN trades into excursion averages. The
+    # report compares completed trade paths, so MAE/MFE use the resolved set.
+    mae_values = [float(t.mae_r) for t in resolved if t.mae_r is not None and math.isfinite(float(t.mae_r))]
+    mfe_values = [float(t.mfe_r) for t in resolved if t.mfe_r is not None and math.isfinite(float(t.mfe_r))]
     quality_fields = (
         "impulse_age_4h_bars", "retest_depth_ratio", "reclaim_bars_after_sweep",
-        "reclaim_age_1h_bars", "entry_extension_atr", "actual_entry_extension_atr", "reclaim_body_ratio",
+        "reclaim_age_1h_bars", "entry_extension_atr", "actual_entry_extension_atr",
+        "value_zone_distance_atr", "actual_value_zone_distance_atr", "reclaim_body_ratio",
         "reclaim_close_location", "reclaim_rvol",
     )
     quality_by_outcome: dict[str, dict[str, float | int]] = {}
@@ -226,6 +246,8 @@ def format_report(summary: BacktestSummary) -> str:
         ("reclaim_rvol", "reclaim_RVOL"),
         ("entry_extension_atr", "signal_extension_ATR"),
         ("actual_entry_extension_atr", "actual_fill_extension_ATR"),
+        ("value_zone_distance_atr", "signal_value_zone_distance_ATR"),
+        ("actual_value_zone_distance_atr", "actual_fill_value_zone_distance_ATR"),
         ("retest_depth_ratio", "retest_depth"),
         ("impulse_age_4h_bars", "impulse_age_4H_bars"),
         ("reclaim_bars_after_sweep", "sweep_to_reclaim_bars"),
@@ -269,7 +291,9 @@ def format_report(summary: BacktestSummary) -> str:
             max_reclaim = int(summary.diagnostics.get("V11_ACCURACY_MAX_RECLAIM_BARS", 3))
             max_extension = int(summary.diagnostics.get("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_X100", 75)) / 100.0
             max_depth = int(summary.diagnostics.get("V11_ACCURACY_MAX_RETEST_DEPTH_X100", 70)) / 100.0
-            active_experiments.append(f"ACCURACY_MODE=ON (reclaim<={max_reclaim}B, extension<={max_extension:.2f}ATR, retest<={max_depth:.0%})")
+            min_rvol = int(summary.diagnostics.get("V11_ACCURACY_MIN_TRIGGER_RVOL_X100", 0)) / 100.0
+            rvol_text = f", reclaim_RVOL>={min_rvol:.2f}" if min_rvol > 0 else ""
+            active_experiments.append(f"ACCURACY_MODE=ON (reclaim<={max_reclaim}B, extension<={max_extension:.2f}ATR, retest<={max_depth:.0%}{rvol_text})")
         else:
             lines.insert(4, "🧪 Accuracy filters: OFF (diagnostics only; strategy baseline preserved)")
         if active_experiments:

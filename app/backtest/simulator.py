@@ -175,6 +175,9 @@ def _quality_snapshot(signal: Mapping[str, Any]) -> dict[str, float]:
         "reclaim_bars_after_sweep",
         "reclaim_age_1h_bars",
         "entry_extension_atr",
+        "value_zone_distance_atr",
+        "value_zone_low",
+        "value_zone_high",
         "reclaim_body_ratio",
         "reclaim_close_location",
         "reclaim_rvol",
@@ -363,6 +366,14 @@ def simulate_trade(
                     quality_snapshot["actual_entry_extension_atr"] = max(0.0, entry_exec - swept_level) / atr_1h
                 else:
                     quality_snapshot["actual_entry_extension_atr"] = max(0.0, swept_level - entry_exec) / atr_1h
+            zone_low = quality_snapshot.get("value_zone_low")
+            zone_high = quality_snapshot.get("value_zone_high")
+            if zone_low is not None and zone_high is not None and atr_1h is not None and atr_1h > 0:
+                if float(zone_low) <= entry_exec <= float(zone_high):
+                    zone_distance = 0.0
+                else:
+                    zone_distance = max(float(zone_low) - entry_exec, entry_exec - float(zone_high), 0.0) / atr_1h
+                quality_snapshot["actual_value_zone_distance_atr"] = zone_distance
         return SimulatedTrade(
             symbol=symbol, side=side, signal_time_ms=signal_time, entry=entry,
             stop_loss=stop, tp1=tp, tp2=tp, planned_rr=signal_rr,

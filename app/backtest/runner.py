@@ -440,6 +440,15 @@ def _safe_number(value: Any, default: float | None = None) -> float | None:
     return result if result == result and result not in (float("inf"), -float("inf")) else default
 
 
+def _nonnegative_setting_float(settings: Any, name: str, default: float) -> float:
+    """Read a nonnegative numeric setting without treating explicit zero as missing."""
+    raw = getattr(settings, name, None)
+    value = _safe_number(raw)
+    if value is None or value < 0.0:
+        value = float(default)
+    return float(value)
+
+
 def simulate_trade_1h(
     signal: dict[str, Any],
     future_candles: Iterable[Any],
@@ -760,25 +769,13 @@ class BacktestRunner:
             )
             or MAX_HOLD_MINUTES
         )
-        fee_rate = float(
-            _safe_number(
-                getattr(
-                    self.settings,
-                    "backtest_fee_rate",
-                    DEFAULT_FEE_RATE,
-                )
-            )
-            or DEFAULT_FEE_RATE
+        # Explicit 0.0 is a valid controlled-experiment value. Do not use
+        # `value or default`, which silently replaces zero fees/slippage.
+        fee_rate = _nonnegative_setting_float(
+            self.settings, "backtest_fee_rate", DEFAULT_FEE_RATE
         )
-        slippage_bps = float(
-            _safe_number(
-                getattr(
-                    self.settings,
-                    "backtest_slippage_bps",
-                    DEFAULT_SLIPPAGE_BPS,
-                )
-            )
-            or DEFAULT_SLIPPAGE_BPS
+        slippage_bps = _nonnegative_setting_float(
+            self.settings, "backtest_slippage_bps", DEFAULT_SLIPPAGE_BPS
         )
 
         # Only 1H bars create decisions.
@@ -1474,6 +1471,7 @@ class BacktestRunner:
                 diagnostics["V11_ACCURACY_MAX_RECLAIM_BARS"] = int(accuracy_cfg["max_reclaim_bars"])
                 diagnostics["V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_X100"] = int(round(float(accuracy_cfg["max_entry_extension_atr"]) * 100))
                 diagnostics["V11_ACCURACY_MAX_RETEST_DEPTH_X100"] = int(round(float(accuracy_cfg["max_retest_depth"]) * 100))
+                diagnostics["V11_ACCURACY_MIN_TRIGGER_RVOL_X100"] = int(round(float(accuracy_cfg.get("min_trigger_rvol", 0.0)) * 100))
                 diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(
                     bool(
                         start_ms is not None

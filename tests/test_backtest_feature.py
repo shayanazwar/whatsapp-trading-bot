@@ -289,3 +289,18 @@ def test_simulator_records_value_zone_distance_at_signal_and_actual_fill():
     assert trade is not None and trade.outcome == "TP"
     assert trade.quality["value_zone_distance_atr"] == pytest.approx(1.0)
     assert trade.quality["actual_value_zone_distance_atr"] == pytest.approx(2.0)
+
+
+def test_report_states_value_zone_proximity_filter_is_independently_enabled():
+    summary = summarize(
+        days=7, period_start_ms=0, period_end_ms=7 * 86_400_000,
+        coins_selected=0, coins_tested=0, data_errors=0, execution_errors=0,
+        rejected_setups=0, trades=[],
+        diagnostics={
+            "V11_ACCURACY_MODE": 0,
+            "V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR_X100": 150,
+        },
+    )
+    report = format_report(summary)
+    assert "Accuracy filters: OFF" in report
+    assert "VALUE_ZONE_PROXIMITY_FILTER=ON (max distance<=1.50x ATR(1H))" in report

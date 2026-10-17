@@ -217,11 +217,13 @@ def test_accuracy_experiment_defaults_off_and_config_is_validated(monkeypatch):
     monkeypatch.delenv("V11_ACCURACY_MAX_RECLAIM_BARS", raising=False)
     monkeypatch.delenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", raising=False)
     monkeypatch.delenv("V11_ACCURACY_MAX_RETEST_DEPTH", raising=False)
+    monkeypatch.delenv("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR", raising=False)
     cfg = engine.v11_accuracy_config()
     assert cfg["enabled"] is False
     assert cfg["max_reclaim_bars"] == 3
     assert cfg["max_entry_extension_atr"] == 0.75
     assert cfg["max_retest_depth"] == 0.70
+    assert cfg["max_value_zone_distance_atr"] == 0.0
     monkeypatch.setenv("V11_ACCURACY_MODE", "true")
     assert engine.v11_accuracy_config()["enabled"] is True
     monkeypatch.setenv("V11_ACCURACY_MAX_RECLAIM_BARS", "99")
@@ -355,3 +357,38 @@ def test_signal_reports_value_zone_distance_separately_from_sweep_extension(monk
     # The two fields measure different reference points and must remain separate.
     assert "entry_extension_atr" in result
     assert result["entry_extension_atr"] >= 0.0
+
+
+def test_value_zone_distance_filter_is_opt_in_and_rejects_overextended_entry(monkeypatch):
+    # Without a positive distance cap, the baseline candidate remains valid.
+    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
+    monkeypatch.setenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", "0.75")
+    monkeypatch.setenv("V11_ACCURACY_MAX_RETEST_DEPTH", "0.70")
+    monkeypatch.setenv("V11_ACCURACY_MIN_TRIGGER_RVOL", "0.0")
+    monkeypatch.setenv("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR", "0.0")
+    daily, c4, c1, now = _build_fixture()
+    baseline = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert baseline["technical_candidate"] is True
+
+    # Move only the completed reclaim close well outside the value zone while
+    # maintaining a valid bullish completed candle. The proximity cap should
+    # reject this candidate before subsequent target geometry is considered.
+    c1[-1] = {
+        **c1[-1], "open": 160.8, "high": 161.2, "low": 160.6, "close": 161.0,
+    }
+    monkeypatch.setenv("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR", "0.25")
+    experimental = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert experimental["technical_candidate"] is False
+    diagnostics = [str(item.get("primary_failure") or "") for item in (experimental.get("side_diagnostics") or [])]
+    diagnostics.append(str(experimental.get("diagnostic_reason") or ""))
+    assert any("value-zone distance" in reason and "optional proximity cap" in reason for reason in diagnostics)
+
+
+def test_value_zone_distance_filter_config_rejects_invalid_values(monkeypatch):
+    monkeypatch.setenv("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR", "-0.1")
+    try:
+        engine.v11_accuracy_config()
+    except ValueError as exc:
+        assert "MAX_VALUE_ZONE_DISTANCE_ATR" in str(exc)
+    else:
+        raise AssertionError("negative value-zone distance cap must fail validation")

@@ -473,6 +473,9 @@ V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT = 0.70
 # Optional RVOL experiment. Zero disables this additional filter even when
 # ACCURACY_MODE is enabled; only promote a nonzero threshold after out-of-sample validation.
 V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT = 0.0
+# Experimental proximity gate based on the latest TP/SL diagnostics. Disabled
+# by default because the observed sample is small and not out-of-sample validated.
+V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR_DEFAULT = 0.0
 # Explicitly declare the stop geometry used below so the runner imports the
 # same module successfully and reports the active mode truthfully.
 V11_SL_MODE = "LIQUIDITY_SWEEP"
@@ -497,6 +500,7 @@ def v11_accuracy_config() -> dict[str, Any]:
         max_extension_atr = float(os.getenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", str(V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT)))
         max_retest_depth = float(os.getenv("V11_ACCURACY_MAX_RETEST_DEPTH", str(V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT)))
         min_trigger_rvol = float(os.getenv("V11_ACCURACY_MIN_TRIGGER_RVOL", str(V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT)))
+        max_value_zone_distance_atr = float(os.getenv("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR", str(V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR_DEFAULT)))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Invalid V11 accuracy experiment configuration") from exc
     if not 1 <= max_reclaim_bars <= V11_MAX_TRIGGER_BARS:
@@ -507,12 +511,15 @@ def v11_accuracy_config() -> dict[str, Any]:
         raise ValueError("V11_ACCURACY_MAX_RETEST_DEPTH must be in (0, 1.0]")
     if not math.isfinite(min_trigger_rvol) or not 0.0 <= min_trigger_rvol <= 10.0:
         raise ValueError("V11_ACCURACY_MIN_TRIGGER_RVOL must be in [0, 10.0]; zero disables the extra filter")
+    if not math.isfinite(max_value_zone_distance_atr) or not 0.0 <= max_value_zone_distance_atr <= 10.0:
+        raise ValueError("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR must be in [0, 10.0]; zero disables the extra filter")
     return {
         "enabled": _env_bool("V11_ACCURACY_MODE", V11_ACCURACY_MODE_DEFAULT),
         "max_reclaim_bars": max_reclaim_bars,
         "max_entry_extension_atr": max_extension_atr,
         "max_retest_depth": max_retest_depth,
         "min_trigger_rvol": min_trigger_rvol,
+        "max_value_zone_distance_atr": max_value_zone_distance_atr,
     }
 
 
@@ -1127,6 +1134,16 @@ def _v11_analyze_side(
             if retest_depth_ratio > float(accuracy_cfg["max_retest_depth"]):
                 last_reason = f"{side}: retest depth {retest_depth_ratio:.1%} exceeds accuracy-mode cap {float(accuracy_cfg['max_retest_depth']):.1%}"
                 continue
+        # This proximity experiment is independently opt-in so it can be
+        # tested against the baseline without also activating the unrelated
+        # reclaim-age, extension and retest filters. A value of 0.0 disables it.
+        max_zone_distance = float(accuracy_cfg.get("max_value_zone_distance_atr", 0.0))
+        if max_zone_distance > 0.0 and value_zone_distance_atr > max_zone_distance:
+            last_reason = (
+                f"{side}: value-zone distance {value_zone_distance_atr:.2f} ATR(1H) "
+                f"exceeds optional proximity cap {max_zone_distance:.2f} ATR(1H)"
+            )
+            continue
         sweep_low = min(float(c["low"]) for c in c1[sweep_idx:trigger_idx + 1])
         sweep_high = max(float(c["high"]) for c in c1[int(trigger["sweep_idx"]):trigger_idx + 1])
         buffer = max(V11_STOP_BUFFER_ATR_4H * atr4, V11_STOP_BUFFER_ATR_1H * atr1)
@@ -1361,6 +1378,7 @@ def _v11_empty(
             "accuracy_max_entry_extension_atr": float(v11_accuracy_config()["max_entry_extension_atr"]),
             "accuracy_max_retest_depth": float(v11_accuracy_config()["max_retest_depth"]),
             "accuracy_min_trigger_rvol": float(v11_accuracy_config()["min_trigger_rvol"]),
+            "accuracy_max_value_zone_distance_atr": float(v11_accuracy_config()["max_value_zone_distance_atr"]),
             "approved_timeframes": list(APPROVED_TIMEFRAMES),
         },
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
@@ -1523,6 +1541,7 @@ def analyze_candles(
             "accuracy_max_entry_extension_atr": float(v11_accuracy_config()["max_entry_extension_atr"]),
             "accuracy_max_retest_depth": float(v11_accuracy_config()["max_retest_depth"]),
             "accuracy_min_trigger_rvol": float(v11_accuracy_config()["min_trigger_rvol"]),
+            "accuracy_max_value_zone_distance_atr": float(v11_accuracy_config()["max_value_zone_distance_atr"]),
             "approved_timeframes": list(APPROVED_TIMEFRAMES),
         },
         "side_diagnostics": side_diagnostics,
@@ -1549,6 +1568,10 @@ def analyze_candles(
             and (
                 float(chosen.get("accuracy_config", {}).get("min_trigger_rvol", V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT)) <= 0.0
                 or float(chosen.get("reclaim_rvol", 0.0)) >= float(chosen.get("accuracy_config", {}).get("min_trigger_rvol", V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT))
+            )
+            and (
+                float(chosen.get("accuracy_config", {}).get("max_value_zone_distance_atr", 0.0)) <= 0.0
+                or float(chosen.get("value_zone_distance_atr", 0.0)) <= float(chosen.get("accuracy_config", {}).get("max_value_zone_distance_atr", 0.0))
             )
         ),
         "structure_quality_ok": True, "trade_geometry_ok": geometry_ok,

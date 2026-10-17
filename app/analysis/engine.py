@@ -761,7 +761,14 @@ def _v11_value_touched(candles_1h: list[Candle], start_time: int, zone: dict[str
     return False, None, None, None
 
 
-def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max_bars: int = V11_MAX_TRIGGER_BARS) -> dict[str, Any]:
+def _v11_liquidity_trigger(
+    candles: list[Candle],
+    start_idx: int,
+    side: str,
+    max_bars: int = V11_MAX_TRIGGER_BARS,
+    *,
+    current_only: bool = False,
+) -> dict[str, Any]:
     """Find a causal sweep and its later reclaim, with the bar limit measured
     from the sweep candle (not from the earlier value-zone touch).
 
@@ -787,9 +794,13 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
     best_current: dict[str, Any] | None = None
     best_historical: dict[str, Any] | None = None
     final_idx = len(candles) - 1
-    # Sweep can happen any time after the first value-zone touch. Each individual
-    # sweep is valid only if a later reclaim occurs within `window` completed bars.
-    for i in range(start_idx, final_idx):
+    # The ordinary helper preserves historical-trigger discovery for callers
+    # and tests. The production analyzer only accepts a reclaim on the current
+    # completed 1H candle, so its current_only path need only inspect sweeps
+    # from the last `window` bars. This is an exact narrowing of the search
+    # domain for that caller; the signal rule and trigger scoring are unchanged.
+    sweep_start = max(start_idx, final_idx - window) if current_only else start_idx
+    for i in range(sweep_start, final_idx):
         prior = candles[max(0, i - 3):i]
         if len(prior) < 3:
             continue
@@ -804,7 +815,10 @@ def _v11_liquidity_trigger(candles: list[Candle], start_idx: int, side: str, max
             continue
 
         last_reclaim_idx = min(final_idx, i + window)
-        for j in range(i + 1, last_reclaim_idx + 1):
+        reclaim_indices = (final_idx,) if current_only else range(i + 1, last_reclaim_idx + 1)
+        if current_only and final_idx > last_reclaim_idx:
+            continue
+        for j in reclaim_indices:
             reclaim = candles[j]
             ropen, rhigh, rlow, rclose = map(float, (reclaim["open"], reclaim["high"], reclaim["low"], reclaim["close"]))
             candle_range = max(rhigh - rlow, 1e-12)
@@ -1071,16 +1085,28 @@ def _v11_analyze_side(
         trigger = None
         value_touch_idx: int | None = None
         touched_value = False
+        # Only the earliest post-impulse value touch is needed: a later touch
+        # cannot make a sweep that occurred before it eligible again, while any
+        # valid current-candle sweep/reclaim after a later touch is also after
+        # this earliest touch. The previous loop repeated the sweep search for
+        # every touch, multiplying work in long 1H histories.
         for touch_idx, touch_candle in enumerate(c1):
             if int(touch_candle["time"]) <= start_time:
                 continue
             if float(touch_candle["low"]) <= zhigh and float(touch_candle["high"]) >= zlow:
                 touched_value = True
-                candidate_trigger = _v11_liquidity_trigger(c1, touch_idx, side, max_bars=(accuracy_cfg["max_reclaim_bars"] if accuracy_cfg["enabled"] else V11_MAX_TRIGGER_BARS))
-                if candidate_trigger.get("ready") and int(candidate_trigger.get("reclaim_idx", -1)) == len(c1) - 1:
-                    trigger = candidate_trigger
-                    value_touch_idx = touch_idx
-                    break
+                value_touch_idx = touch_idx
+                break
+        if value_touch_idx is not None:
+            candidate_trigger = _v11_liquidity_trigger(
+                c1,
+                value_touch_idx,
+                side,
+                max_bars=(accuracy_cfg["max_reclaim_bars"] if accuracy_cfg["enabled"] else V11_MAX_TRIGGER_BARS),
+                current_only=True,
+            )
+            if candidate_trigger.get("ready") and int(candidate_trigger.get("reclaim_idx", -1)) == len(c1) - 1:
+                trigger = candidate_trigger
         if not trigger:
             last_reason = f"{side}: value zone touched={touched_value}, but no 1H sweep -> later reclaim completed on current candle"
             continue
@@ -1260,6 +1286,70 @@ def _v11_analyze_side(
         "rejection_stage": "SETUP",
     }
 
+
+def _v11_diagnostic_value_zone(
+    c4: list[Candle],
+    cache: Optional[dict[str, Any]] = None,
+) -> dict[str, Any] | None:
+    """Find the freshest still-valid 4H value zone for no-signal diagnostics.
+
+    This is informational only: it never changes candidate eligibility. The
+    result and its pure 4H inputs are memoized for the runner's unchanged
+    completed-candle prefixes, avoiding a full duplicate structure/impulse scan
+    on each of the four 1H decisions between successive 4H candle closes.
+    """
+    if not c4:
+        return None
+
+    def build_zone() -> dict[str, Any] | None:
+        closes_4h = _memoized_frame_value(
+            cache, "_v11_closes_4h", c4,
+            lambda: [float(c["close"]) for c in c4],
+        )
+        e21_4h, e50_4h = _memoized_frame_value(
+            cache, "_v11_ema21_50_4h", c4,
+            lambda: (_safe_ema(closes_4h, 21), _safe_ema(closes_4h, 50)),
+        )
+        possible_zones: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
+        for candidate_side in ("LONG", "SHORT"):
+            try:
+                impulses = _memoized_frame_value(
+                    cache, f"_v11_impulses_{candidate_side.lower()}", c4,
+                    lambda side=candidate_side: _v11_find_impulses(c4, side),
+                )
+            except (ValueError, TypeError, IndexError):
+                impulses = []
+            for impulse in reversed(impulses):
+                endpoint_idx = int(impulse["high_idx"] if candidate_side == "LONG" else impulse["low_idx"])
+                age = len(c4) - 1 - endpoint_idx
+                if age < 0 or age > V11_SETUP_MAX_4H_BARS:
+                    continue
+                invalidated = (
+                    any(float(c["close"]) < float(impulse["low"]) for c in c4[endpoint_idx + 1:])
+                    if candidate_side == "LONG"
+                    else any(float(c["close"]) > float(impulse["high"]) for c in c4[endpoint_idx + 1:])
+                )
+                if invalidated:
+                    continue
+                zone = _v11_value_zone(impulse, e21_4h, e50_4h)
+                if zone.get("ok"):
+                    possible_zones.append((endpoint_idx, age, candidate_side, impulse, zone))
+                    break
+        if not possible_zones:
+            return None
+        _, zone_age, zone_side, zone_impulse, zone = max(possible_zones, key=lambda item: item[0])
+        return {
+            "side": zone_side,
+            "low": float(zone["low"]),
+            "high": float(zone["high"]),
+            "impulse_age_4h_bars": int(zone_age),
+            "impulse_high_time": zone_impulse.get("high_time"),
+            "impulse_low_time": zone_impulse.get("low_time"),
+        }
+
+    return _memoized_frame_value(cache, "_v11_diagnostic_zone_4h", c4, build_zone)
+
+
 def _v11_empty(
     symbol: str,
     c1d: list[Candle],
@@ -1288,14 +1378,37 @@ def _v11_empty(
     # this branch omitted 12H/4H/indicator fields, so WhatsApp rendered N/A despite
     # valid candles and a computed daily regime. This is diagnostic enrichment only;
     # it does not alter setup eligibility or emit a trade signal.
-    closes_1d = [float(c["close"]) for c in c1d]
-    closes_12h = [float(c["close"]) for c in c12]
-    closes_4h = [float(c["close"]) for c in c4]
-    closes_1h = [float(c["close"]) for c in c1]
-    structure_12h = _v11_structure(c12) if c12 else "UNKNOWN"
-    structure_4h = _v11_structure(c4) if c4 else "UNKNOWN"
-    e50_12h = _safe_ema(closes_12h, 50)
-    slope_12h = _ema_slope(closes_12h, 50, lookback=5)
+    # Rejected calls are the dominant path in this engine. Cache pure values
+    # computed from unchanged HTF prefixes; the cache is explicitly enabled only
+    # by BacktestRunner for immutable, completed Candle lists.
+    closes_1d = _memoized_frame_value(
+        cache, "_v11_closes_1d", c1d, lambda: [float(c["close"]) for c in c1d]
+    )
+    closes_12h = _memoized_frame_value(
+        cache, "_v11_closes_12h", c12, lambda: [float(c["close"]) for c in c12]
+    )
+    closes_4h = _memoized_frame_value(
+        cache, "_v11_closes_4h", c4, lambda: [float(c["close"]) for c in c4]
+    )
+    closes_1h = _memoized_frame_value(
+        cache, "_v11_closes_1h", c1, lambda: [float(c["close"]) for c in c1]
+    )
+    structure_12h = _memoized_frame_value(
+        cache, "_v11_structure_12h_diag", c12,
+        lambda: _v11_structure(c12) if c12 else "UNKNOWN",
+    )
+    structure_4h = _memoized_frame_value(
+        cache, "_v11_structure_4h_diag", c4,
+        lambda: _v11_structure(c4) if c4 else "UNKNOWN",
+    )
+    e21_12h, e50_12h = _memoized_frame_value(
+        cache, "_v11_ema21_50_12h", c12,
+        lambda: (_safe_ema(closes_12h, 21), _safe_ema(closes_12h, 50)),
+    )
+    slope_12h = _memoized_frame_value(
+        cache, "_v11_ema50_slope_12h_diag", c12,
+        lambda: _ema_slope(closes_12h, 50, lookback=5),
+    )
     price_12h = closes_12h[-1] if closes_12h else None
     if structure_12h == "HH/HL":
         bias_12h = "BULLISH (HH/HL)"
@@ -1307,46 +1420,24 @@ def _v11_empty(
         bias_12h = "BEARISH BIAS (range structure)"
     else:
         bias_12h = "RANGE / NEUTRAL"
-    context_long = _v11_context_12h(c12, "LONG") if c12 else {"status": "UNAVAILABLE", "hostile": False}
-    context_short = _v11_context_12h(c12, "SHORT") if c12 else {"status": "UNAVAILABLE", "hostile": False}
+    context_long = _memoized_frame_value(
+        cache, "_v11_context_12h_long", c12,
+        lambda: _v11_context_12h(c12, "LONG") if c12 else {"status": "UNAVAILABLE", "hostile": False},
+    )
+    context_short = _memoized_frame_value(
+        cache, "_v11_context_12h_short", c12,
+        lambda: _v11_context_12h(c12, "SHORT") if c12 else {"status": "UNAVAILABLE", "hostile": False},
+    )
 
-    # Show the latest still-valid 4H value zone even when no 1H trigger qualifies.
-    # This is context for manual diagnosis only and does not turn a no-trade state
-    # into a candidate. Keep the freshest available impulse across both sides.
-    diagnostic_zone: dict[str, Any] | None = None
-    if c4:
-        e21_4h = _safe_ema(closes_4h, 21)
-        e50_4h = _safe_ema(closes_4h, 50)
-        possible_zones: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
-        for candidate_side in ("LONG", "SHORT"):
-            try:
-                impulses = _v11_find_impulses(c4, candidate_side)
-            except (ValueError, TypeError, IndexError):
-                impulses = []
-            for impulse in reversed(impulses):
-                endpoint_idx = int(impulse["high_idx"] if candidate_side == "LONG" else impulse["low_idx"])
-                age = len(c4) - 1 - endpoint_idx
-                if age < 0 or age > V11_SETUP_MAX_4H_BARS:
-                    continue
-                invalidated = (
-                    any(float(c["close"]) < float(impulse["low"]) for c in c4[endpoint_idx + 1:])
-                    if candidate_side == "LONG"
-                    else any(float(c["close"]) > float(impulse["high"]) for c in c4[endpoint_idx + 1:])
-                )
-                if invalidated:
-                    continue
-                zone = _v11_value_zone(impulse, e21_4h, e50_4h)
-                if zone.get("ok"):
-                    possible_zones.append((endpoint_idx, age, candidate_side, impulse, zone))
-                    break
-        if possible_zones:
-            _, zone_age, zone_side, zone_impulse, zone = max(possible_zones, key=lambda item: item[0])
-            diagnostic_zone = {
-                "side": zone_side, "low": float(zone["low"]), "high": float(zone["high"]),
-                "impulse_age_4h_bars": int(zone_age),
-                "impulse_high_time": zone_impulse.get("high_time"),
-                "impulse_low_time": zone_impulse.get("low_time"),
-            }
+    # Context only; cached by the unchanged completed 4H prefix. Does not affect
+    # candidate eligibility or the selected trading setup.
+    diagnostic_zone = _v11_diagnostic_value_zone(c4, cache)
+    e21_4h, e50_4h = _memoized_frame_value(
+        cache, "_v11_ema21_50_4h", c4,
+        lambda: (_safe_ema(closes_4h, 21), _safe_ema(closes_4h, 50)),
+    )
+    rsi_1h = _memoized_frame_value(cache, "_v11_rsi_1h", c1, lambda: _safe_rsi(closes_1h))
+    rvol_1h = _memoized_frame_value(cache, "_v11_rvol_1h", c1, lambda: _relative_volume(c1, 20))
     return {
         "symbol": symbol.upper(), "price": price, "setup": "NONE", "setup_candidate": "NONE",
         "regime_1d": daily.get("regime"), "daily_structure_1d": daily.get("structure"),
@@ -1355,11 +1446,11 @@ def _v11_empty(
         "context_12h_long": context_long.get("status", "UNAVAILABLE"),
         "context_12h_short": context_short.get("status", "UNAVAILABLE"),
         "ema21_1d": daily.get("e21"), "ema50_1d": daily.get("e50"), "ema200_1d": daily.get("e200"),
-        "ema21_12h": _safe_ema(closes_12h, 21), "ema50_12h": e50_12h,
-        "ema21_4h": _safe_ema(closes_4h, 21), "ema50_4h": _safe_ema(closes_4h, 50),
+        "ema21_12h": e21_12h, "ema50_12h": e50_12h,
+        "ema21_4h": e21_4h, "ema50_4h": e50_4h,
         "ema21_1h": _safe_ema(closes_1h, 21), "ema50_1h": _safe_ema(closes_1h, 50),
-        "rsi": _safe_rsi(closes_1h), "rsi_1h_entry": _safe_rsi(closes_1h),
-        "volume": volume_status(c1), "rvol_1h": _relative_volume(c1, 20),
+        "rsi": rsi_1h, "rsi_1h_entry": rsi_1h,
+        "volume": volume_status(c1), "rvol_1h": rvol_1h,
         "trigger_type": "NONE (no qualified current 1H trigger)", "swept_level_1h": None,
         "value_zone_low": diagnostic_zone.get("low") if diagnostic_zone else None,
         "value_zone_high": diagnostic_zone.get("high") if diagnostic_zone else None,
@@ -1453,7 +1544,13 @@ def analyze_candles(
     else:
         c12 = synthesize_12h_from_4h(c4, now_ms=now)
     for c, tf, minimum in ((c1d, "1d", 210), (c12, "12h", 60), (c4, "4h", 180), (c1, "1h", 180)):
-        ok, reason = _data_quality(c, tf, minimum)
+        if preclosed:
+            ok, reason = _memoized_frame_value(
+                cache, f"_v11_data_quality_{tf}", c,
+                lambda c=c, tf=tf, minimum=minimum: _data_quality(c, tf, minimum),
+            )
+        else:
+            ok, reason = _data_quality(c, tf, minimum)
         if not ok:
             raise ValueError(f"{symbol}: {reason}")
     daily = _memoized_frame_value(

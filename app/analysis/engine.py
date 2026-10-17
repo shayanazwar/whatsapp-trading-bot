@@ -470,6 +470,9 @@ V11_ACCURACY_MODE_DEFAULT = False
 V11_ACCURACY_MAX_RECLAIM_BARS_DEFAULT = 3
 V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT = 0.75
 V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT = 0.70
+# Optional RVOL experiment. Zero disables this additional filter even when
+# ACCURACY_MODE is enabled; only promote a nonzero threshold after out-of-sample validation.
+V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT = 0.0
 # Explicitly declare the stop geometry used below so the runner imports the
 # same module successfully and reports the active mode truthfully.
 V11_SL_MODE = "LIQUIDITY_SWEEP"
@@ -493,6 +496,7 @@ def v11_accuracy_config() -> dict[str, Any]:
         max_reclaim_bars = int(os.getenv("V11_ACCURACY_MAX_RECLAIM_BARS", str(V11_ACCURACY_MAX_RECLAIM_BARS_DEFAULT)))
         max_extension_atr = float(os.getenv("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR", str(V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT)))
         max_retest_depth = float(os.getenv("V11_ACCURACY_MAX_RETEST_DEPTH", str(V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT)))
+        min_trigger_rvol = float(os.getenv("V11_ACCURACY_MIN_TRIGGER_RVOL", str(V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT)))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Invalid V11 accuracy experiment configuration") from exc
     if not 1 <= max_reclaim_bars <= V11_MAX_TRIGGER_BARS:
@@ -501,11 +505,14 @@ def v11_accuracy_config() -> dict[str, Any]:
         raise ValueError("V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR must be in (0, 5.0]")
     if not math.isfinite(max_retest_depth) or not 0.0 < max_retest_depth <= 1.0:
         raise ValueError("V11_ACCURACY_MAX_RETEST_DEPTH must be in (0, 1.0]")
+    if not math.isfinite(min_trigger_rvol) or not 0.0 <= min_trigger_rvol <= 10.0:
+        raise ValueError("V11_ACCURACY_MIN_TRIGGER_RVOL must be in [0, 10.0]; zero disables the extra filter")
     return {
         "enabled": _env_bool("V11_ACCURACY_MODE", V11_ACCURACY_MODE_DEFAULT),
         "max_reclaim_bars": max_reclaim_bars,
         "max_entry_extension_atr": max_extension_atr,
         "max_retest_depth": max_retest_depth,
+        "min_trigger_rvol": min_trigger_rvol,
     }
 
 
@@ -1071,6 +1078,14 @@ def _v11_analyze_side(
             last_reason = f"{side}: value zone touched={touched_value}, but no 1H sweep -> later reclaim completed on current candle"
             continue
 
+        min_trigger_rvol = float(accuracy_cfg.get("min_trigger_rvol", V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT))
+        if accuracy_cfg["enabled"] and min_trigger_rvol > 0.0 and float(trigger.get("rvol", 0.0)) < min_trigger_rvol:
+            last_reason = (
+                f"{side}: reclaim RVOL {float(trigger.get('rvol', 0.0)):.2f} "
+                f"below optional accuracy-experiment minimum {min_trigger_rvol:.2f}"
+            )
+            continue
+
         trigger_idx = int(trigger["reclaim_idx"])
         entry = float(c1[-1]["close"])
         atr4 = max(
@@ -1087,6 +1102,14 @@ def _v11_analyze_side(
             else max(0.0, swept_level - entry) / atr1 if side == "SHORT" and atr1 > 0
             else 0.0
         )
+        # Keep distance from swept liquidity (the existing no-chase metric)
+        # distinct from distance to the value zone. They are not interchangeable.
+        if atr1 > 0:
+            value_zone_distance_atr = (
+                max(0.0, zlow - entry, entry - zhigh) / atr1
+            )
+        else:
+            value_zone_distance_atr = 0.0
         pullback_candles = [c for c in c1 if start_time < int(c["time"]) <= int(c1[sweep_idx]["time"])]
         impulse_leg = max(float(impulse.get("leg", 0.0)), 1e-12)
         if pullback_candles:
@@ -1197,6 +1220,7 @@ def _v11_analyze_side(
             "reclaim_bars_after_sweep": reclaim_bars,
             "reclaim_age_1h_bars": max(0, len(c1) - 1 - trigger_idx),
             "entry_extension_atr": entry_extension_atr,
+            "value_zone_distance_atr": value_zone_distance_atr,
             "reclaim_body_ratio": float(trigger.get("body_ratio", 0.0)),
             "reclaim_close_location": float(trigger.get("close_location", 0.0)),
             "reclaim_rvol": float(trigger.get("rvol", 0.0)),
@@ -1336,6 +1360,7 @@ def _v11_empty(
             "accuracy_max_reclaim_bars": int(v11_accuracy_config()["max_reclaim_bars"]),
             "accuracy_max_entry_extension_atr": float(v11_accuracy_config()["max_entry_extension_atr"]),
             "accuracy_max_retest_depth": float(v11_accuracy_config()["max_retest_depth"]),
+            "accuracy_min_trigger_rvol": float(v11_accuracy_config()["min_trigger_rvol"]),
             "approved_timeframes": list(APPROVED_TIMEFRAMES),
         },
         "primary_entry_timeframe": "1H", "setup_timeframe": "4H", "signal_candle_timeframe": "1H",
@@ -1497,6 +1522,7 @@ def analyze_candles(
             "accuracy_max_reclaim_bars": int(v11_accuracy_config()["max_reclaim_bars"]),
             "accuracy_max_entry_extension_atr": float(v11_accuracy_config()["max_entry_extension_atr"]),
             "accuracy_max_retest_depth": float(v11_accuracy_config()["max_retest_depth"]),
+            "accuracy_min_trigger_rvol": float(v11_accuracy_config()["min_trigger_rvol"]),
             "approved_timeframes": list(APPROVED_TIMEFRAMES),
         },
         "side_diagnostics": side_diagnostics,
@@ -1512,6 +1538,7 @@ def analyze_candles(
         "reclaim_bars_after_sweep": int(chosen.get("reclaim_bars_after_sweep", 0)),
         "reclaim_age_1h_bars": int(chosen.get("reclaim_age_1h_bars", 0)),
         "entry_extension_atr": float(chosen.get("entry_extension_atr", 0.0)),
+        "value_zone_distance_atr": float(chosen.get("value_zone_distance_atr", 0.0)),
         "retest_depth_ratio": float(chosen.get("retest_depth_ratio", 0.0)),
         "impulse_age_4h_bars": int(chosen.get("impulse_age_4h_bars", 0)),
         "accuracy_mode": bool(chosen.get("accuracy_config", {}).get("enabled", False)),
@@ -1519,6 +1546,10 @@ def analyze_candles(
             int(chosen.get("reclaim_bars_after_sweep", 0)) <= int(chosen.get("accuracy_config", {}).get("max_reclaim_bars", V11_ACCURACY_MAX_RECLAIM_BARS_DEFAULT))
             and float(chosen.get("entry_extension_atr", 0.0)) <= float(chosen.get("accuracy_config", {}).get("max_entry_extension_atr", V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_DEFAULT))
             and float(chosen.get("retest_depth_ratio", 0.0)) <= float(chosen.get("accuracy_config", {}).get("max_retest_depth", V11_ACCURACY_MAX_RETEST_DEPTH_DEFAULT))
+            and (
+                float(chosen.get("accuracy_config", {}).get("min_trigger_rvol", V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT)) <= 0.0
+                or float(chosen.get("reclaim_rvol", 0.0)) >= float(chosen.get("accuracy_config", {}).get("min_trigger_rvol", V11_ACCURACY_MIN_TRIGGER_RVOL_DEFAULT))
+            )
         ),
         "structure_quality_ok": True, "trade_geometry_ok": geometry_ok,
         "momentum_quality": _clamp(float(trigger.get("body_ratio", 0.0)), 0.0, 1.0),

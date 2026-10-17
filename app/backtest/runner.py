@@ -1472,6 +1472,7 @@ class BacktestRunner:
                 diagnostics["V11_ACCURACY_MAX_ENTRY_EXTENSION_ATR_X100"] = int(round(float(accuracy_cfg["max_entry_extension_atr"]) * 100))
                 diagnostics["V11_ACCURACY_MAX_RETEST_DEPTH_X100"] = int(round(float(accuracy_cfg["max_retest_depth"]) * 100))
                 diagnostics["V11_ACCURACY_MIN_TRIGGER_RVOL_X100"] = int(round(float(accuracy_cfg.get("min_trigger_rvol", 0.0)) * 100))
+                diagnostics["V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR_X100"] = int(round(float(accuracy_cfg.get("max_value_zone_distance_atr", 0.0)) * 100))
                 diagnostics["FIXED_BACKTEST_PERIOD_ENABLED"] = int(
                     bool(
                         start_ms is not None

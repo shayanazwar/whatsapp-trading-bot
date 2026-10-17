@@ -246,8 +246,8 @@ def format_report(summary: BacktestSummary) -> str:
         ("reclaim_rvol", "reclaim_RVOL"),
         ("entry_extension_atr", "signal_extension_ATR"),
         ("actual_entry_extension_atr", "actual_fill_extension_ATR"),
-        ("value_zone_distance_atr", "signal_value_zone_distance_ATR"),
-        ("actual_value_zone_distance_atr", "actual_fill_value_zone_distance_ATR"),
+        ("value_zone_distance_atr", "signal_value_zone_distance_ATR1H"),
+        ("actual_value_zone_distance_atr", "actual_fill_value_zone_distance_ATR1H"),
         ("retest_depth_ratio", "retest_depth"),
         ("impulse_age_4h_bars", "impulse_age_4H_bars"),
         ("reclaim_bars_after_sweep", "sweep_to_reclaim_bars"),
@@ -296,6 +296,11 @@ def format_report(summary: BacktestSummary) -> str:
             active_experiments.append(f"ACCURACY_MODE=ON (reclaim<={max_reclaim}B, extension<={max_extension:.2f}ATR, retest<={max_depth:.0%}{rvol_text})")
         else:
             lines.insert(4, "🧪 Accuracy filters: OFF (diagnostics only; strategy baseline preserved)")
+        max_zone_distance = int(summary.diagnostics.get("V11_ACCURACY_MAX_VALUE_ZONE_DISTANCE_ATR_X100", 0)) / 100.0
+        if max_zone_distance > 0:
+            active_experiments.append(f"VALUE_ZONE_PROXIMITY_FILTER=ON (max distance<={max_zone_distance:.2f}x ATR(1H))")
+        else:
+            active_experiments.append("VALUE_ZONE_PROXIMITY_FILTER=OFF")
         if active_experiments:
             lines.insert(4, "🧪 V11 Experiment Config: " + " | ".join(active_experiments))
         lines.extend(("", "GATE DIAGNOSTICS"))

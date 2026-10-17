@@ -147,6 +147,7 @@ def test_200_symbol_backtest_does_not_inflate_config_diagnostics():
     report = format_report(summary)
     assert "500.00ATR" not in report
     assert "1200B" not in report
+    assert summary.diagnostics["V11_ACCURACY_MIN_TRIGGER_RVOL_X100"] == 0
 
 
 def test_configured_backtest_symbols_override_dynamic_universe():

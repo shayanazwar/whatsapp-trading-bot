@@ -191,6 +191,9 @@ def test_side_tp_sl_breakdown_excludes_open_and_expired_trades():
     assert summary.tp_hits == summary.sl_hits == 0
     assert summary.long_tp_hits == summary.short_tp_hits == 0
     assert summary.long_sl_hits == summary.short_sl_hits == 0
+    # Incomplete OPEN trade excursions are not mixed into resolved-trade MAE/MFE.
+    assert summary.avg_mae_r == pytest.approx(float(expired_trade.mae_r or 0.0))
+    assert summary.avg_mfe_r == pytest.approx(float(expired_trade.mfe_r or 0.0))
     assert "LONG TPs: 0" in format_report(summary)
     assert "SHORT Trade SLs: 0" in format_report(summary)
 
@@ -234,3 +237,55 @@ def test_simulator_records_actual_fill_extension_from_swept_liquidity():
                            signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0)
     assert trade is not None
     assert trade.quality["actual_entry_extension_atr"] == pytest.approx(1.5)
+
+
+def test_summary_drawdown_and_losing_streak_follow_realised_exit_order():
+    from app.backtest.simulator import SimulatedTrade
+
+    def trade(symbol, side, signal_ms, exit_ms, outcome, r_multiple):
+        return SimulatedTrade(
+            symbol=symbol, side=side, signal_time_ms=signal_ms,
+            entry=100.0, stop_loss=95.0 if side == "LONG" else 105.0,
+            tp1=110.0 if side == "LONG" else 90.0,
+            tp2=110.0 if side == "LONG" else 90.0,
+            planned_rr=2.0, signal_rr=2.0, actual_fill_rr=2.0,
+            tp1_hit=outcome == "TP", tp2_hit=outcome == "TP", sl_hit=outcome == "SL",
+            outcome=outcome, r_multiple=r_multiple, exit_time_ms=exit_ms,
+        )
+
+    # Signal-time order is -4R, +5R, -2R (4R drawdown); exit-time order is
+    # +5R, -2R, -4R (6R drawdown). Realised-equity metrics must use exit order.
+    a = trade("A_USDT", "LONG", 100, 300, "SL", -4.0)
+    b = trade("B_USDT", "LONG", 200, 100, "TP", 5.0)
+    c = trade("C_USDT", "SHORT", 300, 200, "SL", -2.0)
+    summary = summarize(
+        days=1, period_start_ms=0, period_end_ms=86_400_000,
+        coins_selected=3, coins_tested=3, data_errors=0, execution_errors=0,
+        rejected_setups=0, trades=[a, b, c],
+    )
+    assert summary.max_drawdown_r == pytest.approx(6.0)
+    assert summary.max_losing_streak == 2
+
+
+def test_backtest_runner_settings_preserve_explicit_zero_fees_and_slippage():
+    from app.backtest.runner import _nonnegative_setting_float
+    settings = Settings(backtest_fee_rate=0.0, backtest_slippage_bps=0.0)
+    assert _nonnegative_setting_float(settings, "backtest_fee_rate", 0.0006) == 0.0
+    assert _nonnegative_setting_float(settings, "backtest_slippage_bps", 2.0) == 0.0
+
+
+def test_simulator_records_value_zone_distance_at_signal_and_actual_fill():
+    signal = {
+        "symbol": "ZONE_USDT", "setup": "LONG", "entry": 100.0,
+        "stop_loss": 95.0, "tp": 110.0, "entry_mode": "MARKET",
+        "atr_1h": 1.0, "swept_level_1h": 99.0,
+        "value_zone_low": 98.0, "value_zone_high": 99.0,
+        "value_zone_distance_atr": 1.0,
+    }
+    trade = simulate_trade(
+        signal, [candle(3_600_000, 101.0, 111.0, 100.0, 109.0)],
+        signal_close_time_ms=0, fee_rate=0.0, slippage_bps=0.0,
+    )
+    assert trade is not None and trade.outcome == "TP"
+    assert trade.quality["value_zone_distance_atr"] == pytest.approx(1.0)
+    assert trade.quality["actual_value_zone_distance_atr"] == pytest.approx(2.0)

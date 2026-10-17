@@ -321,3 +321,37 @@ def test_minimum_impulse_setting_can_be_tuned_for_paper_experiments(monkeypatch)
             raise AssertionError("out-of-range impulse threshold must fail fast")
     finally:
         monkeypatch.setattr(engine, "V11_MIN_IMPULSE_ATR", baseline)
+
+
+def test_accuracy_rvol_filter_is_optional_and_validated(monkeypatch):
+    daily, c4, c1, now = _build_fixture()
+    monkeypatch.delenv("V11_ACCURACY_MIN_TRIGGER_RVOL", raising=False)
+    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
+    assert engine.v11_accuracy_config()["min_trigger_rvol"] == 0.0
+    baseline = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert baseline["technical_candidate"] is True
+
+    # This deliberately extreme value is an isolation test: only the explicit
+    # opt-in RVOL experiment should reject the otherwise-valid fixture.
+    monkeypatch.setenv("V11_ACCURACY_MODE", "true")
+    monkeypatch.setenv("V11_ACCURACY_MIN_TRIGGER_RVOL", "9.0")
+    experimental = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert experimental["technical_candidate"] is False
+    reported_reasons = [
+        str(item.get("primary_failure") or "")
+        for item in (experimental.get("side_diagnostics") or [])
+    ]
+    reported_reasons.append(str(experimental.get("diagnostic_reason") or ""))
+    assert any("below optional accuracy-experiment minimum" in reason for reason in reported_reasons)
+
+
+def test_signal_reports_value_zone_distance_separately_from_sweep_extension(monkeypatch):
+    monkeypatch.setenv("V11_ACCURACY_MODE", "false")
+    daily, c4, c1, now = _build_fixture()
+    result = analyze_candles("TEST_USDT", daily, None, c4, c1, now_ms=now)
+    assert result["technical_candidate"] is True
+    assert "value_zone_distance_atr" in result
+    assert result["value_zone_distance_atr"] >= 0.0
+    # The two fields measure different reference points and must remain separate.
+    assert "entry_extension_atr" in result
+    assert result["entry_extension_atr"] >= 0.0

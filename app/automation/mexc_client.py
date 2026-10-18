@@ -10,7 +10,7 @@ import time
 import threading
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -94,6 +94,30 @@ def _normalize_timestamp_ms(
     )
 
 
+def _normalize_futures_base_url(configured_base: str | None) -> str:
+    """Return the current MEXC Futures API base URL for known MEXC hosts.
+
+    MEXC announced that Futures API traffic must use ``api.mexc.com`` from
+    2026-01-19 onward. The old ``contract.mexc.com`` host is normalized here
+    so an outdated Render environment variable cannot override the migration.
+    Non-MEXC hosts are preserved to keep local mock/test endpoints usable.
+    """
+    raw = str(configured_base or "https://api.mexc.com").strip().rstrip("/")
+    if not raw:
+        return "https://api.mexc.com"
+
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        hostname = (urlsplit(candidate).hostname or "").lower()
+    except ValueError:
+        hostname = ""
+
+    if hostname in {"api.mexc.com", "contract.mexc.com"}:
+        return "https://api.mexc.com"
+
+    return raw
+
+
 class MexcClient:
     """
     Async client for the MEXC Futures REST API.
@@ -114,9 +138,11 @@ class MexcClient:
     ) -> None:
         self.settings = settings
 
-        configured_base = settings.mexc_api_base_url.rstrip("/")
-        # Futures endpoints live on contract.mexc.com; normalize a legacy spot/API base.
-        self.base_url = "https://contract.mexc.com" if configured_base.endswith("api.mexc.com") else configured_base
+        configured_base = getattr(settings, "mexc_api_base_url", None)
+        # MEXC migrated Futures API traffic from contract.mexc.com to api.mexc.com.
+        # Normalize both known hosts to the current HTTPS host; do not force the
+        # deprecated domain when the setting already points to api.mexc.com.
+        self.base_url = _normalize_futures_base_url(configured_base)
 
         self.http = httpx.AsyncClient(
             timeout=20

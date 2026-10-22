@@ -1,305 +1,169 @@
+"""FastAPI health API, optional scanner/Telegram commands, and Meta WhatsApp webhook endpoints."""
 from __future__ import annotations
-
-import asyncio
+import hashlib
 import hmac
 import json
 import logging
-from contextlib import asynccontextmanager, suppress
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from app.config import Settings
+from app.logging_config import configure_logging
+from app.persistence.store import SQLiteStore
 
-from .alerts import AlertEngine
-from .automation.executor import MexcExecutor
-from .automation.mexc_client import MexcClient
-from .automation.paper_trader import PaperTrader
-from .automation.scanner import MexcScanner
-from .automation.scheduler import ScannerScheduler
-from .automation.signal_manager import SignalManager
-from .automation.universe import MexcUniverse
-from .backtest.runner import BacktestRunner
-from .bot import Bot
-from .charts import ChartRenderer
-from .config import get_settings, validate_whatsapp_settings
-from .database import Database
-from .market import MarketData
-from .whatsapp import WhatsAppClient
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("whatsapp_bot")
-
-settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    await startup_event()
-    try:
-        yield
-    finally:
-        await shutdown_event()
+def create_app(settings: Settings | None = None, store: SQLiteStore | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    settings.validate()
+    settings.ensure_database_parent()
+    storage = store or SQLiteStore(settings.database_path)
 
+    market_data_lock = asyncio.Lock()
 
-app = FastAPI(title="Pak Trading Academy WhatsApp Trading Bot", lifespan=lifespan)
-
-db = Database(settings.database_path)
-whatsapp = WhatsAppClient(
-    access_token=settings.meta_access_token,
-    phone_number_id=settings.meta_phone_number_id,
-    graph_version=settings.meta_graph_version,
-    app_secret=settings.meta_app_secret,
-)
-charts = ChartRenderer(settings.chart_default_bars)
-mexc_client = MexcClient(settings)
-market = MarketData(settings, client=mexc_client)
-bot = Bot(settings=settings, db=db, market=market, whatsapp=whatsapp, charts=charts)
-
-alert_engine = AlertEngine(db=db, market=market, settings=settings, on_trigger=bot.send_triggered_alert)
-mexc_universe = MexcUniverse(mexc_client, max_symbols=settings.max_symbols, test_symbols=settings.test_symbol_list)
-signal_manager = SignalManager(db=db, whatsapp=whatsapp, recipients=settings.auto_signal_recipient_set, expiry_minutes=settings.signal_expiry_minutes)
-mexc_executor = MexcExecutor(mexc_client, settings)
-paper_trader = PaperTrader(db=db, client=mexc_client, settings=settings)
-bot.set_paper_trader(paper_trader)
-mexc_scanner = MexcScanner(
-    client=mexc_client,
-    settings=settings,
-    universe=mexc_universe,
-    signal_manager=signal_manager,
-    executor=mexc_executor,
-    paper_trader=paper_trader,
-)
-scanner_scheduler = ScannerScheduler(mexc_scanner, interval_seconds=settings.scan_interval_seconds)
-
-# Share the process-wide MEXC client with live scanning so public API
-# throttling, connection pooling, and response caches apply to both paths.
-backtest_mexc_client = mexc_client
-backtest_universe = MexcUniverse(backtest_mexc_client, max_symbols=settings.backtest_max_symbols, test_symbols=settings.test_symbol_list)
-backtest_runner = BacktestRunner(client=backtest_mexc_client, universe=backtest_universe, settings=settings, max_concurrency=settings.backtest_symbol_concurrency)
-bot.set_backtest_runner(backtest_runner)
-
-_background_tasks: set[asyncio.Task] = set()
-_processing_message_ids: set[str] = set()
-
-
-def _retain_task(task: asyncio.Task) -> None:
-    _background_tasks.add(task)
-    def done(completed: asyncio.Task) -> None:
-        _background_tasks.discard(completed)
-        if completed.cancelled():
-            return
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        configure_logging(settings.log_level)
+        logger.info(
+            "SHAYAN AI API starting; scanner_enabled=%s whatsapp_enabled=%s telegram_enabled=%s telegram_commands_enabled=%s",
+            settings.enable_scanner, settings.enable_whatsapp, settings.enable_telegram,
+            settings.enable_telegram and settings.enable_telegram_commands,
+        )
+        background_tasks: list[asyncio.Task] = []
+        if settings.enable_scanner:
+            from app.services.scanner import scanner_loop
+            background_tasks.append(asyncio.create_task(
+                scanner_loop(settings, storage, market_data_lock), name="shayan-ai-scanner",
+            ))
+        if settings.enable_telegram and settings.enable_telegram_commands:
+            from app.services.telegram_commands import telegram_command_loop
+            background_tasks.append(asyncio.create_task(
+                telegram_command_loop(settings, storage, market_data_lock), name="shayan-ai-telegram-commands",
+            ))
         try:
-            completed.result()
-        except Exception:
-            logger.exception("Background task failed: %s", completed.get_name())
-    task.add_done_callback(done)
+            yield
+        finally:
+            for task in background_tasks:
+                task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            logger.info("SHAYAN AI API stopped")
 
+    app = FastAPI(title="SHAYAN AI", version="0.4.0", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.store = storage
+    app.state.market_data_lock = market_data_lock
 
-def _configured() -> bool:
-    return all(bool(str(v).strip()) for v in (
-        settings.meta_access_token,
-        settings.meta_phone_number_id,
-        settings.meta_verify_token,
-        settings.meta_app_secret,
-    ))
+    async def read_bounded_body(request: Request) -> bytes:
+        max_bytes = settings.webhook_max_body_bytes
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
+            if declared_length < 0:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+            if declared_length > max_bytes:
+                raise HTTPException(status_code=413, detail="Webhook body exceeds configured size limit")
+        chunks = bytearray()
+        async for chunk in request.stream():
+            if len(chunks) + len(chunk) > max_bytes:
+                raise HTTPException(status_code=413, detail="Webhook body exceeds configured size limit")
+            chunks.extend(chunk)
+        return bytes(chunks)
 
+    @app.get("/")
+    async def root() -> dict[str, object]:
+        return {
+            "service": "SHAYAN AI",
+            "version": "0.4.0",
+            "health": "/health",
+            "live_order_execution": False,
+        }
 
-@app.get("/")
-async def root() -> dict[str, object]:
-    return {
-        "status": "online",
-        "service": "Pak Trading Academy WhatsApp Trading Bot",
-        "whatsapp_configured": _configured(),
-        "scanner_enabled": settings.scanner_enabled,
-        "auto_signal_enabled": settings.auto_signal_enabled,
-        "auto_trade_enabled": settings.auto_trade_enabled,
-        "live_execution_allowed": settings.allow_live_execution,
-        "paper_trading_enabled": settings.paper_trading_enabled,
-        "paper_initial_balance": settings.paper_initial_balance,
-        "paper_margin_percent": settings.paper_margin_percent,
-        "paper_leverage": settings.paper_leverage,
-        "analysis_timeframes": ["1D", "12H", "4H", "1H"],
-    }
+    @app.get("/health")
+    async def health() -> dict[str, object]:
+        # SQLite is synchronous; run it in a thread so lock waits do not block the ASGI event loop.
+        pending_notifications = await run_in_threadpool(storage.count_pending_outbox)
+        return {
+            "status": "ok", "service": "SHAYAN AI", "version": "0.4.0",
+            "scanner_enabled": settings.enable_scanner,
+            "whatsapp_enabled": settings.enable_whatsapp,
+            "telegram_enabled": settings.enable_telegram,
+            "telegram_commands_enabled": settings.enable_telegram and settings.enable_telegram_commands,
+            "pending_notifications": pending_notifications,
+            "live_order_execution": False,
+        }
 
+    @app.get("/webhooks/whatsapp", response_class=PlainTextResponse)
+    async def verify_webhook(request: Request) -> Response:
+        mode = request.query_params.get("hub.mode", "")
+        verify_token = request.query_params.get("hub.verify_token", "")
+        challenge = request.query_params.get("hub.challenge", "")
+        if mode == "subscribe" and settings.meta_verify_token and hmac.compare_digest(verify_token, settings.meta_verify_token) and challenge:
+            return PlainTextResponse(challenge, status_code=200)
+        raise HTTPException(status_code=403, detail="Webhook verification failed")
 
-@app.get("/paper")
-async def paper_status() -> dict[str, object]:
-    """Read-only status for the virtual-money wallet and paper positions."""
-    status = paper_trader.get_status()
-    return {
-        "mode": "PAPER_ONLY",
-        "live_orders_submitted": False,
-        "enabled": status["enabled"],
-        "initial_balance": status["initial_balance"],
-        "balance": status["balance"],
-        "equity": status["equity"],
-        "available_margin": status["available_margin"],
-        "open_margin": status["open_margin"],
-        "unrealized_pnl": status["unrealized_pnl"],
-        "realized_pnl": status["realized_pnl"],
-        "leverage": status["leverage"],
-        "margin_percent": status["margin_percent"],
-        "open_trades": status["open_trades"],
-    }
+    @app.post("/webhooks/whatsapp")
+    async def receive_webhook(request: Request) -> dict[str, str]:
+        if not settings.meta_app_secret:
+            raise HTTPException(status_code=503, detail="Webhook signature verification is not configured")
+        raw = await read_bounded_body(request)
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not signature.startswith("sha256="):
+            raise HTTPException(status_code=401, detail="Missing valid webhook signature")
+        expected = "sha256=" + hmac.new(settings.meta_app_secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise HTTPException(status_code=401, detail="Webhook signature mismatch")
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Malformed JSON payload") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Expected JSON object")
 
-
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "healthy"}
-
-
-@app.get("/webhook")
-async def verify_webhook(
-    hub_mode: str | None = Query(None, alias="hub.mode"),
-    hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
-    hub_challenge: str | None = Query(None, alias="hub.challenge"),
-):
-    valid = (
-        hub_mode == "subscribe"
-        and bool(hub_verify_token)
-        and bool(settings.meta_verify_token)
-        and hmac.compare_digest(str(hub_verify_token), str(settings.meta_verify_token))
-    )
-    if valid:
-        logger.info("WHATSAPP WEBHOOK VERIFICATION SUCCESS")
-        return PlainTextResponse(hub_challenge or "", status_code=200)
-    logger.warning("WHATSAPP WEBHOOK VERIFICATION FAILED")
-    return PlainTextResponse("Forbidden", status_code=403)
-
-
-
-async def process_webhook(payload: dict) -> None:
-    if not isinstance(payload, dict):
-        raise ValueError("WhatsApp webhook payload must be a JSON object")
-    if payload.get("object") not in {None, "whatsapp_business_account"}:
-        logger.warning("Ignoring unexpected webhook object=%s", payload.get("object"))
-        return
-
-    entries = payload.get("entry") or []
-    if not isinstance(entries, list):
-        raise ValueError("Webhook entry must be a list")
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        for change in entry.get("changes") or []:
-            if not isinstance(change, dict) or change.get("field") != "messages":
-                continue
-            value = change.get("value") or {}
-            if not isinstance(value, dict):
-                logger.warning("Ignoring malformed WhatsApp event value")
-                continue
-            metadata = value.get("metadata") or {}
-            if not isinstance(metadata, dict):
-                logger.warning("Ignoring malformed WhatsApp metadata")
-                continue
-            event_phone_number_id = str(metadata.get("phone_number_id") or "").strip()
-            configured_phone_number_id = str(settings.meta_phone_number_id or "").strip()
-            if configured_phone_number_id and event_phone_number_id and event_phone_number_id != configured_phone_number_id:
-                logger.warning(
-                    "Ignoring WhatsApp event for unexpected phone_number_id=%s expected=%s",
-                    event_phone_number_id, configured_phone_number_id,
-                )
-                continue
-            logger.info("WHATSAPP EVENT | field=messages phone_number_id=%s", event_phone_number_id or "MISSING")
-            messages = value.get("messages") or []
-            if not isinstance(messages, list):
-                continue
-
-            for message in messages:
-                if not isinstance(message, dict):
-                    logger.warning("Ignoring malformed WhatsApp message object")
+        body_hash = hashlib.sha256(raw).hexdigest()
+        status_events = 0
+        entries = payload.get("entry", [])
+        if isinstance(entries, list):
+            for entry in entries:
+                changes = entry.get("changes", []) if isinstance(entry, dict) else []
+                if not isinstance(changes, list):
                     continue
-                message_id = str(message.get("id") or "")
-                message_type = str(message.get("type") or "")
-                sender = str(message.get("from") or "").strip()
-
-                if message_id and message_id in _processing_message_ids:
-                    logger.info("Duplicate in-flight WhatsApp message ignored | id=%s", message_id)
-                    continue
-                if message_id and db.is_message_seen(message_id):
-                    logger.info("Duplicate processed WhatsApp message ignored | id=%s", message_id)
-                    continue
-                if message_id:
-                    _processing_message_ids.add(message_id)
-
-                try:
-                    if message_type != "text":
-                        logger.info("Ignoring non-text WhatsApp message | id=%s type=%s", message_id, message_type)
-                        if message_id:
-                            db.mark_message_seen(message_id)
+                for change in changes:
+                    value = change.get("value", {}) if isinstance(change, dict) else {}
+                    statuses = value.get("statuses", []) if isinstance(value, dict) else []
+                    if not isinstance(statuses, list):
                         continue
-                    text = str(((message.get("text") or {}).get("body") or "")).strip()
-                    if not sender or not text:
-                        logger.warning("Ignoring text event missing sender/body | id=%s", message_id)
-                        if message_id:
-                            db.mark_message_seen(message_id)
-                        continue
+                    for event in statuses:
+                        if not isinstance(event, dict):
+                            continue
+                        message_id = str(event.get("id", ""))
+                        status = str(event.get("status", ""))
+                        event_time = str(event.get("timestamp", ""))
+                        if not message_id or not status:
+                            continue
+                        event_key = f"{message_id}:{status}:{event_time}"
+                        event_result = await run_in_threadpool(
+                            storage.apply_webhook_status_event,
+                            event_key,
+                            message_id,
+                            status,
+                            body_hash,
+                            event_time or None,
+                        )
+                        if event_result in {"applied", "deferred"}:
+                            status_events += 1
+        # Do not log the webhook body, recipient list, or message content.
+        logger.info("WhatsApp webhook accepted; status_events=%d", status_events)
+        return {"status": "received"}
 
-                    logger.info("WHATSAPP INBOUND | id=%s from=%s command=%s", message_id, sender, text.split()[0] if text.split() else "")
-                    await bot.handle(sender, text)
-                    if message_id:
-                        db.mark_message_seen(message_id)
-                    logger.info("WHATSAPP COMMAND COMPLETE | id=%s from=%s", message_id, sender)
-                except Exception:
-                    logger.exception("WHATSAPP COMMAND FAILED | id=%s from=%s", message_id, sender)
-                finally:
-                    if message_id:
-                        _processing_message_ids.discard(message_id)
-
-
-@app.post("/webhook")
-async def receive_webhook(request: Request):
-    body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256")
-    if not whatsapp.verify_signature(body, signature):
-        logger.warning("WHATSAPP WEBHOOK REJECTED | invalid signature")
-        return JSONResponse({"status": "invalid_signature"}, status_code=403)
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        logger.warning("WHATSAPP WEBHOOK REJECTED | invalid JSON")
-        return JSONResponse({"status": "invalid_json"}, status_code=400)
-
-    logger.info("WHATSAPP WEBHOOK RECEIVED | bytes=%d signature=valid", len(body))
-    task = asyncio.create_task(process_webhook(payload), name="whatsapp-webhook")
-    _retain_task(task)
-    return JSONResponse({"status": "ok"}, status_code=200)
+    return app
 
 
-async def startup_event() -> None:
-    validate_whatsapp_settings(settings)
-    logger.info("Pak Trading Academy WhatsApp Trading Bot starting")
-    logger.info("Graph API version=%s", settings.meta_graph_version)
-    logger.info("MEXC API base=%s", settings.mexc_api_base_url)
-    logger.info("Analysis timeframes=1D,12H,4H,1H")
-    logger.info("Scanner enabled=%s auto_signals=%s auto_trade=%s live_execution=%s paper_trading=%s", settings.scanner_enabled, settings.auto_signal_enabled, settings.auto_trade_enabled, settings.allow_live_execution, settings.paper_trading_enabled)
-    if not settings.scanner_enabled and settings.auto_signal_enabled:
-        logger.warning("AUTO_SIGNAL_ENABLED=true but SCANNER_ENABLED=false; automatic signal scanning is disabled.")
-    if settings.scanner_enabled and not settings.auto_signal_enabled and not settings.paper_trading_enabled:
-        logger.warning("SCANNER_ENABLED=true but both AUTO_SIGNAL_ENABLED and PAPER_TRADING_ENABLED are false; scheduler will not start and no signals will be scanned.")
-    if settings.scanner_enabled and settings.auto_signal_enabled and not (settings.auto_signal_recipients.strip() or settings.auto_signal_telegram_recipients.strip()):
-        logger.warning("Automatic signal scanning is enabled but no signal recipients are configured; valid signals cannot be delivered.")
-    await market.start()
-    await alert_engine.start()
-    if settings.paper_trading_enabled:
-        await paper_trader.start()
-    if settings.scanner_enabled and (settings.auto_signal_enabled or settings.paper_trading_enabled):
-        await scanner_scheduler.start()
-    logger.info("Bot startup complete")
-
-
-async def shutdown_event() -> None:
-    logger.info("Shutting down Pak Trading Academy WhatsApp Trading Bot")
-    with suppress(Exception):
-        await scanner_scheduler.stop()
-    with suppress(Exception):
-        await paper_trader.stop()
-    with suppress(Exception):
-        await alert_engine.stop()
-    with suppress(Exception):
-        await market.close()
-    with suppress(Exception):
-        await mexc_client.close()
-    with suppress(Exception):
-        await whatsapp.close()
-    logger.info("Shutdown complete")
+app = create_app()

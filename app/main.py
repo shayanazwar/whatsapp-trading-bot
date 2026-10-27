@@ -1,4 +1,3 @@
-
 """FastAPI webhook/health entry point. Long-running command processing is backgrounded."""
 from __future__ import annotations
 
@@ -6,6 +5,7 @@ import asyncio
 import hmac
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -19,18 +19,11 @@ from app.services.command_processor import CommandProcessor
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
 from app.whatsapp import (
-    WhatsAppCloud,
-    WhatsAppPolicyBlocked,
-    extract_incoming_messages,
-    extract_status_updates,
-    sender_key,
-    verify_webhook_signature,
+    WhatsAppCloud, WhatsAppPolicyBlocked, extract_incoming_messages, extract_status_updates,
+    sender_key, verify_webhook_signature,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -40,15 +33,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = Store(cfg.database_path)
-        mexc = MexcClient(
-            base_url=cfg.mexc_rest_base_url,
-            timeout_seconds=cfg.http_timeout_seconds,
-            max_retries=cfg.http_max_retries,
-        )
+        mexc = MexcClient(base_url=cfg.mexc_rest_base_url, timeout_seconds=cfg.http_timeout_seconds,
+                          max_retries=cfg.http_max_retries)
         whatsapp = WhatsAppCloud(cfg)
         processor = CommandProcessor(cfg, store, mexc, whatsapp)
         scheduler = ResearchScheduler(cfg, store, mexc, whatsapp)
-
         app.state.settings = cfg
         app.state.store = store
         app.state.mexc = mexc
@@ -57,62 +46,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.scheduler = scheduler
         app.state.scheduler_task = None
         app.state.background_tasks = set()
-
         if cfg.scheduler_enabled:
-            app.state.scheduler_task = asyncio.create_task(
-                scheduler.run_forever(),
-                name="research-scheduler",
-            )
+            app.state.scheduler_task = asyncio.create_task(scheduler.run_forever(), name="research-scheduler")
         else:
             store.set_state("scheduler_status", "disabled")
-
-        # Recover pending command messages only when command processing is permitted.
+        logger.info(
+            "APPLICATION STARTUP COMPLETE | policy_gate=%s allowlist_configured=%s live_execution=false",
+            "open" if cfg.whatsapp_policy_gate_open else "closed",
+            bool(cfg.whatsapp_allowed_senders),
+        )
+        # Recover durably stored but unprocessed webhooks only when the policy gate and allowlist are open.
         if cfg.whatsapp_policy_gate_open and cfg.whatsapp_allowed_senders:
             for row in store.pending_inbound(limit=50):
                 try:
                     payload = json.loads(row["payload_json"])
-                    messages = extract_incoming_messages(payload)
-                    message = next(
-                        (
-                            item
-                            for item in messages
-                            if item["message_id"] == row["message_id"]
-                        ),
-                        None,
-                    )
-                    if message:
-                        _spawn_message_task(
-                            app, message, row["message_id"]
-                        )
+                    msgs = extract_incoming_messages(payload)
+                    msg = next((m for m in msgs if m["message_id"] == row["message_id"]), None)
+                    if msg:
+                        _spawn_message_task(app, msg, row["message_id"])
                 except Exception:
-                    logger.warning(
-                        "Could not requeue one stored inbound webhook row"
-                    )
-
+                    logger.warning("Could not requeue one stored inbound webhook row")
         yield
-
         scheduler.stop()
         scheduler_task = app.state.scheduler_task
         if scheduler_task is not None:
             scheduler_task.cancel()
-            await asyncio.gather(
-                scheduler_task, return_exceptions=True
-            )
-
+            await asyncio.gather(scheduler_task, return_exceptions=True)
         tasks = list(app.state.background_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
         await mexc.aclose()
         await whatsapp.aclose()
 
-    app = FastAPI(
-        title="MEXC Futures Research Bot",
-        version="0.2.0",
-        lifespan=lifespan,
-    )
+    app = FastAPI(title="MEXC Futures Research Bot", version="0.2.0", lifespan=lifespan)
 
     @app.api_route("/", methods=["GET", "HEAD"])
     async def root() -> dict[str, Any]:
@@ -121,494 +89,325 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "mode": "research/paper",
             "live_execution": "disabled",
             "health": "/healthz",
+            "health_legacy": "/health",
             "whatsapp_webhook": "/webhook/whatsapp",
+            "whatsapp_webhook_legacy": "/webhook",
         }
 
     @app.api_route("/healthz", methods=["GET", "HEAD"])
     @app.api_route("/health", methods=["GET", "HEAD"])
     async def healthz() -> dict[str, Any]:
         store: Store = app.state.store
-
         try:
             store.recent_events(1)
             db = "ok"
         except Exception:
             db = "error"
-
         settings: Settings = app.state.settings
         return {
             "status": "ok" if db == "ok" else "degraded",
             "database": db,
             "scheduler_enabled": settings.scheduler_enabled,
-            "scheduler_worker": store.get_state(
-                "scheduler_status", "not_started"
-            ),
-            "scheduler_last_success": store.get_state(
-                "scheduler_last_success"
-            ),
-            "paper_scheduler_gate": store.get_state(
-                "paper_scheduler_gate", "not_evaluated"
-            ),
+            "scheduler_worker": store.get_state("scheduler_status", "not_started"),
+            "scheduler_last_success": store.get_state("scheduler_last_success"),
+            "paper_scheduler_gate": store.get_state("paper_scheduler_gate", "not_evaluated"),
             "paper_trading_enabled": settings.paper_trading_enabled,
-            "data_alignment_probe_approved": (
-                settings.data_alignment_probe_approved
-            ),
+            "data_alignment_probe_approved": settings.data_alignment_probe_approved,
             "auto_trading_enabled": settings.auto_trading_enabled,
             "live_execution_enabled": False,
-            "live_execution_build_released": (
-                settings.live_execution_build_released
-            ),
-            "whatsapp_policy_gate": (
-                "open-by-configuration"
-                if settings.whatsapp_policy_gate_open
-                else "blocked"
-            ),
+            "live_execution_build_released": settings.live_execution_build_released,
+            "whatsapp_policy_gate": "open-by-configuration" if settings.whatsapp_policy_gate_open else "blocked",
         }
 
     @app.get("/webhook", response_class=PlainTextResponse)
     @app.get("/webhook/whatsapp", response_class=PlainTextResponse)
     async def whatsapp_verify(
         hub_mode: str | None = Query(None, alias="hub.mode"),
-        hub_verify_token: str | None = Query(
-            None, alias="hub.verify_token"
-        ),
-        hub_challenge: str | None = Query(
-            None, alias="hub.challenge"
-        ),
+        hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
+        hub_challenge: str | None = Query(None, alias="hub.challenge"),
     ) -> PlainTextResponse:
         settings: Settings = app.state.settings
-
-        if (
-            hub_mode == "subscribe"
-            and settings.meta_verify_token
-            and hub_verify_token
-            and hmac.compare_digest(
-                settings.meta_verify_token, hub_verify_token
-            )
-            and hub_challenge is not None
-        ):
+        if hub_mode == "subscribe" and settings.meta_verify_token and hub_verify_token and hmac.compare_digest(
+            settings.meta_verify_token, hub_verify_token
+        ) and hub_challenge is not None:
             return PlainTextResponse(hub_challenge, status_code=200)
-
-        raise HTTPException(
-            status_code=403,
-            detail="Webhook verification failed",
-        )
+        raise HTTPException(status_code=403, detail="Webhook verification failed")
 
     @app.post("/webhook")
     @app.post("/webhook/whatsapp")
-    async def whatsapp_inbound(
-        request: Request,
-    ) -> dict[str, str]:
+    async def whatsapp_inbound(request: Request) -> dict[str, str]:
         settings: Settings = app.state.settings
         raw_body = await request.body()
-
         if len(raw_body) > 1_000_000:
-            raise HTTPException(
-                status_code=413,
-                detail="Payload too large",
-            )
-
+            raise HTTPException(status_code=413, detail="Payload too large")
         signature = request.headers.get("X-Hub-Signature-256")
-        if not verify_webhook_signature(
-            raw_body, signature, settings.meta_app_secret
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Webhook signature invalid",
-            )
-
+        if not verify_webhook_signature(raw_body, signature, settings.meta_app_secret):
+            raise HTTPException(status_code=403, detail="Webhook signature invalid")
         try:
             payload = json.loads(raw_body)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail="Malformed JSON",
-            ) from exc
-
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Malformed JSON") from exc
         if not isinstance(payload, dict):
-            raise HTTPException(
-                status_code=400,
-                detail="Payload must be an object",
-            )
-
+            raise HTTPException(status_code=400, detail="Payload must be an object")
         messages = extract_incoming_messages(payload)
         status_updates = extract_status_updates(payload)
         store: Store = app.state.store
-
-        # Record delivery/read/failure updates from Meta.
+        logger.info(
+            "WHATSAPP WEBHOOK PARSED | inbound_messages=%d status_updates=%d object=%s",
+            len(messages), len(status_updates), str(payload.get("object", "unknown"))[:80],
+        )
+        if not messages:
+            logger.info(
+                "WHATSAPP WEBHOOK HAS NO INBOUND MESSAGES | status_updates=%d",
+                len(status_updates),
+            )
         for update in status_updates:
             provider_id = update.get("provider_message_id", "")
             status = update.get("status", "")
             if provider_id and status:
                 store.record_outbox_status(
-                    provider_id,
-                    status,
-                    update.get("error"),
+                    provider_id, status, update.get("error"),
                     details={
                         "recipient_id": update.get("recipient_id"),
                         "timestamp": update.get("timestamp"),
                         "pricing": update.get("pricing", {}),
                     },
                 )
-
-        allowed = {
-            sender_key(value)
-            for value in settings.whatsapp_allowed_senders
-        }
+        allowed = {sender_key(x) for x in settings.whatsapp_allowed_senders}
         allowed.discard("")
-
         for msg in messages:
             message_id = msg.get("message_id", "")
             sender = sender_key(msg.get("from", ""))
 
-            # Reject events from an unexpected WhatsApp phone number.
-            received_phone_id = msg.get("phone_number_id", "")
-            if (
-                settings.meta_phone_number_id
-                and received_phone_id
-                and received_phone_id != settings.meta_phone_number_id
-            ):
+            if (settings.meta_phone_number_id and msg.get("phone_number_id")
+                    and msg["phone_number_id"] != settings.meta_phone_number_id):
                 store.append_event(
                     "WHATSAPP_WRONG_PHONE_NUMBER_ID",
-                    {
-                        "message_id": message_id,
-                        "received_phone_number_id": received_phone_id,
-                    },
+                    {"message_id": message_id, "received_phone_number_id": msg["phone_number_id"]},
                     idempotency_key=f"wrong-phone-id:{message_id}",
+                )
+                logger.warning(
+                    "WHATSAPP INBOUND IGNORED | reason=phone_number_id_mismatch message_id=%s",
+                    message_id,
                 )
                 continue
 
             if not message_id or not sender:
-                store.append_event(
-                    "WHATSAPP_INVALID_INBOUND",
-                    {"reason": "missing id/sender"},
-                )
+                store.append_event("WHATSAPP_INVALID_INBOUND", {"reason": "missing id/sender"})
+                logger.warning("WHATSAPP INBOUND IGNORED | reason=missing_message_id_or_sender")
                 continue
 
-            # Store the inbound event before processing it.
-            accepted = store.save_inbound(
-                message_id, sender, msg.get("body", ""), payload
+            logger.info(
+                "WHATSAPP INBOUND RECEIVED | message_id=%s sender_suffix=%s type=%s",
+                message_id, sender[-4:], msg.get("type", "unknown"),
             )
+            accepted = store.save_inbound(message_id, sender, msg.get("body", ""), payload)
             if not accepted:
                 store.append_event(
-                    "WHATSAPP_DUPLICATE_INBOUND",
-                    {"message_id": message_id},
+                    "WHATSAPP_DUPLICATE_INBOUND", {"message_id": message_id},
                     idempotency_key=f"duplicate-inbound:{message_id}",
                 )
+                logger.info("WHATSAPP INBOUND IGNORED | reason=duplicate message_id=%s", message_id)
                 continue
 
-            # Always check the allowlist before sending any reply.
+            # Always enforce the sender allowlist before any reply or command.
             if not allowed or sender not in allowed:
-                store.mark_inbound_processed(
-                    message_id, "unauthorized_sender_dropped"
-                )
+                store.mark_inbound_processed(message_id, "unauthorized_sender_dropped")
                 store.append_event(
-                    "WHATSAPP_UNAUTHORIZED_SENDER",
-                    {"message_id": message_id},
+                    "WHATSAPP_UNAUTHORIZED_SENDER", {"message_id": message_id},
                     idempotency_key=f"unauthorized:{message_id}",
                 )
+                logger.warning(
+                    "WHATSAPP INBOUND IGNORED | reason=sender_not_allowlisted message_id=%s sender_suffix=%s",
+                    message_id, sender[-4:],
+                )
                 continue
 
-            # With the crypto policy gate closed, send only a fixed,
-            # generic service reply. Do not execute the user's command.
+            # A closed crypto policy gate must never execute the submitted command.
+            # It may send only a fixed, generic, non-trading service acknowledgement.
             if not settings.whatsapp_policy_gate_open:
                 store.append_event(
                     "WHATSAPP_POLICY_GATE_BLOCKED",
-                    {
-                        "message_id": message_id,
-                        "reply_type": "generic_service_status_only",
-                    },
+                    {"message_id": message_id, "reply_type": "generic_service_status_only"},
                     idempotency_key=f"policy-blocked:{message_id}",
                 )
-                _spawn_policy_status_task(
-                    app, msg, message_id
+                logger.warning(
+                    "WHATSAPP POLICY GATE CLOSED | generic non-trading reply scheduled | message_id=%s",
+                    message_id,
                 )
+                _spawn_policy_status_task(app, msg, message_id)
                 continue
 
             _spawn_message_task(app, msg, message_id)
-
-        # Acknowledge Meta promptly; processing runs in the background.
+        # Persist all useful information first and acknowledge quickly; no strategy work happens inline.
         return {"status": "accepted"}
 
     return app
 
 
-def _spawn_message_task(
-    app: FastAPI,
-    message: dict[str, str],
-    message_id: str,
-) -> None:
-    task = asyncio.create_task(
-        _process_one_message(app, message, message_id)
-    )
+def _spawn_task(app: FastAPI, coroutine, *, name: str) -> None:
+    task = asyncio.create_task(coroutine, name=name)
     app.state.background_tasks.add(task)
-    task.add_done_callback(app.state.background_tasks.discard)
+
+    def finished(done: asyncio.Task) -> None:
+        app.state.background_tasks.discard(done)
+        if done.cancelled():
+            return
+        try:
+            done.result()
+        except Exception as exc:
+            logger.error(
+                "WHATSAPP BACKGROUND TASK FAILED | task=%s error_type=%s",
+                name, type(exc).__name__,
+            )
+
+    task.add_done_callback(finished)
 
 
-def _spawn_policy_status_task(
-    app: FastAPI,
-    message: dict[str, str],
-    message_id: str,
-) -> None:
-    task = asyncio.create_task(
-        _send_policy_status_reply(app, message, message_id)
+def _spawn_message_task(app: FastAPI, message: dict[str, str], message_id: str) -> None:
+    _spawn_task(
+        app,
+        _process_one_message(app, message, message_id),
+        name=f"whatsapp-command-{message_id}",
     )
-    app.state.background_tasks.add(task)
-    task.add_done_callback(app.state.background_tasks.discard)
 
 
-async def _send_policy_status_reply(
-    app: FastAPI,
-    message: dict[str, str],
-    message_id: str,
-) -> None:
+def _spawn_policy_status_task(app: FastAPI, message: dict[str, str], message_id: str) -> None:
+    _spawn_task(
+        app,
+        _send_policy_status_reply(app, message, message_id),
+        name=f"whatsapp-status-{message_id}",
+    )
+
+
+async def _send_policy_status_reply(app: FastAPI, message: dict[str, str], message_id: str) -> None:
+    """Send only the generic service response; never execute the user command."""
     store: Store = app.state.store
     sender = sender_key(message.get("from", ""))
     outbox_id = None
-
+    generic_reply = (
+        "Thanks for your message. Automated responses are temporarily unavailable. "
+        "Please try again later."
+    )
+    response_key = f"wa-policy-status:{message_id}"
     try:
-        # send_service_status sends only this fixed generic response.
-        # It does not execute commands or open the crypto policy gate.
-        generic_reply = (
-            "Thanks for your message. Automated responses are "
-            "temporarily unavailable. Please try again later."
-        )
-
         outbox_id = store.enqueue_outbox(
-            sender,
-            generic_reply,
-            category="service",
-            idempotency_key=f"wa-policy-status:{message_id}",
+            sender, generic_reply, category="service", idempotency_key=response_key
         )
-
         result = await app.state.whatsapp.send_service_status(sender)
         provider_messages = result.get("messages", [])
         provider_id = (
             provider_messages[0].get("id")
-            if provider_messages
-            and isinstance(provider_messages[0], dict)
+            if provider_messages and isinstance(provider_messages[0], dict)
             else None
         )
-
         store.record_outbox_attempt(
-            outbox_id,
-            accepted=True,
-            provider_message_id=provider_id,
+            outbox_id, accepted=True, provider_message_id=provider_id
         )
         store.append_event(
             "WHATSAPP_SERVICE_STATUS_ACCEPTED_BY_META",
-            {
-                "message_id": message_id,
-                "provider_message_id": provider_id,
-                "outbox_id": outbox_id,
-                "delivery_confirmed": False,
-            },
+            {"message_id": message_id, "provider_message_id": provider_id,
+             "outbox_id": outbox_id, "delivery_confirmed": False},
             idempotency_key=f"wa-service-status-accepted:{message_id}",
         )
         store.mark_inbound_processed(
             message_id, "policy_gate_closed_service_status_sent"
         )
         logger.info(
-            "Generic WhatsApp status accepted by Meta | message_id=%s",
-            message_id,
+            "WHATSAPP SERVICE REPLY ACCEPTED BY META | message_id=%s provider_id_present=%s",
+            message_id, bool(provider_id),
         )
-
     except Exception as exc:
         if outbox_id is not None:
             try:
-                store.mark_outbox_unknown(
-                    outbox_id, type(exc).__name__
-                )
+                store.mark_outbox_unknown(outbox_id, type(exc).__name__)
             except Exception:
-                logger.warning("Could not update outbox status")
-
+                logger.warning("WHATSAPP OUTBOX UPDATE FAILED | message_id=%s", message_id)
         store.append_event(
             "WHATSAPP_SERVICE_STATUS_FAILED",
-            {
-                "message_id": message_id,
-                "error_type": type(exc).__name__,
-            },
+            {"message_id": message_id, "error_type": type(exc).__name__},
             idempotency_key=f"wa-service-status-failed:{message_id}",
         )
         store.mark_inbound_processed(
-            message_id,
-            f"service_status_failed:{type(exc).__name__}",
+            message_id, f"service_status_failed:{type(exc).__name__}"
         )
         logger.warning(
-            "Generic WhatsApp reply failed | message_id=%s | error=%s",
-            message_id,
-            type(exc).__name__,
+            "WHATSAPP SERVICE REPLY FAILED | message_id=%s error_type=%s",
+            message_id, type(exc).__name__,
         )
 
 
-async def _process_one_message(
-    app: FastAPI,
-    message: dict[str, str],
-    message_id: str,
-) -> None:
+async def _process_one_message(app: FastAPI, message: dict[str, str], message_id: str) -> None:
     store: Store = app.state.store
+    settings: Settings = app.state.settings
     processor: CommandProcessor = app.state.processor
-    sender = sender_key(message.get("from", ""))
+    sender = message.get("from", "")
     body = message.get("body", "")
-
     try:
         if message.get("type") != "text" or not body.strip():
-            store.mark_inbound_processed(
-                message_id, "unsupported_message_type"
-            )
+            store.mark_inbound_processed(message_id, "unsupported_message_type")
             return
-
         timestamp_raw = message.get("timestamp", "")
         try:
             message_time = int(timestamp_raw)
         except (TypeError, ValueError):
             message_time = None
-
-        result = await processor.process_text(
-            sender,
-            body,
-            received_timestamp=message_time,
-            enforce_whatsapp_policy=True,
+        logger.info(
+            "WHATSAPP COMMAND STARTED | message_id=%s command_token=%s",
+            message_id, (body.split()[0].upper()[:24] if body.split() else "EMPTY"),
         )
-
+        result = await processor.process_text(sender, body, received_timestamp=message_time, enforce_whatsapp_policy=True)
+        logger.info(
+            "WHATSAPP COMMAND PROCESSED | message_id=%s response_chars=%d attachments=%d",
+            message_id, len(result.text), len(result.attachments),
+        )
         response_key = f"wa-reply:{message_id}:text"
-        outbox_id = store.enqueue_outbox(
-            sender,
-            result.text,
-            category="service",
-            idempotency_key=response_key,
-        )
-
+        outbox_id = store.enqueue_outbox(sender, result.text, category="service", idempotency_key=response_key)
         try:
-            provider_result = await app.state.whatsapp.send_text(
-                sender, result.text
-            )
+            provider_result = await app.state.whatsapp.send_text(sender, result.text)
             provider_messages = provider_result.get("messages", [])
-            provider_id = (
-                provider_messages[0].get("id")
-                if provider_messages
-                and isinstance(provider_messages[0], dict)
-                else None
+            provider_id = provider_messages[0].get("id") if provider_messages and isinstance(provider_messages[0], dict) else None
+            store.record_outbox_attempt(outbox_id, accepted=True, provider_message_id=provider_id)
+            store.append_event("WHATSAPP_MESSAGE_ACCEPTED_BY_META", {"recipient": sender, "provider_message_id": provider_id,
+                "outbox_id": outbox_id, "category": "service", "delivery_confirmed": False},
+                idempotency_key=f"wa-accepted:{response_key}")
+            logger.info(
+                "WHATSAPP REPLY ACCEPTED BY META | message_id=%s provider_id_present=%s",
+                message_id, bool(provider_id),
             )
-
-            store.record_outbox_attempt(
-                outbox_id,
-                accepted=True,
-                provider_message_id=provider_id,
-            )
-            store.append_event(
-                "WHATSAPP_MESSAGE_ACCEPTED_BY_META",
-                {
-                    "recipient": sender,
-                    "provider_message_id": provider_id,
-                    "outbox_id": outbox_id,
-                    "category": "service",
-                    "delivery_confirmed": False,
-                },
-                idempotency_key=f"wa-accepted:{response_key}",
-            )
-
         except Exception as exc:
-            # Avoid blind retries because a timeout may occur after Meta
-            # accepts the message.
-            store.mark_outbox_unknown(
-                outbox_id, type(exc).__name__
-            )
-            store.append_event(
-                "WHATSAPP_SEND_UNKNOWN",
-                {
-                    "outbox_id": outbox_id,
-                    "error_type": type(exc).__name__,
-                },
-                idempotency_key=f"wa-send-unknown:{response_key}",
-            )
-            store.mark_inbound_processed(
-                message_id, "reply_outcome_unknown_no_retry"
-            )
+            # A timeout may have happened after Meta accepted the message; mark unknown and do not blind retry.
+            store.mark_outbox_unknown(outbox_id, type(exc).__name__)
+            store.append_event("WHATSAPP_SEND_UNKNOWN", {"outbox_id": outbox_id, "error_type": type(exc).__name__},
+                               idempotency_key=f"wa-send-unknown:{response_key}")
+            store.mark_inbound_processed(message_id, "reply_outcome_unknown_no_retry")
             return
-
         for path, media_type in result.attachments:
-            media_key = (
-                f"wa-reply:{message_id}:{media_type}:{path}"
-            )
-            media_outbox_id = store.enqueue_outbox(
-                sender,
-                f"[{media_type.upper()}] {Path(path).name}",
-                category="service",
-                idempotency_key=media_key,
-            )
-
+            media_key = f"wa-reply:{message_id}:{media_type}:{path}"
+            media_outbox_id = store.enqueue_outbox(sender, f"[{media_type.upper()}] {Path(path).name}",
+                category="service", idempotency_key=media_key)
             try:
-                media_result = await app.state.whatsapp.send_media(
-                    sender, path, media_type=media_type
-                )
+                media_result = await app.state.whatsapp.send_media(sender, path, media_type=media_type)
                 media_messages = media_result.get("messages", [])
-                media_provider_id = (
-                    media_messages[0].get("id")
-                    if media_messages
-                    and isinstance(media_messages[0], dict)
-                    else None
-                )
-
-                store.record_outbox_attempt(
-                    media_outbox_id,
-                    accepted=True,
-                    provider_message_id=media_provider_id,
-                )
-                store.append_event(
-                    "WHATSAPP_MEDIA_ACCEPTED_BY_META",
-                    {
-                        "message_id": message_id,
-                        "media_type": media_type,
-                        "provider_message_id": media_provider_id,
-                        "outbox_id": media_outbox_id,
-                        "delivery_confirmed": False,
-                    },
-                    idempotency_key=(
-                        f"wa-media-accepted:{message_id}:"
-                        f"{media_type}:{path}"
-                    ),
-                )
-
+                media_provider_id = media_messages[0].get("id") if media_messages and isinstance(media_messages[0], dict) else None
+                store.record_outbox_attempt(media_outbox_id, accepted=True, provider_message_id=media_provider_id)
+                store.append_event("WHATSAPP_MEDIA_ACCEPTED_BY_META", {"message_id": message_id,
+                    "media_type": media_type, "provider_message_id": media_provider_id, "outbox_id": media_outbox_id,
+                    "delivery_confirmed": False}, idempotency_key=f"wa-media-accepted:{message_id}:{media_type}:{path}")
             except Exception as exc:
-                store.mark_outbox_unknown(
-                    media_outbox_id, type(exc).__name__
-                )
-                store.append_event(
-                    "WHATSAPP_MEDIA_SEND_UNKNOWN",
-                    {
-                        "message_id": message_id,
-                        "media_type": media_type,
-                        "error_type": type(exc).__name__,
-                    },
-                    idempotency_key=(
-                        f"wa-media-unknown:{message_id}:{path}"
-                    ),
-                )
-
+                store.mark_outbox_unknown(media_outbox_id, type(exc).__name__)
+                store.append_event("WHATSAPP_MEDIA_SEND_UNKNOWN", {"message_id": message_id, "media_type": media_type,
+                    "error_type": type(exc).__name__}, idempotency_key=f"wa-media-unknown:{message_id}:{path}")
         store.mark_inbound_processed(message_id, "completed")
-
     except WhatsAppPolicyBlocked:
-        store.mark_inbound_processed(
-            message_id, "crypto_policy_gate_closed"
-        )
-
+        store.mark_inbound_processed(message_id, "crypto_policy_gate_closed")
     except Exception as exc:
-        store.append_event(
-            "WHATSAPP_COMMAND_FAILED",
-            {
-                "message_id": message_id,
-                "error_type": type(exc).__name__,
-            },
-            idempotency_key=f"wa-command-failed:{message_id}",
-        )
-        store.mark_inbound_processed(
-            message_id, f"failed:{type(exc).__name__}"
-        )
+        store.append_event("WHATSAPP_COMMAND_FAILED", {"message_id": message_id, "error_type": type(exc).__name__},
+                           idempotency_key=f"wa-command-failed:{message_id}")
+        store.mark_inbound_processed(message_id, f"failed:{type(exc).__name__}")
         logger.warning(
-            "WhatsApp command processing failed (%s); "
-            "message content not logged",
-            type(exc).__name__,
+            "WHATSAPP COMMAND FAILED | message_id=%s error_type=%s",
+            message_id, type(exc).__name__,
         )
 
 

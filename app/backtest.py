@@ -6,6 +6,7 @@ reliable as its data, fee, funding, contract multiplier and slippage assumptions
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 import statistics
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
@@ -388,7 +389,31 @@ def run_backtest(
         gap_count = sum(1 for a, b in zip(h1, h1[1:]) if b.open_time - a.open_time != 3600)
         if gap_count:
             warnings.append(f"{symbol}: {gap_count} gap(s) in 1H history; open positions are conservatively exited when a gap is encountered.")
-        prepared[symbol] = {"series": series, "bars1": h1, "index_by_open": {c.open_time: i for i, c in enumerate(h1)}}
+        # All timeframe rows are now sorted, complete, and have unique opens.
+        # Store immutable close/open timestamp indexes so each hourly decision
+        # can find its causal prefixes with binary search instead of scanning all
+        # history (including future candles) on every iteration.
+        close_times = {
+            tf: tuple(c.close_time for c in series[tf])
+            for tf in ("1D", "12H", "4H", "1H")
+        }
+        open_times = tuple(c.open_time for c in h1)
+        fast_path_validated = all(
+            c.symbol == symbol and c.timeframe == tf
+            for tf in ("1D", "12H", "4H", "1H")
+            for c in series[tf]
+        ) and all(
+            all(left <= right for left, right in zip(close_times[tf], close_times[tf][1:]))
+            for tf in ("1D", "12H", "4H", "1H")
+        )
+        prepared[symbol] = {
+            "series": series,
+            "bars1": h1,
+            "index_by_open": {c.open_time: i for i, c in enumerate(h1)},
+            "open_times": open_times,
+            "close_times": close_times,
+            "fast_path_validated": fast_path_validated,
+        }
         for candle in h1:
             if candle.open_time < end_time and candle.close_time >= start_time:
                 timeline.setdefault(candle.open_time, []).append((symbol, candle))
@@ -500,8 +525,10 @@ def run_backtest(
                 mark = close_by_symbol.get(pos_symbol)
                 if mark is None:
                     history = prepared[pos_symbol]["bars1"]
-                    prior = [c for c in history if c.open_time <= open_time]
-                    mark = prior[-1].close if prior else pos.entry_price
+                    prior_index = bisect_right(
+                        prepared[pos_symbol]["open_times"], open_time
+                    ) - 1
+                    mark = history[prior_index].close if prior_index >= 0 else pos.entry_price
                 direction = 1.0 if pos.side == "LONG" else -1.0
                 notional_out = pos.quantity * pos.contract_size * mark
                 gross_unrealised = pos.quantity * pos.contract_size * (mark - pos.entry_price) * direction
@@ -522,14 +549,28 @@ def run_backtest(
                 continue
             series = prepared[symbol]["series"]
             decision_time = candle.close_time
-            snapshot: dict[str, list[Candle]] = {
-                tf: [c for c in series[tf] if c.complete and c.close_time <= decision_time]
-                for tf in ("1D", "12H", "4H", "1H")
-            }
+            if prepared[symbol]["fast_path_validated"]:
+                snapshot: dict[str, Sequence[Candle]] = {
+                    tf: series[tf][
+                        :bisect_right(prepared[symbol]["close_times"][tf], decision_time)
+                    ]
+                    for tf in ("1D", "12H", "4H", "1H")
+                }
+            else:
+                # Retain the defensive filter for malformed/non-monotonic input.
+                snapshot = {
+                    tf: [c for c in series[tf] if c.complete and c.close_time <= decision_time]
+                    for tf in ("1D", "12H", "4H", "1H")
+                }
             if not snapshot["12H"] and snapshot["4H"]:
                 snapshot["12H"] = aggregate_12h_from_4h(snapshot["4H"])
             try:
-                evaluation = evaluate_strategy(symbol, snapshot, decision_time=decision_time)
+                evaluation = evaluate_strategy(
+                    symbol,
+                    snapshot,
+                    decision_time=decision_time,
+                    prevalidated=bool(prepared[symbol]["fast_path_validated"]),
+                )
             except Exception as exc:
                 warnings.append(f"{symbol}: strategy evaluation failed at {decision_time} ({type(exc).__name__}); candidate rejected.")
                 rejection_counts["STRATEGY_EVALUATION_ERROR"] = rejection_counts.get("STRATEGY_EVALUATION_ERROR", 0) + 1

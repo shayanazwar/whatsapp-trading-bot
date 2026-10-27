@@ -156,11 +156,19 @@ def _find_active_4h_setup(bars4: Sequence[Candle], side: str) -> dict[str, float
     # avoiding repeated quadratic rescans of the entire history on every 1H decision.
     active_setup_lookback = 24
     earliest_pivot_index = max(0, len(bars4) - active_setup_lookback)
+    # A returned setup must reclaim within the last 4 bars (expiry <= 3),
+    # with retest at most 3 bars before reclaim and breakout at most 6 bars
+    # before retest. Therefore no breakout earlier than len(bars4)-13 can
+    # possibly be active at the current right edge. The old unbounded loop
+    # spent most of its time evaluating expired historical setups repeatedly.
+    earliest_possible_breakout = max(0, len(bars4) - 13)
+    last_index = len(bars4) - 1
     for p in pivots:
         if p < earliest_pivot_index:
             continue
         confirmation_index = p + 2
-        for breakout_idx in range(confirmation_index + 1, len(bars4)):
+        breakout_start = max(confirmation_index + 1, earliest_possible_breakout)
+        for breakout_idx in range(breakout_start, len(bars4)):
             a_idx = breakout_idx - 1
             if a_idx < 13 or atrs[a_idx] is None or float(atrs[a_idx]) <= 0:
                 continue
@@ -203,7 +211,11 @@ def _find_active_4h_setup(bars4: Sequence[Candle], side: str) -> dict[str, float
                     break
             if reclaim_idx is None:
                 continue
-            # If subsequent closed 4H candles have invalidated the retest level, reject this setup.
+            # Expired reclaims can never be returned, whether invalidated or not;
+            # skip their post-reclaim scan entirely. For live candidates, the scan
+            # is bounded to at most 3 subsequent bars by the expiry rule.
+            if last_index - reclaim_idx > 3:
+                continue
             post_invalid = False
             for q in range(reclaim_idx + 1, len(bars4)):
                 if side == "LONG" and closes[q] < pivot_price - 0.25 * a:
@@ -212,7 +224,7 @@ def _find_active_4h_setup(bars4: Sequence[Candle], side: str) -> dict[str, float
                 if side == "SHORT" and closes[q] > pivot_price + 0.25 * a:
                     post_invalid = True
                     break
-            if post_invalid or len(bars4) - 1 - reclaim_idx > 3:
+            if post_invalid:
                 continue
             all_lows = lows[breakout_idx : reclaim_idx + 1]
             all_highs = highs[breakout_idx : reclaim_idx + 1]
@@ -241,8 +253,15 @@ def evaluate_strategy(
     *,
     decision_time: int | None = None,
     strategy_version: str = STRATEGY_VERSION,
+    prevalidated: bool = False,
 ) -> StrategyEvaluation:
-    """Evaluate one symbol at one timestamp using completed bars only."""
+    """Evaluate one symbol at one timestamp using completed bars only.
+
+    ``prevalidated`` is an internal performance hook for the backtester. It may
+    only be used when all series are already sorted, unique, complete, closed
+    by ``decision_time``, and validated for symbol/timeframe. All public callers
+    retain the defensive filtering/validation path by default.
+    """
     unknown = set(series) - STRATEGY_TIMEFRAMES
     if unknown:
         assert_strategy_timeframes(series.keys())
@@ -253,11 +272,18 @@ def evaluate_strategy(
         return StrategyEvaluation(symbol, decision_time or 0, "INSUFFICIENT_DATA", None, ("NO_1H_DATA",), {})
     if decision_time is None:
         decision_time = max(c.close_time for c in series["1H"] if c.complete)
-    bars = _filter_closed(series, int(decision_time))
+    if prevalidated:
+        # BacktestRunner has already sorted, removed incomplete rows, rejected
+        # duplicate opens, checked symbol/timeframe labels, and bisected each
+        # timeframe to close_time <= decision_time. Do not repeat that work on
+        # every hourly decision.
+        bars = {tf: series[tf] for tf in STRATEGY_TIMEFRAMES}
+    else:
+        bars = _filter_closed(series, int(decision_time))
     for tf in STRATEGY_TIMEFRAMES:
         if not bars[tf]:
             return StrategyEvaluation(symbol, int(decision_time), "INSUFFICIENT_DATA", None, (f"NO_CLOSED_{tf}_DATA",), {})
-    if any(c.symbol != symbol for values in bars.values() for c in values):
+    if not prevalidated and any(c.symbol != symbol for values in bars.values() for c in values):
         raise StrategyInputError("Requested symbol does not match one or more input time series")
 
     regime, daily_evidence = _regime(bars["1D"])

@@ -29,11 +29,13 @@ def test_webhook_verify_and_crypto_policy_gate_blocks_commands(tmp_path):
     )
     app = create_app(cfg)
     with TestClient(app) as client:
-        response = client.get("/webhook/whatsapp", params={
+        params = {
             "hub.mode": "subscribe", "hub.verify_token": "verify-me", "hub.challenge": "challenge-123",
-        })
-        assert response.status_code == 200
-        assert response.text == "challenge-123"
+        }
+        for path in ("/webhook/whatsapp", "/webhook"):
+            response = client.get(path, params=params)
+            assert response.status_code == 200
+            assert response.text == "challenge-123"
 
         payload = {"entry": [{"changes": [{"value": {
             "metadata": {"phone_number_id": "not-used"},
@@ -41,7 +43,8 @@ def test_webhook_verify_and_crypto_policy_gate_blocks_commands(tmp_path):
                           "type": "text", "text": {"body": "STATUS"}}],
         }}]}]}
         body = json.dumps(payload, separators=(",", ":")).encode()
-        response = client.post("/webhook/whatsapp", content=body,
+        # The old Meta callback URL used /webhook, while the current one uses /webhook/whatsapp.
+        response = client.post("/webhook", content=body,
                                headers={"X-Hub-Signature-256": signature(body, "test-app-secret")})
         assert response.status_code == 200
         assert app.state.store.recent_events(10, "WHATSAPP_POLICY_GATE_BLOCKED")
@@ -54,9 +57,10 @@ def test_webhook_rejects_invalid_signature(tmp_path):
                   meta_verify_token="v", meta_app_secret="s")
     app = create_app(cfg)
     with TestClient(app) as client:
-        response = client.post("/webhook/whatsapp", content=b'{"entry":[]}',
-                               headers={"X-Hub-Signature-256": "sha256=invalid"})
-        assert response.status_code == 403
+        for path in ("/webhook/whatsapp", "/webhook"):
+            response = client.post(path, content=b'{"entry":[]}',
+                                   headers={"X-Hub-Signature-256": "sha256=invalid"})
+            assert response.status_code == 403
 
 
 def test_health_reports_scheduler_disabled_by_default(tmp_path):
@@ -65,9 +69,9 @@ def test_health_reports_scheduler_disabled_by_default(tmp_path):
                   scheduler_enabled=False, paper_trading_enabled=False)
     app = create_app(cfg)
     with TestClient(app) as client:
-        response = client.get("/healthz")
-    assert response.status_code == 200
-    body = response.json()
+        responses = [client.get("/healthz"), client.get("/health"), client.head("/")]
+    assert all(response.status_code == 200 for response in responses)
+    body = responses[0].json()
     assert body["scheduler_enabled"] is False
     assert body["scheduler_worker"] == "disabled"
     assert body["live_execution_enabled"] is False

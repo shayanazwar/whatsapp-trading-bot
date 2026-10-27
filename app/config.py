@@ -75,6 +75,7 @@ class Settings:
     meta_phone_number_id: str
     whatsapp_allowed_senders: tuple[str, ...]
     whatsapp_monthly_message_cap: int
+    web_api_token: str
     mexc_api_key: str
     mexc_api_secret: str
 
@@ -155,6 +156,7 @@ def load_settings() -> Settings:
             x.strip() for x in os.getenv("WHATSAPP_ALLOWED_SENDERS", "").split(",") if x.strip()
         ),
         whatsapp_monthly_message_cap=_int("WHATSAPP_MONTHLY_MESSAGE_CAP", 900),
+        web_api_token=os.getenv("WEB_API_TOKEN", "").strip(),
         mexc_api_key=os.getenv("MEXC_API_KEY", ""),
         mexc_api_secret=os.getenv("MEXC_API_SECRET", ""),
     )

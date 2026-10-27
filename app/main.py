@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from app.config import Settings, load_settings
 from app.mexc.client import MexcClient
 from app.services.command_processor import CommandProcessor
+from app.commands import CommandError, parse_command
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
 from app.whatsapp import (
@@ -25,6 +26,27 @@ from app.whatsapp import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+
+_RESEARCH_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MEXC Research Dashboard</title><style>
+:root{color-scheme:dark}body{font:16px system-ui,sans-serif;max-width:850px;margin:32px auto;padding:0 16px;background:#101418;color:#edf2f7}
+.card{background:#1a222b;border:1px solid #34404d;border-radius:14px;padding:18px;margin:16px 0}input,button{font:inherit;border-radius:8px;padding:11px;border:1px solid #4b5968}input{background:#0e1318;color:#fff;width:100%;box-sizing:border-box;margin:7px 0 12px}button{background:#d6f36a;color:#151a10;font-weight:700;cursor:pointer;margin:4px 5px 4px 0}button.secondary{background:#303b47;color:#fff}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1015;padding:14px;border-radius:8px;min-height:100px}.muted{color:#aab7c4}.grid{display:flex;flex-wrap:wrap;gap:4px}
+</style></head><body><h1>MEXC Research Dashboard</h1>
+<p class="muted">Authenticated research interface. Read-only commands only; no live orders are available.</p>
+<section class="card"><label for="token">WEB_API_TOKEN</label><input id="token" type="password" autocomplete="off" placeholder="Paste the token configured in Render">
+<label for="command">Command</label><input id="command" value="PRICE BTCUSDT" maxlength="160">
+<div class="grid"><button data-cmd="PRICE BTCUSDT">BTC price</button><button data-cmd="ANALYZE BTCUSDT">Analyze BTC</button><button data-cmd="SCAN">Scan</button><button data-cmd="BACKTEST 7D">7D backtest</button><button data-cmd="STATUS">Status</button><button data-cmd="SIGNALS">Signals</button><button data-cmd="PERFORMANCE">Performance</button><button data-cmd="HELP" class="secondary">Help</button></div>
+<button id="run">Run command</button><button id="clear" class="secondary">Clear token</button></section>
+<section class="card"><strong id="status">Ready</strong><pre id="output">Results will appear here.</pre></section>
+<script>
+const token=document.getElementById('token'), command=document.getElementById('command'), output=document.getElementById('output'), status=document.getElementById('status');
+document.querySelectorAll('[data-cmd]').forEach(b=>b.addEventListener('click',()=>{command.value=b.dataset.cmd}));
+document.getElementById('clear').addEventListener('click',()=>{token.value='';status.textContent='Token cleared';});
+document.getElementById('run').addEventListener('click',async()=>{const t=token.value.trim();if(!t){status.textContent='Enter WEB_API_TOKEN first';return;}status.textContent='Working…';output.textContent='';try{const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+t},body:JSON.stringify({command:command.value})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Request failed');status.textContent=d.command+' · '+d.mode;output.textContent=d.result;}catch(e){status.textContent='Request failed';output.textContent=String(e.message||e);}});
+</script></body></html>"""
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -93,6 +115,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "whatsapp_webhook": "/webhook/whatsapp",
             "whatsapp_webhook_legacy": "/webhook",
         }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def research_dashboard() -> HTMLResponse:
+        # Token is entered by the operator and held only in page memory, not browser storage.
+        return HTMLResponse(content=_RESEARCH_DASHBOARD_HTML)
+
+    @app.post("/api/command")
+    async def web_research_command(request: Request) -> dict[str, str]:
+        settings: Settings = app.state.settings
+        configured_token = settings.web_api_token
+        if not configured_token:
+            raise HTTPException(status_code=503, detail="Web research API is not configured. Set WEB_API_TOKEN.")
+        authorization = request.headers.get("Authorization", "")
+        scheme, _, supplied_token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not supplied_token or not hmac.compare_digest(
+            configured_token, supplied_token
+        ):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("command"), str):
+            raise HTTPException(status_code=422, detail="Provide a command string")
+        command_text = payload["command"].strip()
+        if len(command_text) > 160:
+            raise HTTPException(status_code=422, detail="Command is too long")
+        try:
+            parsed = parse_command(command_text)
+        except CommandError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        allowed_web_commands = {
+            "HELP", "STATUS", "PRICE", "MARKET", "ANALYZE", "SCAN", "BACKTEST",
+            "SIGNALS", "PERFORMANCE", "PNL", "RISK", "LIVE_STATUS",
+            "OPEN_POSITIONS", "POSITIONS",
+        }
+        if parsed.name not in allowed_web_commands:
+            raise HTTPException(status_code=403, detail="This command is not available in the read-only web interface")
+        try:
+            result = await app.state.processor.process_text(
+                "authenticated-web-dashboard", command_text, enforce_whatsapp_policy=False
+            )
+        except CommandError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Web research command failed | command=%s", parsed.name)
+            raise HTTPException(status_code=502, detail="Command failed. Check service logs for details.") from exc
+        return {"command": parsed.name, "result": result.text, "mode": "research/paper; live execution disabled"}
 
     @app.api_route("/healthz", methods=["GET", "HEAD"])
     @app.api_route("/health", methods=["GET", "HEAD"])

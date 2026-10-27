@@ -274,8 +274,10 @@ class WhatsAppCloud:
             )
 
         text = (
-            "Thanks for your message. Automated responses are "
-            "temporarily unavailable. Please try again later."
+            "Automated WhatsApp commands are currently disabled on this channel. "
+            "For permitted read-only research, open the MEXC Research Dashboard: "
+            "https://shayan-millionaire-bot.onrender.com/dashboard . "
+            "This channel will not process crypto commands, and live trading is disabled."
         )
 
         client = await self._ensure_client()

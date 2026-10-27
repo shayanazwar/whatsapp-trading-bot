@@ -1,0 +1,378 @@
+"""Public-only MEXC Futures REST client.
+
+No authenticated trading endpoints are implemented here. GET retries are bounded; a future
+signed order POST must never be retried blindly after an ambiguous timeout.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
+from collections import defaultdict
+from typing import Any, Mapping
+
+import httpx
+
+from app.market.candles import Candle, INTERVAL_SECONDS, parse_kline_payload
+from app.symbols import normalize_symbol
+
+logger = logging.getLogger(__name__)
+
+
+class MexcError(RuntimeError):
+    pass
+
+
+class MexcRequestError(MexcError):
+    pass
+
+
+class MexcRateLimitError(MexcRequestError):
+    pass
+
+
+class MexcClient:
+    """A conservative async client for unauthenticated MEXC Futures market endpoints."""
+
+    def __init__(
+        self,
+        base_url: str = "https://api.mexc.com",
+        timeout_seconds: float = 12.0,
+        max_retries: int = 3,
+        client: httpx.AsyncClient | None = None,
+        min_interval_by_family: Mapping[str, float] | None = None,
+    ) -> None:
+        parsed_base = urlparse(base_url)
+        if parsed_base.scheme != "https" or parsed_base.hostname != "api.mexc.com" or parsed_base.port not in (None, 443):
+            raise ValueError("REST requests must use the exact official Futures host https://api.mexc.com")
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self._client = client
+        self._owns_client = client is None
+        self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._last_request: dict[str, float] = defaultdict(float)
+        self._last_server_time: int | None = None
+        self.server_time_source: str | None = None
+        # Klines: published 20 req/2s -> max theoretical 0.1s spacing; operate below that.
+        # Other families are intentionally throttled separately and conservatively.
+        self._min_interval = {
+            "kline": 0.11,
+            "ticker": 0.12,
+            "contract": 0.25,
+            "funding": 0.25,
+            "server_time": 0.25,
+            "depth": 0.25,
+            "trades": 0.25,
+        }
+        if min_interval_by_family:
+            self._min_interval.update(min_interval_by_family)
+
+    async def __aenter__(self) -> "MexcClient":
+        await self._ensure_client()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_seconds),
+                headers={"User-Agent": "MEXC-Futures-Research-Bot/0.2.0", "Accept": "application/json"},
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def _throttle(self, family: str) -> None:
+        async with self._locks[family]:
+            interval = self._min_interval.get(family, 0.25)
+            now = time.monotonic()
+            wait = interval - (now - self._last_request[family])
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request[family] = time.monotonic()
+
+    @staticmethod
+    def _response_ok(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        if payload.get("success") is False:
+            return False
+        code = payload.get("code")
+        if code not in (None, 0, "0", 200, "200") and payload.get("success") is not True:
+            return False
+        return True
+
+    async def _get(self, path: str, *, params: Mapping[str, Any] | None = None, family: str = "other") -> Any:
+        client = await self._ensure_client()
+        url = f"{self.base_url}{path}"
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            await self._throttle(family)
+            try:
+                response = await client.get(url, params=params)
+                if response.status_code == 429 or response.status_code == 418:
+                    retry_after = response.headers.get("Retry-After")
+                    delay = min(float(retry_after), 30.0) if retry_after else min(1.0 * (2**attempt), 8.0)
+                    if attempt >= self.max_retries:
+                        raise MexcRateLimitError(f"MEXC rate limit at {path}; retries exhausted")
+                    await asyncio.sleep(delay + random.uniform(0.0, min(0.25, delay / 4)))
+                    continue
+                response.raise_for_status()
+                date_header = response.headers.get("Date")
+                if date_header:
+                    try:
+                        self._last_server_time = int(parsedate_to_datetime(date_header).timestamp())
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise MexcRequestError(f"MEXC returned non-JSON data from {path}") from exc
+                if not self._response_ok(payload):
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    message = payload.get("message", payload.get("msg", "unknown error")) if isinstance(payload, dict) else "unknown error"
+                    raise MexcRequestError(f"MEXC logical error at {path}: code={code}, message={message}")
+                return payload
+            except MexcRateLimitError:
+                raise
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError, MexcRequestError) as exc:
+                last_error = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                # Do not retry client errors except transient 408/425/429/5xx.
+                if isinstance(exc, httpx.HTTPStatusError) and status is not None and status < 500 and status not in (408, 425):
+                    raise MexcRequestError(f"MEXC HTTP {status} at {path}") from exc
+                if isinstance(exc, MexcRequestError) and not isinstance(exc, MexcRateLimitError):
+                    raise
+                if attempt >= self.max_retries:
+                    break
+                await asyncio.sleep(min(0.35 * (2**attempt), 4.0) + random.uniform(0.0, 0.15))
+        raise MexcRequestError(f"MEXC request failed at {path}: {type(last_error).__name__ if last_error else 'unknown'}") from last_error
+
+    async def server_time(self) -> int:
+        payload = await self._get("/api/v1/contract/ping", family="server_time")
+        # Some Futures responses return {success:true, data:<timestamp>}; the endpoint can
+        # also act as a health check. A missing timestamp is unresolved, not fabricated.
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, (int, float, str)):
+            stamp = int(float(data))
+            self.server_time_source = "payload.data"
+            return stamp // 1000 if stamp > 100_000_000_000 else stamp
+        if isinstance(payload, dict):
+            for key in ("serverTime", "server_time", "time", "timestamp"):
+                if key in payload:
+                    stamp = int(float(payload[key]))
+                    self.server_time_source = f"payload.{key}"
+                    return stamp // 1000 if stamp > 100_000_000_000 else stamp
+        if self._last_server_time is not None:
+            # HTTP Date is a one-second-resolution server/proxy clock, not a substitute for
+            # explicit exchange-time fields. Callers should record this lower-confidence source.
+            self.server_time_source = "http_date_header"
+            return self._last_server_time
+        raise MexcRequestError("Server-time endpoint and HTTP Date header did not provide a timestamp")
+
+    async def get_klines(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        now_epoch: int | None = None,
+        close_grace_seconds: int = 5,
+        include_incomplete: bool = False,
+    ) -> list[Candle]:
+        symbol = normalize_symbol(symbol)
+        tf = timeframe.upper()
+        mexc_interval = {"1H": "Min60", "4H": "Hour4", "1D": "Day1", "5M": "Min5"}.get(tf)
+        if mexc_interval is None:
+            if tf == "12H":
+                raise ValueError("MEXC has no documented native 12H interval; derive it from completed 4H bars")
+            raise ValueError(f"Unsupported MEXC interval for {timeframe}")
+        params: dict[str, Any] = {"interval": mexc_interval}
+        if start is not None:
+            params["start"] = int(start)
+        if end is not None:
+            params["end"] = int(end)
+        payload = await self._get(f"/api/v1/contract/kline/{symbol}", params=params, family="kline")
+        candles = parse_kline_payload(payload, symbol, tf)
+        if start is not None:
+            candles = [c for c in candles if c.open_time >= start]
+        if end is not None:
+            candles = [c for c in candles if c.open_time <= end]
+        if now_epoch is None:
+            now_epoch = await self.server_time()
+        closed_before = now_epoch - close_grace_seconds
+        if include_incomplete:
+            from dataclasses import replace
+            candles = [replace(c, complete=(c.close_time <= closed_before)) for c in candles]
+        else:
+            candles = [c for c in candles if c.close_time <= closed_before]
+        return candles
+
+    async def get_klines_window(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        start: int,
+        end: int,
+        now_epoch: int | None = None,
+        close_grace_seconds: int = 5,
+        max_bars_per_request: int = 1800,
+    ) -> list[Candle]:
+        """Fetch a history window in bounded segments, deduplicating at boundaries."""
+        tf = timeframe.upper()
+        if tf not in {"1H", "4H", "1D", "5M"}:
+            raise ValueError("Only native REST intervals may be downloaded; 12H is derived")
+        if end < start:
+            raise ValueError("end must be >= start")
+        if not 1 <= max_bars_per_request <= 2000:
+            raise ValueError("max_bars_per_request must be 1..2000")
+        step = INTERVAL_SECONDS[tf]
+        chunk_span = step * (max_bars_per_request - 1)
+        cursor = int(start)
+        by_time: dict[int, Candle] = {}
+        while cursor <= end:
+            chunk_end = min(end, cursor + chunk_span)
+            chunk = await self.get_klines(
+                symbol, tf, start=cursor, end=chunk_end, now_epoch=now_epoch,
+                close_grace_seconds=close_grace_seconds, include_incomplete=False,
+            )
+            for candle in chunk:
+                if start <= candle.open_time <= end:
+                    prior = by_time.get(candle.open_time)
+                    if prior is not None and prior != candle:
+                        raise MexcRequestError(f"MEXC returned conflicting duplicate candle for {symbol} at {candle.open_time}")
+                    by_time[candle.open_time] = candle
+            if chunk_end >= end:
+                break
+            cursor = chunk_end + step
+        return [by_time[t] for t in sorted(by_time)]
+
+    async def contract_details(self) -> list[dict[str, Any]]:
+        payload = await self._get("/api/v1/contract/detail", family="contract")
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            raise MexcRequestError("Unexpected contract detail payload")
+        return [row for row in data if isinstance(row, dict)]
+
+    async def contract_detail(self, symbol: str) -> dict[str, Any] | None:
+        symbol = normalize_symbol(symbol)
+        rows = await self.contract_details()
+        for row in rows:
+            candidate = row.get("symbol") or row.get("contractCode")
+            try:
+                if candidate and normalize_symbol(str(candidate)) == symbol:
+                    return row
+            except ValueError:
+                continue
+        return None
+
+    async def ticker(self, symbol: str) -> dict[str, Any]:
+        symbol = normalize_symbol(symbol)
+        payload = await self._get("/api/v1/contract/ticker", params={"symbol": symbol}, family="ticker")
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(data, list):
+            matches = [x for x in data if isinstance(x, dict) and str(x.get("symbol", "")).upper() == symbol]
+            if not matches:
+                raise MexcRequestError(f"No ticker returned for {symbol}")
+            return matches[0]
+        if not isinstance(data, dict):
+            raise MexcRequestError("Unexpected ticker payload")
+        if data.get("symbol") and str(data["symbol"]).upper() != symbol:
+            raise MexcRequestError("Ticker symbol mismatch")
+        return data
+
+    async def depth(self, symbol: str, *, limit: int = 20) -> dict[str, Any]:
+        """Fetch the current MEXC Futures order book for execution-safety research only."""
+        symbol = normalize_symbol(symbol)
+        if not 1 <= limit <= 50:
+            raise ValueError("depth limit must be 1..50")
+        payload = await self._get(
+            f"/api/v1/contract/depth/{symbol}", params={"limit": limit}, family="depth"
+        )
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, dict):
+            raise MexcRequestError("Unexpected depth payload")
+        return data
+
+    async def recent_trades(self, symbol: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Fetch recent public Futures trades; never used as an extra strategy candle timeframe."""
+        symbol = normalize_symbol(symbol)
+        if not 1 <= limit <= 1000:
+            raise ValueError("trade limit must be 1..1000")
+        payload = await self._get(
+            f"/api/v1/contract/deals/{symbol}", params={"limit": limit}, family="trades"
+        )
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, list):
+            raise MexcRequestError("Unexpected recent-trades payload")
+        return [row for row in data if isinstance(row, dict)]
+
+    async def funding_current(self, symbol: str) -> dict[str, Any]:
+        symbol = normalize_symbol(symbol)
+        payload = await self._get(f"/api/v1/contract/funding_rate/{symbol}", family="funding")
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if isinstance(data, list):
+            if not data or not isinstance(data[0], dict):
+                raise MexcRequestError("Unexpected funding payload")
+            data = data[0]
+        if not isinstance(data, dict):
+            raise MexcRequestError("Unexpected funding payload")
+        return data
+
+    async def funding_history(self, symbol: str, *, page_num: int = 1, page_size: int = 100) -> list[dict[str, Any]]:
+        symbol = normalize_symbol(symbol)
+        if not 1 <= page_size <= 1000 or page_num < 1:
+            raise ValueError("Invalid funding history pagination")
+        payload = await self._get(
+            "/api/v1/contract/funding_rate/history",
+            params={"symbol": symbol, "page_num": page_num, "page_size": page_size},
+            family="funding",
+        )
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        if isinstance(data, dict):
+            data = data.get("resultList", data.get("list", data.get("records", [])))
+        if not isinstance(data, list):
+            return []
+        return [row for row in data if isinstance(row, dict)]
+
+    async def funding_history_window(self, symbol: str, *, start: int, end: int, max_pages: int = 30) -> list[dict[str, Any]]:
+        """Fetch funding history pages until the requested range is covered or page cap is hit.
+
+        Page ordering and endpoint retention are exchange-controlled; results are filtered by
+        settlement time and a warning is required if the oldest retrieved item does not reach start.
+        """
+        symbol = normalize_symbol(symbol)
+        collected: dict[int, dict[str, Any]] = {}
+        for page in range(1, max_pages + 1):
+            rows = await self.funding_history(symbol, page_num=page, page_size=100)
+            if not rows:
+                break
+            for row in rows:
+                stamp_raw = row.get("settleTime", row.get("settle_time", row.get("fundingTime", 0)))
+                try:
+                    stamp = int(float(stamp_raw))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if stamp > 100_000_000_000:
+                    stamp //= 1000
+                row_copy = dict(row)
+                row_copy["settleTime"] = stamp
+                if start < stamp <= end:
+                    collected[stamp] = row_copy
+            stamps = [int(r.get("settleTime", 0)) for r in rows if str(r.get("settleTime", "")).isdigit()]
+            if len(rows) < 100 or (stamps and min(stamps) <= start):
+                break
+        return [collected[t] for t in sorted(collected)]

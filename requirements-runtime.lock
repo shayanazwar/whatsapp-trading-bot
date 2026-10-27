@@ -1,0 +1,36 @@
+# Exact runtime dependency snapshot for the Linux/Python 3.12 Render container.
+# Resolve markers for CPython 3.12; generated from the locally installed runtime dependency versions.
+# Upgrade deliberately, run tests, then regenerate this file before deploying.
+annotated-doc==0.0.4
+annotated-types==0.8.0
+anyio==4.13.0
+certifi==2026.5.20
+click==8.1.8
+contourpy==1.3.3
+cycler==0.12.1
+fastapi==0.128.2
+fonttools==4.63.0
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.17
+kiwisolver==1.5.0
+matplotlib==3.10.8
+numpy==2.3.5
+packaging==25.0
+pillow==12.3.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+pyyaml==6.0.3
+six==1.17.0
+starlette==0.50.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.48.0
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==16.0

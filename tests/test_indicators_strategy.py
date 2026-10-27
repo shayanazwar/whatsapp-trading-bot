@@ -63,3 +63,27 @@ def test_strategy_never_emits_signal_with_inadequate_daily_history():
     ev = evaluate_strategy("BTC_USDT", {"1D": daily, "12H": h12, "4H": h4, "1H": h1}, decision_time=end)
     assert ev.candidate is None
     assert "EMA_WARMUP_INSUFFICIENT" in ev.rejection_reasons
+
+
+def test_prevalidated_backtest_path_matches_defensive_strategy_path():
+    from app.market.candles import aggregate_12h_from_4h
+
+    start = 1704067200  # UTC midnight, divisible by 12 hours
+    daily = candles("BTC_USDT", "1D", start, 240, 86400, base=100, trend=0.08)
+    h4_start = start + 150 * 86400
+    h4 = candles("BTC_USDT", "4H", h4_start, 540, 14400, base=100, trend=0.025)
+    h12 = aggregate_12h_from_4h(h4)
+    h1_start = start + 210 * 86400
+    h1 = candles("BTC_USDT", "1H", h1_start, 600, 3600, base=100, trend=0.01)
+    decision_time = h1[-1].close_time
+    data = {
+        "1D": [c for c in daily if c.complete and c.close_time <= decision_time],
+        "12H": [c for c in h12 if c.complete and c.close_time <= decision_time],
+        "4H": [c for c in h4 if c.complete and c.close_time <= decision_time],
+        "1H": [c for c in h1 if c.complete and c.close_time <= decision_time],
+    }
+    defensive = evaluate_strategy("BTC_USDT", data, decision_time=decision_time)
+    fast = evaluate_strategy(
+        "BTC_USDT", data, decision_time=decision_time, prevalidated=True
+    )
+    assert fast == defensive

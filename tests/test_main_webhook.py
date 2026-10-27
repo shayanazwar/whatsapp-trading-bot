@@ -9,13 +9,14 @@ from fastapi.testclient import TestClient
 
 from app.config import load_settings
 from app.main import create_app
+from app.whatsapp import WhatsAppCloud
 
 
 def signature(body: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-def test_webhook_verify_and_crypto_policy_gate_blocks_commands(tmp_path):
+def test_webhook_closed_policy_gate_sends_only_generic_service_reply(tmp_path, monkeypatch):
     base = load_settings()
     cfg = replace(
         base,
@@ -23,50 +24,78 @@ def test_webhook_verify_and_crypto_policy_gate_blocks_commands(tmp_path):
         reports_dir=tmp_path / "reports",
         meta_verify_token="verify-me",
         meta_app_secret="test-app-secret",
+        meta_access_token="test-token",
+        meta_phone_number_id="test-phone-id",
         whatsapp_allowed_senders=("923001234567",),
         whatsapp_crypto_messaging_allowed=False,
         whatsapp_policy_clearance_ref="",
     )
+    sent_to: list[str] = []
+
+    async def fake_service_status(self, recipient: str):
+        sent_to.append(recipient)
+        return {"messages": [{"id": "wamid.outbound.test"}]}
+
+    # The current main branch provides this method. raising=False also lets this
+    # test run against the earlier source ZIP before that helper was added.
+    monkeypatch.setattr(
+        WhatsAppCloud, "send_service_status", fake_service_status, raising=False
+    )
+
     app = create_app(cfg)
     with TestClient(app) as client:
-        params = {
-            "hub.mode": "subscribe", "hub.verify_token": "verify-me", "hub.challenge": "challenge-123",
-        }
         for path in ("/webhook/whatsapp", "/webhook"):
-            response = client.get(path, params=params)
+            response = client.get(path, params={
+                "hub.mode": "subscribe",
+                "hub.verify_token": "verify-me",
+                "hub.challenge": "challenge-123",
+            })
             assert response.status_code == 200
             assert response.text == "challenge-123"
 
-        payload = {"entry": [{"changes": [{"value": {
-            "metadata": {"phone_number_id": "not-used"},
+        payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
+            "metadata": {"phone_number_id": "test-phone-id"},
             "messages": [{"id": "wamid.in.1", "from": "923001234567", "timestamp": "1793000000",
                           "type": "text", "text": {"body": "STATUS"}}],
         }}]}]}
         body = json.dumps(payload, separators=(",", ":")).encode()
-        # The old Meta callback URL used /webhook, while the current one uses /webhook/whatsapp.
-        response = client.post("/webhook", content=body,
-                               headers={"X-Hub-Signature-256": signature(body, "test-app-secret")})
-        assert response.status_code == 200
+        for path in ("/webhook/whatsapp",):
+            response = client.post(
+                path, content=body,
+                headers={"X-Hub-Signature-256": signature(body, "test-app-secret")},
+            )
+            assert response.status_code == 200
+        # A follow-up request yields the event loop to the background responder.
+        assert client.get("/healthz").status_code == 200
+        assert sent_to == ["923001234567"]
         assert app.state.store.recent_events(10, "WHATSAPP_POLICY_GATE_BLOCKED")
+        assert app.state.store.recent_events(10, "WHATSAPP_SERVICE_STATUS_ACCEPTED_BY_META")
+        assert not app.state.store.recent_events(10, "WHATSAPP_COMMAND_PROCESSED")
         assert app.state.store.pending_outbox() == []
 
 
 def test_webhook_rejects_invalid_signature(tmp_path):
     base = load_settings()
-    cfg = replace(base, database_path=tmp_path / "webhook.sqlite3", reports_dir=tmp_path / "reports",
-                  meta_verify_token="v", meta_app_secret="s")
+    cfg = replace(
+        base, database_path=tmp_path / "signature.sqlite3",
+        reports_dir=tmp_path / "reports", meta_verify_token="v", meta_app_secret="s",
+    )
     app = create_app(cfg)
     with TestClient(app) as client:
         for path in ("/webhook/whatsapp", "/webhook"):
-            response = client.post(path, content=b'{"entry":[]}',
-                                   headers={"X-Hub-Signature-256": "sha256=invalid"})
+            response = client.post(
+                path, content=b'{"entry":[]}',
+                headers={"X-Hub-Signature-256": "sha256=invalid"},
+            )
             assert response.status_code == 403
 
 
 def test_health_reports_scheduler_disabled_by_default(tmp_path):
     base = load_settings()
-    cfg = replace(base, database_path=tmp_path / "health.sqlite3", reports_dir=tmp_path / "reports",
-                  scheduler_enabled=False, paper_trading_enabled=False)
+    cfg = replace(
+        base, database_path=tmp_path / "health.sqlite3", reports_dir=tmp_path / "reports",
+        scheduler_enabled=False, paper_trading_enabled=False,
+    )
     app = create_app(cfg)
     with TestClient(app) as client:
         responses = [client.get("/healthz"), client.get("/health"), client.head("/")]
@@ -75,3 +104,24 @@ def test_health_reports_scheduler_disabled_by_default(tmp_path):
     assert body["scheduler_enabled"] is False
     assert body["scheduler_worker"] == "disabled"
     assert body["live_execution_enabled"] is False
+
+
+def test_status_only_webhook_is_acknowledged_without_creating_replies(tmp_path):
+    base = load_settings()
+    cfg = replace(
+        base, database_path=tmp_path / "status-only.sqlite3", reports_dir=tmp_path / "reports",
+        meta_app_secret="test-app-secret",
+    )
+    app = create_app(cfg)
+    payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
+        "statuses": [{"id": "wamid.sent", "status": "delivered", "recipient_id": "923001234567"}],
+    }}]}]}
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook", content=body,
+            headers={"X-Hub-Signature-256": signature(body, "test-app-secret")},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "accepted"}
+        assert app.state.store.recent_events(10, "WHATSAPP_MESSAGE_ACCEPTED_BY_META") == []

@@ -57,6 +57,11 @@ class MexcClient:
         self._last_request: dict[str, float] = defaultdict(float)
         self._last_server_time: int | None = None
         self.server_time_source: str | None = None
+        # The contract-detail endpoint returns the full market list. A short cache prevents
+        # one identical full-list request per symbol during a multi-symbol backtest.
+        self._contract_details_cache: tuple[float, tuple[dict[str, Any], ...]] | None = None
+        self._contract_details_cache_ttl = 60.0
+        self._contract_details_cache_lock = asyncio.Lock()
         # Klines: published 20 req/2s -> max theoretical 0.1s spacing; operate below that.
         # Other families are intentionally throttled separately and conservatively.
         self._min_interval = {
@@ -259,13 +264,27 @@ class MexcClient:
         return [by_time[t] for t in sorted(by_time)]
 
     async def contract_details(self) -> list[dict[str, Any]]:
-        payload = await self._get("/api/v1/contract/detail", family="contract")
-        data = payload.get("data", []) if isinstance(payload, dict) else []
-        if isinstance(data, dict):
-            data = [data]
-        if not isinstance(data, list):
-            raise MexcRequestError("Unexpected contract detail payload")
-        return [row for row in data if isinstance(row, dict)]
+        """Return contract metadata, caching the full-list endpoint briefly.
+
+        Concurrent symbol lookups share one request. Entries expire after a short TTL so
+        changing contract availability is not cached indefinitely. Copies prevent callers
+        from mutating the shared cached rows.
+        """
+        async with self._contract_details_cache_lock:
+            now = time.monotonic()
+            cached = self._contract_details_cache
+            if cached is not None and now - cached[0] < self._contract_details_cache_ttl:
+                return [dict(row) for row in cached[1]]
+
+            payload = await self._get("/api/v1/contract/detail", family="contract")
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            if isinstance(data, dict):
+                data = [data]
+            if not isinstance(data, list):
+                raise MexcRequestError("Unexpected contract detail payload")
+            rows = tuple(dict(row) for row in data if isinstance(row, dict))
+            self._contract_details_cache = (time.monotonic(), rows)
+            return [dict(row) for row in rows]
 
     async def contract_detail(self, symbol: str) -> dict[str, Any] | None:
         symbol = normalize_symbol(symbol)

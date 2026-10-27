@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 
@@ -41,3 +43,56 @@ def test_client_rejects_lookalike_hosts():
         MexcClient(base_url="https://evil-mexc.com")
     with pytest.raises(ValueError, match="exact official Futures host"):
         MexcClient(base_url="https://api.mexc.com.attacker.invalid")
+
+
+@pytest.mark.asyncio
+async def test_contract_metadata_is_shared_across_concurrent_symbol_lookups():
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        assert request.url.path == "/api/v1/contract/detail"
+        calls += 1
+        return httpx.Response(200, json={"success": True, "data": [
+            {"symbol": "BTC_USDT", "state": 0, "apiAllowed": True},
+            {"symbol": "ETH_USDT", "state": 0, "apiAllowed": True},
+        ]})
+
+    transport_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MexcClient(client=transport_client)
+    try:
+        btc, eth = await asyncio.gather(
+            client.contract_detail("BTCUSDT"), client.contract_detail("ETHUSDT")
+        )
+        assert btc is not None and btc["symbol"] == "BTC_USDT"
+        assert eth is not None and eth["symbol"] == "ETH_USDT"
+        assert calls == 1
+
+        # Cached rows are copied: caller mutation cannot corrupt later symbol lookups.
+        btc["state"] = 999
+        refreshed = await client.contract_detail("BTCUSDT")
+        assert refreshed is not None and refreshed["state"] == 0
+        assert calls == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_contract_metadata_cache_expires():
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"success": True, "data": [{"symbol": "BTC_USDT"}]})
+
+    transport_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MexcClient(client=transport_client)
+    client._contract_details_cache_ttl = 0.01
+    try:
+        await client.contract_details()
+        await asyncio.sleep(0.02)
+        await client.contract_details()
+        assert calls == 2
+    finally:
+        await client.aclose()

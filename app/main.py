@@ -77,12 +77,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="MEXC Futures Research Bot", version="0.2.0", lifespan=lifespan)
 
-    @app.get("/")
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def root() -> dict[str, Any]:
         return {"service": "MEXC Futures Research Bot", "mode": "research/paper", "live_execution": "disabled",
                 "health": "/healthz", "whatsapp_webhook": "/webhook/whatsapp"}
 
-    @app.get("/healthz")
+    # Keep both paths during rollout: Render Dashboard may still be configured to /health,
+    # while render.yaml and this release advertise /healthz. Both must be fast 2xx routes.
+    @app.api_route("/healthz", methods=["GET", "HEAD"])
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def healthz() -> dict[str, Any]:
         store: Store = app.state.store
         try:
@@ -106,6 +109,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "whatsapp_policy_gate": "open-by-configuration" if settings.whatsapp_policy_gate_open else "blocked",
         }
 
+    # Backwards-compatible alias: the previous live revision used /webhook. Keep it
+    # alongside /webhook/whatsapp so existing Meta callback configuration survives rollout.
+    @app.get("/webhook", response_class=PlainTextResponse)
     @app.get("/webhook/whatsapp", response_class=PlainTextResponse)
     async def whatsapp_verify(
         hub_mode: str | None = Query(None, alias="hub.mode"),
@@ -119,6 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return PlainTextResponse(hub_challenge, status_code=200)
         raise HTTPException(status_code=403, detail="Webhook verification failed")
 
+    @app.post("/webhook")
     @app.post("/webhook/whatsapp")
     async def whatsapp_inbound(request: Request) -> dict[str, str]:
         settings: Settings = app.state.settings
@@ -168,7 +175,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 store.mark_inbound_processed(msg["message_id"], "crypto_policy_gate_closed; no command executed")
                 store.append_event("WHATSAPP_POLICY_GATE_BLOCKED", {"message_id": msg["message_id"], "sender": msg["from"]},
                                    idempotency_key=f"policy-blocked:{msg['message_id']}")
-                # Deliberately no reply; don't disguise trading content as a generic status message.
+                logger.warning(
+                    "WhatsApp inbound stored but not replied to: crypto messaging policy gate is closed; message_id=%s",
+                    msg["message_id"],
+                )
+                # Deliberately no reply until genuine written clearance is configured.
                 continue
             allowed = {sender_key(x) for x in settings.whatsapp_allowed_senders}
             if not allowed or msg["from"] not in allowed:

@@ -65,3 +65,34 @@ def test_web_api_is_unavailable_without_token(tmp_path):
     with TestClient(app) as client:
         response = client.post("/api/command", json={"command": "STATUS"})
     assert response.status_code == 503
+
+
+def test_dashboard_price_command_works_when_whatsapp_gate_is_closed(tmp_path, monkeypatch):
+    cfg = replace(
+        load_settings(),
+        database_path=tmp_path / "dashboard-price.sqlite3",
+        reports_dir=tmp_path / "reports",
+        web_api_token="test-secret-token",
+        whatsapp_crypto_messaging_allowed=False,
+        whatsapp_policy_clearance_ref="",
+    )
+    app = create_app(cfg)
+
+    async def fake_ticker(symbol: str) -> dict[str, str]:
+        assert symbol == "BTC_USDT"
+        return {"lastPrice": "67420.5", "timestamp": "1793188800"}
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(app.state.mexc, "ticker", fake_ticker)
+        response = client.post(
+            "/api/command",
+            json={"command": "PRICE BTCUSDT"},
+            headers={"Authorization": "Bearer test-secret-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["command"] == "PRICE"
+    assert "MEXC FUTURES PRICE" in response.json()["result"]
+    assert "67420.5" in response.json()["result"]
+    assert response.json()["mode"].startswith("research/paper")
+

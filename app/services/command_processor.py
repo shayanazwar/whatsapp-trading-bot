@@ -14,7 +14,10 @@ from app.alerts import AlertService
 from app.analysis import analyze_series, format_analysis
 from app.backtest import BacktestConfig, run_backtest
 from app.charting import render_5m_chart
-from app.commands import Command, CommandError, HELP_TEXT, parse_command
+from app.commands import (
+    Command, CommandError, HELP_TEXT, WHATSAPP_SUPPORT_COMMANDS,
+    WHATSAPP_SUPPORT_HELP_TEXT, parse_command,
+)
 from app.config import Settings
 from app.market.candles import Candle
 from app.mexc.client import MexcClient, MexcError
@@ -49,15 +52,30 @@ class CommandProcessor:
 
     async def process_text(self, sender: str, text: str, *, received_timestamp: int | None = None,
                            enforce_whatsapp_policy: bool = True) -> CommandResult:
-        if enforce_whatsapp_policy and not self.settings.whatsapp_policy_gate_open:
-            raise WhatsAppPolicyBlocked("WhatsApp command processing is disabled until written Meta policy clearance covers the exact crypto use case.")
+        # Authorize before parsing so unauthorized senders cannot use validation
+        # responses to probe the command surface.
         allowed = {sender_key(x) for x in self.settings.whatsapp_allowed_senders}
         if enforce_whatsapp_policy and (not allowed or sender_key(sender) not in allowed):
             raise CommandError("Sender is not authorized")
         if received_timestamp is not None and int(time.time()) - received_timestamp > 300:
             raise CommandError("This message is too old to execute. Send the command again.")
+
         command = parse_command(text)
-        result = await self.execute(command)
+        if enforce_whatsapp_policy and not self.settings.whatsapp_policy_gate_open:
+            # HELP and STATUS are support/operations commands and do not fetch
+            # market data or issue trading advice. All crypto-facing commands
+            # remain blocked unless the policy gate is open.
+            if command.name not in WHATSAPP_SUPPORT_COMMANDS:
+                raise WhatsAppPolicyBlocked(
+                    "Only HELP and STATUS are available on WhatsApp while the crypto policy gate is closed."
+                )
+            if command.name == "HELP":
+                result = CommandResult(WHATSAPP_SUPPORT_HELP_TEXT, event_type="WHATSAPP_SUPPORT_HELP")
+            else:
+                result = await self.execute(command)
+        else:
+            result = await self.execute(command)
+
         self.store.append_event("WHATSAPP_COMMAND_PROCESSED" if enforce_whatsapp_policy else "LOCAL_COMMAND_PROCESSED",
             {"sender": sender_key(sender), "command": command.name, "args": command.args,
              "result_event": result.event_type, "mode": "PAPER/RESEARCH"},

@@ -1,4 +1,4 @@
-"""MEXC 5M charting only. This module is not imported by the strategy engine."""
+"""Render higher-timeframe charts, isolated from strategy decisions."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -18,19 +18,20 @@ class ChartError(RuntimeError):
     pass
 
 
-def render_5m_chart(candles: Sequence[Candle], output_path: str | Path, *, title_suffix: str = "") -> Path:
-    """Render 5-minute candles and display-only EMA 21/50/100/200 plus pivot S/R.
-
-    The function only accepts 5M candles and produces an image. It does not call or mutate
-    strategy modules and its results must never be forwarded into a strategy decision.
-    """
+def _render_chart_for_timeframe(
+    candles: Sequence[Candle], output_path: str | Path, *, timeframe: str, title_suffix: str = ""
+) -> Path:
+    tf = timeframe.upper()
+    durations = {"1H": 3600, "4H": 4 * 3600, "12H": 12 * 3600, "1D": 24 * 3600, "5M": 300}
+    if tf not in durations:
+        raise ChartError("Unsupported chart timeframe")
     bars = sorted(candles, key=lambda c: c.open_time)
     if not bars:
-        raise ChartError("No 5M candles are available for charting")
-    if any(c.timeframe != "5M" for c in bars):
-        raise ChartError("Charting accepts only 5M candles")
+        raise ChartError(f"No {tf} candles are available for charting")
+    if any(c.timeframe != tf for c in bars):
+        raise ChartError(f"Charting accepts only {tf} candles")
     if len(bars) < 200:
-        raise ChartError(f"At least 200 5M candles are required for EMA200; received {len(bars)}")
+        raise ChartError(f"At least 200 {tf} candles are required for EMA200; received {len(bars)}")
     closes = [c.close for c in bars]
     ema_series = {period: ema(closes, period) for period in (21, 50, 100, 200)}
     highs = [c.high for c in bars]
@@ -51,7 +52,7 @@ def render_5m_chart(candles: Sequence[Candle], output_path: str | Path, *, title
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(14, 8), dpi=140)
-    width_days = (5 * 60) / 86400 * 0.72
+    width_days = durations[tf] / 86400 * 0.72
     for date, candle in zip(dates, bars):
         color = "#1b9e77" if candle.close >= candle.open else "#d95f02"
         x = mdates.date2num(date)
@@ -69,7 +70,7 @@ def render_5m_chart(candles: Sequence[Candle], output_path: str | Path, *, title
         ax.axhline(price, color="#1b9e77", linestyle="--", linewidth=0.75, alpha=0.65)
     for price in resistances[-5:]:
         ax.axhline(price, color="#d95f02", linestyle="--", linewidth=0.75, alpha=0.65)
-    ax.set_title(f"{bars[-1].symbol} Futures — 5M chart (visualization only) {title_suffix}".strip())
+    ax.set_title(f"{bars[-1].symbol} Futures — {tf} chart (visualization only) {title_suffix}".strip())
     ax.set_ylabel("Price")
     ax.set_xlabel("Time (UTC)")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
@@ -80,3 +81,18 @@ def render_5m_chart(candles: Sequence[Candle], output_path: str | Path, *, title
     fig.savefig(out, format="png")
     plt.close(fig)
     return out
+
+
+def render_timeframe_chart(
+    candles: Sequence[Candle], output_path: str | Path, *, timeframe: str, title_suffix: str = ""
+) -> Path:
+    """Render 1H/4H/12H/1D charts; charts do not themselves create trading signals."""
+    tf = timeframe.upper()
+    if tf not in {"1H", "4H", "12H", "1D"}:
+        raise ChartError("Strategy chart timeframe must be 1H, 4H, 12H or 1D")
+    return _render_chart_for_timeframe(candles, output_path, timeframe=tf, title_suffix=title_suffix)
+
+
+def render_5m_chart(candles: Sequence[Candle], output_path: str | Path, *, title_suffix: str = "") -> Path:
+    """Legacy visualization-only renderer; the current command parser rejects 5M."""
+    return _render_chart_for_timeframe(candles, output_path, timeframe="5M", title_suffix=title_suffix)

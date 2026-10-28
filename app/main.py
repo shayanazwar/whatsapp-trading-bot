@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import mimetypes
 import hmac
 import json
 import logging
@@ -43,11 +45,11 @@ _RESEARCH_DASHBOARD_HTML = r"""<!doctype html>
 <p class="muted">Authenticated research interface. Read-only commands only; no live orders are available.</p>
 <section class="card"><label for="token">WEB_API_TOKEN</label><input id="token" type="password" autocomplete="off" placeholder="Paste the token configured in Render">
 <label for="command">Command</label><input id="command" value="PRICE BTCUSDT" maxlength="160">
-<div class="grid"><button data-cmd="PRICE BTCUSDT">BTC price</button><button data-cmd="ANALYZE BTCUSDT">Analyze BTC</button><button data-cmd="SCAN">Scan</button><button data-cmd="BACKTEST 7D">7D backtest</button><button data-cmd="STATUS">Status</button><button data-cmd="SIGNALS">Signals</button><button data-cmd="PERFORMANCE">Performance</button><button data-cmd="HELP" class="secondary">Help</button></div>
+<div class="grid"><button data-cmd="PRICE BTCUSDT">BTC price</button><button data-cmd="ANALYZE BTCUSDT">Analyze BTC</button><button data-cmd="CHART BTCUSDT 1H">BTC chart · 1H</button><button data-cmd="SCAN">Scan</button><button data-cmd="BACKTEST 7D">7D backtest</button><button data-cmd="STATUS">Status</button><button data-cmd="SIGNALS">Signals</button><button data-cmd="PERFORMANCE">Performance</button><button data-cmd="HELP" class="secondary">Help</button></div>
 <button id="run">Run command</button><button id="clear" class="secondary">Clear token</button></section>
-<section class="card"><strong id="status">Ready</strong><pre id="output">Results will appear here.</pre></section>
+<section class="card"><strong id="status">Ready</strong><pre id="output">Results will appear here.</pre><div id="attachments"></div></section>
 <script>
-const token=document.getElementById('token'), command=document.getElementById('command'), output=document.getElementById('output'), status=document.getElementById('status'), runButton=document.getElementById('run');
+const token=document.getElementById('token'), command=document.getElementById('command'), output=document.getElementById('output'), status=document.getElementById('status'), runButton=document.getElementById('run'), attachments=document.getElementById('attachments');
 let running=false;
 function setBusy(value){running=value;runButton.disabled=value;document.querySelectorAll('[data-cmd]').forEach(b=>b.disabled=value);}
 async function runCommand(preset){
@@ -57,7 +59,7 @@ async function runCommand(preset){
   if(!requested){status.textContent='Enter a command first';output.textContent='Choose a command or type one above.';command.focus();return;}
   const t=token.value.trim();
   if(!t){status.textContent='Token required';output.textContent='Paste the WEB_API_TOKEN configured in Render, then tap a command button again.';token.focus();return;}
-  setBusy(true);status.textContent='Running '+requested+'…';output.textContent='Waiting for the server response…';
+  setBusy(true);status.textContent='Running '+requested+'…';output.textContent='Waiting for the server response…';attachments.replaceChildren();
   try{
     const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+t},body:JSON.stringify({command:requested})});
     const raw=await r.text();let d={};
@@ -65,6 +67,10 @@ async function runCommand(preset){
     if(!r.ok)throw new Error(d.detail||('Request failed (HTTP '+r.status+')'));
     status.textContent=(d.command||requested)+' · '+(d.mode||'completed');
     output.textContent=typeof d.result==='string'?d.result:JSON.stringify(d,null,2);
+    for(const item of (d.attachments||[])){
+      if(item.mime_type&&item.mime_type.startsWith('image/')&&item.data_uri){const img=document.createElement('img');img.src=item.data_uri;img.alt=item.filename||'Generated research chart';img.style.maxWidth='100%';img.style.borderRadius='8px';img.style.marginTop='12px';attachments.appendChild(img);}
+      else if(item.data_uri){const a=document.createElement('a');a.href=item.data_uri;a.download=item.filename||'research-report';a.textContent='Download '+(item.filename||'research report');a.style.display='block';a.style.marginTop='12px';attachments.appendChild(a);}
+    }
   }catch(e){status.textContent='Request failed';output.textContent=String(e.message||e);}
   finally{setBusy(false);}
 }
@@ -158,7 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return HTMLResponse(content=_RESEARCH_DASHBOARD_HTML)
 
     @app.post("/api/command")
-    async def web_research_command(request: Request) -> dict[str, str]:
+    async def web_research_command(request: Request) -> dict[str, Any]:
         settings: Settings = app.state.settings
         configured_token = settings.web_api_token
         if not configured_token:
@@ -183,7 +189,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except CommandError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         allowed_web_commands = {
-            "HELP", "STATUS", "PRICE", "MARKET", "ANALYZE", "SCAN", "BACKTEST",
+            "HELP", "STATUS", "PRICE", "MARKET", "ANALYZE", "CHART", "SCAN", "BACKTEST",
             "SIGNALS", "PERFORMANCE", "PNL", "RISK", "LIVE_STATUS",
             "OPEN_POSITIONS", "POSITIONS",
         }
@@ -198,7 +204,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:
             logger.exception("Web research command failed | command=%s", parsed.name)
             raise HTTPException(status_code=502, detail="Command failed. Check service logs for details.") from exc
-        return {"command": parsed.name, "result": result.text, "mode": "research/paper; live execution disabled"}
+        attachments: list[dict[str, str]] = []
+        for file_path, media_type in result.attachments:
+            report_path = Path(file_path)
+            try:
+                if not report_path.is_file():
+                    continue
+                if report_path.stat().st_size > 3 * 1024 * 1024:
+                    attachments.append({"filename": report_path.name, "mime_type": "text/plain",
+                                       "data_uri": "", "note": "Attachment exceeds the 3 MiB dashboard limit."})
+                    continue
+                content_type = ("image/png" if media_type == "image" else
+                                mimetypes.guess_type(report_path.name)[0] or "application/octet-stream")
+                encoded = base64.b64encode(report_path.read_bytes()).decode("ascii")
+                attachments.append({"filename": report_path.name, "mime_type": content_type,
+                                    "data_uri": f"data:{content_type};base64,{encoded}"})
+            except OSError:
+                logger.exception("Dashboard attachment could not be read | filename=%s", report_path.name)
+        return {"command": parsed.name, "result": result.text,
+                "attachments": attachments,
+                "mode": "research/paper; live execution disabled"}
 
     @app.api_route("/healthz", methods=["GET", "HEAD"])
     @app.api_route("/health", methods=["GET", "HEAD"])

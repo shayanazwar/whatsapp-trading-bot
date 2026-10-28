@@ -23,6 +23,7 @@ RESEARCH DASHBOARD
 PRICE BTCUSDT — Current price
 MARKET BTCUSDT — Market ticker
 ANALYZE BTCUSDT — Market analysis
+CHART BTCUSDT 1H — Chart (1H/4H/12H/1D)
 SCAN — Scan supported symbols
 SIGNALS — Latest signals
 BACKTEST 7D — 7-day backtest
@@ -91,9 +92,9 @@ def parse_command(text: str) -> Command:
         return Command("SCAN", {})
     if head == "CHART" and len(parts) == 3:
         timeframe = upper[2]
-        if timeframe != "5M":
-            raise CommandError("CHART only supports the isolated visualization timeframe 5M")
-        return Command("CHART", {"symbol": _symbol(parts[1]), "timeframe": "5M"})
+        if timeframe not in {"1H", "4H", "12H", "1D"}:
+            raise CommandError("CHART timeframe must be 1H, 4H, 12H or 1D")
+        return Command("CHART", {"symbol": _symbol(parts[1]), "timeframe": timeframe})
 
     if head == "BACKTEST":
         args: dict[str, Any] = {"mode": "fixed_payout", "windows": list(BACKTEST_WINDOW_ORDER)}

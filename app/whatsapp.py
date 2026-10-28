@@ -24,6 +24,15 @@ class WhatsAppPolicyBlocked(WhatsAppError):
     """Raised when crypto-related messaging is not approved."""
 
 
+# One canonical payload is shared by the sender and the durable outbox so the
+# recorded message always matches the message actually submitted to Meta.
+WHATSAPP_POLICY_BLOCKED_REPLY = (
+    "Automated commands are not enabled on this WhatsApp channel. "
+    "Your message was received, but no command was executed. "
+    "Live order execution remains disabled."
+)
+
+
 def verify_webhook_signature(
     raw_body: bytes,
     signature_header: str | None,
@@ -273,12 +282,7 @@ class WhatsAppCloud:
                 "META_ACCESS_TOKEN is not configured"
             )
 
-        text = (
-            "Automated WhatsApp commands are currently disabled on this channel. "
-            "For permitted read-only research, open the MEXC Research Dashboard: "
-            "https://shayan-millionaire-bot.onrender.com/dashboard . "
-            "This channel will not process crypto commands, and live trading is disabled."
-        )
+        text = WHATSAPP_POLICY_BLOCKED_REPLY
 
         client = await self._ensure_client()
         response = await client.post(

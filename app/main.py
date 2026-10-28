@@ -20,8 +20,13 @@ from app.commands import CommandError, parse_command
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
 from app.whatsapp import (
-    WhatsAppCloud, WhatsAppPolicyBlocked, extract_incoming_messages, extract_status_updates,
-    sender_key, verify_webhook_signature,
+    WHATSAPP_POLICY_BLOCKED_REPLY,
+    WhatsAppCloud,
+    WhatsAppPolicyBlocked,
+    extract_incoming_messages,
+    extract_status_updates,
+    sender_key,
+    verify_webhook_signature,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -33,7 +38,7 @@ _RESEARCH_DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MEXC Research Dashboard</title><style>
 :root{color-scheme:dark}body{font:16px system-ui,sans-serif;max-width:850px;margin:32px auto;padding:0 16px;background:#101418;color:#edf2f7}
-.card{background:#1a222b;border:1px solid #34404d;border-radius:14px;padding:18px;margin:16px 0}input,button{font:inherit;border-radius:8px;padding:11px;border:1px solid #4b5968}input{background:#0e1318;color:#fff;width:100%;box-sizing:border-box;margin:7px 0 12px}button{background:#d6f36a;color:#151a10;font-weight:700;cursor:pointer;margin:4px 5px 4px 0}button.secondary{background:#303b47;color:#fff}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1015;padding:14px;border-radius:8px;min-height:100px}.muted{color:#aab7c4}.grid{display:flex;flex-wrap:wrap;gap:4px}
+.card{background:#1a222b;border:1px solid #34404d;border-radius:14px;padding:18px;margin:16px 0}input,button{font:inherit;border-radius:8px;padding:11px;border:1px solid #4b5968}input{background:#0e1318;color:#fff;width:100%;box-sizing:border-box;margin:7px 0 12px}button{background:#d6f36a;color:#151a10;font-weight:700;cursor:pointer;margin:4px 5px 4px 0}button:disabled{opacity:.55;cursor:wait}button.secondary{background:#303b47;color:#fff}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1015;padding:14px;border-radius:8px;min-height:100px}.muted{color:#aab7c4}.grid{display:flex;flex-wrap:wrap;gap:4px}
 </style></head><body><h1>MEXC Research Dashboard</h1>
 <p class="muted">Authenticated research interface. Read-only commands only; no live orders are available.</p>
 <section class="card"><label for="token">WEB_API_TOKEN</label><input id="token" type="password" autocomplete="off" placeholder="Paste the token configured in Render">
@@ -42,10 +47,31 @@ _RESEARCH_DASHBOARD_HTML = r"""<!doctype html>
 <button id="run">Run command</button><button id="clear" class="secondary">Clear token</button></section>
 <section class="card"><strong id="status">Ready</strong><pre id="output">Results will appear here.</pre></section>
 <script>
-const token=document.getElementById('token'), command=document.getElementById('command'), output=document.getElementById('output'), status=document.getElementById('status');
-document.querySelectorAll('[data-cmd]').forEach(b=>b.addEventListener('click',()=>{command.value=b.dataset.cmd}));
-document.getElementById('clear').addEventListener('click',()=>{token.value='';status.textContent='Token cleared';});
-document.getElementById('run').addEventListener('click',async()=>{const t=token.value.trim();if(!t){status.textContent='Enter WEB_API_TOKEN first';return;}status.textContent='Working…';output.textContent='';try{const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+t},body:JSON.stringify({command:command.value})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Request failed');status.textContent=d.command+' · '+d.mode;output.textContent=d.result;}catch(e){status.textContent='Request failed';output.textContent=String(e.message||e);}});
+const token=document.getElementById('token'), command=document.getElementById('command'), output=document.getElementById('output'), status=document.getElementById('status'), runButton=document.getElementById('run');
+let running=false;
+function setBusy(value){running=value;runButton.disabled=value;document.querySelectorAll('[data-cmd]').forEach(b=>b.disabled=value);}
+async function runCommand(preset){
+  if(running)return;
+  if(typeof preset==='string')command.value=preset;
+  const requested=command.value.trim();
+  if(!requested){status.textContent='Enter a command first';output.textContent='Choose a command or type one above.';command.focus();return;}
+  const t=token.value.trim();
+  if(!t){status.textContent='Token required';output.textContent='Paste the WEB_API_TOKEN configured in Render, then tap a command button again.';token.focus();return;}
+  setBusy(true);status.textContent='Running '+requested+'…';output.textContent='Waiting for the server response…';
+  try{
+    const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+t},body:JSON.stringify({command:requested})});
+    const raw=await r.text();let d={};
+    try{d=raw?JSON.parse(raw):{};}catch(_){d={detail:raw||'The server returned an empty or invalid response.'};}
+    if(!r.ok)throw new Error(d.detail||('Request failed (HTTP '+r.status+')'));
+    status.textContent=(d.command||requested)+' · '+(d.mode||'completed');
+    output.textContent=typeof d.result==='string'?d.result:JSON.stringify(d,null,2);
+  }catch(e){status.textContent='Request failed';output.textContent=String(e.message||e);}
+  finally{setBusy(false);}
+}
+document.querySelectorAll('[data-cmd]').forEach(b=>b.addEventListener('click',()=>runCommand(b.dataset.cmd)));
+runButton.addEventListener('click',()=>runCommand());
+command.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runCommand();}});
+document.getElementById('clear').addEventListener('click',()=>{token.value='';status.textContent='Token cleared';output.textContent='Paste the token again before running a command.';token.focus();});
 </script></body></html>"""
 
 
@@ -302,7 +328,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     idempotency_key=f"policy-blocked:{message_id}",
                 )
                 logger.warning(
-                    "WHATSAPP POLICY GATE CLOSED | generic non-trading reply scheduled | message_id=%s",
+                    "WHATSAPP POLICY GATE CLOSED | policy-status reply scheduled | message_id=%s",
                     message_id,
                 )
                 _spawn_policy_status_task(app, msg, message_id)
@@ -351,14 +377,11 @@ def _spawn_policy_status_task(app: FastAPI, message: dict[str, str], message_id:
 
 
 async def _send_policy_status_reply(app: FastAPI, message: dict[str, str], message_id: str) -> None:
-    """Send only the generic service response; never execute the user command."""
+    """Send the policy-status response; never execute the blocked user command."""
     store: Store = app.state.store
     sender = sender_key(message.get("from", ""))
     outbox_id = None
-    generic_reply = (
-        "Thanks for your message. Automated responses are temporarily unavailable. "
-        "Please try again later."
-    )
+    generic_reply = WHATSAPP_POLICY_BLOCKED_REPLY
     response_key = f"wa-policy-status:{message_id}"
     try:
         outbox_id = store.enqueue_outbox(

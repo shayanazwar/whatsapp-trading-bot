@@ -11,6 +11,8 @@ from typing import Any, Mapping
 
 import httpx
 
+from app.commands import WHATSAPP_SUPPORT_COMMANDS, WHATSAPP_SUPPORT_HELP_TEXT
+
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -27,9 +29,9 @@ class WhatsAppPolicyBlocked(WhatsAppError):
 # One canonical payload is shared by the sender and the durable outbox so the
 # recorded message always matches the message actually submitted to Meta.
 WHATSAPP_POLICY_BLOCKED_REPLY = (
-    "Automated commands are not enabled on this WhatsApp channel. "
-    "Your message was received, but no command was executed. "
-    "Live order execution remains disabled."
+    "This WhatsApp channel currently supports HELP and STATUS only. "
+    "Crypto prices, analysis, signals and backtests are not available here. "
+    "Your request was not executed. Live order execution remains disabled."
 )
 
 
@@ -323,68 +325,69 @@ class WhatsAppCloud:
 
         return result if isinstance(result, dict) else {}
 
+    async def send_support_text(
+        self,
+        recipient: str,
+        text: str,
+        *,
+        command: str,
+    ) -> dict[str, Any]:
+        """Send only the explicitly permitted non-crypto support commands."""
+        normalized_command = str(command).strip().upper()
+        if normalized_command not in WHATSAPP_SUPPORT_COMMANDS:
+            raise WhatsAppPolicyBlocked(
+                "Only HELP and STATUS may be sent while the WhatsApp crypto policy gate is closed."
+            )
+        # Fail closed if another caller tries to label arbitrary crypto content as
+        # a support reply. HELP must match its fixed safe text; STATUS must retain
+        # the processor's non-market operational heading.
+        if normalized_command == "HELP" and text != WHATSAPP_SUPPORT_HELP_TEXT:
+            raise WhatsAppPolicyBlocked("HELP reply does not match the approved support text.")
+        if normalized_command == "STATUS" and not text.startswith("SYSTEM STATUS\n"):
+            raise WhatsAppPolicyBlocked("STATUS reply is not a recognized operational-status response.")
+        return await self._post_text(recipient, text)
+
     async def send_text(
         self,
         recipient: str,
         text: str,
     ) -> dict[str, Any]:
-        """Send a normal text message only when the policy gate is open."""
+        """Send a normal text message only when the crypto policy gate is open."""
         self._require_gate()
+        return await self._post_text(recipient, text)
 
+    async def _post_text(
+        self,
+        recipient: str,
+        text: str,
+    ) -> dict[str, Any]:
+        """Common allowlisted text sender; callers must enforce their own policy."""
         if not self.settings.meta_access_token:
-            raise WhatsAppError(
-                "META_ACCESS_TOKEN is not configured"
-            )
-
+            raise WhatsAppError("META_ACCESS_TOKEN is not configured")
         if not text or len(text) > 4000:
-            raise WhatsAppError(
-                "Message is empty or exceeds configured size"
-            )
+            raise WhatsAppError("Message is empty or exceeds configured size")
 
         recipient_key = self._validate_recipient(recipient)
         client = await self._ensure_client()
-
         response = await client.post(
             self._endpoint(),
-            headers={
-                "Authorization": (
-                    f"Bearer {self.settings.meta_access_token}"
-                )
-            },
+            headers={"Authorization": f"Bearer {self.settings.meta_access_token}"},
             json={
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
                 "to": recipient_key,
                 "type": "text",
-                "text": {
-                    "preview_url": False,
-                    "body": text,
-                },
+                "text": {"preview_url": False, "body": text},
             },
         )
-
         if response.is_error:
-            logger.warning(
-                "Meta text send failed | HTTP %s",
-                response.status_code,
-            )
-            raise WhatsAppError(
-                "Meta message send failed with HTTP "
-                f"{response.status_code}"
-            )
-
+            logger.warning("Meta text send failed | HTTP %s", response.status_code)
+            raise WhatsAppError(f"Meta message send failed with HTTP {response.status_code}")
         try:
             result = response.json()
         except ValueError as exc:
-            raise WhatsAppError(
-                "Meta message send returned invalid JSON"
-            ) from exc
-
-        return (
-            result
-            if isinstance(result, dict)
-            else {"response": "unstructured"}
-        )
+            raise WhatsAppError("Meta message send returned invalid JSON") from exc
+        return result if isinstance(result, dict) else {"response": "unstructured"}
 
     async def send_media(
         self,

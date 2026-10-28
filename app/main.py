@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from app.config import Settings, load_settings
 from app.mexc.client import MexcClient
 from app.services.command_processor import CommandProcessor
-from app.commands import CommandError, parse_command
+from app.commands import CommandError, WHATSAPP_SUPPORT_COMMANDS, parse_command
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
 from app.whatsapp import (
@@ -103,15 +103,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "open" if cfg.whatsapp_policy_gate_open else "closed",
             bool(cfg.whatsapp_allowed_senders),
         )
-        # Recover durably stored but unprocessed webhooks only when the policy gate and allowlist are open.
-        if cfg.whatsapp_policy_gate_open and cfg.whatsapp_allowed_senders:
+        # Recover pending messages safely. With the crypto gate closed, only the
+        # support-only HELP/STATUS commands may run; all other pending messages
+        # receive the fixed non-crypto policy response.
+        if cfg.whatsapp_allowed_senders:
+            allowed_recovery_senders = {sender_key(x) for x in cfg.whatsapp_allowed_senders}
             for row in store.pending_inbound(limit=50):
                 try:
                     payload = json.loads(row["payload_json"])
                     msgs = extract_incoming_messages(payload)
                     msg = next((m for m in msgs if m["message_id"] == row["message_id"]), None)
-                    if msg:
+                    if not msg:
+                        continue
+                    if sender_key(msg.get("from", "")) not in allowed_recovery_senders:
+                        store.mark_inbound_processed(row["message_id"], "unauthorized_sender_dropped_on_recovery")
+                        continue
+                    if cfg.whatsapp_policy_gate_open or _is_support_command(msg.get("body", "")):
                         _spawn_message_task(app, msg, row["message_id"])
+                    else:
+                        _spawn_policy_status_task(app, msg, row["message_id"])
                 except Exception:
                     logger.warning("Could not requeue one stored inbound webhook row")
         yield
@@ -319,21 +329,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 continue
 
-            # A closed crypto policy gate must never execute the submitted command.
-            # It may send only a fixed, generic, non-trading service acknowledgement.
-            if not settings.whatsapp_policy_gate_open:
+            # With the policy gate closed, allow only non-crypto support commands.
+            # Crypto market data, signals, scans and backtests must not reach the
+            # processor through WhatsApp without the required written clearance.
+            if not settings.whatsapp_policy_gate_open and not _is_support_command(msg.get("body", "")):
                 store.append_event(
                     "WHATSAPP_POLICY_GATE_BLOCKED",
-                    {"message_id": message_id, "reply_type": "generic_service_status_only"},
+                    {"message_id": message_id, "reply_type": "support_only_policy_notice"},
                     idempotency_key=f"policy-blocked:{message_id}",
                 )
                 logger.warning(
-                    "WHATSAPP POLICY GATE CLOSED | policy-status reply scheduled | message_id=%s",
+                    "WHATSAPP POLICY GATE CLOSED | crypto command blocked; support-only notice scheduled | message_id=%s",
                     message_id,
                 )
                 _spawn_policy_status_task(app, msg, message_id)
                 continue
 
+            if not settings.whatsapp_policy_gate_open:
+                logger.info(
+                    "WHATSAPP SUPPORT COMMAND ACCEPTED | message_id=%s command=%s",
+                    message_id, parse_command(msg.get("body", "")).name,
+                )
             _spawn_message_task(app, msg, message_id)
         # Persist all useful information first and acknowledge quickly; no strategy work happens inline.
         return {"status": "accepted"}
@@ -358,6 +374,14 @@ def _spawn_task(app: FastAPI, coroutine, *, name: str) -> None:
             )
 
     task.add_done_callback(finished)
+
+
+def _is_support_command(body: str) -> bool:
+    """Return True only for syntactically valid support commands allowed by the closed gate."""
+    try:
+        return parse_command(body).name in WHATSAPP_SUPPORT_COMMANDS
+    except CommandError:
+        return False
 
 
 def _spawn_message_task(app: FastAPI, message: dict[str, str], message_id: str) -> None:
@@ -457,16 +481,35 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
         response_key = f"wa-reply:{message_id}:text"
         outbox_id = store.enqueue_outbox(sender, result.text, category="service", idempotency_key=response_key)
         try:
-            provider_result = await app.state.whatsapp.send_text(sender, result.text)
+            if settings.whatsapp_policy_gate_open:
+                provider_result = await app.state.whatsapp.send_text(sender, result.text)
+            else:
+                safe_command = parse_command(body).name
+                provider_result = await app.state.whatsapp.send_support_text(
+                    sender, result.text, command=safe_command
+                )
             provider_messages = provider_result.get("messages", [])
-            provider_id = provider_messages[0].get("id") if provider_messages and isinstance(provider_messages[0], dict) else None
+            provider_id = (
+                provider_messages[0].get("id")
+                if provider_messages and isinstance(provider_messages[0], dict)
+                else None
+            )
             store.record_outbox_attempt(outbox_id, accepted=True, provider_message_id=provider_id)
-            store.append_event("WHATSAPP_MESSAGE_ACCEPTED_BY_META", {"recipient": sender, "provider_message_id": provider_id,
-                "outbox_id": outbox_id, "category": "service", "delivery_confirmed": False},
-                idempotency_key=f"wa-accepted:{response_key}")
+            store.append_event(
+                "WHATSAPP_MESSAGE_ACCEPTED_BY_META",
+                {
+                    "recipient": sender,
+                    "provider_message_id": provider_id,
+                    "outbox_id": outbox_id,
+                    "category": "service",
+                    "delivery_confirmed": False,
+                },
+                idempotency_key=f"wa-accepted:{response_key}",
+            )
             logger.info(
                 "WHATSAPP REPLY ACCEPTED BY META | message_id=%s provider_id_present=%s",
-                message_id, bool(provider_id),
+                message_id,
+                bool(provider_id),
             )
         except Exception as exc:
             # A timeout may have happened after Meta accepted the message; mark unknown and do not blind retry.

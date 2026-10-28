@@ -11,6 +11,14 @@ ALLOWED_ALERT_INTERVALS = {"1H", "4H", "12H", "1D"}
 BACKTEST_WINDOW_ORDER = ["1D", "3D", "7D", "30D", "90D"]
 ALLOWED_BACKTEST_WINDOWS = set(BACKTEST_WINDOW_ORDER)
 
+# Only these support commands may run over WhatsApp while crypto messaging is gated.
+WHATSAPP_SUPPORT_COMMANDS = frozenset({"HELP", "STATUS"})
+WHATSAPP_SUPPORT_HELP_TEXT = """TRADING AI — WHATSAPP HELP
+Available here: HELP, STATUS
+Crypto prices, analysis, scans, signals and backtests are not available on this WhatsApp channel while its policy gate is closed.
+Live order execution remains disabled.
+"""
+
 
 class CommandError(ValueError):
     pass

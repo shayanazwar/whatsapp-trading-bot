@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from app.config import load_settings
 from app.main import create_app
+from app.mexc.client import MexcClient
+from tests.helpers import candles
 
 
 def test_dashboard_loads_and_api_requires_token(tmp_path):
@@ -96,3 +98,37 @@ def test_dashboard_price_command_works_when_whatsapp_gate_is_closed(tmp_path, mo
     assert "67420.5" in response.json()["result"]
     assert response.json()["mode"].startswith("research/paper")
 
+
+
+def test_dashboard_chart_returns_real_generated_image_attachment(tmp_path, monkeypatch):
+    cfg = replace(
+        load_settings(),
+        database_path=tmp_path / "dashboard-chart.sqlite3",
+        reports_dir=tmp_path / "reports",
+        web_api_token="test-secret-token",
+        mexc_price_series="standard",
+        whatsapp_crypto_messaging_allowed=False,
+        whatsapp_policy_clearance_ref="",
+    )
+    app = create_app(cfg)
+
+    async def fake_klines_window(self, symbol, timeframe, *, start, end, now_epoch=None,
+                                 close_grace_seconds=5, max_bars_per_request=500):
+        assert symbol == "BTC_USDT"
+        assert timeframe == "1H"
+        return candles("BTC_USDT", "1H", 1704067200, 220, 3600, trend=0.001)
+
+    monkeypatch.setattr(MexcClient, "get_klines_window", fake_klines_window)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/command",
+            json={"command": "CHART BTCUSDT 1H"},
+            headers={"Authorization": "Bearer test-secret-token"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["command"] == "CHART"
+    assert "MEXC FUTURES CHART" in body["result"]
+    assert len(body["attachments"]) == 1
+    assert body["attachments"][0]["mime_type"] == "image/png"
+    assert body["attachments"][0]["data_uri"].startswith("data:image/png;base64,")

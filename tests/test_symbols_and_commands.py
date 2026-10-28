@@ -17,12 +17,17 @@ def test_symbol_rejects_bad_input(bad):
         normalize_symbol(bad)
 
 
-def test_command_parser_chart_is_only_5m_visualization():
-    cmd = parse_command("CHART btc 5m")
+@pytest.mark.parametrize("timeframe", ["1H", "4H", "12H", "1D"])
+def test_command_parser_chart_supports_only_approved_higher_timeframes(timeframe):
+    cmd = parse_command(f"CHART btc {timeframe.lower()}")
     assert cmd.name == "CHART"
-    assert cmd.args == {"symbol": "BTC_USDT", "timeframe": "5M"}
-    with pytest.raises(CommandError):
-        parse_command("CHART BTC 15M")
+    assert cmd.args == {"symbol": "BTC_USDT", "timeframe": timeframe}
+
+
+@pytest.mark.parametrize("timeframe", ["5M", "15M", "30M", "5m"])
+def test_command_parser_rejects_unapproved_chart_timeframes(timeframe):
+    with pytest.raises(CommandError, match="1H, 4H, 12H or 1D"):
+        parse_command(f"CHART BTC {timeframe}")
 
 
 def test_command_parser_backtest_modes_and_windows():

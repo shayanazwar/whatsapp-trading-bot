@@ -127,9 +127,9 @@ def test_closed_gate_processes_help_and_status_as_support_commands(tmp_path, mon
         assert "🤖 TRADING AI — COMMAND MENU" in help_text
         assert "HELP — Show this menu" in help_text
         assert "PRICE BTCUSDT — Current price" in help_text
+        assert "CHART BTCUSDT 1H — Chart (1H/4H/12H/1D)" in help_text
         assert "BACKTEST 7D — 7-day backtest" in help_text
         assert "https://shayan-millionaire-bot.onrender.com/dashboard" in help_text
-        assert "Crypto prices, analysis, scans, signals and backtests are not available" not in help_text
         assert "SYSTEM STATUS" in status_text
         assert len(app.state.store.recent_events(10, "WHATSAPP_COMMAND_PROCESSED")) == 2
         assert not app.state.store.recent_events(10, "WHATSAPP_POLICY_GATE_BLOCKED")

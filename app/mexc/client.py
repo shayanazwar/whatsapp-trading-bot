@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -116,6 +118,28 @@ class MexcClient:
             return False
         return True
 
+    @staticmethod
+    def _retry_after_seconds(value: str | None, attempt: int) -> float:
+        """Parse both Retry-After delta-seconds and HTTP-date forms safely."""
+        fallback = min(1.0 * (2**attempt), 8.0)
+        if not value:
+            return fallback
+        try:
+            seconds = float(value)
+            if not math.isfinite(seconds):
+                return fallback
+        except (TypeError, ValueError, OverflowError):
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                if not math.isfinite(seconds):
+                    return fallback
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return fallback
+        return min(max(seconds, 0.0), 30.0)
+
     async def _get(self, path: str, *, params: Mapping[str, Any] | None = None, family: str = "other") -> Any:
         client = await self._ensure_client()
         url = f"{self.base_url}{path}"
@@ -126,7 +150,7 @@ class MexcClient:
                 response = await client.get(url, params=params)
                 if response.status_code == 429 or response.status_code == 418:
                     retry_after = response.headers.get("Retry-After")
-                    delay = min(float(retry_after), 30.0) if retry_after else min(1.0 * (2**attempt), 8.0)
+                    delay = self._retry_after_seconds(retry_after, attempt)
                     if attempt >= self.max_retries:
                         raise MexcRateLimitError(f"MEXC rate limit at {path}; retries exhausted")
                     await asyncio.sleep(delay + random.uniform(0.0, min(0.25, delay / 4)))

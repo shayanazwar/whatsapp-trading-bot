@@ -13,11 +13,28 @@ ALLOWED_BACKTEST_WINDOWS = set(BACKTEST_WINDOW_ORDER)
 
 # Only these support commands may run over WhatsApp while crypto messaging is gated.
 WHATSAPP_SUPPORT_COMMANDS = frozenset({"HELP", "STATUS"})
-WHATSAPP_SUPPORT_HELP_TEXT = """TRADING AI — WHATSAPP HELP
-Available here: HELP, STATUS
-Crypto prices, analysis, scans, signals and backtests are not available on this WhatsApp channel while its policy gate is closed.
-Live order execution remains disabled.
-"""
+WHATSAPP_SUPPORT_HELP_TEXT = """🤖 TRADING AI — COMMAND MENU
+
+WHATSAPP
+HELP — Show this menu
+STATUS — Bot/service status
+
+RESEARCH DASHBOARD
+PRICE BTCUSDT — Current price
+MARKET BTCUSDT — Market ticker
+ANALYZE BTCUSDT — Market analysis
+SCAN — Scan supported symbols
+SIGNALS — Latest signals
+BACKTEST 7D — 7-day backtest
+PERFORMANCE — Performance summary
+PNL — Paper P&L
+RISK — Risk summary
+OPEN_POSITIONS — Paper positions
+
+Open dashboard:
+https://shayan-millionaire-bot.onrender.com/dashboard
+
+Research commands are dashboard-only while WhatsApp access is disabled. Live orders: OFF."""
 
 
 class CommandError(ValueError):

@@ -13,13 +13,13 @@ from typing import Any
 from app.alerts import AlertService
 from app.analysis import analyze_series, format_analysis
 from app.backtest import BacktestConfig, run_backtest
-from app.charting import render_5m_chart
+from app.charting import render_timeframe_chart
 from app.commands import (
     Command, CommandError, HELP_TEXT, WHATSAPP_SUPPORT_COMMANDS,
     WHATSAPP_SUPPORT_HELP_TEXT, parse_command,
 )
 from app.config import Settings
-from app.market.candles import Candle
+from app.market.candles import Candle, INTERVAL_SECONDS, aggregate_12h_from_4h
 from app.mexc.client import MexcClient, MexcError
 from app.services.market_data import MarketDataService, SymbolData
 from app.storage import Store, canonical_json
@@ -121,9 +121,24 @@ class CommandProcessor:
             return CommandResult(f"MEXC FUTURES PRICE — {symbol}\nLast traded price: {price:.10g}\nSource timestamp: {source_time}\nFetched: {datetime.now(timezone.utc).isoformat(timespec='seconds')} UTC\nSource: MEXC Futures ticker. This is a market observation, not an order fill.")
         if name == "CHART":
             symbol = args["symbol"]
+            timeframe = args["timeframe"]
             now = int(time.time())
-            candles = await self.mexc.get_klines_window(symbol, "5M", start=now - 500 * 300, end=now,
-                now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds, max_bars_per_request=500)
+            duration = INTERVAL_SECONDS[timeframe]
+            # MEXC supplies 1H/4H/1D natively; 12H is deterministically derived from 4H.
+            fetch_timeframe = "4H" if timeframe == "12H" else timeframe
+            start = now - (501 * duration)
+            if timeframe == "12H":
+                start -= start % duration
+            candles = await self.mexc.get_klines_window(
+                symbol, fetch_timeframe, start=start, end=now, now_epoch=now,
+                close_grace_seconds=self.settings.candle_close_grace_seconds,
+                max_bars_per_request=1800 if timeframe == "12H" else 500,
+            )
+            if timeframe == "12H":
+                candles = aggregate_12h_from_4h(candles)
+            candles = candles[-500:]
+            if not candles:
+                raise MexcError(f"No completed {timeframe} candles were returned; chart was not rendered")
             if self.settings.mexc_price_series == "real":
                 from dataclasses import replace
                 if any(any(v is None for v in (c.real_open, c.real_high, c.real_low, c.real_close)) for c in candles):
@@ -131,9 +146,15 @@ class CommandProcessor:
                 candles = [replace(c, open=float(c.real_open), high=float(c.real_high),
                     low=float(c.real_low), close=float(c.real_close)) for c in candles]
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            path = self.settings.reports_dir / f"chart_{symbol}_{stamp}.png"
-            render_5m_chart(candles, path, title_suffix="visualization-only")
-            return CommandResult(f"CHART — {symbol} 5M\nVisualization only; 5M data and indicators are isolated from strategy decisions.\nLatest candle: {datetime.fromtimestamp(candles[-1].close_time, timezone.utc).isoformat()}", [(str(path), "image")], "CHART_RENDERED")
+            path = self.settings.reports_dir / f"chart_{symbol}_{timeframe}_{stamp}.png"
+            render_timeframe_chart(candles, path, timeframe=timeframe, title_suffix="research visualization")
+            return CommandResult(
+                f"MEXC FUTURES CHART — {symbol} · {timeframe}\n"
+                f"Candles loaded: {len(candles)}\n"
+                f"Latest completed candle close: {datetime.fromtimestamp(candles[-1].close_time, timezone.utc).isoformat()}\n"
+                "Visualization only; chart annotations are not a trade recommendation.",
+                [(str(path), "image")], "CHART_RENDERED"
+            )
         if name == "ANALYZE":
             symbol = args["symbol"]
             data = await self.market_data.fetch_symbol(symbol, window_days=15, daily_warmup_days=400, extra_intraday_warmup_days=45)

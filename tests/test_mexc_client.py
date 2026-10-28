@@ -20,6 +20,37 @@ async def test_client_uses_official_domain_and_parses_ticker():
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_retry_after_http_date_does_not_crash():
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+                json={"success": False, "code": 429, "message": "rate limited"},
+            )
+        return httpx.Response(
+            200,
+            json={"success": True, "data": {"symbol": "BTC_USDT", "lastPrice": "67000"}},
+        )
+
+    transport_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MexcClient(
+        client=transport_client, max_retries=1, min_interval_by_family={"ticker": 0}
+    )
+    try:
+        result = await client.ticker("BTCUSDT")
+        assert result["lastPrice"] == "67000"
+        assert calls == 2
+    finally:
+        await client.aclose()
+        await transport_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_client_rejects_logical_success_false_even_http_200():
     async def handler(request):
         return httpx.Response(200, json={"success": False, "code": 1001, "message": "bad request"})

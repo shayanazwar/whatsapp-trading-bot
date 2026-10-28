@@ -5,11 +5,13 @@ import hmac
 import json
 from dataclasses import replace
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import load_settings
 from app.main import create_app
-from app.whatsapp import WhatsAppCloud
+from app.whatsapp import WHATSAPP_POLICY_BLOCKED_REPLY, WhatsAppCloud
 
 
 def signature(body: bytes, secret: str) -> str:
@@ -72,6 +74,51 @@ def test_webhook_closed_policy_gate_sends_only_generic_service_reply(tmp_path, m
         assert app.state.store.recent_events(10, "WHATSAPP_SERVICE_STATUS_ACCEPTED_BY_META")
         assert not app.state.store.recent_events(10, "WHATSAPP_COMMAND_PROCESSED")
         assert app.state.store.pending_outbox() == []
+        # The durable outbox must record the exact text submitted to Meta, not a stale fallback.
+        with app.state.store.connection() as conn:
+            outbox = conn.execute(
+                "SELECT body FROM outbox WHERE idempotency_key=?",
+                ("wa-policy-status:wamid.in.1",),
+            ).fetchone()
+        assert outbox is not None
+        assert outbox["body"] == WHATSAPP_POLICY_BLOCKED_REPLY
+        assert "no command was executed" in outbox["body"].lower()
+        assert "onrender.com/dashboard" not in outbox["body"]
+
+
+@pytest.mark.asyncio
+async def test_policy_status_sender_uses_canonical_message_and_allowlist():
+    cfg = replace(
+        load_settings(),
+        meta_access_token="test-access-token",
+        meta_phone_number_id="test-phone-id",
+        whatsapp_allowed_senders=("923001234567",),
+        whatsapp_crypto_messaging_allowed=False,
+        whatsapp_policy_clearance_ref="",
+    )
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={"messages": [{"id": "wamid.policy-reply"}]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    cloud = WhatsAppCloud(cfg, client=client)
+    try:
+        result = await cloud.send_service_status("+92 300 1234567")
+    finally:
+        await client.aclose()
+
+    assert result["messages"][0]["id"] == "wamid.policy-reply"
+    assert captured["url"].endswith("/v26.0/test-phone-id/messages")
+    assert captured["authorization"] == "Bearer test-access-token"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["to"] == "923001234567"
+    assert payload["text"]["body"] == WHATSAPP_POLICY_BLOCKED_REPLY
+    assert "onrender.com/dashboard" not in payload["text"]["body"]
 
 
 def test_webhook_rejects_invalid_signature(tmp_path):

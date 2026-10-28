@@ -20,6 +20,11 @@ def test_dashboard_loads_and_api_requires_token(tmp_path):
         page = client.get("/dashboard")
         assert page.status_code == 200
         assert "MEXC Research Dashboard" in page.text
+        # Quick actions must execute their command directly; merely filling the field
+        # left mobile users staring at the unchanged "Ready" panel.
+        assert "runCommand(b.dataset.cmd)" in page.text
+        assert "command.addEventListener('keydown'" in page.text
+        assert "Waiting for the server response" in page.text
         denied = client.post("/api/command", json={"command": "STATUS"})
         assert denied.status_code == 401
         ok = client.post(

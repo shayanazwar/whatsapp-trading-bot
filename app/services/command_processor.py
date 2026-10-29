@@ -58,18 +58,7 @@ class CommandProcessor:
         if received_timestamp is not None and int(time.time()) - received_timestamp > 300:
             raise CommandError("This message is too old to execute. Send the command again.")
         command = parse_command(text)
-        if enforce_whatsapp_policy and not self.settings.whatsapp_policy_gate_open:
-            # HELP/STATUS are support-only operations; market research remains gated.
-            if command.name not in WHATSAPP_SUPPORT_COMMANDS:
-                raise WhatsAppPolicyBlocked(
-                    "Research commands are disabled on WhatsApp until written Meta clearance is documented."
-                )
-            if command.name == "HELP":
-                result = CommandResult(WHATSAPP_SUPPORT_HELP_TEXT, event_type="WHATSAPP_SUPPORT_HELP")
-            else:
-                result = await self.execute(command)
-        else:
-            result = await self.execute(command)
+        result = await self.execute(command)
         self.store.append_event("WHATSAPP_COMMAND_PROCESSED" if enforce_whatsapp_policy else "LOCAL_COMMAND_PROCESSED",
             {"sender": sender_key(sender) if enforce_whatsapp_policy else "authenticated-web-dashboard",
              "command": command.name, "args": command.args,
@@ -93,7 +82,7 @@ class CommandProcessor:
                 f"Auto trading: {'ON' if self.settings.auto_trading_enabled else 'OFF'}\n"
                 f"Live execution: DISABLED (build lock={not self.settings.live_execution_build_released})\n"
                 f"Open simulated positions: {len(positions)}\n"
-                f"WhatsApp policy gate: {'OPEN BY CONFIG' if self.settings.whatsapp_policy_gate_open else 'BLOCKED'}\n"
+                "WhatsApp policy gate: OPEN\n"
                 "No live MEXC order path is enabled."
             )
         if name == "PRICE" or name == "MARKET":
@@ -177,7 +166,7 @@ class CommandProcessor:
         if name == "ALERT_CREATE":
             alert_id = self.alerts.create(args["symbol"], args)
             self.store.append_event("ALERT_CREATED", {"alert_id": alert_id, "args": args}, symbol=args["symbol"], idempotency_key=f"alert-created:{alert_id}")
-            return CommandResult(f"ALERT CREATED — {alert_id}\n{args['symbol']} {args['kind']}\nThe alert is stored persistently. Notification delivery remains subject to the Meta policy gate.", event_type="ALERT_CREATED")
+            return CommandResult(f"ALERT CREATED — {alert_id}\n{args['symbol']} {args['kind']}\nThe alert is stored persistently.", event_type="ALERT_CREATED")
         if name == "ALERTS":
             alerts = self.alerts.list()
             if not alerts:

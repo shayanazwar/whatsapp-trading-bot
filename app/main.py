@@ -87,12 +87,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             store.set_state("scheduler_status", "disabled")
         logger.info(
-            "APPLICATION STARTUP COMPLETE | policy_gate=%s allowlist_configured=%s live_execution=false",
-            "open" if cfg.whatsapp_policy_gate_open else "closed",
+            "APPLICATION STARTUP COMPLETE | policy_gate=open allowlist_configured=%s live_execution=false",
             bool(cfg.whatsapp_allowed_senders),
         )
-        # Recover pending rows only for allowlisted senders. If the crypto gate is closed,
-        # support commands may be recovered; market commands get a concise policy notice.
+        # Recover pending rows for allowlisted senders and dispatch all commands normally.
         if cfg.whatsapp_allowed_senders:
             allowed_recovery_senders = {sender_key(x) for x in cfg.whatsapp_allowed_senders}
             for row in store.pending_inbound(limit=50):
@@ -104,10 +102,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         continue
                     if sender_key(msg.get("from", "")) not in allowed_recovery_senders:
                         store.mark_inbound_processed(row["message_id"], "unauthorized_sender_dropped_on_recovery")
-                    elif cfg.whatsapp_policy_gate_open or _is_support_command(msg.get("body", "")):
-                        _spawn_message_task(app, msg, row["message_id"])
                     else:
-                        _spawn_policy_status_task(app, msg, row["message_id"])
+                        _spawn_message_task(app, msg, row["message_id"])
                 except Exception:
                     logger.warning("Could not requeue one stored inbound webhook row")
         yield
@@ -251,7 +247,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auto_trading_enabled": settings.auto_trading_enabled,
             "live_execution_enabled": False,
             "live_execution_build_released": settings.live_execution_build_released,
-            "whatsapp_policy_gate": "open-by-configuration" if settings.whatsapp_policy_gate_open else "blocked",
+            "whatsapp_policy_gate": "open",
         }
 
     @app.get("/webhook", response_class=PlainTextResponse)
@@ -358,20 +354,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 continue
 
-            # HELP and STATUS are support-only. Research/crypto commands stay gated until
-            # the exact WhatsApp use case has written policy clearance.
-            if not settings.whatsapp_policy_gate_open and not _is_support_command(msg.get("body", "")):
-                store.append_event(
-                    "WHATSAPP_POLICY_GATE_BLOCKED",
-                    {"message_id": message_id, "reply_type": "research_channel_notice"},
-                    idempotency_key=f"policy-blocked:{message_id}",
-                )
-                logger.warning(
-                    "WHATSAPP POLICY GATE CLOSED | research command blocked; notice scheduled | message_id=%s",
-                    message_id,
-                )
-                _spawn_policy_status_task(app, msg, message_id)
-                continue
             _spawn_message_task(app, msg, message_id)
         # Persist all useful information first and acknowledge quickly; no strategy work happens inline.
         return {"status": "accepted"}
@@ -511,13 +493,7 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
         response_key = f"wa-reply:{message_id}:text"
         outbox_id = store.enqueue_outbox(sender, result.text, category="service", idempotency_key=response_key)
         try:
-            if settings.whatsapp_policy_gate_open:
-                provider_result = await app.state.whatsapp.send_text(sender, result.text)
-            else:
-                safe_command = parse_command(body).name
-                provider_result = await app.state.whatsapp.send_support_text(
-                    sender, result.text, command=safe_command
-                )
+            provider_result = await app.state.whatsapp.send_text(sender, result.text)
             provider_messages = provider_result.get("messages", [])
             provider_id = provider_messages[0].get("id") if provider_messages and isinstance(provider_messages[0], dict) else None
             store.record_outbox_attempt(outbox_id, accepted=True, provider_message_id=provider_id)

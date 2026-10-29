@@ -1,0 +1,71 @@
+# Render Blueprint: split responsive WhatsApp/web traffic from the long-running scanner worker.
+# Live execution is disabled and no order-placement loop is started by this worker.
+databases:
+  - name: mexc-rsi-ema-db
+    databaseName: mexc_rsi_ema
+    user: mexc_rsi_ema
+    plan: basic-256mb
+    region: singapore
+    ipAllowList: []
+
+services:
+  - type: web
+    name: mexc-rsi-ema-web
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /healthz
+    envVars: &commonEnv
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mexc-rsi-ema-db
+          property: connectionString
+      - key: DATABASE_PATH
+        value: /tmp/mexc_bot.sqlite3
+      - key: REPORTS_DIR
+        value: /tmp/reports
+      - key: MEXC_REST_BASE_URL
+        value: https://api.mexc.com
+      - key: MEXC_PRICE_SERIES
+        value: standard
+      - key: DEFAULT_SYMBOLS
+        value: BTC_USDT,ETH_USDT,SOL_USDT
+      - key: SCHEDULER_ENABLED
+        value: "false"
+      - key: SCHEDULER_INTERVAL_SECONDS
+        value: "60"
+      - key: PAPER_TRADING_ENABLED
+        value: "false"
+      - key: DATA_ALIGNMENT_PROBE_APPROVED
+        value: "false"
+      - key: AUTO_TRADING_ENABLED
+        value: "false"
+      - key: LIVE_EXECUTION_ENABLED
+        value: "false"
+      - key: LIVE_EXECUTION_BUILD_RELEASED
+        value: "false"
+      - key: WHATSAPP_CRYPTO_MESSAGING_ALLOWED
+        value: "false"
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_ACCESS_TOKEN
+        sync: false
+      - key: META_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_ALLOWED_SENDERS
+        sync: false
+      - key: WHATSAPP_POLICY_CLEARANCE_REF
+        sync: false
+      - key: WEB_API_TOKEN
+        generateValue: true
+
+  - type: worker
+    name: mexc-rsi-ema-scanner
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerCommand: python -m app.worker
+    envVars: *commonEnv

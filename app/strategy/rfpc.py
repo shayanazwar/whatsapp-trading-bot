@@ -254,6 +254,7 @@ def evaluate_strategy(
     decision_time: int | None = None,
     strategy_version: str = STRATEGY_VERSION,
     prevalidated: bool = False,
+    target_r_multiple: float = 2.0,
 ) -> StrategyEvaluation:
     """Evaluate one symbol at one timestamp using completed bars only.
 
@@ -262,6 +263,9 @@ def evaluate_strategy(
     by ``decision_time``, and validated for symbol/timeframe. All public callers
     retain the defensive filtering/validation path by default.
     """
+    if not isinstance(target_r_multiple, (int, float)) or not 0.25 <= float(target_r_multiple) <= 10:
+        raise ValueError("target_r_multiple must be between 0.25R and 10R")
+    target_r_multiple = float(target_r_multiple)
     unknown = set(series) - STRATEGY_TIMEFRAMES
     if unknown:
         assert_strategy_timeframes(series.keys())
@@ -322,14 +326,16 @@ def evaluate_strategy(
     if (side == "LONG" and stop >= entry_ref) or (side == "SHORT" and stop <= entry_ref):
         return StrategyEvaluation(symbol, int(decision_time), regime, None, ("STOP_NOT_ON_LOSS_SIDE",), evidence)
     risk_dist = abs(entry_ref - stop)
-    target = entry_ref + (2 * risk_dist if side == "LONG" else -2 * risk_dist)
-    # Reject if a known opposing 12H swing lies at or inside the gross 2R target path.
+    target = entry_ref + (target_r_multiple * risk_dist if side == "LONG" else -target_r_multiple * risk_dist)
+    # Keep setup qualification fixed at the control's 2R path. TP sensitivity runs
+    # must compare the same entry candidates and change exits only.
+    control_path_target = entry_ref + (2.0 * risk_dist if side == "LONG" else -2.0 * risk_dist)
     highs12, lows12, _ = _ohlc(bars["12H"])
     ph12, pl12 = confirmed_pivots(highs12, lows12, 2)
     if side == "LONG":
-        obstacles = [highs12[i] for i in ph12 if highs12[i] > entry_ref and highs12[i] <= target]
+        obstacles = [highs12[i] for i in ph12 if highs12[i] > entry_ref and highs12[i] <= control_path_target]
     else:
-        obstacles = [lows12[i] for i in pl12 if lows12[i] < entry_ref and lows12[i] >= target]
+        obstacles = [lows12[i] for i in pl12 if lows12[i] < entry_ref and lows12[i] >= control_path_target]
     if obstacles:
         return StrategyEvaluation(symbol, int(decision_time), regime, None, ("OPPOSING_12H_LEVEL_BLOCKS_2R_TARGET",), {**evidence, "opposing_levels": obstacles})
 
@@ -350,7 +356,7 @@ def evaluate_strategy(
         breakout_time=int(setup["breakout_time"]),
         reclaim_time=reclaim_time,
         trigger_time=latest1.open_time,
-        gross_reward_risk=2.0,
+        gross_reward_risk=target_r_multiple,
         reason="1D regime and 12H structure aligned; 4H breakout/retest/reclaim active; 1H trigger confirmed.",
         evidence={
             **evidence,

@@ -42,9 +42,9 @@ def _parse_backtest(parts: list[str]) -> Command:
     rest = [part.upper() for part in parts[1:]]
     if any(token in {"LEGACY", "FIXED", "FIXED_PAYOUT", "REALISTIC", "EXCHANGE_REALISTIC"} for token in rest):
         raise CommandError("This release uses the 3M RSI/EMA backtest only; legacy modes are unavailable.")
-    if any(token.startswith("TP=") and token != "TP=CONTROL" for token in rest):
-        raise CommandError("3M RSI/EMA uses its configured net-profit target; TP=R scenarios are not supported.")
-    clean = [token for token in rest if token != "TP=CONTROL"]
+    if any(token.startswith("TP=") for token in rest):
+        raise CommandError("3M RSI/EMA uses configured net TP/SL values; TP scenario overrides are not supported.")
+    clean = list(rest)
     windows = [token for token in clean if token in ALLOWED_BACKTEST_WINDOWS]
     if len(windows) > 1:
         raise CommandError("Run one backtest period at a time: 1D, 7D, 30D, 60D or 90D")
@@ -200,7 +200,8 @@ DELETE ALL
 STATUS • PERFORMANCE • PNL • RISK • COST
 AUTOTRADE STATUS • AUTOTRADE OFF • PAUSE
 
-Strategy: completed 3-minute candles · RSI 14 rising above 70 · EMA 21/50/100 bullish alignment and crossover · previous-high breakout · relative-volume confirmation.
+Strategy: completed 3-minute candles · LONG and SHORT RSI/EMA momentum · EMA 21/50/100 alignment and crossover · prior-candle breakout/breakdown · relative-volume confirmation.
+BACKTEST: Cross-margin single-position research model by default, $100 starting wallet, $1 initial margin, 50x leverage cap, +$0.30 net TP, -$3.00 requested SL, 24-hour maximum holding period. Actual contract leverage and quantity limits apply.
 Top universe: active USDT perpetuals ranked by 24H turnover. Live orders: OFF.
 """
 

@@ -70,8 +70,11 @@ class Settings:
     max_leverage: int
     net_take_profit_usdt: float
     requested_stop_loss_usdt: float
+    backtest_margin_mode: str
+    backtest_max_holding_minutes: int
     rsi_period: int
     rsi_overbought: float
+    rsi_oversold: float
     ema_fast: int
     ema_mid: int
     ema_slow: int
@@ -148,7 +151,7 @@ def load_settings() -> Settings:
         default_symbols=symbols,
         mexc_universe_top_n=_int("MEXC_UNIVERSE_TOP_N", 100),
         mexc_universe_scan_enabled=_bool("MEXC_UNIVERSE_SCAN_ENABLED", False),
-        strategy_version=os.getenv("STRATEGY_VERSION", "S1-RFPC-0.2.0-1H-trigger"),
+        strategy_version=os.getenv("STRATEGY_VERSION", "RSI-EMA-3M-LONG-SHORT-CROSS-v2"),
         risk_per_trade_fraction=_float("RISK_PER_TRADE_FRACTION", 0.005),
         max_open_risk_fraction=_float("MAX_OPEN_RISK_FRACTION", 0.02),
         max_drawdown_fraction=_float("MAX_DRAWDOWN_FRACTION", 0.10),
@@ -163,8 +166,11 @@ def load_settings() -> Settings:
         max_leverage=_int("MAX_LEVERAGE", 50),
         net_take_profit_usdt=_float("NET_TAKE_PROFIT_USDT", 0.30),
         requested_stop_loss_usdt=_float("REQUESTED_STOP_LOSS_USDT", 3.0),
+        backtest_margin_mode=os.getenv("BACKTEST_MARGIN_MODE", "cross").strip().lower(),
+        backtest_max_holding_minutes=_int("BACKTEST_MAX_HOLDING_MINUTES", 1440),
         rsi_period=_int("RSI_PERIOD", 14),
         rsi_overbought=_float("RSI_OVERBOUGHT", 70.0),
+        rsi_oversold=_float("RSI_OVERSOLD", 30.0),
         ema_fast=_int("EMA_FAST", 21),
         ema_mid=_int("EMA_MID", 50),
         ema_slow=_int("EMA_SLOW", 100),
@@ -204,8 +210,12 @@ def load_settings() -> Settings:
         raise ValueError("MAX_LEVERAGE must be between 1 and 50")
     if settings.net_take_profit_usdt <= 0 or settings.requested_stop_loss_usdt <= 0:
         raise ValueError("NET_TAKE_PROFIT_USDT and REQUESTED_STOP_LOSS_USDT must be positive")
-    if settings.rsi_period < 2 or not 0 < settings.rsi_overbought <= 100:
-        raise ValueError("Invalid RSI settings")
+    if settings.backtest_margin_mode not in {"cross", "isolated"}:
+        raise ValueError("BACKTEST_MARGIN_MODE must be cross or isolated")
+    if settings.backtest_max_holding_minutes < 3:
+        raise ValueError("BACKTEST_MAX_HOLDING_MINUTES must be at least 3")
+    if settings.rsi_period < 2 or not 0 < settings.rsi_oversold < settings.rsi_overbought <= 100:
+        raise ValueError("RSI settings require 0 < RSI_OVERSOLD < RSI_OVERBOUGHT <= 100")
     if not 2 <= settings.ema_fast < settings.ema_mid < settings.ema_slow:
         raise ValueError("EMA_FAST < EMA_MID < EMA_SLOW must hold and each period must be >=2")
     if settings.rsi_volume_period < 2 or settings.rsi_volume_multiplier <= 0:

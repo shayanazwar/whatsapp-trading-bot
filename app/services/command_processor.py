@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import logging
 import time
@@ -10,18 +11,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from app.alerts import AlertService
 from app.analysis import analyze_series, format_analysis
 from app.backtest import BacktestConfig, run_backtest
-from app.backtest_rsi_ema import RsiEmaBacktestConfig, render_equity_curve, run_backtest_rsi_ema, write_backtest_artifacts
 from app.charting import render_candle_chart
-from app.commands import (Command, CommandError, HELP_TEXT, WHATSAPP_SUPPORT_COMMANDS, WHATSAPP_SUPPORT_HELP_TEXT, parse_command)
+from app.commands import Command, CommandError, HELP_TEXT, parse_command
 from app.config import Settings
 from app.market.candles import Candle, INTERVAL_SECONDS, aggregate_12h_from_4h
 from app.mexc.client import MexcClient, MexcError
 from app.services.market_data import MarketDataService, SymbolData
 from app.storage import Store, canonical_json
-from app.strategy.rsi_ema import RsiEmaConfig
 from app.symbols import normalize_symbol
 from app.whatsapp import WhatsAppCloud, WhatsAppPolicyBlocked, sender_key
 
@@ -82,9 +85,75 @@ class CommandProcessor:
                 f"Auto trading: {'ON' if self.settings.auto_trading_enabled else 'OFF'}\n"
                 f"Live execution: DISABLED (build lock={not self.settings.live_execution_build_released})\n"
                 f"Open simulated positions: {len(positions)}\n"
-                "WhatsApp policy gate: OPEN\n"
+                f"WhatsApp policy gate: {'OPEN' if self.settings.whatsapp_policy_gate_open else 'CLOSED'}\n"
                 "No live MEXC order path is enabled."
             )
+        if name == "PAPER":
+            view = args.get("view", "SUMMARY")
+            all_positions = self.store.paper_positions(open_only=False)
+            open_positions = [p for p in all_positions if p.get("status") == "open"]
+            closed_positions = [p for p in all_positions if p.get("status") == "closed"]
+            if view == "SUMMARY":
+                start_equity = float(self.settings.default_starting_balance)
+                realised = sum(float(p.get("realised_pnl") or 0.0) for p in closed_positions)
+                equity = start_equity + realised
+                return CommandResult(
+                    "LIVE PAPER TRADING — FAKE MONEY ONLY\n"
+                    f"Starting wallet: ${start_equity:.2f}\n"
+                    f"Realised closed-trade P&L: ${realised:+.2f}\n"
+                    f"Estimated wallet/equity: ${equity:.2f}\n"
+                    f"Open virtual positions: {len(open_positions)} | Closed virtual trades: {len(closed_positions)}\n"
+                    "Equity excludes unrealised P&L on open positions; no real funds or live orders are involved."
+                )
+            if view == "OPEN":
+                if not open_positions:
+                    return CommandResult("PAPER OPEN — no current virtual positions.\nFake money only; no live orders.")
+                rows = ["PAPER OPEN — VIRTUAL POSITIONS ONLY"]
+                for position in open_positions[-20:]:
+                    opened = datetime.fromtimestamp(int(position["entry_time"]), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    rows.append(
+                        f"{position['id']} | {position['symbol']} {position['side']} | entry={float(position['entry_price']):.8g} "
+                        f"SL={float(position['stop_price']):.8g} TP={float(position['target_price']):.8g} "
+                        f"qty={float(position['quantity']):.8g} | {opened}"
+                    )
+                rows.append("Fake money only; unrealised P&L is not marked to market.")
+                return CommandResult("\n".join(rows))
+            if view == "HISTORY":
+                recent = list(reversed(closed_positions[-10:]))
+                if not recent:
+                    return CommandResult("PAPER HISTORY — no closed virtual trades yet.")
+                rows = ["PAPER HISTORY — RECENT CLOSED VIRTUAL TRADES"]
+                for position in recent:
+                    closed_at = position.get("exit_time")
+                    when = datetime.fromtimestamp(int(closed_at), timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if closed_at else "time unavailable"
+                    pnl = float(position.get("realised_pnl") or 0.0)
+                    rows.append(
+                        f"{position['symbol']} {position['side']} | entry={float(position['entry_price']):.8g} "
+                        f"exit={float(position.get('exit_price') or 0.0):.8g} | P&L={pnl:+.4f} | {when}"
+                    )
+                return CommandResult("\n".join(rows) + "\nFake money only; not a live-trading record.")
+        if name == "SEARCH":
+            query = args["query"].upper()
+            contracts = await self.mexc.contract_details()
+            matches = []
+            for contract in contracts:
+                symbol_text = str(contract.get("symbol", "")).upper()
+                base_text = str(contract.get("baseCoin", contract.get("base_coin", ""))).upper()
+                quote_text = str(contract.get("quoteCoin", contract.get("quote_coin", ""))).upper()
+                if query not in symbol_text and query not in base_text:
+                    continue
+                state = contract.get("state")
+                active = state in (0, "0")
+                matches.append((not active, symbol_text, quote_text, contract))
+            matches.sort(key=lambda item: (item[0], item[1]))
+            if not matches:
+                return CommandResult(f"MEXC FUTURES SEARCH — {query}\nNo matching contract found in current metadata.")
+            rows = [f"MEXC FUTURES SEARCH — {query}", f"Matches: {min(len(matches), 20)} of {len(matches)}"]
+            for inactive, symbol_text, quote_text, contract in matches[:20]:
+                state_text = "ACTIVE" if not inactive else f"NOT ACTIVE (state={contract.get('state', 'unknown')})"
+                rows.append(f"{symbol_text} | {state_text}" + (f" | quote={quote_text}" if quote_text else ""))
+            rows.append("Search results are contract metadata, not a trade recommendation.")
+            return CommandResult("\n".join(rows), event_type="CONTRACT_SEARCH_COMPLETED")
         if name == "PRICE" or name == "MARKET":
             symbol = args["symbol"]
             ticker = await self.mexc.ticker(symbol)
@@ -107,22 +176,23 @@ class CommandProcessor:
             symbol = args["symbol"]
             timeframe = args["timeframe"]
             now = int(time.time())
-            # 12H is deterministically constructed from three complete 4H bars aligned to UTC.
-            count = 120 if timeframe == "1MO" else 400
+            count = 400
             interval = INTERVAL_SECONDS[timeframe]
             if timeframe == "12H":
-                source = await self.mexc.get_klines_window(
-                    symbol, "12H", start=now - count * interval, end=now, now_epoch=now,
-                    close_grace_seconds=self.settings.candle_close_grace_seconds, max_bars_per_request=1800,
+                source_4h = await self.mexc.get_klines_window(
+                    symbol, "4H", start=now - count * interval, end=now, now_epoch=now,
+                    close_grace_seconds=self.settings.candle_close_grace_seconds,
+                    max_bars_per_request=1800,
                 )
-                candles = self._apply_selected_price_series(source)[-count:]
+                source_4h = self._apply_selected_price_series(source_4h)
+                candles = aggregate_12h_from_4h(source_4h)[-count:]
             else:
                 candles = await self.mexc.get_klines_window(
                     symbol, timeframe, start=now - count * interval, end=now,
                     now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds,
                     max_bars_per_request=1800,
                 )
-                candles = self._apply_selected_price_series(candles)
+                candles = self._apply_selected_price_series(candles)[-count:]
             if not candles:
                 raise MexcError(f"MEXC returned no completed {timeframe} candles for {symbol}")
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -132,7 +202,8 @@ class CommandProcessor:
             caption = (
                 f"MEXC FUTURES CHART — {symbol} · {timeframe}\n"
                 f"Completed candles: {len(candles)} | Latest candle close: {last_closed} UTC\n"
-                "Chart is an observation aid; the selected test strategy uses completed 3-minute bars."
+                "Indicators: EMA 21/50/100/200, Volume, RSI 14 and confirmed swing levels.\n"
+                "Signal framework: completed 1D → 12H → 4H → 1H candles only."
             )
             return CommandResult(caption, [(str(path), "image")], "CHART_RENDERED")
         if name == "ANALYZE":
@@ -159,9 +230,9 @@ class CommandProcessor:
                     results.append(f"{symbol}: DATA/ANALYSIS ERROR ({type(exc).__name__})")
             return CommandResult("MEXC FUTURES SCAN\n" + "\n".join(results) + "\nHypotheses only; no live orders.", event_type="SCAN_COMPLETED")
         if name == "BACKTEST":
+            # Every public BACKTEST command uses the selected 1D → 12H → 4H → 1H engine.
+            # The legacy 3-minute RSI/EMA simulator is not part of this command path.
             async with self._backtest_lock:
-                if args.get("mode", "rsi_ema") == "rsi_ema":
-                    return await self._run_rsi_ema_backtest(args)
                 return await self._run_backtest(args)
         if name == "ALERT_CREATE":
             alert_id = self.alerts.create(args["symbol"], args)
@@ -173,6 +244,12 @@ class CommandProcessor:
                 return CommandResult("No alerts configured.")
             lines = [f"{a['id']} | {a['symbol']} | {a['kind']} | {'ACTIVE' if a['active'] else 'PAUSED'} | {canonical_json(a['params'])}" for a in alerts]
             return CommandResult("ALERTS\n" + "\n".join(lines[:50]))
+        if name == "DELETE_ALL_ALERTS":
+            alerts = self.alerts.list()
+            deleted = sum(1 for alert in alerts if self.alerts.delete(alert["id"]))
+            self.store.append_event("ALL_ALERTS_DELETED", {"deleted_count": deleted},
+                                    idempotency_key=f"all-alerts-deleted:{int(time.time() // 60)}")
+            return CommandResult(f"DELETE ALL — removed {deleted} alert(s).")
         if name == "ALERT_DELETE":
             changed = self.alerts.delete(args["alert_id"])
             return CommandResult(f"Alert {args['alert_id']}: {'deleted' if changed else 'not found'}.")
@@ -237,46 +314,52 @@ class CommandProcessor:
         raise CommandError(f"Unsupported command: {name}")
 
     async def _run_backtest(self, args: dict[str, Any]) -> CommandResult:
+        """Backtest the selected 1D → 12H → 4H → 1H strategy on verified completed bars."""
         symbols = [args["symbol"]] if args.get("symbol") else list(self.settings.default_symbols)
-        windows = args["windows"]
-        longest = max({"1D": 1, "3D": 3, "7D": 7, "30D": 30, "90D": 90}[w] for w in windows)
-        start_time = int(time.time())
+        windows = list(args.get("windows") or ["7D"])
+        days_by_window = {"1D": 1, "3D": 3, "7D": 7, "30D": 30, "60D": 60, "90D": 90, "180D": 180, "365D": 365}
+        try:
+            now_epoch = await self.mexc.server_time()
+            clock_warning: list[str] = []
+        except Exception as exc:
+            now_epoch = int(time.time())
+            clock_warning = [f"Exchange server time was unavailable ({type(exc).__name__}); local UTC time was used only to bound the data window."]
+        longest = max(days_by_window[w] for w in windows)
         loaded: dict[str, SymbolData] = {}
         data_load_errors: dict[str, str] = {}
 
-        # Fetch symbols concurrently while the shared MEXC client's endpoint-family
-        # throttles still bound request pressure. One failed symbol must not discard
-        # valid data already obtained for the other symbols.
         async def load_one(symbol: str):
             return symbol, await self.market_data.fetch_symbol(
                 symbol, window_days=longest, daily_warmup_days=400,
-                extra_intraday_warmup_days=45, now_epoch=start_time,
+                extra_intraday_warmup_days=45, now_epoch=now_epoch,
             )
 
         load_results = await asyncio.gather(*(load_one(s) for s in symbols), return_exceptions=True)
         for symbol, item in zip(symbols, load_results):
             if isinstance(item, Exception):
-                data_load_errors[symbol] = type(item).__name__
+                data_load_errors[symbol] = f"{type(item).__name__}: {str(item)[:160]}"
                 self.store.append_event("BACKTEST_DATA_LOAD_FAILED", {
                     "symbol": symbol, "error_type": type(item).__name__, "window_days": longest,
-                }, symbol=symbol, idempotency_key=f"backtest-load-failed:{symbol}:{start_time // 60}")
+                }, symbol=symbol, idempotency_key=f"backtest-load-failed:{symbol}:{now_epoch // 60}")
                 logger.warning("Backtest market data failed for %s (%s)", symbol, type(item).__name__)
             else:
                 loaded[symbol] = item[1]
 
         series_map = {s: d.timeframes for s, d in loaded.items()}
-        # Pass an empty series for failed symbols so a total data outage creates an
-        # explicit no-data report per requested period instead of an invented result.
+        # Include empty entries to report an explicit no-data result rather than silently
+        # pretending that a failed API request was a losing or breakeven strategy.
         if not series_map:
             series_map = {s: {} for s in symbols}
         specs = {s: d.contract for s, d in loaded.items() if d.contract}
         funding: dict[str, list[dict[str, Any]]] = {}
         funding_missing_symbols: list[str] = []
-        mode = args.get("mode", "fixed_payout")
+        mode = args.get("mode", "exchange_realistic")
         if mode == "exchange_realistic":
-            funding_start = start_time - (longest + 45) * 86400
+            funding_start = now_epoch - (longest + 45) * 86400
+
             async def load_funding(symbol: str):
-                return symbol, await self.mexc.funding_history_window(symbol, start=funding_start, end=start_time)
+                return symbol, await self.mexc.funding_history_window(symbol, start=funding_start, end=now_epoch)
+
             funding_results = await asyncio.gather(*(load_funding(s) for s in loaded), return_exceptions=True)
             for symbol, item in zip(loaded, funding_results):
                 if isinstance(item, Exception):
@@ -288,6 +371,8 @@ class CommandProcessor:
                     if not item[1]:
                         funding_missing_symbols.append(symbol)
 
+        scenario = str(args.get("tp_scenario", "CONTROL"))
+        reward_risk = float(args.get("reward_risk_multiple", 2.0))
         cfg = BacktestConfig(
             mode=mode, starting_balance=self.settings.default_starting_balance,
             tp_pct=self.settings.fixed_tp_pct, sl_pct=self.settings.fixed_sl_pct,
@@ -295,27 +380,45 @@ class CommandProcessor:
             risk_fraction=self.settings.risk_per_trade_fraction,
             taker_fee_rate=self.settings.exchange_taker_fee_rate,
             slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
+            reward_risk_multiple=reward_risk,
         )
         results: list[dict[str, Any]] = []
+        data_warnings = list(clock_warning)
+        data_warnings.extend(
+            f"{s}: market-data load failed ({error}); this symbol was not simulated."
+            for s, error in data_load_errors.items()
+        )
+        for symbol, data in loaded.items():
+            data_warnings.extend(f"{symbol}: {warning}" for warning in data.warnings)
+        if mode == "exchange_realistic" and funding_missing_symbols:
+            data_warnings.extend(
+                f"{symbol}: funding history is missing/empty; realized P&L excludes unknown funding."
+                for symbol in funding_missing_symbols
+            )
+
         for window in windows:
             result = await asyncio.to_thread(
                 run_backtest, series_map, window=window, config=cfg,
                 contract_specs=specs,
                 funding_events=funding if mode == "exchange_realistic" else None,
-                now_epoch=start_time,
+                now_epoch=now_epoch,
             )
-            data_warnings = [f"{s}: {w}" for s, d in loaded.items() for w in d.warnings]
-            data_warnings += [f"{s}: MEXC market-data load failed ({err}); this symbol was not simulated."
-                              for s, err in data_load_errors.items()]
-            if mode == "exchange_realistic" and funding_missing_symbols:
-                data_warnings += [f"{s}: funding history is missing/empty; exchange-realistic P&L is incomplete."
-                                  for s in funding_missing_symbols]
             result["warnings"] = list(dict.fromkeys(result["warnings"] + data_warnings))
             result["data_load_errors"] = dict(data_load_errors)
-            result["funding_missing_symbols"] = list(funding_missing_symbols) if mode == "exchange_realistic" else []
-
-            # Report cost robustness beside—not merged into—the baseline result.
-            # Fixed-payout scenarios have no exchange-cost model and are not cost-stressed.
+            result["strategy"] = "S1-RFPC: 1D regime → 12H structure → 4H setup → 1H trigger"
+            result["signal_timeframes"] = ["1D", "12H", "4H", "1H"]
+            result["tp_scenario"] = scenario
+            result["reward_risk_multiple"] = reward_risk
+            result["data_quality"] = {
+                "requested_symbols": symbols,
+                "loaded_symbols": sorted(loaded),
+                "bar_counts": {
+                    symbol: {tf: len(data.timeframes.get(tf, [])) for tf in ("1D", "12H", "4H", "1H")}
+                    for symbol, data in loaded.items()
+                },
+                "contract_metadata_available": sorted(specs),
+                "completed_candles_only": True,
+            }
             sensitivity: list[dict[str, Any]] = []
             if mode == "exchange_realistic":
                 multipliers = sorted(set((1.0, *self.settings.cost_stress_multipliers)))
@@ -323,13 +426,12 @@ class CommandProcessor:
                     stress_cfg = replace(cfg, cost_multiplier=multiplier)
                     stress_result = result if multiplier == 1.0 else await asyncio.to_thread(
                         run_backtest, series_map, window=window, config=stress_cfg,
-                        contract_specs=specs, funding_events=funding, now_epoch=start_time,
+                        contract_specs=specs, funding_events=funding, now_epoch=now_epoch,
                     )
                     sensitivity.append({
                         "cost_multiplier": multiplier,
                         "completed_trades": stress_result["completed_trades"],
-                        "wins": stress_result["wins"],
-                        "losses": stress_result["losses"],
+                        "wins": stress_result["wins"], "losses": stress_result["losses"],
                         "win_rate_pct": stress_result["win_rate_pct"],
                         "total_pnl": stress_result["total_pnl"],
                         "ending_balance": stress_result["ending_balance"],
@@ -337,193 +439,125 @@ class CommandProcessor:
                         "expectancy_r_per_trade": stress_result["expectancy_r_per_trade"],
                         "profit_factor": stress_result["profit_factor"],
                         "max_drawdown_pct": stress_result["max_drawdown_pct"],
-                        "fees": stress_result["fees"],
-                        "funding_pnl": stress_result["funding_pnl"],
+                        "fees": stress_result["fees"], "funding_pnl": stress_result["funding_pnl"],
                         "slippage_cost": stress_result["slippage_cost"],
                     })
             result["cost_sensitivity"] = sensitivity
 
             run_id = self.store.create_research_run(mode, {
                 "symbols": symbols, "window": window, "strategy_version": self.settings.strategy_version,
+                "tp_scenario": scenario, "reward_risk_multiple": reward_risk,
                 "config": {"mode": cfg.mode, "tp_pct": cfg.tp_pct, "sl_pct": cfg.sl_pct,
                            "risk_fraction": cfg.risk_fraction, "taker_fee_rate": cfg.taker_fee_rate,
                            "slippage_bps_per_side": cfg.slippage_bps_per_side,
                            "cost_stress_multipliers": list(self.settings.cost_stress_multipliers)},
             })
             self.store.finish_research_run(run_id, result)
+            stamp_artifact = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            csv_path = self.settings.reports_dir / f"backtest_{window}_{scenario}_{stamp_artifact}_trades.csv"
+            csv_fields = ["symbol", "side", "entry_time", "exit_time", "entry_price", "exit_price",
+                          "exit_reason", "pnl", "realised_r", "risk_amount", "candidate_id", "mode",
+                          "fees", "funding_pnl", "slippage_cost"]
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=csv_fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(result.get("trades", []))
+
+            curve_path = self.settings.reports_dir / f"backtest_{window}_{scenario}_{stamp_artifact}_equity.png"
+            fig, axis = plt.subplots(figsize=(10, 4.8), dpi=140, facecolor="#0b0f14")
+            axis.set_facecolor("#10161f")
+            axis.tick_params(colors="#b8c3d1", labelsize=8)
+            for spine in axis.spines.values():
+                spine.set_color("#283241")
+            axis.set_title(f"Paper Backtest Equity — {window} — TP {scenario}", color="#e2e8f0", loc="left")
+            if result.get("status") == "NOT_RUN_NO_DATA":
+                axis.text(0.5, 0.5, "NOT RUN — NO VERIFIED CANDLE DATA", transform=axis.transAxes,
+                          ha="center", va="center", color="#f59e0b", fontsize=11, fontweight="bold")
+            elif result.get("status") == "NOT_RUN_INSUFFICIENT_HISTORY":
+                axis.text(0.5, 0.5, "NOT RUN — INSUFFICIENT STRATEGY WARM-UP", transform=axis.transAxes,
+                          ha="center", va="center", color="#f59e0b", fontsize=11, fontweight="bold")
+            elif result.get("status") == "COMPLETED_NO_TRADES":
+                axis.text(0.5, 0.5, "NO QUALIFYING CLOSED TRADES\nNo expectancy conclusion", transform=axis.transAxes,
+                          ha="center", va="center", color="#b8c3d1", fontsize=11, fontweight="bold")
+            else:
+                curve = result.get("equity_curve", [])
+                if len(curve) > 1200:
+                    stride = max(1, len(curve) // 1200)
+                    curve = curve[::stride]
+                    if result.get("equity_curve"):
+                        curve = [*curve, result["equity_curve"][-1]]
+                axis.plot(range(len(curve)), curve, color="#22c55e", linewidth=1.3, label="Simulated equity")
+                axis.axhline(cfg.starting_balance, color="#8b98aa", linestyle="--", linewidth=0.8,
+                             alpha=0.75, label="Starting wallet")
+                axis.set_ylabel("Equity (quote currency)", color="#b8c3d1", fontsize=8)
+                axis.set_xlabel("Hourly simulation steps", color="#b8c3d1", fontsize=8)
+                axis.legend(loc="upper left", frameon=False, labelcolor="#d7dee8", fontsize=8)
+            axis.grid(True, color="#283241", linewidth=0.55, alpha=0.65)
+            fig.tight_layout()
+            try:
+                fig.savefig(curve_path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+            finally:
+                plt.close(fig)
+            result["artifacts"] = {"trades_csv": str(csv_path), "equity_curve_png": str(curve_path)}
             results.append(result)
+
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         json_path = self.settings.reports_dir / f"backtest_{mode}_{stamp}.json"
         text_path = self.settings.reports_dir / f"backtest_{mode}_{stamp}.txt"
-        json_path.write_text(json.dumps({"mode": mode, "symbols": symbols, "results": results}, indent=2, sort_keys=True), encoding="utf-8")
-        lines = [f"BACKTEST COMPLETE — {mode.upper()}", f"Symbols requested: {', '.join(symbols)}",
-                 f"Symbols loaded: {', '.join(loaded) if loaded else 'none'}",
-                 "Each window starts with its own $100 balance."]
+        json_path.write_text(json.dumps({
+            "mode": mode, "symbols": symbols, "strategy": "S1-RFPC 1D-12H-4H-1H",
+            "tp_scenario": scenario, "reward_risk_multiple": reward_risk, "results": results,
+        }, indent=2, sort_keys=True), encoding="utf-8")
+        lines = [
+            f"BACKTEST — {mode.upper()}",
+            "Strategy: 1D regime → 12H structure → 4H setup → 1H trigger",
+            f"TP scenario: {scenario} ({reward_risk:.1f}R gross target before costs)",
+            f"Symbols requested: {', '.join(symbols)}",
+            f"Symbols with retrieved history: {', '.join(sorted(loaded)) if loaded else 'none'}",
+            f"Starting simulated equity per run: ${cfg.starting_balance:.2f}",
+            "Only completed 1D, 12H, 4H and 1H candles are used. Live trading: DISABLED.",
+        ]
         if data_load_errors:
-            lines.append("DATA WARNINGS: " + "; ".join(f"{s}={err}" for s, err in data_load_errors.items()))
-        for r in results:
-            wr = "n/a" if r["win_rate_pct"] is None else f"{r['win_rate_pct']:.2f}%"
-            lines.append(f"{r['window']}: trades={r['completed_trades']} W/L={r['wins']}/{r['losses']} win-rate={wr} PnL=${r['total_pnl']:.2f} ending=${r['ending_balance']:.2f} maxDD={r['max_drawdown_pct']:.2f}%")
-            if r.get("cost_sensitivity"):
-                stress_line = ", ".join(f"{x['cost_multiplier']:.1f}x=${x['total_pnl']:.2f}" for x in r["cost_sensitivity"])
-                lines.append(f"  Cost stress net PnL: {stress_line}")
-        lines.append("A no-data or insufficient-history result is not a strategy result. Exchange-realistic P&L is modeled, not live execution. FIXED_PAYOUT is a hypothetical scenario. See the machine-readable JSON in the reports directory for full warnings and assumptions.")
-        report_text = "\n".join(lines)
-        text_path.write_text(report_text + "\n", encoding="utf-8")
-        return CommandResult(report_text, [(str(text_path), "document"), (str(json_path), "json")], "BACKTEST_COMPLETED")
-
-
-    async def _run_rsi_ema_backtest(self, args: dict[str, Any]) -> CommandResult:
-        """Fetch genuine MEXC 1-minute candles, aggregate 3-minute bars, and test the selected strategy."""
-        symbols = [args["symbol"]] if args.get("symbol") else list(self.settings.default_symbols)
-        windows = list(args.get("windows") or ["1D", "7D", "30D", "90D"])
-        day_by_window = {"1D": 1, "7D": 7, "30D": 30, "90D": 90}
-        longest = max((day_by_window[w] for w in windows), default=90)
-        exchange_time_error: str | None = None
-        try:
-            now_epoch = await self.mexc.server_time()
-        except Exception as exc:
-            # Do not attempt a history test against a guessed exchange timestamp.
-            # A local clock is used only to stamp a truthful NOT RUN report.
-            now_epoch = int(time.time())
-            exchange_time_error = type(exc).__name__
-        warmup_seconds = 180 * 160
-        start_time = now_epoch - longest * 86400 - warmup_seconds
-        loaded: dict[str, list[Candle]] = {}
-        load_errors: dict[str, str] = ({s: f"EXCHANGE_TIME_UNAVAILABLE:{exchange_time_error}" for s in symbols}
-                                       if exchange_time_error else {})
-        specs: dict[str, dict[str, Any]] = {}
-        funding: dict[str, list[dict[str, Any]]] = {}
-        funding_missing: list[str] = []
-
-        async def load_symbol(symbol: str):
-            bars = await self.mexc.get_klines_window(
-                symbol, "3M", start=start_time, end=now_epoch, now_epoch=now_epoch,
-                close_grace_seconds=self.settings.candle_close_grace_seconds,
-                max_bars_per_request=1800,
-            )
-            bars = self._apply_selected_price_series(bars)
-            return symbol, bars
-
-        if exchange_time_error is None:
-            load_results = await asyncio.gather(*(load_symbol(s) for s in symbols), return_exceptions=True)
-            for symbol, result in zip(symbols, load_results):
-                if isinstance(result, Exception):
-                    load_errors[symbol] = type(result).__name__
-                    logger.warning("RSI/EMA backtest data load failed for %s (%s)", symbol, type(result).__name__)
-                elif not result[1]:
-                    load_errors[symbol] = "NO_CLOSED_CANDLES_RETURNED"
-                else:
-                    loaded[symbol] = result[1]
-
-            async def load_spec(symbol: str):
-                return symbol, await self.mexc.contract_detail(symbol)
-
-            spec_results = await asyncio.gather(*(load_spec(s) for s in list(loaded)), return_exceptions=True)
-            for symbol, result in zip(list(loaded), spec_results):
-                if isinstance(result, Exception):
-                    load_errors[symbol] = "CONTRACT_METADATA_UNAVAILABLE"
-                    loaded.pop(symbol, None)
-                elif not result[1]:
-                    load_errors[symbol] = "CONTRACT_METADATA_MISSING"
-                    loaded.pop(symbol, None)
-                else:
-                    usable, reason = _validate_backtest_contract_spec(result[1])
-                    if not usable:
-                        load_errors[symbol] = reason
-                        loaded.pop(symbol, None)
-                    else:
-                        specs[symbol] = result[1]
-                        if not any(_first_number(result[1], key) is not None for key in
-                                   ("maintenanceMarginRate", "maintenance_margin_rate")):
-                            load_errors[f"{symbol}_MAINTENANCE_MARGIN"] = "MAINTENANCE_MARGIN_RATE_MISSING_USING_CONSERVATIVE_ESTIMATE"
-
-            async def load_funding(symbol: str):
-                return symbol, await self.mexc.funding_history_window(symbol, start=start_time, end=now_epoch)
-
-            valid_symbols = list(loaded)
-            fund_results = await asyncio.gather(*(load_funding(s) for s in valid_symbols), return_exceptions=True)
-            for symbol, result in zip(valid_symbols, fund_results):
-                if isinstance(result, Exception):
-                    funding[symbol] = []
-                    funding_missing.append(symbol)
-                else:
-                    funding[symbol] = result[1]
-                    if not result[1]:
-                        funding_missing.append(symbol)
-
-        cfg = RsiEmaBacktestConfig(
-            starting_equity=100.0, initial_margin=self.settings.initial_margin_usdt,
-            max_leverage=self.settings.max_leverage,
-            net_take_profit_usd=self.settings.net_take_profit_usdt,
-            requested_stop_loss_usd=self.settings.requested_stop_loss_usdt,
-            taker_fee_rate=self.settings.exchange_taker_fee_rate,
-            slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
-            max_positions=1,
-            strategy=RsiEmaConfig(
-                rsi_period=self.settings.rsi_period,
-                rsi_overbought=self.settings.rsi_overbought,
-                ema_fast=self.settings.ema_fast, ema_mid=self.settings.ema_mid,
-                ema_slow=self.settings.ema_slow,
-                volume_period=self.settings.rsi_volume_period,
-                volume_multiplier=self.settings.rsi_volume_multiplier,
-            ),
-        )
-        all_results: list[dict[str, Any]] = []
-        attachments: list[tuple[str, str]] = []
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        for window in windows:
-            result = await asyncio.to_thread(
-                run_backtest_rsi_ema, loaded, window_days=day_by_window[window], config=cfg,
-                contract_specs=specs, funding_events=funding, now_epoch=now_epoch,
-            )
-            warnings: list[str] = []
-            for s, error in load_errors.items():
-                if s.endswith("_MAINTENANCE_MARGIN"):
-                    warnings.append(f"{s.removesuffix('_MAINTENANCE_MARGIN')}: {error}; liquidation is only an estimate.")
-                else:
-                    warnings.append(f"{s}: MEXC history/price validation unavailable ({error}); symbol omitted from trades.")
-            warnings.extend([f"{s}: funding history missing/empty; any funding cost is incomplete."
-                             for s in funding_missing])
-            result["warnings"] = warnings
-            files = write_backtest_artifacts(result, self.settings.reports_dir,
-                                              prefix=f"rsi_ema_{window}_{stamp}")
-            curve_path = render_equity_curve(result, self.settings.reports_dir / f"rsi_ema_{window}_{stamp}_equity.png")
-            result["artifacts"] = {**files, "equity_curve": str(curve_path)}
-            if window == "7D":
-                attachments.extend([(files["text"], "document"), (files["csv"], "document"),
-                                    (str(curve_path), "image")])
-            all_results.append(result)
-
-        summary = {
-            "strategy": "RSI_OVERBOUGHT_EMA21_50_100_CROSS_LONG_ONLY_3M",
-            "mode": "historical_simulation_only", "live_trading_enabled": False,
-            "requested_symbols": symbols, "symbols_with_history": sorted(loaded),
-            "data_load_errors": load_errors, "results": all_results,
-            "notices": ["No real orders were submitted.", "History is genuine only for symbols successfully fetched.",
-                        "A missing or empty dataset is not a zero-return backtest.",
-                        "$3 stop-loss may be beyond liquidation for $1 margin; liquidation is modeled first."],
-        }
-        summary_json = self.settings.reports_dir / f"rsi_ema_summary_{stamp}.json"
-        summary_text = self.settings.reports_dir / f"rsi_ema_summary_{stamp}.txt"
-        summary_json.write_text(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False, default=str), encoding="utf-8")
-        lines = ["RSI/EMA 3-MINUTE BACKTEST SUMMARY", f"Requested symbols: {', '.join(symbols)}",
-                 f"Symbols with verified bars: {', '.join(sorted(loaded)) if loaded else 'none'}",
-                 "Every test window starts with $100 simulated equity and $1 target margin. Live trading: DISABLED."]
-        if load_errors:
-            lines.append("Data/metadata errors: " + "; ".join(f"{s}={e}" for s, e in load_errors.items()))
-        for result in all_results:
-            if result.get("status") == "NOT_RUN_NO_VERIFIED_BARS":
-                lines.append(f"{result['window']}: NOT RUN — no verified historical data; no performance result.")
+            lines.append("DATA LOAD ERRORS: " + "; ".join(f"{symbol}={error}" for symbol, error in data_load_errors.items()))
+        for result in results:
+            label = result["window"]
+            status = result.get("status", "COMPLETED")
+            if status == "NOT_RUN_NO_DATA":
+                lines.append(f"{label}: NOT RUN — no completed historical candles were available; no performance result.")
                 continue
-            wr = "n/a" if result["win_rate_pct"] is None else f"{result['win_rate_pct']:.2f}%"
-            lines.append(f"{result['window']}: trades={result['completed_trades']} W/L={result['wins']}/{result['losses']} "
-                         f"win-rate={wr} net=${result['net_profit']:.2f} end=${result['ending_equity']:.2f} "
-                         f"DD={result['max_drawdown_pct']:.2f}% liquidations={result['liquidation_exits']}")
-        lines.append("$3 stop-loss is not guaranteed: exchange liquidation can occur first. See attached CSV/equity plot and JSON for costs and limitations.")
-        summary_text.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        attachments.extend([(str(summary_text), "document"), (str(summary_json), "json")])
-        return CommandResult("\n".join(lines), attachments, "RSI_EMA_BACKTEST_COMPLETED")
+            if status == "NOT_RUN_INSUFFICIENT_HISTORY":
+                lines.append(f"{label}: NOT RUN — insufficient 1D EMA200/1H warm-up; no performance result.")
+                continue
+            if status == "COMPLETED_NO_TRADES":
+                lines.append(
+                    f"{label}: NO QUALIFYING CLOSED TRADES | 1H bars in test={result['valid_candles']} "
+                    f"| eligible symbols={result['symbols_eligible']}/{result['symbols_tested']} | "
+                    "no trade expectancy can be inferred from the unchanged wallet balance."
+                )
+            else:
+                wr = "n/a" if result["win_rate_pct"] is None else f"{result['win_rate_pct']:.2f}%"
+                lines.append(
+                    f"{label}: trades={result['completed_trades']} open={result['open_trades_at_end']} "
+                    f"W/L={result['wins']}/{result['losses']} win-rate={wr} "
+                    f"net P&L=${result['total_pnl']:.2f} ending=${result['ending_balance']:.2f} "
+                    f"maxDD={result['max_drawdown_pct']:.2f}%"
+                )
+            if result.get("cost_sensitivity"):
+                stress_line = ", ".join(f"{x['cost_multiplier']:.1f}x=${x['total_pnl']:.2f}" for x in result["cost_sensitivity"])
+                lines.append(f"  Cost-stress net P&L: {stress_line}")
+        lines.append(
+            "Modeled P&L is not observed execution. Funding gaps, account-specific fees, contract units, "
+            "slippage, liquidation and intra-candle price ordering can change results. See the attached report JSON."
+        )
+        text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        attachments: list[tuple[str, str]] = [(str(text_path), "document"), (str(json_path), "document")]
+        for result in results:
+            artifacts = result.get("artifacts", {})
+            if artifacts.get("trades_csv"):
+                attachments.append((str(artifacts["trades_csv"]), "document"))
+            if artifacts.get("equity_curve_png"):
+                attachments.append((str(artifacts["equity_curve_png"]), "image"))
+        return CommandResult("\n".join(lines), attachments, "BACKTEST_COMPLETED")
 
     def _apply_selected_price_series(self, candles: list[Candle]) -> list[Candle]:
         """Apply one consistent OHLC series; never silently mix real and adjusted prices."""

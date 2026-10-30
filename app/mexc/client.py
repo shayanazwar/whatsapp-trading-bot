@@ -423,19 +423,33 @@ class MexcClient:
             rows = await self.funding_history(symbol, page_num=page, page_size=100)
             if not rows:
                 break
+            normalized_page_times: list[int] = []
             for row in rows:
                 stamp_raw = row.get("settleTime", row.get("settle_time", row.get("fundingTime", 0)))
                 try:
                     stamp = int(float(stamp_raw))
                 except (TypeError, ValueError, OverflowError):
                     continue
-                if stamp > 100_000_000_000:
+                # MEXC documents settleTime as a Unix-millisecond timestamp.  Convert
+                # once and use that same seconds value for collection AND pagination.
+                if stamp >= 100_000_000_000:
                     stamp //= 1000
+                normalized_page_times.append(stamp)
                 row_copy = dict(row)
                 row_copy["settleTime"] = stamp
                 if start < stamp <= end:
                     collected[stamp] = row_copy
-            stamps = [int(r.get("settleTime", 0)) for r in rows if str(r.get("settleTime", "")).isdigit()]
-            if len(rows) < 100 or (stamps and min(stamps) <= start):
+            # MEXC's funding-history endpoint is normally newest-first, but do not
+            # assume page row order when deciding that the requested interval is covered.
+            # Infer this page's order from its endpoints so ascending responses are also
+            # handled correctly. All comparisons are Unix seconds after normalization.
+            if len(rows) < 100:
                 break
+            if len(normalized_page_times) >= 2:
+                first_stamp = normalized_page_times[0]
+                last_stamp = normalized_page_times[-1]
+                if first_stamp > last_stamp and min(normalized_page_times) <= start:
+                    break  # Newest-first: this page already reaches before the test start.
+                if first_stamp < last_stamp and max(normalized_page_times) >= end:
+                    break  # Oldest-first: this page has reached the end of the requested range.
         return [collected[t] for t in sorted(collected)]

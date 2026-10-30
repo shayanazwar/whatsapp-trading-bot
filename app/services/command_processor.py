@@ -59,6 +59,11 @@ class CommandProcessor:
         if received_timestamp is not None and int(time.time()) - received_timestamp > 300:
             raise CommandError("This message is too old to execute. Send the command again.")
         command = parse_command(text)
+        if command.name == "BACKTEST":
+            logger.info(
+                "BACKTEST COMMAND PARSED | raw=%r requested_window=%s symbol=%s",
+                text.strip(), command.args.get("window"), command.args.get("symbol", "TOP_UNIVERSE"),
+            )
         result = await self.execute(command)
         self.store.append_event("WHATSAPP_COMMAND_PROCESSED" if enforce_whatsapp_policy else "LOCAL_COMMAND_PROCESSED",
             {"sender": sender_key(sender) if enforce_whatsapp_policy else "authenticated-web-dashboard",
@@ -380,11 +385,23 @@ class CommandProcessor:
     async def _run_rsi_ema_backtest(self, args: dict[str, Any]) -> CommandResult:
         """Run a completed-candle, top-universe 3M backtest and persist its full audit artifacts."""
         started = time.perf_counter()
-        windows = list(args.get("windows") or ["7D"])
         days_map = {"1D": 1, "7D": 7, "30D": 30, "60D": 60, "90D": 90}
-        if len(windows) != 1 or any(window not in days_map for window in windows):
-            raise CommandError("Run one 3M backtest period at a time: 1D, 7D, 30D, 60D or 90D.")
-        window = windows[0]
+        # `window` is the canonical parsed argument. Never silently default to 1D/7D:
+        # a missing period indicates a parser/deployment mismatch and must fail closed.
+        window = str(args.get("window") or "").strip().upper()
+        legacy_windows = args.get("windows")
+        if not window and isinstance(legacy_windows, list) and len(legacy_windows) == 1:
+            window = str(legacy_windows[0]).strip().upper()
+        if window and isinstance(legacy_windows, list) and len(legacy_windows) == 1:
+            legacy_window = str(legacy_windows[0]).strip().upper()
+            if legacy_window != window:
+                raise CommandError(
+                    f"Conflicting backtest periods received: window={window}, windows={legacy_window}. "
+                    "Send BACKTEST 1D or BACKTEST 7D again."
+                )
+        if window not in days_map:
+            raise CommandError("Backtest period missing or invalid. Send BACKTEST 1D or BACKTEST 7D.")
+        windows = [window]
         longest = days_map[window]
         if not args.get("symbol") and longest > 7:
             raise CommandError(
@@ -526,9 +543,44 @@ class CommandProcessor:
             liquidation_candles_by_symbol=fair_price_bars,
             funding_price_candles_by_symbol=funding_price_bars,
             now_epoch=now,
+            close_grace_seconds=self.settings.candle_close_grace_seconds,
         )
+        # Preserve and cross-check the requested horizon all the way into the report.
+        if int(report.get("window_days", -1)) != longest:
+            raise RuntimeError(
+                f"Backtest horizon mismatch: requested {window} ({longest}D), "
+                f"engine returned {report.get('window_days')}D"
+            )
+        report["window"] = window
+        report["window_days"] = longest
+        report["requested_window"] = window
+        report["requested_start_epoch"] = cutoff
+        report["requested_end_epoch"] = now
+        report["requested_start_utc"] = datetime.fromtimestamp(cutoff, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        report["requested_end_utc"] = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         report["coins_tested"] = len(universe)
         report["coins_with_data"] = len(loaded)
+        report["loaded_3m_candles_including_warmup"] = sum(len(v) for v in loaded.values())
+        observed_window_bars = sum(report.get("data_quality", {}).get("bar_counts", {}).values())
+        expected_per_symbol = int(report.get("data_quality", {}).get("expected_completed_3m_bars_per_symbol", 0))
+        expected_total = expected_per_symbol * len(loaded)
+        report["observed_window_3m_bars"] = observed_window_bars
+        report["expected_window_3m_bars"] = expected_total
+        report["window_candle_coverage_pct"] = (
+            min(100.0, observed_window_bars / expected_total * 100.0) if expected_total else None
+        )
+        first_window_stamps = report.get("data_quality", {}).get("first_completed_bar_by_symbol", {}).values()
+        last_window_stamps = report.get("data_quality", {}).get("last_completed_bar_by_symbol", {}).values()
+        first_window_stamp = min(first_window_stamps, default=None)
+        last_window_stamp = max(last_window_stamps, default=None)
+        report["actual_data_start_utc"] = (
+            datetime.fromtimestamp(first_window_stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if first_window_stamp is not None else "n/a"
+        )
+        report["actual_data_end_utc"] = (
+            datetime.fromtimestamp(last_window_stamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if last_window_stamp is not None else "n/a"
+        )
         report["data_errors"] = list(failures)
         # The engine flags missing support data for symbols that actually opened a
         # trade, not every market that merely produced a signal.
@@ -539,7 +591,8 @@ class CommandProcessor:
             "fair_price": sorted(set(fair_price_missing)),
         }
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # Microseconds prevent same-second commands from overwriting each other's audit files.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         artifact_paths = write_backtest_artifacts(
             report, self.settings.reports_dir, prefix=f"backtest_3m_{window.lower()}_{stamp}",
         )
@@ -562,8 +615,10 @@ class CommandProcessor:
             summary += f"\n\n⚠️ Data/metadata errors: {len(failures)} ({', '.join(failures[:8])})"
         summary += f"\n📁 Audit files saved: {Path(artifact_paths['json']).name}, {Path(artifact_paths['csv']).name}"
         logger.info(
-            "BACKTEST 3M COMPLETE | window=%s universe=%d data=%d signals=%d resolved=%d unresolved=%d liquidations=%d elapsed_s=%.1f margin_mode=%s",
-            window, len(universe), len(loaded), report["signals"], report["resolved"],
+            "BACKTEST 3M COMPLETE | requested_window=%s window_days=%d start_utc=%s end_utc=%s universe=%d data=%d candles=%d signals=%d entered=%d resolved=%d unresolved=%d liquidations=%d elapsed_s=%.1f margin_mode=%s",
+            window, longest, report["requested_start_utc"], report["requested_end_utc"],
+            len(universe), len(loaded), report["loaded_3m_candles_including_warmup"],
+            report["signals"], report["trades_opened"], report["resolved"],
             report["open_unresolved"], report["liquidation_exits"], time.perf_counter() - started,
             config.margin_mode,
         )

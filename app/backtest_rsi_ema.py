@@ -338,9 +338,12 @@ def run_backtest_rsi_ema(
     liquidation_candles_by_symbol: Mapping[str, Sequence[Candle]] | None = None,
     funding_price_candles_by_symbol: Mapping[str, Sequence[Candle]] | None = None,
     now_epoch: int | None = None,
+    close_grace_seconds: int = 5,
 ) -> dict[str, Any]:
     cfg = config or RsiEmaBacktestConfig()
     cfg.validate()
+    if not isinstance(close_grace_seconds, int) or close_grace_seconds < 0:
+        raise ValueError("close_grace_seconds must be a non-negative integer")
     if window_days not in {1, 7, 30, 60, 90}:
         raise ValueError("Backtest windows must be 1, 7, 30, 60 or 90 days")
 
@@ -795,8 +798,13 @@ def run_backtest_rsi_ema(
         "long_count": long_signals, "short_count": short_signals,
         "signals_with_contract_metadata": len(candidates),
         "tradeable_signals": len(candidates),
+        "signals_entered": len(ledger),
         "blocked_signals_due_to_open_position": blocked_due_open_position,
-        "unfilled_signals": max(0, signal_count - len(candidates)),
+        # A signal is entered only when an actual simulated position is appended
+        # to the ledger. Candidates skipped by the one-position rule or rejected
+        # by contract/size/risk checks must not disappear from the report.
+        "unfilled_signals": max(0, signal_count - len(ledger)),
+        "other_unentered_signals": max(0, signal_count - len(ledger) - blocked_due_open_position),
         "resolved": len(resolved), "open_unresolved": unresolved_count,
         "completed_trades": len(resolved), "trades_opened": len(ledger),
         "wins": len(winners), "losses": len(losers),
@@ -837,6 +845,9 @@ def run_backtest_rsi_ema(
             "symbols_with_bars": sorted(eligible),
             "bar_counts": {symbol: len(bars) for symbol, bars in eligible.items()},
             "warmup_bars_used": {symbol: max(0, len(warmup[symbol]) - len(eligible[symbol])) for symbol in eligible},
+            "expected_completed_3m_bars_per_symbol": max(0, int((now_epoch - close_grace_seconds - cutoff) // 180)),
+            "first_completed_bar_by_symbol": {symbol: bars[0].close_time for symbol, bars in eligible.items()},
+            "last_completed_bar_by_symbol": {symbol: bars[-1].close_time for symbol, bars in eligible.items()},
             "historical_funding_events_supplied": funding_events is not None,
             "funding_missing_symbols": missing_funding,
             "fair_price_symbols": sorted(fair_data_symbols),
@@ -913,10 +924,16 @@ def format_backtest_whatsapp(report: Mapping[str, Any], *, elapsed_seconds: floa
     def r_plain(value: Any) -> str:
         return "n/a" if value is None else f"{float(value):.2f}R"
 
+    coverage_pct = report.get("window_candle_coverage_pct")
+    coverage_text = "n/a" if coverage_pct is None else f"{float(coverage_pct):.1f}%"
     lines = [
         f"💥BACKTEST {report['window']} 💥",
+        f"📅 Requested UTC Window: {report.get('requested_start_utc', 'n/a')} → {report.get('requested_end_utc', 'n/a')}",
+        f"🗓️ Actual data coverage: {report.get('actual_data_start_utc', 'n/a')} → {report.get('actual_data_end_utc', 'n/a')}",
+        f"🕯️ 3M candles in window: {report.get('observed_window_3m_bars', 'n/a')} / {report.get('expected_window_3m_bars', 'n/a')} ({coverage_text})",
+        f"🧮 3M candles loaded incl. warm-up: {report.get('loaded_3m_candles_including_warmup', 'n/a')}",
         "",
-        f"🪙 Coins Tested: {report['coins_tested']}",
+        f"🪙 Coins Tested: {report['coins_tested']} · With valid data: {report.get('coins_with_data', report['coins_tested'])}",
         f"📡 Signals: {report['signals']}",
         f"🟢 LONG: {report['long_signals']}",
         f"🔴 SHORT: {report['short_signals']}",
@@ -942,7 +959,8 @@ def format_backtest_whatsapp(report: Mapping[str, Any], *, elapsed_seconds: floa
         f"📉 Max Losing Streak: {report['max_losing_streak']}",
         f"🧭 Avg MAE / MFE: {r_plain(report['avg_mae_r'])} / {r_plain(report['avg_mfe_r'])}",
         f"⚙️ Entry Mode: MARKET {report['market_entries']} / LIMIT {report['limit_entries']}",
-        f"📥 Signals not entered: {report['unfilled_signals']} · Blocked by open position: {report['blocked_signals_due_to_open_position']}",
+        f"📥 Positions Entered: {report.get('signals_entered', report['trades_opened'])}",
+        f"🚫 Signals Not Entered: {report['unfilled_signals']} (blocked by open position: {report['blocked_signals_due_to_open_position']}; other filters/rejections: {report.get('other_unentered_signals', 0)})",
         "",
         f"💳 Wallet: ${report['starting_equity']:.2f} → ${report['ending_equity']:.2f}",
         f"💵 Net P&L: ${report['net_profit']:+.2f} (realized ${report['realized_net_profit']:+.2f})",
@@ -973,7 +991,7 @@ def format_backtest_whatsapp(report: Mapping[str, Any], *, elapsed_seconds: floa
     if report.get("open_unresolved"):
         warnings.append("Open trades are marked to market and are not included in realized R/win-rate statistics.")
     warnings.append("Research simulation only: synthetic market fills; order-book impact and positions outside this bot are not replayed.")
-    warnings.append("Cross-margin liquidation is estimated for this bot's single active position; account-wide concurrent positions and open-order margin are not replayed.")
+    warnings.append("Cross-margin simulation is limited to one active bot position at a time; external positions and open-order margin are not replayed.")
     lines.extend(["", *["⚠️ " + warning for warning in warnings]])
     if elapsed_seconds is not None:
         lines.append(f"Top turnover universe · {elapsed_seconds:.1f}s · Live orders OFF")

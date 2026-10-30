@@ -46,7 +46,9 @@ def _parse_backtest(parts: list[str]) -> Command:
         raise CommandError("3M RSI/EMA uses configured net TP/SL values; TP scenario overrides are not supported.")
     clean = list(rest)
     windows = [token for token in clean if token in ALLOWED_BACKTEST_WINDOWS]
-    if len(windows) > 1:
+    if not windows:
+        raise CommandError("Specify the backtest period explicitly: BACKTEST 1D or BACKTEST 7D")
+    if len(windows) != 1:
         raise CommandError("Run one backtest period at a time: 1D, 7D, 30D, 60D or 90D")
     symbols = [token for token in clean if token not in ALLOWED_BACKTEST_WINDOWS]
     if any(re.fullmatch(r"\d+[A-Z]+", token) for token in symbols):
@@ -57,7 +59,9 @@ def _parse_backtest(parts: list[str]) -> Command:
         raise CommandError(
             "Top-100 3M backtests support 1D or 7D only. Add one symbol for longer periods, e.g. BACKTEST BTCUSDT 30D."
         )
-    args: dict[str, Any] = {"mode": "rsi_ema", "windows": windows or ["7D"]}
+    # Store one canonical scalar as well as the legacy list alias. The runner
+    # consumes `window` so a lost/empty list can never silently select a period.
+    args: dict[str, Any] = {"mode": "rsi_ema", "window": windows[0], "windows": windows}
     if symbols:
         args["symbol"] = _symbol(symbols[0])
     return Command("BACKTEST", args)

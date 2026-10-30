@@ -127,3 +127,61 @@ async def test_contract_metadata_cache_expires():
         assert calls == 2
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_fetches_completed_fair_price_candles():
+    async def handler(request):
+        assert request.url.path == "/api/v1/contract/kline/fair_price/BTC_USDT"
+        assert request.url.params["interval"] == "Min1"
+        return httpx.Response(200, json={
+            "success": True,
+            "data": {
+                "time": [1704067200], "open": [100], "high": [101],
+                "low": [99], "close": [100.5], "vol": [10],
+            },
+        })
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MexcClient(client=transport, min_interval_by_family={"kline": 0})
+    try:
+        bars = await client.get_fair_price_klines(
+            "BTCUSDT", "1M", now_epoch=1704067320, close_grace_seconds=5,
+        )
+        assert len(bars) == 1
+        assert bars[0].source == "mexc_fair_price_rest"
+        assert bars[0].timeframe == "1M"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_funding_history_window_reports_partial_vs_complete_coverage():
+    client = MexcClient(client=httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"success": True, "data": []})
+    )))
+    start, end = 1_704_067_200, 1_704_672_000
+
+    async def partial_history(symbol, *, page_num=1, page_size=100):
+        return [{"symbol": symbol, "settleTime": (start + 3600) * 1000, "fundingRate": "0.001"}]
+
+    async def complete_history(symbol, *, page_num=1, page_size=100):
+        return [
+            {"symbol": symbol, "settleTime": (start + 3600) * 1000, "fundingRate": "0.001"},
+            {"symbol": symbol, "settleTime": start * 1000, "fundingRate": "0.001"},
+        ]
+
+    try:
+        client.funding_history = partial_history
+        partial_rows, partial_coverage = await client.funding_history_window_with_coverage(
+            "BTCUSDT", start=start, end=end,
+        )
+        assert len(partial_rows) == 1 and partial_coverage is False
+
+        client.funding_history = complete_history
+        complete_rows, complete_coverage = await client.funding_history_window_with_coverage(
+            "BTCUSDT", start=start, end=end,
+        )
+        assert len(complete_rows) == 1 and complete_coverage is True
+    finally:
+        await client.aclose()

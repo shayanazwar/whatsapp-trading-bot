@@ -30,14 +30,16 @@ def test_command_parser_rejects_unknown_chart_timeframe():
 
 
 def test_command_parser_backtest_modes_and_windows():
-    assert parse_command("BACKTEST").args == {"mode": "rsi_ema", "windows": ["1D", "7D", "30D", "90D"]}
+    assert parse_command("BACKTEST").args == {"mode": "rsi_ema", "windows": ["7D"]}
     assert parse_command("BACKTEST BTCUSDT 7D").args == {"mode": "rsi_ema", "windows": ["7D"], "symbol": "BTC_USDT"}
-    cmd = parse_command("BACKTEST LEGACY BTCUSDT 30D")
-    assert cmd.args["mode"] == "exchange_realistic"
-    assert parse_command("BACKTEST FIXED BTCUSDT 7D").args["mode"] == "fixed_payout"
-    assert cmd.args["windows"] == ["30D"]
+    with pytest.raises(CommandError, match="3M RSI/EMA backtest only"):
+        parse_command("BACKTEST LEGACY BTCUSDT 30D")
+    with pytest.raises(CommandError, match="3M RSI/EMA backtest only"):
+        parse_command("BACKTEST FIXED BTCUSDT 7D")
     with pytest.raises(CommandError):
         parse_command("BACKTEST 5M")
+    with pytest.raises(CommandError, match="TP scenario overrides"):
+        parse_command("BACKTEST 7D TP=CONTROL")
 
 
 def test_command_parser_alert_grammar():

@@ -15,7 +15,7 @@ from app.market.candles import Candle, aggregate_12h_from_4h
 from app.market.indicators import atr
 from app.strategy.rfpc import TradeCandidate, evaluate_strategy
 
-STANDARD_WINDOWS = {"1D": 1, "3D": 3, "7D": 7, "30D": 30, "90D": 90}
+STANDARD_WINDOWS = {"1D": 1, "3D": 3, "7D": 7, "30D": 30, "60D": 60, "90D": 90, "180D": 180, "365D": 365}
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +32,7 @@ class BacktestConfig:
     cost_multiplier: float = 1.0
     max_trades_per_symbol: int = 10000
     max_holding_hours: int = 240
+    reward_risk_multiple: float = 2.0
 
     def __post_init__(self) -> None:
         if self.mode not in {"fixed_payout", "exchange_realistic"}:
@@ -46,6 +47,8 @@ class BacktestConfig:
             raise ValueError("Invalid cost inputs")
         if self.max_holding_hours < 1:
             raise ValueError("max_holding_hours must be positive")
+        if not math.isfinite(self.reward_risk_multiple) or not 0.25 <= self.reward_risk_multiple <= 10:
+            raise ValueError("reward_risk_multiple must be finite and between 0.25R and 10R")
 
 
 @dataclass(slots=True)
@@ -216,7 +219,16 @@ def _metrics(
     r_values = [t.realised_r for t in trades]
     expectancy_r = statistics.fmean(r_values) if r_values else None
     max_dd, max_dd_pct = _drawdown(equity_curve)
+    if start_time == 0 and end_time == 0 and valid_candles == 0:
+        status = "NOT_RUN_NO_DATA"
+    elif symbols_eligible == 0:
+        status = "NOT_RUN_INSUFFICIENT_HISTORY"
+    elif count == 0 and not open_positions:
+        status = "COMPLETED_NO_TRADES"
+    else:
+        status = "COMPLETED"
     return {
+        "status": status,
         "window": window,
         "mode": mode,
         "start_time": start_time,
@@ -245,6 +257,7 @@ def _metrics(
         "expectancy_r_per_trade": round(expectancy_r, 8) if expectancy_r is not None else None,
         "max_drawdown": round(max_dd, 8),
         "max_drawdown_pct": round(max_dd_pct, 6),
+        "equity_curve": [round(float(value), 8) for value in equity_curve],
         "fees": round(sum(t.fees for t in trades), 8),
         "funding_pnl": round(sum(t.funding_pnl for t in trades), 8),
         "slippage_cost": round(sum(t.slippage_cost for t in trades), 8),
@@ -302,7 +315,7 @@ def _position_from_candidate(candidate: TradeCandidate, candle: Candle, index: i
         stop_distance = abs(entry - stop)
         risk_budget = max(0.0, balance) * config.risk_fraction
         unit_stop = stop_distance * contract_size
-        target = entry + (2 * stop_distance if candidate.side == "LONG" else -2 * stop_distance)
+        target = entry + (config.reward_risk_multiple * stop_distance if candidate.side == "LONG" else -config.reward_risk_multiple * stop_distance)
         unit_fee = entry * contract_size * fee_rate + max(target, stop, entry) * contract_size * fee_rate
         unit_slippage = (entry + max(target, stop)) * contract_size * slippage_rate
         unit_risk = unit_stop + unit_fee + unit_slippage
@@ -570,6 +583,7 @@ def run_backtest(
                     snapshot,
                     decision_time=decision_time,
                     prevalidated=bool(prepared[symbol]["fast_path_validated"]),
+                    target_r_multiple=config.reward_risk_multiple,
                 )
             except Exception as exc:
                 warnings.append(f"{symbol}: strategy evaluation failed at {decision_time} ({type(exc).__name__}); candidate rejected.")

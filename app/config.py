@@ -144,7 +144,7 @@ def load_settings() -> Settings:
         live_execution_enabled=_bool("LIVE_EXECUTION_ENABLED", False),
         live_execution_build_released=_bool("LIVE_EXECUTION_BUILD_RELEASED", False),
         default_symbols=symbols,
-        strategy_version=os.getenv("STRATEGY_VERSION", "RSI-EMA-3M-LONG-v1"),
+        strategy_version=os.getenv("STRATEGY_VERSION", "S1-RFPC-0.2.0-1H-trigger"),
         risk_per_trade_fraction=_float("RISK_PER_TRADE_FRACTION", 0.005),
         max_open_risk_fraction=_float("MAX_OPEN_RISK_FRACTION", 0.02),
         max_drawdown_fraction=_float("MAX_DRAWDOWN_FRACTION", 0.10),

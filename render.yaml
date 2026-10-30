@@ -29,6 +29,26 @@ services:
         value: https://api.mexc.com
       - key: MEXC_PRICE_SERIES
         value: standard
+      - key: MEXC_UNIVERSE_TOP_N
+        value: "100"
+      - key: MEXC_UNIVERSE_SCAN_ENABLED
+        value: "true"
+      - key: DEFAULT_STARTING_BALANCE
+        value: "100"
+      - key: INITIAL_MARGIN_USDT
+        value: "1"
+      - key: MAX_LEVERAGE
+        value: "50"
+      - key: NET_TAKE_PROFIT_USDT
+        value: "0.30"
+      - key: REQUESTED_STOP_LOSS_USDT
+        value: "3.00"
+      - key: BACKTEST_MARGIN_MODE
+        value: cross
+      - key: BACKTEST_MAX_HOLDING_MINUTES
+        value: "1440"
+      - key: RSI_OVERSOLD
+        value: "30"
       - key: DEFAULT_SYMBOLS
         value: BTC_USDT,ETH_USDT,SOL_USDT
       - key: SCHEDULER_ENABLED

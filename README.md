@@ -1,19 +1,18 @@
-# MEXC Futures RSI/EMA Bot — v0.4.0 (Backtest-first)
+# MEXC Futures RSI/EMA Bot — v0.5.0 (Backtest-first)
 
-This release updates the saved Pak Trading Academy project for the approved **3-minute, LONG-only RSI/EMA strategy**. It uses MEXC USDT-margined perpetual market data only. **Live order execution is not implemented/released and remains disabled.** The scanner records signal candidates; it does not send real orders.
+This release updates the Pak Trading Academy project for a **3-minute, symmetric LONG/SHORT RSI/EMA research strategy** with a cross-margin-aware historical simulator. It uses MEXC USDT-margined perpetual market data only. **Live order execution is not implemented/released and remains disabled.** The scanner records signal candidates; it does not send real orders.
 
 ## Strategy defaults
 
 - Build completed **3-minute** bars from three contiguous, completed MEXC 1-minute bars. Do not use a forming bar.
-- RSI(14) must be at least 70 and rising.
-- EMA(21) must cross above EMA(50) within the last 3 completed bars; EMA(21) > EMA(50) > EMA(100).
-- Closing price must be above EMA(21) and break the previous completed candle's high.
-- Current volume must be at least 1.2× the mean volume of the preceding 20 completed bars.
-- LONG only. One simulated global position at a time.
+- LONG: RSI(14) at/above 70 and rising, EMA(21) crosses above EMA(50), bullish EMA alignment, close breaks the prior high, and relative volume confirms.
+- SHORT: RSI(14) at/below 30 and falling, EMA(21) crosses below EMA(50), bearish EMA alignment, close breaks the prior low, and relative volume confirms.
+- EMA periods: 21/50/100; volume confirmation: 1.2× the preceding 20 completed bars.
+- One simulated global position at a time; signals are evaluated on completed 3M candles and entries use the following candle.
 - Initial margin assumption: $1; leverage capped at 50× and reduced to each contract's declared limit. Net target: $0.30 after estimated costs. Requested stop: $3, but liquidation can occur first.
 - Fee assumption: 0.08% taker fee per side; default estimated adverse slippage: 5 bps each side. These are assumptions for simulation, not an account-specific fee quote.
 
-This is a testable strategy hypothesis, not a profitability claim. Requiring RSI >70 alongside a recent EMA cross and breakout is restrictive and may produce few or no signals.
+This is a testable strategy hypothesis, not a profitability claim. Extreme RSI, a recent EMA cross, price breakout/breakdown and volume confirmation can be restrictive and may produce few or no signals.
 
 ## Run locally
 
@@ -34,8 +33,9 @@ Open `http://localhost:8000/dashboard`. Set a strong local `WEB_API_TOKEN` in `.
 Useful dashboard commands:
 
 ```text
-BACKTEST                 # 1D, 7D, 30D and 90D reports
-BACKTEST BTCUSDT 7D      # Seven-day test for one symbol
+BACKTEST 1D             # Top-100 universe, 1-day test
+BACKTEST 7D             # Top-100 universe, 7-day test
+BACKTEST BTCUSDT 30D    # Longer test for one specified symbol
 CHART BTCUSDT 5M         # Also 15M, 1H, 4H, 8H, 12H, 1D, 3D, 1W, 1MO
 STATUS
 SIGNALS
@@ -45,9 +45,9 @@ Charts overlay EMA 21/50/100/200 and include an RSI panel with divergence marker
 
 ## Backtest evidence
 
-Run `BACKTEST` from the dashboard once the deployed service can reach the MEXC API. The application downloads genuine historical MEXC candles and funding history when available, then writes JSON, CSV trade ledger, text summary, and an equity-curve image. If data cannot be retrieved, it must show a data-unavailable result rather than substitute synthetic prices. The tests use deterministic synthetic fixtures only to verify calculation logic; those test fixtures are **not** performance evidence.
+Run `BACKTEST` from the dashboard once the deployed service can reach the MEXC API. The application downloads completed historical MEXC trade candles, then fetches Fair Price and funding history only for symbols that actually receive simulated entries. Data downloads are concurrency-bounded to reduce peak memory. It writes JSON, CSV trade ledger, text summary, and an equity-curve image. If data cannot be retrieved, it must show a data-unavailable result rather than substitute synthetic prices. The tests use deterministic synthetic fixtures only to verify calculation logic; those test fixtures are **not** performance evidence.
 
-The current development environment could not resolve the MEXC API host during its API connectivity check. Therefore this delivery includes **no verified live-market backtest results** for 1D/7D/30D/90D. See `docs/TEST_REPORT.md`.
+Automated tests validate the calculation paths with deterministic fixtures. They do not prove profitable performance or substitute for a live MEXC historical-data run. No verified market-performance claim is made by this source archive. See `docs/TEST_REPORT.md`.
 
 ## WhatsApp policy gate
 
@@ -59,11 +59,11 @@ Meta's published WhatsApp Business policy prohibits using WhatsApp Business Serv
 
 1. Push this project to a private GitHub repository.
 2. In Render, create a Blueprint from that repository and review resource costs/plans before confirming.
-3. Confirm the web service health path is `/healthz`, with only one worker process for the web app.
+3. Confirm the web service health path is `/healthz`, with only one worker process for the web app. The Blueprint enables `MEXC_UNIVERSE_SCAN_ENABLED=true` and `MEXC_UNIVERSE_TOP_N=100` on the shared environment; the dedicated worker performs the scheduled scan while the web in-process scheduler remains off.
 4. Keep `AUTO_TRADING_ENABLED=false`, `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_BUILD_RELEASED=false`, and `WHATSAPP_CRYPTO_MESSAGING_ALLOWED=false`. Leave `PAPER_TRADING_ENABLED=false` until reviewing results; it is simulated only and does not send orders.
 5. Add a random strong `WEB_API_TOKEN`. Never expose MEXC keys to the browser or WhatsApp.
 6. Wait for the web service and worker to show healthy/running. Check the logs for ticker freshness and scan summaries.
-7. Open `/dashboard`, enter the `WEB_API_TOKEN`, run `BACKTEST 7D`, then download the report and CSV. Review data coverage before trusting any result.
+7. Confirm `/healthz` reports `scanner_enabled: true`, `scanner_worker_status: running`, and a recent `scanner_last_success`/`scanner_last_summary`. Then open `/dashboard`, enter the `WEB_API_TOKEN`, run `BACKTEST 7D`, and inspect data coverage and the CSV trade ledger. Review data coverage before trusting any result.
 
 Git commands:
 
@@ -80,7 +80,7 @@ Do not include `.env`, API credentials or exported private account data. For Ren
 
 ## Current limits
 
-- The new scanner emits LONG candidate events. Optional simulated execution can be enabled with `PAPER_TRADING_ENABLED=true`; it estimates market fills from public prices and completed 3-minute candles and never submits orders.
+- The top-universe scanner emits LONG and SHORT candidate events and persists per-symbol scan outcomes, including data errors. Optional simulated execution can be enabled with `PAPER_TRADING_ENABLED=true`; it estimates market fills from public prices and completed 3-minute candles and never submits orders.
 - Historical order-book replay, exact intrabar path, account-specific liquidation tiers, and actual private-account execution have not been verified.
 - The $3 stop-loss is not a maximum-loss guarantee with $1 margin and up to 50× leverage.
 - A complete authenticated private-order client, position reconciliation, exchange-side protective order lifecycle, and full live execution readiness audit are required before real trading can be considered.

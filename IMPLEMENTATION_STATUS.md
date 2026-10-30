@@ -1,36 +1,36 @@
-# Implementation Status — v0.4.0
+# Implementation Status — v0.5.0 · 3M LONG/SHORT Cross-Margin Research Build
 
-## State at packaging
+## Current code state
 
-This is a backtest-first rebuild for the user-approved **MEXC USDT-M LONG-only, 3-minute RSI/EMA strategy**. Live order execution remains disabled and is not implemented/released in this build.
-
-| Area | Current state | Evidence / limits |
+| Area | State | Limits |
 |---|---|---|
-| Public MEXC REST client | Implemented against current documented host, with timeouts, bounded retries, throttling, public ticker/candle/contract/funding reads | Mocked tests pass. Actual runtime connection failed at DNS resolution; payloads and account access remain unverified. |
-| 3-minute candles | Derived from three contiguous, completed, epoch-aligned 1-minute candles | Unit tested; no incomplete candle should generate a decision. |
-| Strategy | RSI(14) >= 70 and rising; recent EMA21/EMA50 cross; EMA21 > EMA50 > EMA100; close above EMA21 and prior high; volume confirmation; LONG only | Deterministic strategy fixtures pass. This is a hypothesis, not evidence of profitability. |
-| All-contract candidate scan | Public all-ticker WebSocket + active-contract metadata; per-contract REST history checks | Implemented; WebSocket has not been verified against live MEXC in this execution environment. |
-| Paper execution | Optional simulated entries/exits, one global position, contract quantity constraints, fees, slippage and estimated liquidation checks | Unit tests pass; simulated fills are not exchange fills. `PAPER_TRADING_ENABLED=false` by default. |
-| Historical backtest | 1D/7D/30D/90D, $100 start, $1 margin, fee/slippage/funding accounting, quantity filters, CSV/JSON/text/equity chart | Engine and fixtures tested. No verified real-market results are available because MEXC history could not be downloaded from this environment. |
-| Charts | 5M, 15M, 1H, 4H, 8H, 12H, 1D, 3D, 1W, 1MO; EMA 21/50/100/200; RSI with confirmed-pivot divergence markers | Fixture tests pass; current-price charts require live MEXC data access. |
-| Dashboard | Token-protected `/dashboard`, command API and artifact endpoints; `/healthz` | Local smoke test returned HTTP 200 for dashboard and health endpoint. |
-| WhatsApp | Signature/auth/deduplication code retained; policy gate closed for crypto research/alerts | Only support HELP/STATUS path; crypto trade notifications/charts/balance messaging are not enabled due Meta policy restriction. No live Meta delivery tested. |
-| Persistence/deployment | Render web + background worker + PostgreSQL Blueprint; advisory lock prevents a second DB-connected worker | Blueprint YAML parsed; no Render or PostgreSQL instance created or tested. |
-| Authenticated MEXC order execution | Not included/released | No signed private order was sent. No claims of live trading readiness. |
+| Universe | Top 100 active USDT perpetual contracts ranked by 24-hour turnover | The universe is selected at run time; using today's top-100 universe for historical windows introduces survivorship bias. |
+| Candle interval | Completed 3-minute candles aggregated from three contiguous 1-minute MEXC candles | MEXC does not provide a native 3M interval. Gaps remain gaps; no synthetic filler candles are created. |
+| Strategy | Symmetric LONG and SHORT RSI/EMA momentum rules (RSI 70/30, EMA 21/50/100, breakout/breakdown and volume confirmation) | Strategy is a hypothesis, not evidence of profitability. |
+| Backtest | Cross-margin-aware, one-active-position research simulator with contract metadata, risk-tier limits, fees, slippage, funding and Fair Price liquidation checks where data is available | Synthetic market fills; OHLC candles cannot reproduce exact intrabar path, order-book impact, queue position, partial fills, or account-wide external positions/open orders. |
+| Memory | Historical candles load with two in-flight symbol requests; Fair Price/funding history loads only for symbols actually opened by the simulator; raw 1M support bars are discarded after 3M aggregation | Long runs remain CPU/network intensive and are still executed by the web process; background-job migration is a future resilience improvement. |
+| Scanner worker | Dedicated Render worker scans once per completed 3M slot; every symbol outcome, including data errors, is persisted | Render must deploy the updated Blueprint/environment. Existing manual Render settings may override Blueprint values. |
+| Health diagnostics | `/healthz` exposes build version, scanner enablement, worker status/heartbeat, last attempt/success, summary and last error | Worker and web service must share the configured PostgreSQL database for health visibility. |
+| Live execution | Disabled; no exchange order placement is implemented in this research path | Do not enable live trading based on backtest output. |
+| WhatsApp | Webhook acknowledges inbound messages and processes commands in a background task | The Render memory-limit email is an infrastructure alert, not an outbound-email feature failure. |
 
-## Verification performed
+## Forensic fixes in this patch
 
-- `python -m compileall -q app tests` — passed.
-- `pytest -q` — **94 passed**.
-- Render Blueprint YAML parsed successfully; it declares one web service, one background worker and one PostgreSQL database.
-- Local FastAPI smoke test with lifespan enabled: `/healthz` HTTP 200, `/dashboard` HTTP 200; live switches both false.
-- `ruff check app tests` — not run successfully because Ruff was unavailable in the execution environment.
-- MEXC live API/network probe — failed with a DNS resolution error in this environment; this does not prove the exchange is down.
-- WebSocket handshake, live Meta delivery, real PostgreSQL behavior, Render deployment, account permissions, and authenticated trading — not tested.
+1. Render Blueprint now sets `MEXC_UNIVERSE_TOP_N=100` and `MEXC_UNIVERSE_SCAN_ENABLED=true`; the worker previously skipped `_universe_scan_tick()` because this setting defaulted to false and was absent from the Blueprint.
+2. Backtest market-history downloads are limited to two concurrent symbols instead of eight.
+3. Fair Price/funding support is loaded only for symbols that receive simulated positions, not every symbol that generated a raw signal. Support loading is sequential, and raw 1M Fair Price candles are discarded after 3M aggregation.
+4. When a Fair Price-driven liquidation opens a later position on another symbol, the backtest detects the new traded symbol, loads its support data, and replays the simulation. The replay stops after a bounded number of passes and flags incomplete support data.
+5. The scanner persists `DATA_ERROR` outcomes per pair instead of silently dropping failed symbols. Scan logs and `/healthz` now expose its operational state.
+6. The dashboard text and shortcuts have been aligned with the current 3M strategy and supported commands.
+7. A single build identifier (`0.5.0`) is exposed by FastAPI and `/healthz`; the worker logs it at startup. A 20-second worker heartbeat is persisted so operators can distinguish an active worker from a stale `running` state.
 
-## Safety decisions
+## Source/deployment identity warning
 
-- `LIVE_EXECUTION_ENABLED=false` and `LIVE_EXECUTION_BUILD_RELEASED=false`.
-- The $3 requested stop is not a guaranteed maximum loss with $1 margin; liquidation can be reached first. Liquidation in the simulator is an approximation.
-- A no-data backtest is labelled **NOT RUN**, not reported as a flat/zero-return result.
-- WhatsApp crypto trading messages remain blocked. Use the protected dashboard for charts and reports.
+The user-supplied V38 ZIP identifies itself as version `0.4.0` and describes a LONG-only strategy. Its `app/backtest_rsi_ema.py` also sets `isolated_margin=True` in the report metadata. The live WhatsApp screenshots supplied separately show both LONG and SHORT signals and `Margin: CROSS`. Therefore the attached ZIP is not the same source revision as the running Render service that produced those screenshots (or the deployed service has code that is not present in the ZIP). The ZIP contains no `.git` directory and its README contains a placeholder GitHub remote URL. The connected GitHub account exposed no repositories in this session, so the deployed private branch and commit could not be inspected.
+
+## Verification boundary
+
+- Local source compilation and automated tests are run on this patch.
+- No real 100-symbol MEXC scan, real 7D exchange download, Render deployment, or memory benchmark on the user's Render instance was performed in this environment.
+- The Render email is the notification for the web process exceeding its memory limit. This patch reduces the identified peak-memory drivers; it cannot confirm that the service has recovered until the updated build runs on Render.
+- For exact production verification, the deployed private GitHub repository and branch/commit must be accessible, and Render must deploy this exact patch.

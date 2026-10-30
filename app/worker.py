@@ -1,8 +1,8 @@
-"""Standalone worker for the selected MEXC swing-research strategy.
+"""Standalone worker for the top-100 MEXC 3-minute RSI/EMA research scanner.
 
-The worker runs the existing ResearchScheduler (1D → 12H → 4H → 1H).
-It does not perform the retired 3-minute RSI/EMA scanner and cannot submit live orders.
-The web process can keep SCHEDULER_ENABLED=false to avoid starting a second scheduler.
+The worker runs ResearchScheduler, which can scan active USDT perpetuals once
+per completed 3-minute slot. Legacy paper-position processing is separate and
+remains disabled by default. This worker cannot submit live orders.
 """
 from __future__ import annotations
 
@@ -126,7 +126,9 @@ async def _run() -> None:
         scheduler = ResearchScheduler(settings, store, mexc, whatsapp)
         store.set_state("worker_status", "starting")
         logger.info(
-            "Swing research worker starting | strategy=1D-12H-4H-1H | paper=%s | live_execution=false",
+            "MEXC research worker starting | universe=top-%d | strategy=3M-RSI-EMA | auto_scan=%s | paper=%s | live_execution=false",
+            settings.mexc_universe_top_n,
+            settings.mexc_universe_scan_enabled,
             settings.paper_trading_enabled,
         )
         # This is a dedicated Render worker. SCHEDULER_ENABLED controls only the web

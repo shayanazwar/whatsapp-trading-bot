@@ -99,8 +99,8 @@ def run_backtest_rsi_ema(
 ) -> dict[str, Any]:
     cfg = config or RsiEmaBacktestConfig()
     cfg.validate()
-    if window_days not in {1, 7, 30, 90}:
-        raise ValueError("Backtest windows must be 1, 7, 30 or 90 days")
+    if window_days not in {1, 7, 30, 60, 90}:
+        raise ValueError("Backtest windows must be 1, 7, 30, 60 or 90 days")
     all_bars: dict[str, list[Candle]] = {}
     for sym, items in candles_by_symbol.items():
         norm = str(sym).upper()

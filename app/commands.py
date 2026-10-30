@@ -8,9 +8,9 @@ from typing import Any
 from app.symbols import InvalidSymbol, normalize_symbol
 
 ALLOWED_ALERT_INTERVALS = {"1H", "4H", "12H", "1D"}
-BACKTEST_WINDOW_ORDER = ["1D", "7D", "30D", "60D", "90D", "180D", "365D"]
+BACKTEST_WINDOW_ORDER = ["1D", "7D", "30D", "60D", "90D"]
 ALLOWED_BACKTEST_WINDOWS = set(BACKTEST_WINDOW_ORDER)
-CHART_TIMEFRAMES = frozenset({"1H", "4H", "12H", "1D"})
+CHART_TIMEFRAMES = frozenset({"3M", "5M", "15M", "30M", "1H", "4H", "8H", "12H", "1D", "3D", "1W", "1MO"})
 WHATSAPP_SUPPORT_COMMANDS = frozenset({"HELP", "STATUS"})
 TP_SCENARIOS: dict[str, float] = {
     "CONTROL": 2.0,
@@ -38,49 +38,28 @@ def _symbol(value: str) -> str:
 
 
 def _parse_backtest(parts: list[str]) -> Command:
-    """Parse one explicit backtest run; default is 7D control, not every period at once."""
+    """Parse a 3-minute RSI/EMA backtest over the current top-turnover universe."""
     rest = [part.upper() for part in parts[1:]]
-    mode = "exchange_realistic"
-    if rest and rest[0] in {"LEGACY", "FIXED", "FIXED_PAYOUT"}:
-        # Retain the old explicit fixed-payout research mode as an opt-in only.
-        rest.pop(0)
-        mode = "fixed_payout"
-    elif rest and rest[0] in {"REALISTIC", "EXCHANGE_REALISTIC"}:
-        rest.pop(0)
-
-    scenario = "CONTROL"
-    reward_risk = TP_SCENARIOS[scenario]
-    if len([token for token in rest if token.startswith("TP=")]) > 1:
-        raise CommandError("Use only one TP scenario: CONTROL, 1.5R, 2.0R or 2.5R")
-    clean: list[str] = []
-    for token in rest:
-        if token.startswith("TP="):
-            scenario = token[3:]
-            if scenario not in TP_SCENARIOS:
-                raise CommandError("TP must be CONTROL, 1.5R, 2.0R or 2.5R")
-            reward_risk = TP_SCENARIOS[scenario]
-        else:
-            clean.append(token)
-
+    if any(token in {"LEGACY", "FIXED", "FIXED_PAYOUT", "REALISTIC", "EXCHANGE_REALISTIC"} for token in rest):
+        raise CommandError("This release uses the 3M RSI/EMA backtest only; legacy modes are unavailable.")
+    if any(token.startswith("TP=") and token != "TP=CONTROL" for token in rest):
+        raise CommandError("3M RSI/EMA uses its configured net-profit target; TP=R scenarios are not supported.")
+    clean = [token for token in rest if token != "TP=CONTROL"]
     windows = [token for token in clean if token in ALLOWED_BACKTEST_WINDOWS]
     if len(windows) > 1:
-        raise CommandError("Run one backtest period at a time: 1D, 7D, 30D, 60D, 90D, 180D or 365D")
+        raise CommandError("Run one backtest period at a time: 1D, 7D, 30D, 60D or 90D")
     symbols = [token for token in clean if token not in ALLOWED_BACKTEST_WINDOWS]
     if any(re.fullmatch(r"\d+[A-Z]+", token) for token in symbols):
-        raise CommandError("Backtest period must be 1D, 7D, 30D, 60D, 90D, 180D or 365D")
+        raise CommandError("Backtest period must be 1D, 7D, 30D, 60D or 90D")
     if len(symbols) > 1:
         raise CommandError("Use at most one symbol per backtest command")
-
-    args: dict[str, Any] = {
-        "mode": mode,
-        "windows": windows or ["7D"],
-        "tp_scenario": scenario,
-        "reward_risk_multiple": reward_risk,
-    }
+    if not symbols and windows and windows[0] not in {"1D", "7D"}:
+        raise CommandError(
+            "Top-100 3M backtests support 1D or 7D only. Add one symbol for longer periods, e.g. BACKTEST BTCUSDT 30D."
+        )
+    args: dict[str, Any] = {"mode": "rsi_ema", "windows": windows or ["7D"]}
     if symbols:
         args["symbol"] = _symbol(symbols[0])
-    if scenario != "CONTROL" and mode != "exchange_realistic":
-        raise CommandError("TP=R scenarios require the exchange-realistic backtest mode")
     return Command("BACKTEST", args)
 
 
@@ -135,7 +114,7 @@ def parse_command(text: str) -> Command:
     if head == "CHART" and len(parts) == 3:
         timeframe = upper[2]
         if timeframe not in CHART_TIMEFRAMES:
-            raise CommandError("CHART timeframe must be 1H, 4H, 12H or 1D")
+            raise CommandError("CHART timeframe must be a supported MEXC interval or derived 3M/12H/3D interval")
         return Command("CHART", {"symbol": _symbol(parts[1]), "timeframe": timeframe})
     if head == "BACKTEST":
         return _parse_backtest(parts)
@@ -189,45 +168,40 @@ PRICE BTCUSDT
 ANALYZE BTCUSDT
 
 📈 CHART
+CHART BTCUSDT 3M
 CHART BTCUSDT 1H
 CHART BTCUSDT 4H
 CHART BTCUSDT 12H
 CHART BTCUSDT 1D
 
-🔔 ALERT
+🔎 MARKET SCAN
+SCAN — Top 100 active MEXC USDT perpetuals by 24H turnover
+SIGNALS — Latest 3M scan results
+SEARCH PEPE
+
+🧪 BACKTEST — 3M RSI/EMA
+BACKTEST 1D
+BACKTEST 7D
+BACKTEST BTCUSDT 30D — Single-symbol longer test
+BACKTEST BTCUSDT 60D
+BACKTEST BTCUSDT 90D
+
+🧪 PAPER (FAKE MONEY ONLY)
+PAPER
+PAPER OPEN
+PAPER HISTORY
+
+🔔 ALERTS
 ALERT BTCUSDT ABOVE 120000
 ALERTS
 DELETE 12
 DELETE ALL
 
-🔎 SEARCH
-SEARCH PEPE
-
-🧪 BACKTEST
-BACKTEST 1D
-BACKTEST 7D
-BACKTEST 7D TP=CONTROL
-BACKTEST 7D TP=1.5R
-BACKTEST 7D TP=2.0R
-BACKTEST 7D TP=2.5R
-BACKTEST 30D
-BACKTEST 60D
-BACKTEST 90D
-BACKTEST 180D
-BACKTEST 365D
-
-🧪 LIVE PAPER TRADING (FAKE MONEY ONLY)
-PAPER          — Wallet/equity summary
-PAPER OPEN     — Current virtual positions
-PAPER HISTORY  — Recent closed virtual trades
-
-STATUS • SIGNALS • PERFORMANCE • PNL • RISK • COST
+STATUS • PERFORMANCE • PNL • RISK • COST
 AUTOTRADE STATUS • AUTOTRADE OFF • PAUSE
 
-⏱ SIGNAL: 1D • 12H • 4H • 1H
-CHART: 1H / 4H / 12H / 1D only
-
-Strategy uses completed candles only. Backtests are historical simulations; fees, slippage, funding and contract limits are modeled assumptions. No live orders are submitted by this release.
+Strategy: completed 3-minute candles · RSI 14 rising above 70 · EMA 21/50/100 bullish alignment and crossover · previous-high breakout · relative-volume confirmation.
+Top universe: active USDT perpetuals ranked by 24H turnover. Live orders: OFF.
 """
 
 WHATSAPP_SUPPORT_HELP_TEXT = """📈 Pak Trading Academy Bot — Service Help

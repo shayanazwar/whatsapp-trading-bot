@@ -53,6 +53,8 @@ class Settings:
     live_execution_enabled: bool
     live_execution_build_released: bool
     default_symbols: tuple[str, ...]
+    mexc_universe_top_n: int
+    mexc_universe_scan_enabled: bool
     strategy_version: str
     risk_per_trade_fraction: float
     max_open_risk_fraction: float
@@ -144,6 +146,8 @@ def load_settings() -> Settings:
         live_execution_enabled=_bool("LIVE_EXECUTION_ENABLED", False),
         live_execution_build_released=_bool("LIVE_EXECUTION_BUILD_RELEASED", False),
         default_symbols=symbols,
+        mexc_universe_top_n=_int("MEXC_UNIVERSE_TOP_N", 100),
+        mexc_universe_scan_enabled=_bool("MEXC_UNIVERSE_SCAN_ENABLED", False),
         strategy_version=os.getenv("STRATEGY_VERSION", "S1-RFPC-0.2.0-1H-trigger"),
         risk_per_trade_fraction=_float("RISK_PER_TRADE_FRACTION", 0.005),
         max_open_risk_fraction=_float("MAX_OPEN_RISK_FRACTION", 0.02),
@@ -208,4 +212,6 @@ def load_settings() -> Settings:
         raise ValueError("Invalid RSI strategy volume settings")
     if settings.exchange_taker_fee_rate < 0 or settings.exchange_maker_fee_rate < 0:
         raise ValueError("Fee rates cannot be negative")
+    if not 1 <= settings.mexc_universe_top_n <= 100:
+        raise ValueError("MEXC_UNIVERSE_TOP_N must be between 1 and 100")
     return settings

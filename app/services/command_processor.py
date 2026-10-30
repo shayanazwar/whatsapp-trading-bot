@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import json
 import logging
 import time
@@ -10,10 +9,6 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from app.alerts import AlertService
 from app.analysis import analyze_series, format_analysis
@@ -34,7 +29,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class CommandResult:
     text: str
-    attachments: list[tuple[str, str]] = field(default_factory=list)  # (path, image|document)
+    attachments: list[tuple[str, str]] = field(default_factory=list)  # (path, image); documents are disabled
     event_type: str = "COMMAND_COMPLETED"
     idempotency_key: str | None = None
 
@@ -160,18 +155,21 @@ class CommandProcessor:
             price = _first_number(ticker, "lastPrice", "last_price", "last")
             if price is None:
                 raise MexcError("MEXC ticker did not provide a last-traded price; no substitute price field was used")
-            source_ts = ticker.get("timestamp", ticker.get("time"))
-            if source_ts is not None:
-                try:
-                    source_stamp = int(float(source_ts))
-                    if source_stamp > 100_000_000_000:
-                        source_stamp //= 1000
-                    source_time = datetime.fromtimestamp(source_stamp, timezone.utc).isoformat(timespec="seconds")
-                except (TypeError, ValueError, OverflowError, OSError):
-                    source_time = "unparseable"
-            else:
-                source_time = "not provided by response"
-            return CommandResult(f"MEXC FUTURES PRICE — {symbol}\nLast traded price: {price:.10g}\nSource timestamp: {source_time}\nFetched: {datetime.now(timezone.utc).isoformat(timespec='seconds')} UTC\nSource: MEXC Futures ticker. This is a market observation, not an order fill.")
+            change = _optional_float(ticker.get("riseFallRate"))
+            high = _first_number(ticker, "high24Price", "high24", "high")
+            low = _first_number(ticker, "lower24Price", "low24Price", "low")
+            bid = _first_number(ticker, "bid1", "bidPrice")
+            ask = _first_number(ticker, "ask1", "askPrice")
+            rows = [f"💰 {symbol.replace('_', '/')}", f"${price:,.10g}"]
+            if change is not None:
+                rows.append(f"24H {change * 100:+.2f}%")
+            if high is not None or low is not None:
+                rows.append(f"H {high:,.8g}" if high is not None else "H n/a")
+                rows[-1] += f"  ·  L {low:,.8g}" if low is not None else "  ·  L n/a"
+            if bid is not None or ask is not None:
+                rows.append(f"Bid {bid:,.8g}" if bid is not None else "Bid n/a")
+                rows[-1] += f"  ·  Ask {ask:,.8g}" if ask is not None else "  ·  Ask n/a"
+            return CommandResult("\n".join(rows), event_type="PRICE_QUOTE")
         if name == "CHART":
             symbol = args["symbol"]
             timeframe = args["timeframe"]
@@ -198,25 +196,14 @@ class CommandProcessor:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             path = self.settings.reports_dir / f"chart_{symbol}_{timeframe}_{stamp}.png"
             render_candle_chart(candles, path, timeframe=timeframe)
-            last_closed = datetime.fromtimestamp(candles[-1].close_time, timezone.utc).isoformat(timespec="seconds")
-            caption = (
-                f"MEXC FUTURES CHART — {symbol} · {timeframe}\n"
-                f"Completed candles: {len(candles)} | Latest candle close: {last_closed} UTC\n"
-                "Indicators: EMA 21/50/100/200, Volume, RSI 14 and confirmed swing levels.\n"
-                "Signal framework: completed 1D → 12H → 4H → 1H candles only."
-            )
+            caption = f"📈 {symbol.replace('_', '/')} · {timeframe}"
             return CommandResult(caption, [(str(path), "image")], "CHART_RENDERED")
         if name == "ANALYZE":
             symbol = args["symbol"]
             data = await self.market_data.fetch_symbol(symbol, window_days=15, daily_warmup_days=400, extra_intraday_warmup_days=45)
             report = analyze_series(symbol, data.timeframes, data_warnings=data.warnings)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            json_path = self.settings.reports_dir / f"analysis_{symbol}_{stamp}.json"
-            text_path = self.settings.reports_dir / f"analysis_{symbol}_{stamp}.txt"
-            json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
             analysis_text = format_analysis(report)
-            text_path.write_text(analysis_text + "\n", encoding="utf-8")
-            return CommandResult(analysis_text, [(str(text_path), "document"), (str(json_path), "json")], "ANALYSIS_COMPLETED")
+            return CommandResult(analysis_text, event_type="ANALYSIS_COMPLETED")
         if name == "SCAN":
             results: list[str] = []
             for symbol in self.settings.default_symbols:
@@ -314,63 +301,69 @@ class CommandProcessor:
         raise CommandError(f"Unsupported command: {name}")
 
     async def _run_backtest(self, args: dict[str, Any]) -> CommandResult:
-        """Backtest the selected 1D → 12H → 4H → 1H strategy on verified completed bars."""
+        """Run the selected completed-bar strategy and return one concise WhatsApp reply."""
+        command_started = time.perf_counter()
         symbols = [args["symbol"]] if args.get("symbol") else list(self.settings.default_symbols)
         windows = list(args.get("windows") or ["7D"])
-        days_by_window = {"1D": 1, "3D": 3, "7D": 7, "30D": 30, "60D": 60, "90D": 90, "180D": 180, "365D": 365}
+        days_by_window = {"1D": 1, "3D": 3, "7D": 7, "30D": 30, "60D": 60,
+                          "90D": 90, "180D": 180, "365D": 365}
+        unknown_windows = [window for window in windows if window not in days_by_window]
+        if unknown_windows:
+            raise CommandError(f"Unsupported backtest window: {unknown_windows[0]}")
+
         try:
             now_epoch = await self.mexc.server_time()
             clock_warning: list[str] = []
         except Exception as exc:
             now_epoch = int(time.time())
-            clock_warning = [f"Exchange server time was unavailable ({type(exc).__name__}); local UTC time was used only to bound the data window."]
-        longest = max(days_by_window[w] for w in windows)
+            clock_warning = [f"Exchange time unavailable ({type(exc).__name__}); local UTC clock bounded the test window."]
+
+        longest = max(days_by_window[window] for window in windows)
         loaded: dict[str, SymbolData] = {}
         data_load_errors: dict[str, str] = {}
+        load_started = time.perf_counter()
 
         async def load_one(symbol: str):
-            return symbol, await self.market_data.fetch_symbol(
+            symbol_started = time.perf_counter()
+            logger.info("BACKTEST SYMBOL LOAD START | symbol=%s window_days=%d", symbol, longest)
+            data = await self.market_data.fetch_symbol(
                 symbol, window_days=longest, daily_warmup_days=400,
                 extra_intraday_warmup_days=45, now_epoch=now_epoch,
             )
+            logger.info(
+                "BACKTEST SYMBOL LOAD COMPLETE | symbol=%s bars=%s contract_metadata=%s elapsed_ms=%.0f",
+                symbol,
+                {tf: len(data.timeframes.get(tf, [])) for tf in ("1D", "12H", "4H", "1H")},
+                bool(data.contract),
+                (time.perf_counter() - symbol_started) * 1000,
+            )
+            return symbol, data
 
-        load_results = await asyncio.gather(*(load_one(s) for s in symbols), return_exceptions=True)
+        load_results = await asyncio.gather(*(load_one(symbol) for symbol in symbols), return_exceptions=True)
         for symbol, item in zip(symbols, load_results):
             if isinstance(item, Exception):
                 data_load_errors[symbol] = f"{type(item).__name__}: {str(item)[:160]}"
                 self.store.append_event("BACKTEST_DATA_LOAD_FAILED", {
                     "symbol": symbol, "error_type": type(item).__name__, "window_days": longest,
                 }, symbol=symbol, idempotency_key=f"backtest-load-failed:{symbol}:{now_epoch // 60}")
-                logger.warning("Backtest market data failed for %s (%s)", symbol, type(item).__name__)
+                logger.warning("BACKTEST SYMBOL LOAD FAILED | symbol=%s error_type=%s detail=%s",
+                               symbol, type(item).__name__, str(item)[:180])
             else:
                 loaded[symbol] = item[1]
 
-        series_map = {s: d.timeframes for s, d in loaded.items()}
-        # Include empty entries to report an explicit no-data result rather than silently
-        # pretending that a failed API request was a losing or breakeven strategy.
+        logger.info(
+            "BACKTEST DATA LOAD COMPLETE | requested=%d loaded=%d failed=%d bars=%s elapsed_ms=%.0f",
+            len(symbols), len(loaded), len(data_load_errors),
+            {symbol: {tf: len(data.timeframes.get(tf, [])) for tf in ("1D", "12H", "4H", "1H")}
+             for symbol, data in loaded.items()},
+            (time.perf_counter() - load_started) * 1000,
+        )
+
+        series_map = {symbol: data.timeframes for symbol, data in loaded.items()}
         if not series_map:
-            series_map = {s: {} for s in symbols}
-        specs = {s: d.contract for s, d in loaded.items() if d.contract}
-        funding: dict[str, list[dict[str, Any]]] = {}
-        funding_missing_symbols: list[str] = []
+            series_map = {symbol: {} for symbol in symbols}
+        specs = {symbol: data.contract for symbol, data in loaded.items() if data.contract}
         mode = args.get("mode", "exchange_realistic")
-        if mode == "exchange_realistic":
-            funding_start = now_epoch - (longest + 45) * 86400
-
-            async def load_funding(symbol: str):
-                return symbol, await self.mexc.funding_history_window(symbol, start=funding_start, end=now_epoch)
-
-            funding_results = await asyncio.gather(*(load_funding(s) for s in loaded), return_exceptions=True)
-            for symbol, item in zip(loaded, funding_results):
-                if isinstance(item, Exception):
-                    funding[symbol] = []
-                    funding_missing_symbols.append(symbol)
-                    logger.warning("Funding history fetch failed for %s (%s)", symbol, type(item).__name__)
-                else:
-                    funding[symbol] = item[1]
-                    if not item[1]:
-                        funding_missing_symbols.append(symbol)
-
         scenario = str(args.get("tp_scenario", "CONTROL"))
         reward_risk = float(args.get("reward_risk_multiple", 2.0))
         cfg = BacktestConfig(
@@ -382,27 +375,89 @@ class CommandProcessor:
             slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
             reward_risk_multiple=reward_risk,
         )
-        results: list[dict[str, Any]] = []
+
         data_warnings = list(clock_warning)
         data_warnings.extend(
-            f"{s}: market-data load failed ({error}); this symbol was not simulated."
-            for s, error in data_load_errors.items()
+            f"{symbol}: market-data load failed ({error}); symbol not simulated."
+            for symbol, error in data_load_errors.items()
         )
         for symbol, data in loaded.items():
             data_warnings.extend(f"{symbol}: {warning}" for warning in data.warnings)
-        if mode == "exchange_realistic" and funding_missing_symbols:
+
+        # First evaluate the strategy with no funding payload. Funding only changes
+        # position P&L; it cannot alter a run that never opens a position. This avoids
+        # paginating historical settlements for the common no-trade case.
+        preflight_results: list[dict[str, Any]] = []
+        if mode == "exchange_realistic":
+            for window in windows:
+                preflight = await asyncio.to_thread(
+                    run_backtest, series_map, window=window, config=cfg,
+                    contract_specs=specs, funding_events=None, now_epoch=now_epoch,
+                )
+                preflight_results.append(preflight)
+            funding_needed = any(
+                result.get("completed_trades", 0) or result.get("open_trades_at_end", 0)
+                for result in preflight_results
+            )
+        else:
+            funding_needed = False
+
+        funding: dict[str, list[dict[str, Any]]] = {}
+        funding_missing_symbols: list[str] = []
+        funding_started = time.perf_counter()
+        if mode == "exchange_realistic" and loaded and funding_needed:
+            # Entries are only opened inside the test window and simulation ends at
+            # `now_epoch`; candle warm-up history is not required for funding accrual.
+            funding_start = now_epoch - longest * 86400
+
+            async def load_funding(symbol: str):
+                return symbol, await self.mexc.funding_history_window(
+                    symbol, start=funding_start, end=now_epoch, max_pages=30,
+                )
+
+            funding_results = await asyncio.gather(
+                *(load_funding(symbol) for symbol in loaded), return_exceptions=True,
+            )
+            for symbol, item in zip(loaded, funding_results):
+                if isinstance(item, Exception):
+                    funding[symbol] = []
+                    funding_missing_symbols.append(symbol)
+                    logger.warning("BACKTEST FUNDING LOAD FAILED | symbol=%s error_type=%s detail=%s",
+                                   symbol, type(item).__name__, str(item)[:160])
+                else:
+                    funding[symbol] = item[1]
+                    if not item[1]:
+                        funding_missing_symbols.append(symbol)
             data_warnings.extend(
-                f"{symbol}: funding history is missing/empty; realized P&L excludes unknown funding."
+                f"{symbol}: funding history unavailable; modeled P&L excludes unknown funding."
                 for symbol in funding_missing_symbols
             )
-
-        for window in windows:
-            result = await asyncio.to_thread(
-                run_backtest, series_map, window=window, config=cfg,
-                contract_specs=specs,
-                funding_events=funding if mode == "exchange_realistic" else None,
-                now_epoch=now_epoch,
+            logger.info(
+                "BACKTEST FUNDING LOAD COMPLETE | symbols=%d missing=%d events=%d elapsed_ms=%.0f",
+                len(funding), len(funding_missing_symbols), sum(len(rows) for rows in funding.values()),
+                (time.perf_counter() - funding_started) * 1000,
             )
+        elif mode == "exchange_realistic":
+            logger.info(
+                "BACKTEST FUNDING SKIPPED | reason=no_simulated_positions_or_trades elapsed_ms=%.0f",
+                (time.perf_counter() - funding_started) * 1000,
+            )
+
+        results: list[dict[str, Any]] = []
+        simulation_started = time.perf_counter()
+        for window_index, window in enumerate(windows):
+            window_started = time.perf_counter()
+            if mode == "exchange_realistic" and not funding_needed:
+                # No position was ever opened in this exact run, so its preflight
+                # result is final and funding settlements cannot affect its P&L.
+                result = preflight_results[window_index]
+            else:
+                result = await asyncio.to_thread(
+                    run_backtest, series_map, window=window, config=cfg,
+                    contract_specs=specs,
+                    funding_events=funding if mode == "exchange_realistic" else None,
+                    now_epoch=now_epoch,
+                )
             result["warnings"] = list(dict.fromkeys(result["warnings"] + data_warnings))
             result["data_load_errors"] = dict(data_load_errors)
             result["strategy"] = "S1-RFPC: 1D regime → 12H structure → 4H setup → 1H trigger"
@@ -419,13 +474,17 @@ class CommandProcessor:
                 "contract_metadata_available": sorted(specs),
                 "completed_candles_only": True,
             }
+
+            # If there were no entries/open positions, cost multipliers cannot change
+            # the result. Avoid rerunning the entire simulation three times for a zero-trade test.
             sensitivity: list[dict[str, Any]] = []
-            if mode == "exchange_realistic":
+            has_activity = bool(result.get("completed_trades") or result.get("open_trades_at_end"))
+            if mode == "exchange_realistic" and has_activity:
                 multipliers = sorted(set((1.0, *self.settings.cost_stress_multipliers)))
                 for multiplier in multipliers:
-                    stress_cfg = replace(cfg, cost_multiplier=multiplier)
                     stress_result = result if multiplier == 1.0 else await asyncio.to_thread(
-                        run_backtest, series_map, window=window, config=stress_cfg,
+                        run_backtest, series_map, window=window,
+                        config=replace(cfg, cost_multiplier=multiplier),
                         contract_specs=specs, funding_events=funding, now_epoch=now_epoch,
                     )
                     sensitivity.append({
@@ -447,117 +506,69 @@ class CommandProcessor:
             run_id = self.store.create_research_run(mode, {
                 "symbols": symbols, "window": window, "strategy_version": self.settings.strategy_version,
                 "tp_scenario": scenario, "reward_risk_multiple": reward_risk,
-                "config": {"mode": cfg.mode, "tp_pct": cfg.tp_pct, "sl_pct": cfg.sl_pct,
-                           "risk_fraction": cfg.risk_fraction, "taker_fee_rate": cfg.taker_fee_rate,
-                           "slippage_bps_per_side": cfg.slippage_bps_per_side,
-                           "cost_stress_multipliers": list(self.settings.cost_stress_multipliers)},
+                "config": {
+                    "mode": cfg.mode, "tp_pct": cfg.tp_pct, "sl_pct": cfg.sl_pct,
+                    "risk_fraction": cfg.risk_fraction, "taker_fee_rate": cfg.taker_fee_rate,
+                    "slippage_bps_per_side": cfg.slippage_bps_per_side,
+                    "cost_stress_multipliers": list(self.settings.cost_stress_multipliers),
+                },
             })
             self.store.finish_research_run(run_id, result)
-            stamp_artifact = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            csv_path = self.settings.reports_dir / f"backtest_{window}_{scenario}_{stamp_artifact}_trades.csv"
-            csv_fields = ["symbol", "side", "entry_time", "exit_time", "entry_price", "exit_price",
-                          "exit_reason", "pnl", "realised_r", "risk_amount", "candidate_id", "mode",
-                          "fees", "funding_pnl", "slippage_cost"]
-            with csv_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=csv_fields, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(result.get("trades", []))
-
-            curve_path = self.settings.reports_dir / f"backtest_{window}_{scenario}_{stamp_artifact}_equity.png"
-            fig, axis = plt.subplots(figsize=(10, 4.8), dpi=140, facecolor="#0b0f14")
-            axis.set_facecolor("#10161f")
-            axis.tick_params(colors="#b8c3d1", labelsize=8)
-            for spine in axis.spines.values():
-                spine.set_color("#283241")
-            axis.set_title(f"Paper Backtest Equity — {window} — TP {scenario}", color="#e2e8f0", loc="left")
-            if result.get("status") == "NOT_RUN_NO_DATA":
-                axis.text(0.5, 0.5, "NOT RUN — NO VERIFIED CANDLE DATA", transform=axis.transAxes,
-                          ha="center", va="center", color="#f59e0b", fontsize=11, fontweight="bold")
-            elif result.get("status") == "NOT_RUN_INSUFFICIENT_HISTORY":
-                axis.text(0.5, 0.5, "NOT RUN — INSUFFICIENT STRATEGY WARM-UP", transform=axis.transAxes,
-                          ha="center", va="center", color="#f59e0b", fontsize=11, fontweight="bold")
-            elif result.get("status") == "COMPLETED_NO_TRADES":
-                axis.text(0.5, 0.5, "NO QUALIFYING CLOSED TRADES\nNo expectancy conclusion", transform=axis.transAxes,
-                          ha="center", va="center", color="#b8c3d1", fontsize=11, fontweight="bold")
-            else:
-                curve = result.get("equity_curve", [])
-                if len(curve) > 1200:
-                    stride = max(1, len(curve) // 1200)
-                    curve = curve[::stride]
-                    if result.get("equity_curve"):
-                        curve = [*curve, result["equity_curve"][-1]]
-                axis.plot(range(len(curve)), curve, color="#22c55e", linewidth=1.3, label="Simulated equity")
-                axis.axhline(cfg.starting_balance, color="#8b98aa", linestyle="--", linewidth=0.8,
-                             alpha=0.75, label="Starting wallet")
-                axis.set_ylabel("Equity (quote currency)", color="#b8c3d1", fontsize=8)
-                axis.set_xlabel("Hourly simulation steps", color="#b8c3d1", fontsize=8)
-                axis.legend(loc="upper left", frameon=False, labelcolor="#d7dee8", fontsize=8)
-            axis.grid(True, color="#283241", linewidth=0.55, alpha=0.65)
-            fig.tight_layout()
-            try:
-                fig.savefig(curve_path, facecolor=fig.get_facecolor(), bbox_inches="tight")
-            finally:
-                plt.close(fig)
-            result["artifacts"] = {"trades_csv": str(csv_path), "equity_curve_png": str(curve_path)}
             results.append(result)
+            logger.info(
+                "BACKTEST WINDOW COMPLETE | window=%s status=%s symbols=%d/%d bars=%d evaluations=%d candidates=%d entry_attempts=%d trades=%d rejects=%s elapsed_ms=%.0f",
+                window, result.get("status"), result.get("symbols_eligible", 0), len(symbols),
+                result.get("valid_candles", 0), result.get("strategy_evaluations", 0),
+                result.get("candidate_signals", 0), result.get("entry_attempts", 0),
+                result.get("completed_trades", 0), result.get("rejection_reasons", {}),
+                (time.perf_counter() - window_started) * 1000,
+            )
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        json_path = self.settings.reports_dir / f"backtest_{mode}_{stamp}.json"
-        text_path = self.settings.reports_dir / f"backtest_{mode}_{stamp}.txt"
-        json_path.write_text(json.dumps({
-            "mode": mode, "symbols": symbols, "strategy": "S1-RFPC 1D-12H-4H-1H",
-            "tp_scenario": scenario, "reward_risk_multiple": reward_risk, "results": results,
-        }, indent=2, sort_keys=True), encoding="utf-8")
-        lines = [
-            f"BACKTEST — {mode.upper()}",
-            "Strategy: 1D regime → 12H structure → 4H setup → 1H trigger",
-            f"TP scenario: {scenario} ({reward_risk:.1f}R gross target before costs)",
-            f"Symbols requested: {', '.join(symbols)}",
-            f"Symbols with retrieved history: {', '.join(sorted(loaded)) if loaded else 'none'}",
-            f"Starting simulated equity per run: ${cfg.starting_balance:.2f}",
-            "Only completed 1D, 12H, 4H and 1H candles are used. Live trading: DISABLED.",
-        ]
-        if data_load_errors:
-            lines.append("DATA LOAD ERRORS: " + "; ".join(f"{symbol}={error}" for symbol, error in data_load_errors.items()))
+        lines: list[str] = []
         for result in results:
-            label = result["window"]
-            status = result.get("status", "COMPLETED")
-            if status == "NOT_RUN_NO_DATA":
-                lines.append(f"{label}: NOT RUN — no completed historical candles were available; no performance result.")
+            window = result["window"]
+            if result.get("status") == "NOT_RUN_NO_DATA":
+                lines.extend([f"🧪 BACKTEST {window} — NOT RUN", "No completed candle data was retrieved."])
                 continue
-            if status == "NOT_RUN_INSUFFICIENT_HISTORY":
-                lines.append(f"{label}: NOT RUN — insufficient 1D EMA200/1H warm-up; no performance result.")
+            if result.get("status") == "NOT_RUN_INSUFFICIENT_HISTORY":
+                lines.extend([f"🧪 BACKTEST {window} — NOT RUN", "Not enough completed history for the 1D EMA200 warm-up."])
                 continue
-            if status == "COMPLETED_NO_TRADES":
-                lines.append(
-                    f"{label}: NO QUALIFYING CLOSED TRADES | 1H bars in test={result['valid_candles']} "
-                    f"| eligible symbols={result['symbols_eligible']}/{result['symbols_tested']} | "
-                    "no trade expectancy can be inferred from the unchanged wallet balance."
-                )
+
+            lines.append(f"🧪 BACKTEST {window} · {scenario}")
+            lines.append(f"Symbols {result['symbols_eligible']}/{result['symbols_tested']} · 1H bars {result['valid_candles']}")
+            lines.append(
+                f"Evaluations {result.get('strategy_evaluations', 0)} · Candidates {result.get('candidate_signals', 0)} · Entries {result.get('entry_attempts', 0)}"
+            )
+            if result.get("completed_trades", 0) == 0 and result.get("open_trades_at_end", 0) == 0:
+                lines.append("No qualifying trades in this period.")
+                blockers = sorted(result.get("rejection_reasons", {}).items(), key=lambda item: (-item[1], item[0]))[:3]
+                if blockers:
+                    lines.append("Main filters: " + " · ".join(f"{name.replace('_', ' ').lower()} ×{count}" for name, count in blockers))
             else:
-                wr = "n/a" if result["win_rate_pct"] is None else f"{result['win_rate_pct']:.2f}%"
+                win_rate = result.get("win_rate_pct")
+                win_rate_text = "n/a" if win_rate is None else f"{win_rate:.1f}%"
                 lines.append(
-                    f"{label}: trades={result['completed_trades']} open={result['open_trades_at_end']} "
-                    f"W/L={result['wins']}/{result['losses']} win-rate={wr} "
-                    f"net P&L=${result['total_pnl']:.2f} ending=${result['ending_balance']:.2f} "
-                    f"maxDD={result['max_drawdown_pct']:.2f}%"
+                    f"Trades {result['completed_trades']} · W/L {result['wins']}/{result['losses']} · Win {win_rate_text}"
+                )
+                lines.append(
+                    f"Net P&L ${result['total_pnl']:+.2f} · Equity ${result['ending_balance']:.2f} · DD {result['max_drawdown_pct']:.2f}%"
                 )
             if result.get("cost_sensitivity"):
-                stress_line = ", ".join(f"{x['cost_multiplier']:.1f}x=${x['total_pnl']:.2f}" for x in result["cost_sensitivity"])
-                lines.append(f"  Cost-stress net P&L: {stress_line}")
-        lines.append(
-            "Modeled P&L is not observed execution. Funding gaps, account-specific fees, contract units, "
-            "slippage, liquidation and intra-candle price ordering can change results. See the attached report JSON."
+                stress = " · ".join(
+                    f"{item['cost_multiplier']:.1f}× ${item['total_pnl']:+.2f}"
+                    for item in result["cost_sensitivity"]
+                )
+                lines.append(f"Cost stress: {stress}")
+            if result.get("warnings") and (data_load_errors or funding_missing_symbols or clock_warning):
+                lines.append("Data note: " + " · ".join(result["warnings"][:2]))
+
+        lines.append("Live orders: OFF")
+        total_ms = (time.perf_counter() - command_started) * 1000
+        logger.info(
+            "BACKTEST COMMAND COMPLETE | windows=%s requested_symbols=%d loaded_symbols=%d elapsed_ms=%.0f",
+            windows, len(symbols), len(loaded), total_ms,
         )
-        text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        attachments: list[tuple[str, str]] = [(str(text_path), "document"), (str(json_path), "document")]
-        for result in results:
-            artifacts = result.get("artifacts", {})
-            if artifacts.get("trades_csv"):
-                attachments.append((str(artifacts["trades_csv"]), "document"))
-            if artifacts.get("equity_curve_png"):
-                attachments.append((str(artifacts["equity_curve_png"]), "image"))
-        return CommandResult("\n".join(lines), attachments, "BACKTEST_COMPLETED")
+        return CommandResult("\n".join(lines), event_type="BACKTEST_COMPLETED")
 
     def _apply_selected_price_series(self, candles: list[Candle]) -> list[Candle]:
         """Apply one consistent OHLC series; never silently mix real and adjusted prices."""
@@ -570,6 +581,14 @@ class CommandProcessor:
             )
         return [replace(c, open=float(c.real_open), high=float(c.real_high),
                         low=float(c.real_low), close=float(c.real_close)) for c in candles]
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
 
 
 def _first_number(mapping: dict[str, Any], *keys: str) -> float | None:

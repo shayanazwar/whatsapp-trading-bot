@@ -34,6 +34,10 @@ from app.whatsapp import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+# Successful low-level HTTP requests and routine Render/Meta callbacks are noisy;
+# retain warnings/errors plus the bot's stage-level operational summaries.
+for _quiet_logger in ("httpx", "httpcore", "uvicorn.access"):
+    logging.getLogger(_quiet_logger).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -190,7 +194,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except ValueError:
                 logger.warning("Refusing artifact outside reports directory: %s", path.name)
                 continue
-            if not path.is_file() or media_type not in {"image", "document", "json"}:
+            # User-facing command responses intentionally expose images only.
+            # Reports remain in the research database; WhatsApp document spam is disabled.
+            if not path.is_file() or media_type != "image":
                 continue
             artifact_id = secrets.token_urlsafe(18)
             app.state.artifacts[artifact_id] = {
@@ -287,15 +293,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         messages = extract_incoming_messages(payload)
         status_updates = extract_status_updates(payload)
         store: Store = app.state.store
-        logger.info(
-            "WHATSAPP WEBHOOK PARSED | inbound_messages=%d status_updates=%d object=%s",
-            len(messages), len(status_updates), str(payload.get("object", "unknown"))[:80],
-        )
-        if not messages:
+        if messages:
             logger.info(
-                "WHATSAPP WEBHOOK HAS NO INBOUND MESSAGES | status_updates=%d",
-                len(status_updates),
+                "WHATSAPP WEBHOOK RECEIVED | inbound_messages=%d status_updates=%d",
+                len(messages), len(status_updates),
             )
+        elif status_updates:
+            # Delivery/read callbacks are expected and are persisted below; avoid
+            # generating one INFO line for every Meta status notification.
+            logger.debug("WHATSAPP STATUS CALLBACK | count=%d", len(status_updates))
         for update in status_updates:
             provider_id = update.get("provider_message_id", "")
             status = update.get("status", "")
@@ -554,6 +560,7 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
     processor: CommandProcessor = app.state.processor
     sender = message.get("from", "")
     body = message.get("body", "")
+    command_started = time.perf_counter()
     try:
         if message.get("type") != "text" or not body.strip():
             store.mark_inbound_processed(message_id, "unsupported_message_type")
@@ -568,9 +575,11 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
             message_id, (body.split()[0].upper()[:24] if body.split() else "EMPTY"),
         )
         result = await processor.process_text(sender, body, received_timestamp=message_time, enforce_whatsapp_policy=True)
+        image_attachments = [(path, kind) for path, kind in result.attachments if kind == "image"]
         logger.info(
-            "WHATSAPP COMMAND PROCESSED | message_id=%s response_chars=%d attachments=%d",
-            message_id, len(result.text), len(result.attachments),
+            "WHATSAPP COMMAND PROCESSED | message_id=%s response_chars=%d images=%d duration_ms=%.0f",
+            message_id, len(result.text), len(image_attachments),
+            (time.perf_counter() - command_started) * 1000,
         )
         response_key = f"wa-reply:{message_id}:text"
         outbox_id = store.enqueue_outbox(sender, result.text, category="service", idempotency_key=response_key)
@@ -593,9 +602,7 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
                                idempotency_key=f"wa-send-unknown:{response_key}")
             store.mark_inbound_processed(message_id, "reply_outcome_unknown_no_retry")
             return
-        for path, media_type in result.attachments:
-            if media_type not in {"image", "document"}:
-                continue
+        for path, media_type in image_attachments:
             media_key = f"wa-reply:{message_id}:{media_type}:{path}"
             media_outbox_id = store.enqueue_outbox(sender, f"[{media_type.upper()}] {Path(path).name}",
                 category="service", idempotency_key=media_key)
@@ -612,6 +619,31 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
                 store.append_event("WHATSAPP_MEDIA_SEND_UNKNOWN", {"message_id": message_id, "media_type": media_type,
                     "error_type": type(exc).__name__}, idempotency_key=f"wa-media-unknown:{message_id}:{path}")
         store.mark_inbound_processed(message_id, "completed")
+    except CommandError as exc:
+        detail = str(exc)[:220]
+        logger.warning(
+            "WHATSAPP COMMAND REJECTED | message_id=%s detail=%s duration_ms=%.0f",
+            message_id, detail, (time.perf_counter() - command_started) * 1000,
+        )
+        store.append_event(
+            "WHATSAPP_COMMAND_REJECTED", {"message_id": message_id, "detail": detail},
+            idempotency_key=f"wa-command-rejected:{message_id}",
+        )
+        # Never disclose authorization failures to an untrusted sender; for an
+        # authorized sender, explain malformed/expired input instead of silently dropping it.
+        if detail != "Sender is not authorized":
+            try:
+                reply = f"⚠️ {detail}\nSend HELP to see valid commands."
+                response_key = f"wa-reply:{message_id}:command-error"
+                outbox_id = store.enqueue_outbox(sender, reply, category="service", idempotency_key=response_key)
+                provider_result = await app.state.whatsapp.send_text(sender, reply)
+                provider_messages = provider_result.get("messages", [])
+                provider_id = provider_messages[0].get("id") if provider_messages and isinstance(provider_messages[0], dict) else None
+                store.record_outbox_attempt(outbox_id, accepted=True, provider_message_id=provider_id)
+            except Exception as send_exc:
+                logger.warning("WHATSAPP COMMAND ERROR REPLY FAILED | message_id=%s error_type=%s",
+                               message_id, type(send_exc).__name__)
+        store.mark_inbound_processed(message_id, "rejected:CommandError")
     except WhatsAppPolicyBlocked:
         store.mark_inbound_processed(message_id, "crypto_policy_gate_closed")
     except Exception as exc:
@@ -619,8 +651,9 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
                            idempotency_key=f"wa-command-failed:{message_id}")
         store.mark_inbound_processed(message_id, f"failed:{type(exc).__name__}")
         logger.warning(
-            "WHATSAPP COMMAND FAILED | message_id=%s error_type=%s",
-            message_id, type(exc).__name__,
+            "WHATSAPP COMMAND FAILED | message_id=%s error_type=%s detail=%s duration_ms=%.0f",
+            message_id, type(exc).__name__, str(exc)[:180],
+            (time.perf_counter() - command_started) * 1000,
         )
 
 

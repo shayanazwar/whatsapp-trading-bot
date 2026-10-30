@@ -32,6 +32,51 @@ class ChartError(RuntimeError):
     """Raised when a chart cannot be rendered honestly from the supplied candles."""
 
 
+def _latest_divergence_pair(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    rsi_values: Sequence[float | None],
+    *,
+    pivot_width: int = 5,
+    minimum_separation: int = 5,
+    maximum_separation: int = 60,
+) -> list[dict[str, object]]:
+    """Return the most recent confirmed regular bullish/bearish RSI divergence.
+
+    Price pivots are confirmed only after `pivot_width` bars to the right have
+    closed. RSI is sampled at those same pivot bars to avoid look-ahead and
+    mismatched pivot dates. The separation bounds follow the supplied
+    divergence-indicator reference (5..60 bars).
+    """
+    high_pivots, low_pivots = confirmed_pivots(highs, lows, pivot_width)
+    found: list[dict[str, object]] = []
+    for kind, pivots, prices in (("Bear", high_pivots, highs), ("Bull", low_pivots, lows)):
+        for previous, current in zip(pivots, pivots[1:]):
+            distance = current - previous
+            if not minimum_separation <= distance <= maximum_separation:
+                continue
+            rsi_previous = rsi_values[previous] if previous < len(rsi_values) else None
+            rsi_current = rsi_values[current] if current < len(rsi_values) else None
+            if rsi_previous is None or rsi_current is None:
+                continue
+            if kind == "Bear":
+                is_divergence = prices[current] > prices[previous] and float(rsi_current) < float(rsi_previous)
+            else:
+                is_divergence = prices[current] < prices[previous] and float(rsi_current) > float(rsi_previous)
+            if is_divergence and current >= len(highs) - maximum_separation - pivot_width:
+                found.append({
+                    "kind": kind, "first": previous, "second": current,
+                    "first_rsi": float(rsi_previous), "second_rsi": float(rsi_current),
+                })
+    # At most one of each type is drawn; each is the newest valid confirmed pair.
+    latest: dict[str, dict[str, object]] = {}
+    for item in found:
+        kind = str(item["kind"])
+        if kind not in latest or int(item["second"]) > int(latest[kind]["second"]):
+            latest[kind] = item
+    return sorted(latest.values(), key=lambda item: int(item["second"]))
+
+
 def render_candle_chart(
     candles: Sequence[Candle],
     output_path: str | Path,
@@ -142,21 +187,35 @@ def render_candle_chart(
     rsi_ax.set_ylabel("RSI 14", color=MUTED, fontsize=8, labelpad=8)
     rsi_ax.set_xlabel("Time (UTC)", color=MUTED, fontsize=8)
 
-    # Annotate divergence only when both price pivots have confirmed RSI values.
-    high_pivots, low_pivots = confirmed_pivots(highs, lows, 2)
-    rsi_points = {i: value for i, value in valid_rsi}
-    if len(low_pivots) >= 2:
-        p1, p2 = low_pivots[-2], low_pivots[-1]
-        if p1 in rsi_points and p2 in rsi_points and lows[p2] < lows[p1] and rsi_points[p2] > rsi_points[p1]:
-            rsi_ax.annotate("Bull div", (x_values[p2], rsi_points[p2]), xytext=(6, 10),
-                            textcoords="offset points", fontsize=7, color=TEXT,
-                            arrowprops={"arrowstyle": "->", "linewidth": 0.7, "color": TEXT})
-    if len(high_pivots) >= 2:
-        p1, p2 = high_pivots[-2], high_pivots[-1]
-        if p1 in rsi_points and p2 in rsi_points and highs[p2] > highs[p1] and rsi_points[p2] < rsi_points[p1]:
-            rsi_ax.annotate("Bear div", (x_values[p2], rsi_points[p2]), xytext=(6, -12),
-                            textcoords="offset points", fontsize=7, color=TEXT,
-                            arrowprops={"arrowstyle": "->", "linewidth": 0.7, "color": TEXT})
+    # Confirmed RSI divergences use 5-left/5-right price pivots and a 5..60-bar
+    # separation. Trend lines are drawn on both price and RSI panels, with a
+    # visible Bull/Bear Divergence badge.
+    divergence_pairs = _latest_divergence_pair(highs, lows, rsi_series)
+    divergence_colors = {"Bull": UP, "Bear": DOWN}
+    for divergence in divergence_pairs:
+        kind = str(divergence["kind"])
+        first, second = int(divergence["first"]), int(divergence["second"])
+        first_rsi = float(divergence["first_rsi"])
+        second_rsi = float(divergence["second_rsi"])
+        color = divergence_colors[kind]
+        price_points = lows if kind == "Bull" else highs
+        ax.plot([x_values[first], x_values[second]], [price_points[first], price_points[second]],
+                color=color, linewidth=1.8, alpha=0.9, zorder=5)
+        ax.scatter([x_values[first], x_values[second]], [price_points[first], price_points[second]],
+                   color=color, s=18, zorder=6, edgecolors=BACKGROUND, linewidths=0.4)
+        rsi_ax.plot([x_values[first], x_values[second]], [first_rsi, second_rsi],
+                    color=color, linewidth=2.4, zorder=5)
+        rsi_ax.scatter([x_values[first], x_values[second]], [first_rsi, second_rsi],
+                       color=color, s=22, zorder=6, edgecolors=BACKGROUND, linewidths=0.5)
+        label_offset = (10, 12) if kind == "Bull" else (10, -23)
+        rsi_ax.annotate(
+            f"{kind} Divergence", (x_values[second], second_rsi),
+            xytext=label_offset, textcoords="offset points", fontsize=8,
+            color="#ffffff", fontweight="bold", clip_on=False,
+            bbox={"boxstyle": "round,pad=0.30", "facecolor": color,
+                  "edgecolor": color, "alpha": 0.96},
+            arrowprops={"arrowstyle": "-", "linewidth": 1.0, "color": color},
+        )
 
     suffix = f" | {title_suffix}" if title_suffix else ""
     fig.suptitle(f"{last.symbol}  ·  {actual_tf}  |  MEXC FUTURES{suffix}",
@@ -166,6 +225,10 @@ def render_candle_chart(
              f"O  {last.open:,.8g}    H  {last.high:,.8g}    L  {last.low:,.8g}    C  {last.close:,.8g}    {change_pct:+.2f}%",
              ha="left", va="center", color=candle_label_color, fontsize=9, fontweight="medium")
     ax.set_ylabel("Price", color=MUTED, fontsize=8, labelpad=8)
+    # Put the price scale on the right side, matching a conventional trading chart.
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.tick_params(axis="y", labelleft=False, labelright=True)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda value, _pos: f"{value:,.8g}"))
     ax.grid(True, color=GRID, linewidth=0.65, alpha=0.72)
     volume_ax.grid(True, axis="y", color=GRID, linewidth=0.55, alpha=0.7)

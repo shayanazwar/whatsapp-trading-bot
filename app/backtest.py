@@ -359,11 +359,13 @@ def run_backtest(
     all_bars = [c for series in timeframes_by_symbol.values() for vals in series.values() for c in vals if c.complete]
     starting_balance = config.starting_balance
     if not all_bars:
-        return _metrics(window=window, mode=config.mode, start_time=0, end_time=0,
+        empty = _metrics(window=window, mode=config.mode, start_time=0, end_time=0,
             starting_balance=starting_balance, ending_balance=starting_balance,
             trades=[], open_positions=[], equity_curve=[starting_balance], symbols_tested=len(timeframes_by_symbol),
             symbols_eligible=0, valid_candles=0, rejection_counts={"NO_DATA": len(timeframes_by_symbol)},
             warnings=["No completed candle data supplied; no results can be inferred."])
+        empty.update({"strategy_evaluations": 0, "candidate_signals": 0, "entry_attempts": 0})
+        return empty
     end_time = int(now_epoch or max(c.close_time for c in all_bars))
     start_time = end_time - STANDARD_WINDOWS[window] * 86400
     balance = starting_balance
@@ -375,6 +377,9 @@ def run_backtest(
     trade_counts: dict[str, int] = {symbol: 0 for symbol in timeframes_by_symbol}
     prepared: dict[str, dict[str, Any]] = {}
     timeline: dict[int, list[tuple[str, Candle]]] = {}
+    strategy_evaluations = 0
+    candidate_signals = 0
+    entry_attempts = 0
 
     for symbol, raw_series in timeframes_by_symbol.items():
         forbidden = set(raw_series) - {"1D", "12H", "4H", "1H"}
@@ -468,6 +473,7 @@ def run_backtest(
                 else:
                     entry_candidates.append((symbol, candidate, setup_key, expected_entry_time, candle))
         for symbol, candidate, setup_key, expected_entry_time, candle in entry_candidates:
+            entry_attempts += 1
             if symbol in positions or len(positions) >= 4:
                 rejection_counts["MAX_CONCURRENT_POSITIONS"] = rejection_counts.get("MAX_CONCURRENT_POSITIONS", 0) + 1
                 continue
@@ -577,6 +583,7 @@ def run_backtest(
                 }
             if not snapshot["12H"] and snapshot["4H"]:
                 snapshot["12H"] = aggregate_12h_from_4h(snapshot["4H"])
+            strategy_evaluations += 1
             try:
                 evaluation = evaluate_strategy(
                     symbol,
@@ -590,10 +597,13 @@ def run_backtest(
                 rejection_counts["STRATEGY_EVALUATION_ERROR"] = rejection_counts.get("STRATEGY_EVALUATION_ERROR", 0) + 1
                 continue
             if evaluation.candidate:
+                candidate_signals += 1
                 candidate = evaluation.candidate
                 setup_key = f"{candidate.symbol}|{candidate.side}|{candidate.setup_pivot_time}|{candidate.breakout_time}|{candidate.reclaim_time}"
                 if setup_key not in used_setup_ids:
                     pending_by_symbol[symbol] = (candidate, setup_key, candle.close_time)
+                else:
+                    rejection_counts["DUPLICATE_SETUP_SUPPRESSED"] = rejection_counts.get("DUPLICATE_SETUP_SUPPRESSED", 0) + 1
             elif evaluation.rejection_reasons:
                 reason = evaluation.rejection_reasons[0]
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
@@ -603,22 +613,31 @@ def run_backtest(
         warnings.append(f"{len(pending_by_symbol)} candidate(s) remained unfilled at the end of the window; not counted as trades.")
     if config.mode == "exchange_realistic":
         warnings.append("Exchange-realistic mode is modeled, not observed execution. Verify applicable fees, funding coverage, contract-size units and price-series semantics before interpreting results.")
-        missing_funding = [s for s in prepared if not funding_events or not funding_events.get(s)]
-        if missing_funding:
-            warnings.append("Funding event history is missing/empty for: " + ", ".join(sorted(missing_funding)) + "; realized P&L excludes unknown funding and is not validation-ready.")
+        # Funding can affect P&L only while a position is open. Do not warn about
+        # missing settlements when this run never opened a position.
+        if completed or open_positions:
+            missing_funding = [s for s in prepared if not funding_events or not funding_events.get(s)]
+            if missing_funding:
+                warnings.append("Funding event history is missing/empty for: " + ", ".join(sorted(missing_funding)) + "; realized P&L excludes unknown funding and is not validation-ready.")
     else:
         warnings.append("Fixed-payout mode is hypothetical: TP/SL price distances select outcome; +win/-loss payouts are credited without exchange fees and are not MEXC trade economics.")
         warnings.append("Fixed-payout maximum drawdown is based on realised fixed-payout equity; it does not mark open trades to market.")
     if not symbols_eligible:
         warnings.append("No eligible symbol had sufficient historical warm-up data; no strategy performance conclusion is possible.")
     warnings.append(f"Strategy simulation maximum holding period: {config.max_holding_hours} hours; time-stop is modeled at the next available 1H open.")
-    return _metrics(
+    metrics = _metrics(
         window=window, mode=config.mode, start_time=start_time, end_time=end_time,
         starting_balance=starting_balance, ending_balance=balance, trades=completed,
         open_positions=open_positions, equity_curve=equity_curve, symbols_tested=len(timeframes_by_symbol),
         symbols_eligible=symbols_eligible, valid_candles=valid_candles,
         rejection_counts=rejection_counts, warnings=warnings,
     )
+    metrics.update({
+        "strategy_evaluations": strategy_evaluations,
+        "candidate_signals": candidate_signals,
+        "entry_attempts": entry_attempts,
+    })
+    return metrics
 
 
 def _close_position(pos: SimPosition, candle: Candle, raw_exit: float, exit_reason: str,

@@ -380,10 +380,8 @@ class WhatsAppCloud:
         """Upload media only when the explicit research messaging gate is open."""
 
         self._require_gate()
-        if media_type not in {"image", "document"}:
-            raise ValueError(
-                "media_type must be image or document"
-            )
+        if media_type != "image":
+            raise ValueError("Only chart images may be sent; document attachments are disabled")
 
         if not self.settings.meta_access_token:
             raise WhatsAppError(
@@ -398,19 +396,7 @@ class WhatsAppCloud:
                 "Requested media file does not exist"
             )
 
-        if media_type == "image":
-            mime = "image/png"
-        else:
-            suffix = file_path.suffix.lower()
-            allowed_doc_types = {
-                ".pdf": "application/pdf",
-                ".txt": "text/plain",
-                ".csv": "text/csv",
-                ".json": "application/json",
-            }
-            if suffix not in allowed_doc_types:
-                raise WhatsAppError("WhatsApp report attachments must be PDF, TXT, CSV or JSON documents")
-            mime = allowed_doc_types[suffix]
+        mime = "image/png"
 
         client = await self._ensure_client()
         headers = {
@@ -451,9 +437,6 @@ class WhatsAppCloud:
             ) from exc
 
         media_content: dict[str, Any] = {"id": media_id}
-
-        if media_type == "document":
-            media_content["filename"] = file_path.name
 
         body = {
             "messaging_product": "whatsapp",

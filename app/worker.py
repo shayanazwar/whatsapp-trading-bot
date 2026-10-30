@@ -21,6 +21,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+# Keep application-stage and warning/error logs, but suppress one INFO line per
+# successful MEXC/Meta HTTP request. Backtest progress is logged by app services.
+for _quiet_logger in ("httpx", "httpcore"):
+    logging.getLogger(_quiet_logger).setLevel(logging.WARNING)
 logger = logging.getLogger("mexc-swing-research-worker")
 
 

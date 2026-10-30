@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import datetime, timezone
 from typing import Any
 
 from app.config import load_settings
+from app.version import APP_VERSION
 from app.mexc.client import MexcClient
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
@@ -94,6 +96,16 @@ def _active_contract_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
     return out
 
 
+async def _heartbeat(store: Store, stop: asyncio.Event) -> None:
+    """Persist a heartbeat so the web health endpoint can detect a stale worker."""
+    while not stop.is_set():
+        store.set_state("worker_heartbeat_utc", datetime.now(timezone.utc).isoformat())
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=20.0)
+        except TimeoutError:
+            continue
+
+
 async def _run() -> None:
     settings = load_settings()
     store = Store(settings.database_url or settings.database_path)
@@ -116,6 +128,7 @@ async def _run() -> None:
     scheduler: ResearchScheduler | None = None
     scheduler_task: asyncio.Task | None = None
     stop_task: asyncio.Task | None = None
+    heartbeat_task: asyncio.Task | None = None
     try:
         mexc = MexcClient(
             base_url=settings.mexc_rest_base_url,
@@ -126,7 +139,8 @@ async def _run() -> None:
         scheduler = ResearchScheduler(settings, store, mexc, whatsapp)
         store.set_state("worker_status", "starting")
         logger.info(
-            "MEXC research worker starting | universe=top-%d | strategy=3M-RSI-EMA | auto_scan=%s | paper=%s | live_execution=false",
+            "MEXC research worker starting | build=%s | universe=top-%d | strategy=3M-RSI-EMA | auto_scan=%s | paper=%s | live_execution=false",
+            APP_VERSION,
             settings.mexc_universe_top_n,
             settings.mexc_universe_scan_enabled,
             settings.paper_trading_enabled,
@@ -136,6 +150,8 @@ async def _run() -> None:
         scheduler_task = asyncio.create_task(
             scheduler.run_forever(), name="swing-research-scheduler"
         )
+        store.set_state("worker_status", "running")
+        heartbeat_task = asyncio.create_task(_heartbeat(store, stop), name="worker-heartbeat")
         stop_task = asyncio.create_task(stop.wait(), name="swing-research-shutdown-waiter")
         done, _ = await asyncio.wait(
             {scheduler_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
@@ -147,6 +163,13 @@ async def _run() -> None:
     finally:
         if scheduler is not None:
             scheduler.stop()
+        stop.set()
+        if heartbeat_task is not None:
+            try:
+                await asyncio.wait_for(heartbeat_task, timeout=2.0)
+            except TimeoutError:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
         if stop_task is not None:
             stop_task.cancel()
             await asyncio.gather(stop_task, return_exceptions=True)

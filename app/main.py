@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from app.config import Settings, load_settings
+from app.version import APP_VERSION
 from app.mexc.client import MexcClient
 from app.services.command_processor import CommandProcessor
 from app.commands import (
@@ -128,7 +129,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await mexc.aclose()
         await whatsapp.aclose()
 
-    app = FastAPI(title="MEXC Futures Research Bot", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="MEXC Futures Research Bot", version=APP_VERSION, lifespan=lifespan)
 
     @app.api_route("/", methods=["GET", "HEAD"])
     async def root() -> dict[str, Any]:
@@ -247,10 +248,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings: Settings = app.state.settings
         return {
             "status": "ok" if db == "ok" else "degraded",
+            "build_version": APP_VERSION,
             "database": db,
             "scheduler_enabled": settings.scheduler_enabled,
             "scheduler_worker": store.get_state("scheduler_status", "not_started"),
             "scheduler_last_success": store.get_state("scheduler_last_success"),
+            "scanner_enabled": settings.mexc_universe_scan_enabled,
+            "scanner_top_n": settings.mexc_universe_top_n,
+            "scanner_worker_status": store.get_state("worker_status", "unknown"),
+            "scanner_worker_heartbeat_utc": store.get_state("worker_heartbeat_utc"),
+            "scanner_last_attempt": store.get_state("top100_3m_scan_last_attempt"),
+            "scanner_last_success": store.get_state("top100_3m_scan_last_success"),
+            "scanner_last_summary": store.get_state("top100_3m_scan_summary"),
+            "scanner_last_error": store.get_state("top100_3m_scan_last_error"),
             "paper_scheduler_gate": store.get_state("paper_scheduler_gate", "not_evaluated"),
             "paper_trading_enabled": settings.paper_trading_enabled,
             "data_alignment_probe_approved": settings.data_alignment_probe_approved,
@@ -650,11 +660,33 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
         store.append_event("WHATSAPP_COMMAND_FAILED", {"message_id": message_id, "error_type": type(exc).__name__},
                            idempotency_key=f"wa-command-failed:{message_id}")
         store.mark_inbound_processed(message_id, f"failed:{type(exc).__name__}")
-        logger.warning(
+        logger.exception(
             "WHATSAPP COMMAND FAILED | message_id=%s error_type=%s detail=%s duration_ms=%.0f",
             message_id, type(exc).__name__, str(exc)[:180],
             (time.perf_counter() - command_started) * 1000,
         )
+        # Do not silently lose a report when a recoverable application error occurs.
+        # A process-level OOM kill cannot be caught here; the memory-bounded loader addresses that separately.
+        try:
+            reply = (
+                "⚠️ Command did not complete, so no backtest result was generated. "
+                "No partial figures are being reported. Check Render logs, then retry the same command."
+            )
+            outbox_id = store.enqueue_outbox(
+                sender, reply, category="service", idempotency_key=f"wa-failure-reply:{message_id}"
+            )
+            provider_result = await app.state.whatsapp.send_text(sender, reply)
+            provider_messages = provider_result.get("messages", [])
+            provider_id = (
+                provider_messages[0].get("id")
+                if provider_messages and isinstance(provider_messages[0], dict) else None
+            )
+            store.record_outbox_attempt(outbox_id, accepted=True, provider_message_id=provider_id)
+        except Exception as send_exc:
+            logger.warning(
+                "WHATSAPP FAILURE NOTICE COULD NOT BE SENT | message_id=%s error_type=%s",
+                message_id, type(send_exc).__name__,
+            )
 
 
 app = create_app()

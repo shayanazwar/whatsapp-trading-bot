@@ -215,8 +215,11 @@ class WhatsAppCloud:
         self.graph_version = graph_version
 
     def _require_gate(self) -> None:
-        """Policy gate restriction removed; all allowlisted WhatsApp messages are permitted."""
-        return None
+        """Block research messages unless the explicitly configured gate is open."""
+        if not self.settings.whatsapp_policy_gate_open:
+            raise WhatsAppPolicyBlocked(
+                "WhatsApp research messaging is blocked until written policy clearance is configured"
+            )
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -323,7 +326,8 @@ class WhatsAppCloud:
         recipient: str,
         text: str,
     ) -> dict[str, Any]:
-        """Send text response to an allowlisted WhatsApp recipient."""
+        """Send research text only when the explicit policy gate is open."""
+        self._require_gate()
         return await self._send_text_payload(recipient, text)
 
     async def send_support_text(
@@ -333,8 +337,10 @@ class WhatsAppCloud:
         *,
         command: str = "",
     ) -> dict[str, Any]:
-        """Send text response via standard payload path (support-only restriction removed)."""
-        _ = command
+        """Send only the small support allowlist while research messaging is gated."""
+        normalized = command.strip().upper()
+        if normalized not in WHATSAPP_SUPPORT_COMMANDS:
+            raise WhatsAppPolicyBlocked("Only HELP and STATUS are allowed through the support path")
         return await self._send_text_payload(recipient, text)
 
     async def _send_text_payload(self, recipient: str, text: str) -> dict[str, Any]:
@@ -371,8 +377,9 @@ class WhatsAppCloud:
         *,
         media_type: str,
     ) -> dict[str, Any]:
-        """Upload and send image/document media to an allowlisted recipient."""
+        """Upload media only when the explicit research messaging gate is open."""
 
+        self._require_gate()
         if media_type not in {"image", "document"}:
             raise ValueError(
                 "media_type must be image or document"
@@ -399,9 +406,10 @@ class WhatsAppCloud:
                 ".pdf": "application/pdf",
                 ".txt": "text/plain",
                 ".csv": "text/csv",
+                ".json": "application/json",
             }
             if suffix not in allowed_doc_types:
-                raise WhatsAppError("WhatsApp report attachments must be PDF, TXT or CSV documents")
+                raise WhatsAppError("WhatsApp report attachments must be PDF, TXT, CSV or JSON documents")
             mime = allowed_doc_types[suffix]
 
         client = await self._ensure_client()

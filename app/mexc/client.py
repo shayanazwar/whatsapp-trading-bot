@@ -11,6 +11,7 @@ import math
 import random
 import time
 from datetime import datetime, timezone
+from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from collections import defaultdict
@@ -251,6 +252,84 @@ class MexcClient:
             candles = [c for c in candles if c.close_time <= closed_before]
         return candles
 
+    async def get_fair_price_klines(
+        self,
+        symbol: str,
+        timeframe: str = "1M",
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        now_epoch: int | None = None,
+        close_grace_seconds: int = 5,
+    ) -> list[Candle]:
+        """Fetch MEXC Fair Price candles; intended for historical liquidation checks only."""
+        symbol = normalize_symbol(symbol)
+        tf = timeframe.upper()
+        interval = {
+            "1M": "Min1", "5M": "Min5", "15M": "Min15", "30M": "Min30",
+            "1H": "Min60", "4H": "Hour4", "8H": "Hour8", "1D": "Day1",
+        }.get(tf)
+        if interval is None:
+            raise ValueError(f"Unsupported Fair Price interval: {timeframe}")
+        params: dict[str, Any] = {"interval": interval}
+        if start is not None:
+            params["start"] = int(start)
+        if end is not None:
+            params["end"] = int(end)
+        payload = await self._get(
+            f"/api/v1/contract/kline/fair_price/{symbol}", params=params, family="kline",
+        )
+        candles = [replace(candle, source="mexc_fair_price_rest")
+                   for candle in parse_kline_payload(payload, symbol, tf)]
+        if start is not None:
+            candles = [candle for candle in candles if candle.open_time >= start]
+        if end is not None:
+            candles = [candle for candle in candles if candle.open_time <= end]
+        if now_epoch is None:
+            now_epoch = await self.server_time()
+        closed_before = now_epoch - close_grace_seconds
+        return [candle for candle in candles if candle.close_time <= closed_before]
+
+    async def get_fair_price_klines_window(
+        self,
+        symbol: str,
+        timeframe: str = "1M",
+        *,
+        start: int,
+        end: int,
+        now_epoch: int | None = None,
+        close_grace_seconds: int = 5,
+        max_bars_per_request: int = 1800,
+    ) -> list[Candle]:
+        """Fetch bounded Fair Price candle history and deduplicate request boundaries."""
+        tf = timeframe.upper()
+        if tf not in INTERVAL_SECONDS or tf not in {"1M", "5M", "15M", "30M", "1H", "4H", "8H", "1D"}:
+            raise ValueError("Unsupported Fair Price history interval")
+        if end < start or not 1 <= max_bars_per_request <= 2000:
+            raise ValueError("Invalid Fair Price history range or page size")
+        step = INTERVAL_SECONDS[tf]
+        chunk_span = step * (max_bars_per_request - 1)
+        cursor = int(start)
+        by_time: dict[int, Candle] = {}
+        while cursor <= end:
+            chunk_end = min(end, cursor + chunk_span)
+            chunk = await self.get_fair_price_klines(
+                symbol, tf, start=cursor, end=chunk_end, now_epoch=now_epoch,
+                close_grace_seconds=close_grace_seconds,
+            )
+            for candle in chunk:
+                if start <= candle.open_time <= end:
+                    previous = by_time.get(candle.open_time)
+                    if previous is not None and previous != candle:
+                        raise MexcRequestError(
+                            f"MEXC returned conflicting Fair Price candle for {symbol} at {candle.open_time}"
+                        )
+                    by_time[candle.open_time] = candle
+            if chunk_end >= end:
+                break
+            cursor = chunk_end + step
+        return [by_time[timestamp] for timestamp in sorted(by_time)]
+
     async def get_klines_window(
         self,
         symbol: str,
@@ -421,14 +500,20 @@ class MexcClient:
             return []
         return [row for row in data if isinstance(row, dict)]
 
-    async def funding_history_window(self, symbol: str, *, start: int, end: int, max_pages: int = 30) -> list[dict[str, Any]]:
-        """Fetch funding history pages until the requested range is covered or page cap is hit.
+    async def funding_history_window_with_coverage(
+        self, symbol: str, *, start: int, end: int, max_pages: int = 30,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Fetch settlements and indicate whether history reaches the requested start.
 
-        Page ordering and endpoint retention are exchange-controlled; results are filtered by
-        settlement time and a warning is required if the oldest retrieved item does not reach start.
+        Empty and retention-truncated responses are incomplete rather than silently
+        treated as zero funding. MEXC settlement timestamps are normalized to seconds.
         """
+        if end < start or max_pages < 1:
+            raise ValueError("Invalid funding history window")
         symbol = normalize_symbol(symbol)
         collected: dict[int, dict[str, Any]] = {}
+        observed_times: list[int] = []
+        reached_start = False
         for page in range(1, max_pages + 1):
             rows = await self.funding_history(symbol, page_num=page, page_size=100)
             if not rows:
@@ -440,26 +525,32 @@ class MexcClient:
                     stamp = int(float(stamp_raw))
                 except (TypeError, ValueError, OverflowError):
                     continue
-                # MEXC documents settleTime as a Unix-millisecond timestamp.  Convert
-                # once and use that same seconds value for collection AND pagination.
                 if stamp >= 100_000_000_000:
                     stamp //= 1000
                 normalized_page_times.append(stamp)
+                observed_times.append(stamp)
                 row_copy = dict(row)
                 row_copy["settleTime"] = stamp
                 if start < stamp <= end:
                     collected[stamp] = row_copy
-            # MEXC's funding-history endpoint is normally newest-first, but do not
-            # assume page row order when deciding that the requested interval is covered.
-            # Infer this page's order from its endpoints so ascending responses are also
-            # handled correctly. All comparisons are Unix seconds after normalization.
+            if normalized_page_times and min(normalized_page_times) <= start:
+                reached_start = True
+                break
             if len(rows) < 100:
                 break
             if len(normalized_page_times) >= 2:
-                first_stamp = normalized_page_times[0]
-                last_stamp = normalized_page_times[-1]
-                if first_stamp > last_stamp and min(normalized_page_times) <= start:
-                    break  # Newest-first: this page already reaches before the test start.
+                first_stamp, last_stamp = normalized_page_times[0], normalized_page_times[-1]
                 if first_stamp < last_stamp and max(normalized_page_times) >= end:
-                    break  # Oldest-first: this page has reached the end of the requested range.
-        return [collected[t] for t in sorted(collected)]
+                    break  # Oldest-first response; the requested end has been reached.
+        events = [collected[timestamp] for timestamp in sorted(collected)]
+        coverage = reached_start or bool(observed_times and min(observed_times) <= start)
+        return events, coverage
+
+    async def funding_history_window(
+        self, symbol: str, *, start: int, end: int, max_pages: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Compatibility wrapper returning events only; audit paths should inspect coverage."""
+        events, _coverage = await self.funding_history_window_with_coverage(
+            symbol, start=start, end=end, max_pages=max_pages,
+        )
+        return events

@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -27,6 +28,8 @@ from app.risk import RiskConfig, RiskEngine
 from app.services.market_data import MarketDataService
 from app.storage import Store
 from app.strategy.rfpc import TradeCandidate, evaluate_strategy
+from app.strategy.rsi_ema import RsiEmaConfig, evaluate_signals
+from app.services.universe import top_usdt_perpetual_symbols
 from app.whatsapp import WhatsAppCloud, sender_key
 
 logger = logging.getLogger(__name__)
@@ -156,6 +159,9 @@ class ResearchScheduler:
 
     async def run_once(self) -> None:
         """Single testable worker cycle. All data access stays on MEXC."""
+        if self.settings.mexc_universe_scan_enabled:
+            await self._universe_scan_tick()
+
         if self.settings.paper_trading_enabled:
             passed, reason = self.alignment_gate_passed()
             if not passed:
@@ -174,6 +180,69 @@ class ResearchScheduler:
             await self._flush_outbox()
         else:
             self.store.set_state("whatsapp_dispatch_gate", "blocked; no crypto message sent")
+
+    async def _universe_scan_tick(self) -> None:
+        """Scan active USDT perpetuals once per completed 3-minute slot."""
+        try:
+            now = await self.mexc.server_time()
+            # A 3M bar becomes eligible only after its close-grace period has elapsed.
+            slot = (now - self.settings.candle_close_grace_seconds) // 180
+            if self.store.get_state("top100_3m_scan_slot") == str(slot):
+                return
+            universe = await top_usdt_perpetual_symbols(self.mexc, self.settings.mexc_universe_top_n)
+            cfg = RsiEmaConfig(
+                rsi_period=self.settings.rsi_period, rsi_overbought=self.settings.rsi_overbought,
+                ema_fast=self.settings.ema_fast, ema_mid=self.settings.ema_mid,
+                ema_slow=self.settings.ema_slow, volume_period=self.settings.rsi_volume_period,
+                volume_multiplier=self.settings.rsi_volume_multiplier,
+            )
+            semaphore = asyncio.Semaphore(8)
+
+            async def scan_one(item: Mapping[str, Any]):
+                symbol = str(item["symbol"])
+                async with semaphore:
+                    bars = await self.mexc.get_klines_window(
+                        symbol, "3M", start=now - 450 * 180, end=now,
+                        now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds,
+                    )
+                    if self.settings.mexc_price_series == "real":
+                        missing = [bar.open_time for bar in bars if any(
+                            value is None for value in (bar.real_open, bar.real_high, bar.real_low, bar.real_close)
+                        )]
+                        if missing:
+                            raise MexcError(
+                                f"Configured real OHLC series is incomplete on {len(missing)} 3M candle(s)."
+                            )
+                        bars = [replace(bar, open=float(bar.real_open), high=float(bar.real_high),
+                                        low=float(bar.real_low), close=float(bar.real_close)) for bar in bars]
+                    signals = evaluate_signals(bars, cfg)
+                    latest = signals[-1] if signals and bars and signals[-1].timestamp == bars[-1].close_time else None
+                    return symbol, item["turnover_24h"], latest, len(bars)
+
+            results = await asyncio.gather(*(scan_one(item) for item in universe), return_exceptions=True)
+            errors = signal_count = 0
+            for result in results:
+                if isinstance(result, Exception):
+                    errors += 1
+                    continue
+                symbol, turnover, signal, bar_count = result
+                payload = {
+                    "symbol": symbol, "timeframe": "3M", "turnover_24h": turnover,
+                    "scan_slot": slot, "status": "SIGNAL" if signal else "NO_SIGNAL",
+                    "signal": signal.as_dict() if signal else None, "bars": bar_count,
+                }
+                signal_count += int(signal is not None)
+                self.store.append_event("SCAN_RESULT_3M", payload, symbol=symbol,
+                    idempotency_key=f"scheduled-scan3m:{symbol}:{slot}")
+            self.store.set_state("top100_3m_scan_slot", str(slot))
+            self.store.set_state("top100_3m_scan_last_success", datetime.now(timezone.utc).isoformat())
+            self.store.set_state("top100_3m_scan_summary",
+                f"scanned={len(universe)-errors}/{len(universe)} signals={signal_count} errors={errors}")
+            logger.info("TOP-100 3M SCAN COMPLETE | scanned=%d signals=%d errors=%d slot=%d",
+                        len(universe)-errors, signal_count, errors, slot)
+        except Exception as exc:
+            logger.warning("TOP-100 3M SCAN FAILED | error_type=%s detail=%s",
+                           type(exc).__name__, str(exc)[:180])
 
     async def _paper_tick(self) -> None:
         if self.store.get_state("entry_halt", "false") == "true":

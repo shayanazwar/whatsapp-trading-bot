@@ -13,6 +13,9 @@ from typing import Any
 from app.alerts import AlertService
 from app.analysis import analyze_series, format_analysis
 from app.backtest import BacktestConfig, run_backtest
+from app.backtest_rsi_ema import RsiEmaBacktestConfig, run_backtest_rsi_ema
+from app.strategy.rsi_ema import RsiEmaConfig, evaluate_signals
+from app.services.universe import top_usdt_perpetual_symbols
 from app.charting import render_candle_chart
 from app.commands import Command, CommandError, HELP_TEXT, parse_command
 from app.config import Settings
@@ -205,22 +208,10 @@ class CommandProcessor:
             analysis_text = format_analysis(report)
             return CommandResult(analysis_text, event_type="ANALYSIS_COMPLETED")
         if name == "SCAN":
-            results: list[str] = []
-            for symbol in self.settings.default_symbols:
-                try:
-                    data = await self.market_data.fetch_symbol(symbol, window_days=10, daily_warmup_days=400, extra_intraday_warmup_days=45)
-                    report = analyze_series(symbol, data.timeframes, data_warnings=data.warnings)
-                    results.append(f"{symbol}: {report['regime']} / {report['signal']} ({', '.join(report['rejection_reasons'][:2])})")
-                    self.store.append_event("SCAN_RESULT", report, symbol=symbol,
-                        idempotency_key=f"scan:{symbol}:{report['decision_time']}")
-                except Exception as exc:
-                    results.append(f"{symbol}: DATA/ANALYSIS ERROR ({type(exc).__name__})")
-            return CommandResult("MEXC FUTURES SCAN\n" + "\n".join(results) + "\nHypotheses only; no live orders.", event_type="SCAN_COMPLETED")
+            return await self._scan_top_100_3m()
         if name == "BACKTEST":
-            # Every public BACKTEST command uses the selected 1D → 12H → 4H → 1H engine.
-            # The legacy 3-minute RSI/EMA simulator is not part of this command path.
             async with self._backtest_lock:
-                return await self._run_backtest(args)
+                return await self._run_rsi_ema_backtest(args)
         if name == "ALERT_CREATE":
             alert_id = self.alerts.create(args["symbol"], args)
             self.store.append_event("ALERT_CREATED", {"alert_id": alert_id, "args": args}, symbol=args["symbol"], idempotency_key=f"alert-created:{alert_id}")
@@ -246,10 +237,29 @@ class CommandProcessor:
             return CommandResult(f"Alert {args['alert_id']}: {'ACTIVE' if active else 'PAUSED'}" if changed else f"Alert {args['alert_id']} not found.")
         if name in {"SIGNALS", "PERFORMANCE", "PNL"}:
             if name == "SIGNALS":
-                events = self.store.recent_events(20, "SCAN_RESULT")
+                events = self.store.recent_events(250, "SCAN_RESULT_3M")
                 if not events:
-                    return CommandResult("No recorded scan results yet.")
-                return CommandResult("RECENT SCAN RESULTS\n" + "\n".join(f"{x['created_at']} | {x['symbol']} | {json.loads(x['payload_json']).get('signal', 'n/a')}" for x in events[:15]))
+                    return CommandResult("No TOP-100 3M scan results recorded yet. Run SCAN or check the scanner worker.")
+                decoded = [(event, json.loads(event["payload_json"])) for event in events]
+                known_slots = [int(payload["scan_slot"]) for _, payload in decoded if payload.get("scan_slot") is not None]
+                latest_slot = max(known_slots) if known_slots else None
+                latest = [(event, payload) for event, payload in decoded
+                          if latest_slot is None or payload.get("scan_slot") == latest_slot]
+                signal_rows = [(event, payload) for event, payload in latest if payload.get("signal")]
+                signal_rows.sort(key=lambda pair: float(pair[1].get("turnover_24h", 0.0)), reverse=True)
+                lines = ["LATEST COMPLETED 3M SCAN"]
+                if signal_rows:
+                    lines.append(f"Signals found: {len(signal_rows)}")
+                    for event, payload in signal_rows[:15]:
+                        signal = payload["signal"]
+                        lines.append(
+                            f"{event['symbol']} {signal.get('direction', 'SIGNAL')} @ "
+                            f"{float(signal.get('close', 0.0)):.8g} · RSI {float(signal.get('rsi', 0.0)):.1f}"
+                        )
+                else:
+                    error_count = sum(payload.get("status") == "DATA_ERROR" for _, payload in latest)
+                    lines.append(f"No qualifying signal · checked {len(latest)} symbols · data errors {error_count}")
+                return CommandResult("\n".join(lines))
             runs = self.store.research_runs(20)
             if not runs:
                 return CommandResult("No backtest runs recorded yet.")
@@ -299,6 +309,153 @@ class CommandProcessor:
         if name == "LIVE_STATUS":
             return CommandResult("LIVE EXECUTION: DISABLED AND BUILD-LOCKED. No live order has been sent by this app.")
         raise CommandError(f"Unsupported command: {name}")
+
+    async def _load_top_universe(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = await top_usdt_perpetual_symbols(self.mexc, limit=limit)
+        if not rows:
+            raise MexcError("MEXC returned no eligible active USDT perpetual contracts with valid 24h turnover.")
+        return rows
+
+    def _rsi_ema_config(self) -> RsiEmaConfig:
+        return RsiEmaConfig(
+            rsi_period=self.settings.rsi_period, rsi_overbought=self.settings.rsi_overbought,
+            ema_fast=self.settings.ema_fast, ema_mid=self.settings.ema_mid,
+            ema_slow=self.settings.ema_slow, volume_period=self.settings.rsi_volume_period,
+            volume_multiplier=self.settings.rsi_volume_multiplier,
+        )
+
+    async def _scan_top_100_3m(self) -> CommandResult:
+        started = time.perf_counter()
+        now = await self.mexc.server_time()
+        scan_slot = (now - self.settings.candle_close_grace_seconds) // 180
+        universe = await self._load_top_universe(self.settings.mexc_universe_top_n)
+        semaphore = asyncio.Semaphore(8)
+        cfg = self._rsi_ema_config()
+
+        async def scan_one(item: dict[str, Any]):
+            symbol = item["symbol"]
+            async with semaphore:
+                try:
+                    bars = await self.mexc.get_klines_window(
+                        symbol, "3M", start=now - 450 * 180, end=now, now_epoch=now,
+                        close_grace_seconds=self.settings.candle_close_grace_seconds,
+                    )
+                    bars = self._apply_selected_price_series(bars)
+                    if len(bars) < max(cfg.ema_slow, cfg.rsi_period + 1, cfg.volume_period + 1) + 2:
+                        return (symbol, item["turnover_24h"], "INSUFFICIENT_HISTORY", None, None)
+                    signals = evaluate_signals(bars, cfg)
+                    latest_signal = signals[-1] if signals and signals[-1].timestamp == bars[-1].close_time else None
+                    return (symbol, item["turnover_24h"], "SIGNAL" if latest_signal else "NO_SIGNAL",
+                            latest_signal.as_dict() if latest_signal else None, None)
+                except Exception as exc:
+                    return (symbol, item["turnover_24h"], "DATA_ERROR", None,
+                            f"{type(exc).__name__}: {str(exc)[:100]}")
+
+        rows = await asyncio.gather(*(scan_one(item) for item in universe))
+        rows.sort(key=lambda x: (-x[1], x[0]))
+        signals = [row for row in rows if row[2] == "SIGNAL"]
+        errors = [row for row in rows if row[2] == "DATA_ERROR"]
+        for symbol, turnover, status, signal, error in rows:
+            self.store.append_event("SCAN_RESULT_3M", {
+                "symbol": symbol, "turnover_24h": turnover, "status": status,
+                "signal": signal, "error": error, "timeframe": "3M",
+                "scan_slot": scan_slot,
+            }, symbol=symbol, idempotency_key=f"scan3m:{symbol}:{scan_slot}")
+        lines = [
+            "🔎 MEXC TOP-100 FUTURES SCAN · 3M",
+            f"Scanned {len(rows)}/{len(universe)} · Signals {len(signals)} · Data errors {len(errors)}",
+        ]
+        if signals:
+            lines.append("LATEST SIGNALS")
+            for symbol, turnover, _, signal, _ in signals[:20]:
+                lines.append(f"{symbol} LONG · ${signal['close']:.8g} · RSI {signal['rsi']:.1f}")
+        else:
+            lines.append("No qualifying signal on the latest completed 3M candle.")
+        if errors:
+            lines.append("Data errors: " + ", ".join(row[0] for row in errors[:8]))
+        lines.append(f"Ranked by 24H USDT turnover · {time.perf_counter()-started:.1f}s · Live orders OFF")
+        return CommandResult("\n".join(lines), event_type="SCAN_3M_COMPLETED")
+
+    async def _run_rsi_ema_backtest(self, args: dict[str, Any]) -> CommandResult:
+        started = time.perf_counter()
+        windows = list(args.get("windows") or ["7D"])
+        days_map = {"1D": 1, "7D": 7, "30D": 30, "60D": 60, "90D": 90}
+        if any(w not in days_map for w in windows):
+            raise CommandError("3M backtest supports 1D, 7D, 30D, 60D and 90D only.")
+        longest = max(days_map[w] for w in windows)
+        if not args.get("symbol") and longest > 7:
+            raise CommandError(
+                "Top-100 3M backtests are limited to 1D/7D to protect worker memory. "
+                "Use BACKTEST SYMBOL 30D/60D/90D for a single-symbol longer test."
+            )
+        now = await self.mexc.server_time()
+        if args.get("symbol"):
+            contract = await self.mexc.contract_detail(args["symbol"])
+            if not contract:
+                raise CommandError("The requested symbol is not an active MEXC Futures contract.")
+            universe = [{"symbol": args["symbol"], "turnover_24h": 0.0, "contract": contract}]
+        else:
+            universe = await self._load_top_universe(self.settings.mexc_universe_top_n)
+        semaphore = asyncio.Semaphore(8)
+        loaded: dict[str, list[Candle]] = {}
+        specs: dict[str, dict[str, Any]] = {}
+        failures: list[str] = []
+
+        async def load_one(item: dict[str, Any]):
+            symbol = item["symbol"]
+            async with semaphore:
+                bars = await self.mexc.get_klines_window(
+                    symbol, "3M", start=now - longest * 86400 - 450 * 180, end=now,
+                    now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds,
+                )
+                return symbol, self._apply_selected_price_series(bars), item["contract"]
+
+        loaded_results = await asyncio.gather(*(load_one(item) for item in universe), return_exceptions=True)
+        for item, result in zip(universe, loaded_results):
+            if isinstance(result, Exception):
+                failures.append(f"{item['symbol']}:{type(result).__name__}")
+                continue
+            symbol, bars, contract = result
+            if bars:
+                loaded[symbol] = bars
+                specs[symbol] = contract
+        if not loaded:
+            raise MexcError("No verified completed 3M candles loaded for the selected MEXC universe.")
+
+        config = RsiEmaBacktestConfig(
+            starting_equity=self.settings.default_starting_balance,
+            initial_margin=self.settings.initial_margin_usdt, max_leverage=self.settings.max_leverage,
+            net_take_profit_usd=self.settings.net_take_profit_usdt,
+            requested_stop_loss_usd=self.settings.requested_stop_loss_usdt,
+            taker_fee_rate=self.settings.exchange_taker_fee_rate,
+            slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
+            max_positions=1, strategy=self._rsi_ema_config(),
+        )
+        output: list[str] = []
+        for window in windows:
+            report = await asyncio.to_thread(
+                run_backtest_rsi_ema, loaded, window_days=days_map[window], config=config,
+                contract_specs=specs, funding_events=None, now_epoch=now,
+            )
+            run_id = self.store.create_research_run("rsi_ema_3m", {
+                "symbols": sorted(loaded), "window": window,
+                "strategy_version": self.settings.strategy_version,
+                "universe": "top_100_by_24h_turnover",
+            })
+            self.store.finish_research_run(run_id, report)
+            win_rate = "n/a" if report["win_rate_pct"] is None else f"{report['win_rate_pct']:.1f}%"
+            output.extend([
+                f"🧪 BACKTEST {window} · RSI/EMA 3M",
+                f"Symbols {len(loaded)}/{len(universe)} · 3M bars {sum(len(v) for v in loaded.values())}",
+                f"Trades {report['completed_trades']} · W/L {report['wins']}/{report['losses']} · Win {win_rate}",
+                f"Net P&L ${report['net_profit']:+.2f} · Equity ${report['ending_equity']:.2f} · DD {report['max_drawdown_pct']:.2f}%",
+                f"TP {report['take_profit_exits']} · SL {report['stop_loss_exits']} · Liquidations {report['liquidation_exits']}",
+                "Funding history not replayed in this 3M report; net P&L is incomplete if funding applies.",
+            ])
+        if failures:
+            output.append(f"Data errors {len(failures)}: " + ", ".join(failures[:8]))
+        output.append(f"Top-100 by 24H USDT turnover · {time.perf_counter()-started:.1f}s · Live orders OFF")
+        return CommandResult("\n".join(output), event_type="BACKTEST_3M_COMPLETED")
 
     async def _run_backtest(self, args: dict[str, Any]) -> CommandResult:
         """Run the selected completed-bar strategy and return one concise WhatsApp reply."""

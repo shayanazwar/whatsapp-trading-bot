@@ -13,13 +13,13 @@ from typing import Any
 from app.alerts import AlertService
 from app.analysis import analyze_series, format_analysis
 from app.backtest import BacktestConfig, run_backtest
-from app.backtest_rsi_ema import RsiEmaBacktestConfig, run_backtest_rsi_ema
+from app.backtest_rsi_ema import (RsiEmaBacktestConfig, format_backtest_whatsapp, run_backtest_rsi_ema, write_backtest_artifacts)
 from app.strategy.rsi_ema import RsiEmaConfig, evaluate_signals
 from app.services.universe import top_usdt_perpetual_symbols
 from app.charting import render_candle_chart
 from app.commands import Command, CommandError, HELP_TEXT, parse_command
 from app.config import Settings
-from app.market.candles import Candle, INTERVAL_SECONDS, aggregate_12h_from_4h
+from app.market.candles import Candle, INTERVAL_SECONDS, aggregate_3m_from_1m, aggregate_12h_from_4h
 from app.mexc.client import MexcClient, MexcError
 from app.services.market_data import MarketDataService, SymbolData
 from app.storage import Store, canonical_json
@@ -319,6 +319,7 @@ class CommandProcessor:
     def _rsi_ema_config(self) -> RsiEmaConfig:
         return RsiEmaConfig(
             rsi_period=self.settings.rsi_period, rsi_overbought=self.settings.rsi_overbought,
+            rsi_oversold=self.settings.rsi_oversold,
             ema_fast=self.settings.ema_fast, ema_mid=self.settings.ema_mid,
             ema_slow=self.settings.ema_slow, volume_period=self.settings.rsi_volume_period,
             volume_multiplier=self.settings.rsi_volume_multiplier,
@@ -368,7 +369,7 @@ class CommandProcessor:
         if signals:
             lines.append("LATEST SIGNALS")
             for symbol, turnover, _, signal, _ in signals[:20]:
-                lines.append(f"{symbol} LONG · ${signal['close']:.8g} · RSI {signal['rsi']:.1f}")
+                lines.append(f"{symbol} {signal.get('direction', 'SIGNAL')} · ${signal['close']:.8g} · RSI {signal['rsi']:.1f}")
         else:
             lines.append("No qualifying signal on the latest completed 3M candle.")
         if errors:
@@ -377,17 +378,19 @@ class CommandProcessor:
         return CommandResult("\n".join(lines), event_type="SCAN_3M_COMPLETED")
 
     async def _run_rsi_ema_backtest(self, args: dict[str, Any]) -> CommandResult:
+        """Run a completed-candle, top-universe 3M backtest and persist its full audit artifacts."""
         started = time.perf_counter()
         windows = list(args.get("windows") or ["7D"])
         days_map = {"1D": 1, "7D": 7, "30D": 30, "60D": 60, "90D": 90}
-        if any(w not in days_map for w in windows):
-            raise CommandError("3M backtest supports 1D, 7D, 30D, 60D and 90D only.")
-        longest = max(days_map[w] for w in windows)
+        if len(windows) != 1 or any(window not in days_map for window in windows):
+            raise CommandError("Run one 3M backtest period at a time: 1D, 7D, 30D, 60D or 90D.")
+        window = windows[0]
+        longest = days_map[window]
         if not args.get("symbol") and longest > 7:
             raise CommandError(
-                "Top-100 3M backtests are limited to 1D/7D to protect worker memory. "
-                "Use BACKTEST SYMBOL 30D/60D/90D for a single-symbol longer test."
+                "Top-100 3M backtests are limited to 1D/7D. Use BACKTEST SYMBOL 30D/60D/90D for a longer test."
             )
+
         now = await self.mexc.server_time()
         if args.get("symbol"):
             contract = await self.mexc.contract_detail(args["symbol"])
@@ -396,66 +399,175 @@ class CommandProcessor:
             universe = [{"symbol": args["symbol"], "turnover_24h": 0.0, "contract": contract}]
         else:
             universe = await self._load_top_universe(self.settings.mexc_universe_top_n)
-        semaphore = asyncio.Semaphore(8)
+
+        data_semaphore = asyncio.Semaphore(8)
         loaded: dict[str, list[Candle]] = {}
         specs: dict[str, dict[str, Any]] = {}
         failures: list[str] = []
+        history_start = now - longest * 86400 - 450 * 180
 
         async def load_one(item: dict[str, Any]):
             symbol = item["symbol"]
-            async with semaphore:
+            async with data_semaphore:
                 bars = await self.mexc.get_klines_window(
-                    symbol, "3M", start=now - longest * 86400 - 450 * 180, end=now,
-                    now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds,
+                    symbol, "3M", start=history_start, end=now, now_epoch=now,
+                    close_grace_seconds=self.settings.candle_close_grace_seconds,
                 )
                 return symbol, self._apply_selected_price_series(bars), item["contract"]
 
-        loaded_results = await asyncio.gather(*(load_one(item) for item in universe), return_exceptions=True)
-        for item, result in zip(universe, loaded_results):
+        results = await asyncio.gather(*(load_one(item) for item in universe), return_exceptions=True)
+        for item, result in zip(universe, results):
             if isinstance(result, Exception):
                 failures.append(f"{item['symbol']}:{type(result).__name__}")
                 continue
             symbol, bars, contract = result
+            valid, reason = _validate_backtest_contract_spec(
+                contract, margin_mode=self.settings.backtest_margin_mode,
+            )
+            if not valid:
+                failures.append(f"{symbol}:{reason}")
+                continue
             if bars:
                 loaded[symbol] = bars
                 specs[symbol] = contract
         if not loaded:
-            raise MexcError("No verified completed 3M candles loaded for the selected MEXC universe.")
+            raise MexcError("No verified completed 3M candles and valid contract metadata were loaded.")
 
-        config = RsiEmaBacktestConfig(
+        strategy = self._rsi_ema_config()
+        preliminary_config = RsiEmaBacktestConfig(
             starting_equity=self.settings.default_starting_balance,
-            initial_margin=self.settings.initial_margin_usdt, max_leverage=self.settings.max_leverage,
+            initial_margin=self.settings.initial_margin_usdt,
+            max_leverage=self.settings.max_leverage,
             net_take_profit_usd=self.settings.net_take_profit_usdt,
             requested_stop_loss_usd=self.settings.requested_stop_loss_usdt,
             taker_fee_rate=self.settings.exchange_taker_fee_rate,
             slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
-            max_positions=1, strategy=self._rsi_ema_config(),
+            margin_mode=self.settings.backtest_margin_mode,
+            max_holding_minutes=self.settings.backtest_max_holding_minutes,
+            strategy=strategy,
         )
-        output: list[str] = []
-        for window in windows:
-            report = await asyncio.to_thread(
-                run_backtest_rsi_ema, loaded, window_days=days_map[window], config=config,
-                contract_specs=specs, funding_events=None, now_epoch=now,
-            )
-            run_id = self.store.create_research_run("rsi_ema_3m", {
-                "symbols": sorted(loaded), "window": window,
-                "strategy_version": self.settings.strategy_version,
-                "universe": "top_100_by_24h_turnover",
-            })
-            self.store.finish_research_run(run_id, report)
-            win_rate = "n/a" if report["win_rate_pct"] is None else f"{report['win_rate_pct']:.1f}%"
-            output.extend([
-                f"🧪 BACKTEST {window} · RSI/EMA 3M",
-                f"Symbols {len(loaded)}/{len(universe)} · 3M bars {sum(len(v) for v in loaded.values())}",
-                f"Trades {report['completed_trades']} · W/L {report['wins']}/{report['losses']} · Win {win_rate}",
-                f"Net P&L ${report['net_profit']:+.2f} · Equity ${report['ending_equity']:.2f} · DD {report['max_drawdown_pct']:.2f}%",
-                f"TP {report['take_profit_exits']} · SL {report['stop_loss_exits']} · Liquidations {report['liquidation_exits']}",
-                "Funding history not replayed in this 3M report; net P&L is incomplete if funding applies.",
-            ])
+        cutoff = now - longest * 86400
+        signal_symbols: set[str] = set()
+        for symbol, bars in loaded.items():
+            try:
+                candidates = evaluate_signals(bars, strategy)
+                if any(
+                    signal.timestamp > cutoff
+                    and signal.candle_index + 1 < len(bars)
+                    and bars[signal.candle_index + 1].open_time >= cutoff
+                    for signal in candidates
+                ):
+                    signal_symbols.add(symbol)
+            except Exception as exc:
+                logger.warning("BACKTEST SIGNAL PREFLIGHT FAILED | symbol=%s error=%s", symbol, type(exc).__name__)
+
+        support_semaphore = asyncio.Semaphore(6)
+        funding_events: dict[str, list[dict[str, Any]]] = {}
+        fair_price_bars: dict[str, list[Candle]] = {}
+        funding_price_bars: dict[str, list[Candle]] = {}
+        funding_missing: list[str] = []
+        funding_partial: list[str] = []
+        fair_price_missing: list[str] = []
+
+        async def load_trade_support(symbol: str):
+            async with support_semaphore:
+                funding_task = self.mexc.funding_history_window_with_coverage(
+                    symbol, start=cutoff, end=now, max_pages=4,
+                )
+                fair_task = self.mexc.get_fair_price_klines_window(
+                    symbol, "1M", start=history_start, end=now,
+                    now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds,
+                )
+                funding_result, fair_result = await asyncio.gather(
+                    funding_task, fair_task, return_exceptions=True,
+                )
+                return symbol, funding_result, fair_result
+
+        support_results = await asyncio.gather(
+            *(load_trade_support(symbol) for symbol in sorted(signal_symbols)),
+            return_exceptions=True,
+        )
+        for item in support_results:
+            if isinstance(item, Exception):
+                logger.warning("BACKTEST SUPPORT DATA FAILED | error_type=%s detail=%s", type(item).__name__, str(item)[:140])
+                continue
+            symbol, funding_result, fair_result = item
+            if isinstance(funding_result, Exception):
+                funding_events[symbol] = []
+                funding_missing.append(symbol)
+                logger.warning("BACKTEST FUNDING LOAD FAILED | symbol=%s error_type=%s", symbol, type(funding_result).__name__)
+            else:
+                funding_rows, funding_coverage_complete = funding_result
+                funding_events[symbol] = list(funding_rows)
+                if not funding_rows:
+                    funding_missing.append(symbol)
+                elif not funding_coverage_complete:
+                    funding_partial.append(symbol)
+            if isinstance(fair_result, Exception):
+                fair_price_missing.append(symbol)
+                logger.warning("BACKTEST FAIR PRICE LOAD FAILED | symbol=%s error_type=%s", symbol, type(fair_result).__name__)
+            else:
+                if fair_result:
+                    funding_price_bars[symbol] = list(fair_result)
+                derived_fair = aggregate_3m_from_1m(fair_result)
+                if derived_fair:
+                    fair_price_bars[symbol] = derived_fair
+                else:
+                    fair_price_missing.append(symbol)
+
+        config = preliminary_config
+        report = await asyncio.to_thread(
+            run_backtest_rsi_ema,
+            loaded,
+            window_days=longest,
+            config=config,
+            contract_specs=specs,
+            funding_events=funding_events,
+            liquidation_candles_by_symbol=fair_price_bars,
+            funding_price_candles_by_symbol=funding_price_bars,
+            now_epoch=now,
+        )
+        report["coins_tested"] = len(universe)
+        report["coins_with_data"] = len(loaded)
+        report["data_errors"] = list(failures)
+        # The engine flags missing support data for symbols that actually opened a
+        # trade, not every market that merely produced a signal.
+        report["data_quality"]["support_data_requested_symbols"] = sorted(signal_symbols)
+        report["data_quality"]["funding_partial_coverage_symbols"] = sorted(set(funding_partial))
+        report["data_quality"]["support_data_fetch_errors"] = {
+            "funding": sorted(set(funding_missing)),
+            "fair_price": sorted(set(fair_price_missing)),
+        }
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        artifact_paths = write_backtest_artifacts(
+            report, self.settings.reports_dir, prefix=f"backtest_3m_{window.lower()}_{stamp}",
+        )
+        run_id = self.store.create_research_run("rsi_ema_3m_cross_margin", {
+            "symbols": sorted(loaded), "window": window,
+            "strategy_version": self.settings.strategy_version,
+            "universe": "top_100_by_24h_turnover" if not args.get("symbol") else "single_symbol",
+            "margin_mode": config.margin_mode,
+            "starting_equity": config.starting_equity,
+            "initial_margin": config.initial_margin,
+            "max_leverage": config.max_leverage,
+            "net_take_profit_usd": config.net_take_profit_usd,
+            "requested_stop_loss_usd": config.requested_stop_loss_usd,
+        })
+        report["artifact_paths"] = artifact_paths
+        self.store.finish_research_run(run_id, report)
+
+        summary = format_backtest_whatsapp(report, elapsed_seconds=time.perf_counter() - started)
         if failures:
-            output.append(f"Data errors {len(failures)}: " + ", ".join(failures[:8]))
-        output.append(f"Top-100 by 24H USDT turnover · {time.perf_counter()-started:.1f}s · Live orders OFF")
-        return CommandResult("\n".join(output), event_type="BACKTEST_3M_COMPLETED")
+            summary += f"\n\n⚠️ Data/metadata errors: {len(failures)} ({', '.join(failures[:8])})"
+        summary += f"\n📁 Audit files saved: {Path(artifact_paths['json']).name}, {Path(artifact_paths['csv']).name}"
+        logger.info(
+            "BACKTEST 3M COMPLETE | window=%s universe=%d data=%d signals=%d resolved=%d unresolved=%d liquidations=%d elapsed_s=%.1f margin_mode=%s",
+            window, len(universe), len(loaded), report["signals"], report["resolved"],
+            report["open_unresolved"], report["liquidation_exits"], time.perf_counter() - started,
+            config.margin_mode,
+        )
+        return CommandResult(summary, event_type="BACKTEST_3M_COMPLETED")
 
     async def _run_backtest(self, args: dict[str, Any]) -> CommandResult:
         """Run the selected completed-bar strategy and return one concise WhatsApp reply."""
@@ -762,8 +874,10 @@ def _first_number(mapping: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-def _validate_backtest_contract_spec(spec: dict[str, Any]) -> tuple[bool, str]:
-    """Require verified active contract metadata before simulating order sizes."""
+def _validate_backtest_contract_spec(
+    spec: dict[str, Any], *, margin_mode: str = "cross",
+) -> tuple[bool, str]:
+    """Require verified, compatible USDT-perpetual metadata before sizing a position."""
     state = spec.get("state")
     try:
         if state is None or int(state) != 0:
@@ -771,11 +885,42 @@ def _validate_backtest_contract_spec(spec: dict[str, Any]) -> tuple[bool, str]:
     except (TypeError, ValueError, OverflowError):
         return False, "CONTRACT_STATE_INVALID"
 
+    future_type = spec.get("futureType")
+    if future_type is None:
+        return False, "CONTRACT_METADATA_MISSING:futureType"
+    try:
+        if int(future_type) != 1:
+            return False, "CONTRACT_NOT_USDT_PERPETUAL"
+    except (TypeError, ValueError, OverflowError):
+        return False, "CONTRACT_FUTURE_TYPE_INVALID"
+
+    quote_raw = spec.get("quoteCoin")
+    settle_raw = spec.get("settleCoin")
+    if quote_raw is None or settle_raw is None:
+        return False, "CONTRACT_METADATA_MISSING:quoteCoin_or_settleCoin"
+    if str(quote_raw).upper() != "USDT" or str(settle_raw).upper() != "USDT":
+        return False, "CONTRACT_NOT_USDT_SETTLED"
+
+    position_open_type = spec.get("positionOpenType")
+    if position_open_type is None:
+        return False, "CONTRACT_METADATA_MISSING:positionOpenType"
+    try:
+        open_type = int(position_open_type)
+    except (TypeError, ValueError, OverflowError):
+        return False, "CONTRACT_POSITION_MODE_INVALID"
+    # GET Contract Info defines 1=isolated-only, 2=cross-only, 3=both.
+    if margin_mode == "cross" and open_type not in {2, 3}:
+        return False, "CONTRACT_CROSS_MARGIN_UNSUPPORTED"
+    if margin_mode == "isolated" and open_type not in {1, 3}:
+        return False, "CONTRACT_ISOLATED_MARGIN_UNSUPPORTED"
+
     required = {
         "contractSize": ("contractSize", "contract_size"),
         "volUnit": ("volUnit", "volumeUnit", "quantityStep"),
         "minVol": ("minVol", "minVolume", "minOrderQty"),
         "maxVol": ("maxVol", "maxVolume", "maxOrderQty"),
+        "priceUnit": ("priceUnit", "price_unit"),
+        "maintenanceMarginRate": ("maintenanceMarginRate", "maintenance_margin_rate", "mmr"),
     }
     for label, keys in required.items():
         value = _first_number(spec, *keys)

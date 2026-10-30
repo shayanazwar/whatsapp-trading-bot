@@ -357,6 +357,16 @@ class MexcClient:
             raise MexcRequestError("Ticker symbol mismatch")
         return data
 
+    async def all_tickers(self) -> list[dict[str, Any]]:
+        """Fetch the public 24h ticker snapshot for all MEXC Futures contracts."""
+        payload = await self._get("/api/v1/contract/ticker", family="ticker")
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            raise MexcRequestError("Unexpected all-contract ticker payload")
+        return [dict(row) for row in data if isinstance(row, dict)]
+
     async def depth(self, symbol: str, *, limit: int = 20) -> dict[str, Any]:
         """Fetch the current MEXC Futures order book for execution-safety research only."""
         symbol = normalize_symbol(symbol)

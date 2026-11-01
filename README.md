@@ -1,79 +1,91 @@
-# PAK TRADING ACADEMY — MEXC Futures Research Platform v0.7.0
+# PAK TRADING ACADEMY — MEXC Futures Research Platform v0.8.0
 
-Research-only MEXC USDT perpetual scanner, strategy comparison engine, historical backtester, and protected dashboard. **Live order execution is disabled and not implemented in this release.**
+Research-only MEXC USDT perpetual scanner, swing-strategy backtester, durable job worker and protected dashboard. Live order execution is disabled and no live order-placement loop is available in this build.
 
-## What this release contains
+## Strategy and supported timeframes
 
-- Dynamically discovers up to 100 active USDT-settled perpetual contracts ranked by 24-hour turnover. `DEFAULT_SYMBOLS` is retained only for legacy paper features; it does not select the top-universe scanner.
-- Captures completed MEXC 1-minute candles and builds UTC-aligned 3-minute candles only from three complete, contiguous 1-minute bars. Incomplete or conflicting candles are rejected.
-- Stores raw 1M and derived 3M candles in a gzip archive on the dedicated Render Background Worker persistent disk. PostgreSQL is the shared source of truth for signals, scan outcomes, worker health and durable backtest jobs. The worker-owned disk is not shared with the web service.
-- Runs two separately identified strategy variants with the same market-data and portfolio simulator:
-  - **CONTROL:** existing 3M RSI/EMA baseline, retained as a benchmark. It is not asserted to be profitable.
-  - **CANDIDATE:** 15M trend context with 3M pullback/reclaim, ATR-based stop/target hypothesis, volume/volatility filters, and net reward/risk validation.
-- Runs portfolio-aware research simulations with one active bot position at a time, a $100 starting-wallet default, a $1 maximum initial-margin cap, 0.5% candidate risk budget, Cross Margin model, configured leverage limits, contract risk tiers where available, fees, slippage, funding and Fair Price liquidation checks where historical data is available.
-- Queues `BACKTEST` requests as durable jobs in PostgreSQL. The web service acknowledges and reads job status; the background worker downloads/loads history and performs the simulation.
-- Requires explicit historical data coverage. A 7D request cannot silently become 1D. A top-100 run fails rather than reporting a partial universe below the configured coverage gate.
-- Generates report text plus JSON/CSV/TXT audit artifacts on the worker's persistent report directory.
+The active strategy is **S1-RFPC** and is restricted to completed candles on exactly these timeframes:
 
-The candidate strategy's thresholds are research hypotheses, not validated optimal parameters. The report includes data coverage, missing support-data warnings, current-universe survivorship-bias disclosure, and simulator limitations.
+`1D regime → 12H structure → 4H setup → 1H entry trigger`
+
+The 12H series is deterministically aggregated from completed UTC-aligned 4H bars. The active swing scanner and the active backtest command use the same strategy and timeframe sequence. The previous 3M RSI/EMA and 15M/3M candidate backtest path is no longer used by `BACKTEST` or `SCAN`; its code remains only as inactive legacy implementation while migration compatibility is retained.
+
+## Backtest and portfolio model
+
+- `BACKTEST 1D` and `BACKTEST 7D` rank the current top 100 active USDT-settled MEXC perpetual contracts by 24-hour turnover. A symbol-specific command such as `BACKTEST BTCUSDT 30D` is supported for longer windows.
+- Jobs are durably queued by the web process and claimed by the dedicated worker through the shared PostgreSQL database. The job stores symbol-by-symbol progress and the completed report. The report is also placed in the WhatsApp outbox when the crypto-message policy gate is open.
+- Historical data is fetched with a bounded concurrency of five symbols for a backtest. Worker logs include `BACKTEST SYMBOL SCAN | progress=1/100 ...`, plus per-symbol start, completion and failure details. The scheduled top-100 scan is deferred while a backtest job is using MEXC API capacity.
+- The research portfolio cap is configurable from 1 to **50 simultaneous positions** (`BACKTEST_MAX_POSITIONS`, default 50). Per-entry modeled risk defaults to 0.5% of realized balance; aggregate planned stop-risk is capped at 25%; gross notional is capped at 3.0× current realized balance. These filters mean 50 is a ceiling, not a promise that 50 positions can be opened.
+- The separate paper-trading simulator remains limited to one active position (`MAX_CONCURRENT_POSITIONS=1`). The research portfolio cap does not change paper or live execution settings.
+- Reports show requested UTC window, symbols tested/eligible, 1H bars, strategy evaluations, candidates, entry attempts, maximum concurrent positions, open positions, TP hits, SL hits, time-stop exits, data-gap exits, fees, funding where available, slippage, drawdown, cost-stress runs and warnings.
+
+## Accuracy and limitations
+
+No historical backtest can be guaranteed 100% accurate. This simulator uses completed OHLC candles and modeled entry/exit fills, fees, slippage and available funding history. It does not replay historical order-book queue position or impact, all partial-fill behavior, the user's external positions/open orders, or full cross-margin maintenance-margin and liquidation mechanics. Therefore liquidation exits are explicitly reported as **not modeled**, not as zero. Positions still open at the end of a test are reported separately and are not included in realized P&L/equity statistics. Current top-100 membership also introduces survivorship/selection bias for historical periods. Treat results as research estimates, not confirmed exchange execution.
+
+The backtest is chronological. Entries at the same timestamp are allocated in symbol order for deterministic results. Data fetch failures, insufficient history, unverified contract metadata and missing funding are surfaced as warnings/rejections; missing data is not filled with fabricated candles or prices.
+
+## WhatsApp signals and reports
+
+The worker is configured to evaluate the top-universe swing scanner once per completed 1H candle. A signal is sent only when S1-RFPC produces a candidate and the delivery checks pass: valid contract/price tick, sensible rounded stop/target geometry, minimum net reward/risk after modeled fees/slippage, usable top-of-book depth/spread, and an available non-adverse current funding snapshot. The system does **not** broadcast rejected or incomplete candidates as trade signals.
+
+`SIGNAL_PUSH_ENABLED=true` enables the push feature, but the separate crypto WhatsApp policy gate still controls actual sending. By default `WHATSAPP_CRYPTO_MESSAGING_ALLOWED=false`, and the gate remains closed unless `WHATSAPP_POLICY_CLEARANCE_REF` is populated as well. Configure this only after you have confirmed that your exact business use is permitted and have the required written clearance. The allowed recipient list (`WHATSAPP_ALLOWED_SENDERS`) and valid Meta Cloud API credentials are also required. When the gate is closed, signals/reports remain in research storage and the worker logs that WhatsApp delivery was blocked; it does not claim messages were sent.
+
+The user-facing `BACKTEST` acknowledgement is sent immediately after durable queueing. The final report is sent by the worker only when the policy gate is open; otherwise retrieve it using the protected dashboard or the stored job report route after the gate is addressed.
+
+## Commands
+
+```text
+BACKTEST 1D
+BACKTEST 7D
+BACKTEST BTCUSDT 30D
+BACKTEST STATUS
+BACKTEST REPORT <JOB_ID>
+SCAN
+SIGNALS
+STATUS
+HELP
+```
+
+Legacy `CONTROL`, `CANDIDATE`, `BOTH`, `LEGACY`, and `FIXED` backtest selectors are rejected so the same command cannot silently run the old 3M model.
 
 ## Architecture
 
 ```text
-MEXC Futures REST
-      |
-      v
-Render Background Worker ------------------------------+
-  - top-100 universe discovery                           |
-  - 1M candle capture                                    |
-  - validated 1M -> 3M aggregation                        |
-  - 3M scan + 15M context                                 |
-  - per-symbol outcomes and signal persistence           |
-  - durable backtest job consumer                         |
-  - worker-owned persistent candle archive                |
-      |                                                   |
-      +---------------------> PostgreSQL <----------------+
-                               - signals
-                               - scan cycles/outcomes
-                               - worker heartbeat
-                               - backtest jobs/results
-                               - events/idempotency
-                                      ^
-                                      |
-                         Render FastAPI Web Service
-                         - WhatsApp webhook support
-                         - dashboard and health endpoint
-                         - enqueue/read backtest jobs
-                         - no heavy backtest execution
+MEXC Futures public API
+        |
+        v
+Render background worker
+  - top-100 turnover universe
+  - S1-RFPC 1D/12H/4H/1H scanner
+  - per-symbol progress and scan events
+  - durable backtest job consumer
+  - WhatsApp crypto outbox dispatcher (policy-gated)
+        |
+        v
+Shared PostgreSQL database
+  - inbound/outbound message idempotency
+  - scan results and active signals
+  - backtest jobs, progress and reports
+  - worker heartbeat and operational state
+        ^
+        |
+FastAPI web service
+  - signed WhatsApp webhook
+  - command acknowledgement and job creation
+  - read-only dashboard and /healthz diagnostics
 ```
 
-## Backtest commands
+The Render Blueprint creates one web service, one background worker and a shared PostgreSQL database. Both services must use the same `DATABASE_URL`; otherwise a job queued by the web service will not be visible to the worker. The worker's persistent disk is not shared with the web service, so PostgreSQL—not the local archive disk—is the cross-service source of truth.
 
-```text
-BACKTEST 1D                 # Top-100 CONTROL + CANDIDATE
-BACKTEST 7D                 # Top-100 CONTROL + CANDIDATE
-BACKTEST CONTROL 7D         # Control strategy only
-BACKTEST CANDIDATE 7D       # Candidate strategy only
-BACKTEST BTCUSDT 30D        # Longer single-symbol run
-BACKTEST STATUS             # Latest job status/progress
-BACKTEST REPORT <JOB_ID>    # Retrieve a completed job report
-```
+## Deploy and verify
 
-Top-universe backtests are limited to 1D/7D. Longer windows require one symbol. A job fails if actual data coverage or valid-universe coverage is below configured thresholds; it does not substitute a shorter period or fabricate candles.
-
-Historical MEXC klines are fetched in bounded pages (up to 1,800 candles/request in this client, below the documented 2,000-point API maximum). A 2,000-candle response cap is per request, not a claim that the exchange only retains 2,000 candles of history. API history availability may still vary by symbol/endpoint; actual coverage is checked for every run.
-
-## Scanner and monitoring
-
-The Render Blueprint enables the scanner on the dedicated worker (`MEXC_UNIVERSE_SCAN_ENABLED=true`, `MEXC_UNIVERSE_TOP_N=100`). The web service's optional in-process scheduler remains disabled to avoid duplicate scanning.
-
-Open `/healthz` to inspect database status, build version, scanner configuration, worker heartbeat, last scan attempt/success, summary, last error, live-execution flags, and WhatsApp policy gate. Worker logs should include `TOP-100 MTF-TPR 3M SCAN COMPLETE` with discovered/processed/success/error/signal counts.
-
-Each symbol is reported as `SIGNAL`, `NO_SIGNAL`, `DATA_ERROR`, or `INSUFFICIENT_HISTORY`. A zero-signal cycle with complete data is different from a data-fetch failure.
-
-## WhatsApp restrictions
-
-The crypto-message gate is **closed by default**. Do not set `WHATSAPP_CRYPTO_MESSAGING_ALLOWED=true` to bypass Meta policy. Meta's WhatsApp Business Messaging Policy restricts use of WhatsApp Business to promote or facilitate exchange of real or virtual currency. This build therefore does not send crypto signal pushes or crypto backtest reports through the WhatsApp Business Platform. The protected web dashboard is the research interface. Only permitted support commands such as `HELP` and `STATUS` are enabled for WhatsApp.
+1. Deploy the same repository commit to the web service and the worker.
+2. Confirm both services connect to the same PostgreSQL database.
+3. Confirm worker logs identify the build, database backend, `S1-RFPC-1D-12H-4H-1H`, `backtest_max_positions=50`, `paper_max_positions=1`, scanner state and WhatsApp policy gate state.
+4. Check `/healthz` for worker heartbeat, latest scan summary/error, backtest latest job and policy gate.
+5. Run `BACKTEST 1D`; verify `BACKTEST JOB START`, progress lines from `1/100` onward, `BACKTEST WINDOW COMPLETE` and `BACKTEST JOB COMPLETE` in worker logs. Use `BACKTEST STATUS` and `BACKTEST REPORT <JOB_ID>` to inspect queue state and final output.
+6. Keep `AUTO_TRADING_ENABLED=false`, `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_BUILD_RELEASED=false`, `PAPER_TRADING_ENABLED=false` and `MAX_CONCURRENT_POSITIONS=1`. Do not open the WhatsApp crypto-message policy gate without confirming the applicable policy/clearance first.
 
 ## Local development
 
@@ -81,38 +93,14 @@ Requires Python 3.11+.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate                 # Windows: .venv\\Scripts\\Activate.ps1
+source .venv/bin/activate                 # Windows: .venv\Scripts\Activate.ps1
 pip install -e '.[test]'
 cp .env.example .env                      # Windows: copy .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-For local-only development, `DATABASE_URL` may be blank and SQLite is used by the single process. Production requires `DATABASE_URL` (PostgreSQL). To run the worker locally, use a separate terminal with `APP_ROLE=worker`; configure writable `MARKET_DATA_DIR` and `REPORTS_DIR`. Do not run a local worker and production worker against the same local SQLite file.
+For a single local process, blank `DATABASE_URL` uses SQLite. To run a local worker separately, both processes must point to the same PostgreSQL database; separate SQLite files are not a shared job queue. Set `WEB_API_TOKEN` before using dashboard research commands. Never commit `.env`, API tokens, Meta secrets or private account data.
 
-Set `WEB_API_TOKEN` in `.env` before using protected dashboard actions. Never commit `.env`, API tokens, Meta secrets or private account data.
+## Validation
 
-## Render deployment notes
-
-The Blueprint creates a PostgreSQL database, a FastAPI web service, and one background worker. The worker alone mounts `/var/data`; it stores the gzip candle archive and local audit artifacts there. The web service does not depend on that filesystem. Both services use PostgreSQL for shared state.
-
-Review plans/pricing before applying the Blueprint. After deployment:
-
-1. Verify the web service and worker use the same Git commit/build version.
-2. Verify PostgreSQL connectivity from both services.
-3. Verify the worker log says `auto_scan=true` and `APP_ROLE=worker` data paths resolve under `/var/data`.
-4. Verify `/healthz` shows worker heartbeat and a recent top-100 scan summary.
-5. Run `BACKTEST 1D` then `BACKTEST 7D` from the protected dashboard. Inspect requested/actual UTC window, valid symbol count, candle coverage and warnings before considering the metrics.
-6. Keep `AUTO_TRADING_ENABLED=false`, `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_BUILD_RELEASED=false`, `PAPER_TRADING_ENABLED=false`, and `WHATSAPP_CRYPTO_MESSAGING_ALLOWED=false` until separately reviewed.
-
-## Important limitations
-
-- No live MEXC account or order was used. Live execution remains disabled.
-- Historical fills are synthetic; no historical order-book queue position or guaranteed fill is available.
-- Cross-margin simulation is intentionally limited to one bot position and does not replay the user's external positions, isolated positions or open orders. Contract risk-tier and liquidation-fee data may be unavailable; fallback use is disclosed in the report.
-- Fair Price history may be unavailable for a symbol; when missing, liquidation checks for that symbol are unavailable and flagged, not invented.
-- Funding history may be incomplete; unknown funding is flagged and cannot be treated as exact net performance.
-- The current top-100 turnover universe is applied to historical windows. Point-in-time historical membership is unavailable, so survivorship/selection bias is disclosed.
-- Current API fee rates in environment variables are defaults/assumptions. Contract/account-specific rates can differ. Verify your own current MEXC fee tier.
-- Automated tests use deterministic fixtures and mocks. They do not establish live MEXC reachability, actual Render memory use, WhatsApp eligibility, or strategy profitability.
-
-See `docs/TEST_REPORT.md` and `docs/IMPLEMENTATION_REPORT_V0.7.0.md`.
+Run tests with `pytest -q`. Automated tests validate deterministic fixtures, parser behavior, job idempotency, data handling and simulator accounting. They do not prove current MEXC API availability, Render deployment health, WhatsApp account eligibility or future strategy profitability.

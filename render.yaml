@@ -36,13 +36,9 @@ services:
       - key: MEXC_UNIVERSE_SCAN_ENABLED
         value: "true"
       - key: SIGNAL_PUSH_ENABLED
-        value: "false"
+        value: "true"
       - key: SIGNAL_TTL_BARS
         value: "2"
-      - key: SIGNAL_MIN_SCORE
-        value: "65"
-      - key: SIGNAL_PUSH_MIN_SCORE
-        value: "80"
       - key: CANDIDATE_STOP_ATR_MULTIPLE
         value: "1.5"
       - key: CANDIDATE_TARGET_ATR_MULTIPLE
@@ -55,6 +51,10 @@ services:
         value: "90"
       - key: RISK_PER_TRADE_FRACTION
         value: "0.005"
+      - key: BACKTEST_MAX_POSITIONS
+        value: "50"
+      - key: BACKTEST_MAX_OPEN_RISK_FRACTION
+        value: "0.25"
       - key: MAX_CONCURRENT_POSITIONS
         value: "1"
       - key: MTF_HTF_WARMUP_BARS

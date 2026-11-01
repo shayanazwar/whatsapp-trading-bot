@@ -97,6 +97,8 @@ class Settings:
     exchange_taker_fee_rate: float
     exchange_maker_fee_rate: float
     backtest_slippage_bps_per_side: float
+    backtest_max_positions: int
+    backtest_max_open_risk_fraction: float
     cost_stress_multipliers: tuple[float, ...]
     whatsapp_crypto_messaging_allowed: bool
     whatsapp_policy_clearance_ref: str
@@ -185,7 +187,7 @@ def load_settings() -> Settings:
         max_adverse_funding_rate=_float("MAX_ADVERSE_FUNDING_RATE", 0.0005),
         backtest_min_coverage_pct=_float("BACKTEST_MIN_COVERAGE_PCT", 98.0),
         backtest_min_universe_coverage_pct=_float("BACKTEST_MIN_UNIVERSE_COVERAGE_PCT", 90.0),
-        strategy_version=os.getenv("STRATEGY_VERSION", "RSI-EMA-3M-CONTROL-v3"),
+        strategy_version=os.getenv("STRATEGY_VERSION", "S1-RFPC-0.2.0-1H-trigger"),
         risk_per_trade_fraction=_float("RISK_PER_TRADE_FRACTION", 0.005),
         max_open_risk_fraction=_float("MAX_OPEN_RISK_FRACTION", 0.02),
         max_drawdown_fraction=_float("MAX_DRAWDOWN_FRACTION", 0.10),
@@ -213,6 +215,8 @@ def load_settings() -> Settings:
         exchange_taker_fee_rate=_float("EXCHANGE_TAKER_FEE_RATE", 0.0008),
         exchange_maker_fee_rate=_float("EXCHANGE_MAKER_FEE_RATE", 0.0006),
         backtest_slippage_bps_per_side=_float("BACKTEST_SLIPPAGE_BPS_PER_SIDE", 5.0),
+        backtest_max_positions=_int("BACKTEST_MAX_POSITIONS", 50),
+        backtest_max_open_risk_fraction=_float("BACKTEST_MAX_OPEN_RISK_FRACTION", 0.25),
         cost_stress_multipliers=stresses,
         whatsapp_crypto_messaging_allowed=_bool("WHATSAPP_CRYPTO_MESSAGING_ALLOWED", False),
         whatsapp_policy_clearance_ref=os.getenv("WHATSAPP_POLICY_CLEARANCE_REF", ""),
@@ -243,7 +247,11 @@ def load_settings() -> Settings:
     if settings.initial_margin_usdt > settings.default_starting_balance:
         raise ValueError("INITIAL_MARGIN_USDT cannot exceed DEFAULT_STARTING_BALANCE")
     if settings.max_concurrent_positions != 1:
-        raise ValueError("MAX_CONCURRENT_POSITIONS is currently fixed at 1 until portfolio multi-position modeling is implemented")
+        raise ValueError("MAX_CONCURRENT_POSITIONS remains fixed at 1 for the separate paper-trading engine")
+    if not 1 <= settings.backtest_max_positions <= 50:
+        raise ValueError("BACKTEST_MAX_POSITIONS must be between 1 and 50")
+    if not 0 < settings.backtest_max_open_risk_fraction <= 0.50:
+        raise ValueError("BACKTEST_MAX_OPEN_RISK_FRACTION must be in (0, 0.50]")
     if not 1 <= settings.max_leverage <= 50:
         raise ValueError("MAX_LEVERAGE must be between 1 and 50")
     if settings.net_take_profit_usdt <= 0 or settings.requested_stop_loss_usdt <= 0:

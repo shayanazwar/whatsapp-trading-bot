@@ -52,7 +52,7 @@ _RESEARCH_DASHBOARD_HTML = r"""<!doctype html>
 h1{font-size:clamp(28px,6vw,44px);margin-bottom:8px}.muted{color:#aab7c4;line-height:1.5}.card{background:#1a222b;border:1px solid #34404d;border-radius:14px;padding:18px;margin:16px 0}
 input,button{font:inherit;border-radius:9px;padding:12px;border:1px solid #4b5968}input{background:#0e1318;color:#fff;width:100%;margin:7px 0 12px}button{background:#d6f36a;color:#151a10;font-weight:700;cursor:pointer;margin:4px 5px 4px 0}button:disabled{opacity:.55;cursor:wait}button.secondary{background:#303b47;color:#fff}.grid{display:flex;flex-wrap:wrap;gap:3px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1015;padding:14px;border-radius:8px;min-height:100px;line-height:1.45}.result-image{display:block;width:100%;height:auto;border-radius:10px;margin:12px 0;border:1px solid #34404d}.download-link{display:inline-block;color:#d6f36a;word-break:break-word;margin:8px 0}.tag{display:inline-block;color:#aab7c4;font-size:13px;margin:5px 0}
 </style></head><body><h1>MEXC Research Dashboard</h1>
-<p class="muted">MEXC Futures research using the top 100 active USDT perpetual markets and completed 3-minute candles. Backtests use the exact period entered (1D or 7D for the top-100 universe) and show requested UTC dates plus observed candle coverage. Results are historical simulations with modeled costs, not confirmed exchange fills. Live orders are disabled.</p>
+<p class="muted">MEXC Futures swing research using the top 100 active USDT perpetual markets and completed 1D → 12H → 4H → 1H candles. Backtests use a chronological multi-position portfolio simulation with a configurable cap of up to 50 simultaneous research positions. Results model costs where data is available; they are not confirmed exchange fills and do not fully reproduce order-book impact or cross-margin liquidation. Live orders are disabled.</p>
 <section class="card"><label for="token">WEB_API_TOKEN</label><input id="token" type="password" autocomplete="off" placeholder="Paste the token configured in Render">
 <label for="command">Command</label><input id="command" value="PRICE BTCUSDT" maxlength="160">
 <div class="grid">
@@ -248,6 +248,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             db = "error"
         settings: Settings = app.state.settings
+        latest_jobs = store.recent_backtest_jobs(1)
+        latest_job = None
+        if latest_jobs:
+            item = latest_jobs[0]
+            latest_job = {
+                "id": item.get("id"), "status": item.get("status"),
+                "progress": item.get("progress"), "error": item.get("error"),
+            }
         worker_heartbeat = store.get_state("worker_heartbeat_utc")
         scanner_health = "disabled"
         worker_heartbeat_age_seconds: float | None = None
@@ -275,10 +283,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "scanner_worker_status": store.get_state("worker_status", "unknown"),
             "scanner_worker_heartbeat_utc": worker_heartbeat,
             "scanner_worker_heartbeat_age_seconds": worker_heartbeat_age_seconds,
-            "scanner_last_attempt": store.get_state("top100_3m_scan_last_attempt"),
-            "scanner_last_success": store.get_state("top100_3m_scan_last_success"),
-            "scanner_last_summary": store.get_state("top100_3m_scan_summary"),
-            "scanner_last_error": store.get_state("top100_3m_scan_last_error"),
+            "scanner_last_attempt": store.get_state("top100_swing_scan_last_attempt"),
+            "scanner_last_success": store.get_state("top100_swing_scan_last_success"),
+            "scanner_last_summary": store.get_state("top100_swing_scan_summary"),
+            "scanner_last_error": store.get_state("top100_swing_scan_last_error"),
+            "backtest_max_positions": settings.backtest_max_positions,
+            "backtest_max_open_risk_fraction": settings.backtest_max_open_risk_fraction,
+            "paper_max_concurrent_positions": settings.max_concurrent_positions,
+            "signal_push_enabled": settings.signal_push_enabled,
+            "backtest_latest_job": latest_job,
             "paper_scheduler_gate": store.get_state("paper_scheduler_gate", "not_evaluated"),
             "paper_trading_enabled": settings.paper_trading_enabled,
             "data_alignment_probe_approved": settings.data_alignment_probe_approved,
@@ -602,7 +615,10 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
             "WHATSAPP COMMAND STARTED | message_id=%s command_token=%s",
             message_id, (body.split()[0].upper()[:24] if body.split() else "EMPTY"),
         )
-        result = await processor.process_text(sender, body, received_timestamp=message_time, enforce_whatsapp_policy=True)
+        result = await processor.process_text(
+            sender, body, received_timestamp=message_time,
+            request_id=message_id, enforce_whatsapp_policy=True,
+        )
         image_attachments = [(path, kind) for path, kind in result.attachments if kind == "image"]
         logger.info(
             "WHATSAPP COMMAND PROCESSED | message_id=%s response_chars=%d images=%d duration_ms=%.0f",

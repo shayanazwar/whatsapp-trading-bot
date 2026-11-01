@@ -1,8 +1,8 @@
-"""Standalone worker for the top-100 MEXC 3-minute MTF research scanner.
+"""Standalone worker for top-100 MEXC S1-RFPC swing research.
 
-The worker runs ResearchScheduler, which can scan active USDT perpetuals once
-per completed 3-minute slot. Legacy paper-position processing is separate and
-remains disabled by default. This worker cannot submit live orders.
+The scanner evaluates completed 1D → 12H → 4H → 1H candles once per
+completed 1H slot. Durable backtests run in this worker; live order execution
+is unavailable in this release.
 """
 from __future__ import annotations
 
@@ -152,10 +152,15 @@ async def _run() -> None:
         )
         store.set_state("worker_status", "starting")
         logger.info(
-            "MEXC research worker starting | build=%s | universe=top-%d | strategy=3M-MTF-TPR | auto_scan=%s | archive=%s | paper=%s | live_execution=false",
+            "MEXC research worker starting | build=%s | database=%s | universe=top-%d | backtest=S1-RFPC-1D-12H-4H-1H | scanner=S1-RFPC-1H | auto_scan=%s | signal_push=%s | policy_gate=%s | backtest_max_positions=%d | paper_max_positions=%d | archive=%s | paper=%s | live_execution=false",
             APP_VERSION,
+            "postgresql" if settings.database_url else "sqlite_local",
             settings.mexc_universe_top_n,
             settings.mexc_universe_scan_enabled,
+            settings.signal_push_enabled,
+            "open" if settings.whatsapp_policy_gate_open else "closed",
+            settings.backtest_max_positions,
+            settings.max_concurrent_positions,
             settings.market_data_dir,
             settings.paper_trading_enabled,
         )

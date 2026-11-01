@@ -33,6 +33,8 @@ class BacktestConfig:
     max_trades_per_symbol: int = 10000
     max_holding_hours: int = 240
     reward_risk_multiple: float = 2.0
+    max_concurrent_positions: int = 50
+    max_open_risk_fraction: float = 0.25
 
     def __post_init__(self) -> None:
         if self.mode not in {"fixed_payout", "exchange_realistic"}:
@@ -47,6 +49,10 @@ class BacktestConfig:
             raise ValueError("Invalid cost inputs")
         if self.max_holding_hours < 1:
             raise ValueError("max_holding_hours must be positive")
+        if not 1 <= self.max_concurrent_positions <= 50:
+            raise ValueError("max_concurrent_positions must be between 1 and 50")
+        if not math.isfinite(self.max_open_risk_fraction) or not 0 < self.max_open_risk_fraction <= 0.50:
+            raise ValueError("max_open_risk_fraction must be in (0, 0.50]")
         if not math.isfinite(self.reward_risk_multiple) or not 0.25 <= self.reward_risk_multiple <= 10:
             raise ValueError("reward_risk_multiple must be finite and between 0.25R and 10R")
 
@@ -206,6 +212,8 @@ def _metrics(
     valid_candles: int,
     rejection_counts: Mapping[str, int],
     warnings: Sequence[str],
+    max_observed_concurrent_positions: int = 0,
+    configured_max_concurrent_positions: int = 50,
 ) -> dict[str, Any]:
     wins = [t for t in trades if t.pnl > 1e-12]
     losses = [t for t in trades if t.pnl < -1e-12]
@@ -242,6 +250,20 @@ def _metrics(
         "valid_candles": valid_candles,
         "completed_trades": count,
         "open_trades_at_end": len(open_positions),
+        "take_profit_hits": sum(t.exit_reason.startswith("TARGET") for t in trades),
+        "stop_loss_hits": sum(t.exit_reason.startswith("STOP") for t in trades),
+        "long_take_profit_hits": sum(t.side == "LONG" and t.exit_reason.startswith("TARGET") for t in trades),
+        "short_take_profit_hits": sum(t.side == "SHORT" and t.exit_reason.startswith("TARGET") for t in trades),
+        "long_stop_loss_hits": sum(t.side == "LONG" and t.exit_reason.startswith("STOP") for t in trades),
+        "short_stop_loss_hits": sum(t.side == "SHORT" and t.exit_reason.startswith("STOP") for t in trades),
+        "time_stop_exits": sum(t.exit_reason == "TIME_STOP" for t in trades),
+        "data_gap_exits": sum(t.exit_reason == "DATA_GAP_CONSERVATIVE" for t in trades),
+        "liquidation_exits": None,
+        "liquidation_modelled": False,
+        "cross_margin_maintenance_margin_modelled": False,
+        "orderbook_impact_modelled": False,
+        "max_observed_concurrent_positions": int(max_observed_concurrent_positions),
+        "configured_max_concurrent_positions": int(configured_max_concurrent_positions),
         "long_trades": sum(t.side == "LONG" for t in trades),
         "short_trades": sum(t.side == "SHORT" for t in trades),
         "wins": len(wins),
@@ -322,17 +344,17 @@ def _position_from_candidate(candidate: TradeCandidate, candle: Candle, index: i
         if unit_risk <= 0:
             return None, "INVALID_MODELED_RISK"
         notional_cap = max(0.0, balance * 3.0 - sum(p.quantity * p.contract_size * p.entry_price for p in open_positions))
-        risk_cap = max(0.0, balance * 0.02 - sum(p.risk_amount for p in open_positions))
+        risk_cap = max(0.0, balance * config.max_open_risk_fraction - sum(p.risk_amount for p in open_positions))
         raw_qty = min(risk_budget / unit_risk, notional_cap / (entry * contract_size), max_vol)
         qty = _floor_step(raw_qty, vol_step)
-        while qty >= min_vol and (qty * unit_risk > risk_budget + 1e-9 or qty * unit_stop > risk_cap + 1e-9):
+        while qty >= min_vol and (qty * unit_risk > risk_budget + 1e-9 or qty * unit_risk > risk_cap + 1e-9):
             qty = round(qty - vol_step, 12)
         if qty < min_vol:
             return None, "BELOW_MINIMUM_RISK_SIZE"
         notional = qty * contract_size * entry
         opening_fee = notional * fee_rate
         return SimPosition(candidate.symbol, candidate.side, index, candle.open_time, entry, stop, target,
-            candidate.candidate_id, setup_key, risk_budget, qty, contract_size, opening_fee, 0.0, config.mode,
+            candidate.candidate_id, setup_key, qty * unit_risk, qty, contract_size, opening_fee, 0.0, config.mode,
             funding_checked_until=candle.open_time), None
     except (TypeError, ValueError, OverflowError):
         return None, "INVALID_CONTRACT_OR_SIZE"
@@ -363,7 +385,9 @@ def run_backtest(
             starting_balance=starting_balance, ending_balance=starting_balance,
             trades=[], open_positions=[], equity_curve=[starting_balance], symbols_tested=len(timeframes_by_symbol),
             symbols_eligible=0, valid_candles=0, rejection_counts={"NO_DATA": len(timeframes_by_symbol)},
-            warnings=["No completed candle data supplied; no results can be inferred."])
+            warnings=["No completed candle data supplied; no results can be inferred."],
+            max_observed_concurrent_positions=0,
+            configured_max_concurrent_positions=config.max_concurrent_positions)
         empty.update({"strategy_evaluations": 0, "candidate_signals": 0, "entry_attempts": 0})
         return empty
     end_time = int(now_epoch or max(c.close_time for c in all_bars))
@@ -380,6 +404,7 @@ def run_backtest(
     strategy_evaluations = 0
     candidate_signals = 0
     entry_attempts = 0
+    max_observed_concurrent_positions = 0
 
     for symbol, raw_series in timeframes_by_symbol.items():
         forbidden = set(raw_series) - {"1D", "12H", "4H", "1H"}
@@ -472,9 +497,9 @@ def run_backtest(
                     rejection_counts["MISSED_NEXT_BAR"] = rejection_counts.get("MISSED_NEXT_BAR", 0) + 1
                 else:
                     entry_candidates.append((symbol, candidate, setup_key, expected_entry_time, candle))
-        for symbol, candidate, setup_key, expected_entry_time, candle in entry_candidates:
+        for symbol, candidate, setup_key, expected_entry_time, candle in sorted(entry_candidates, key=lambda row: row[0]):
             entry_attempts += 1
-            if symbol in positions or len(positions) >= 4:
+            if symbol in positions or len(positions) >= config.max_concurrent_positions:
                 rejection_counts["MAX_CONCURRENT_POSITIONS"] = rejection_counts.get("MAX_CONCURRENT_POSITIONS", 0) + 1
                 continue
             if config.mode == "fixed_payout" and balance < config.fixed_loss_payout:
@@ -490,7 +515,7 @@ def run_backtest(
                     rejection_counts["ENTRY_GAP_EXCEEDED"] = rejection_counts.get("ENTRY_GAP_EXCEEDED", 0) + 1
                     continue
             live_risk = sum(p.risk_amount for p in positions.values())
-            if config.mode == "exchange_realistic" and live_risk >= balance * 0.02:
+            if config.mode == "exchange_realistic" and live_risk >= balance * config.max_open_risk_fraction:
                 rejection_counts["MAX_OPEN_RISK_EXCEEDED"] = rejection_counts.get("MAX_OPEN_RISK_EXCEEDED", 0) + 1
                 continue
             entry_index = prepared[symbol]["index_by_open"].get(candle.open_time, signal_index or 0)
@@ -501,6 +526,7 @@ def run_backtest(
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                 continue
             positions[symbol] = pos
+            max_observed_concurrent_positions = max(max_observed_concurrent_positions, len(positions))
 
         # 3) Resolve exits for every position in the same timestamp batch, then apply PnL together.
         # The pre-registered 240-hour maximum holding period exits at the first available 1H open
@@ -616,7 +642,8 @@ def run_backtest(
         # Funding can affect P&L only while a position is open. Do not warn about
         # missing settlements when this run never opened a position.
         if completed or open_positions:
-            missing_funding = [s for s in prepared if not funding_events or not funding_events.get(s)]
+            traded_symbols = {trade.symbol for trade in completed} | {pos.symbol for pos in open_positions}
+            missing_funding = [s for s in sorted(traded_symbols) if not funding_events or not funding_events.get(s)]
             if missing_funding:
                 warnings.append("Funding event history is missing/empty for: " + ", ".join(sorted(missing_funding)) + "; realized P&L excludes unknown funding and is not validation-ready.")
     else:
@@ -625,12 +652,22 @@ def run_backtest(
     if not symbols_eligible:
         warnings.append("No eligible symbol had sufficient historical warm-up data; no strategy performance conclusion is possible.")
     warnings.append(f"Strategy simulation maximum holding period: {config.max_holding_hours} hours; time-stop is modeled at the next available 1H open.")
+    warnings.append(
+        f"Portfolio simulation cap: {config.max_concurrent_positions} concurrent positions; "
+        f"aggregate planned stop-risk cap: {config.max_open_risk_fraction:.1%} of current balance; "
+        "gross notional is capped at 3.0× current realized balance. This release does not replay exchange liquidation, "
+        "full cross-margin maintenance-margin rules, or order-book market impact."
+    )
+    if open_positions:
+        warnings.append("Open positions at the end of the test are reported separately and are not marked to market in realized P&L/equity statistics.")
     metrics = _metrics(
         window=window, mode=config.mode, start_time=start_time, end_time=end_time,
         starting_balance=starting_balance, ending_balance=balance, trades=completed,
         open_positions=open_positions, equity_curve=equity_curve, symbols_tested=len(timeframes_by_symbol),
         symbols_eligible=symbols_eligible, valid_candles=valid_candles,
         rejection_counts=rejection_counts, warnings=warnings,
+        max_observed_concurrent_positions=max_observed_concurrent_positions,
+        configured_max_concurrent_positions=config.max_concurrent_positions,
     )
     metrics.update({
         "strategy_evaluations": strategy_evaluations,

@@ -458,16 +458,21 @@ class Store:
             row = conn.execute("SELECT id FROM signals WHERE idempotency_key=?", (key,)).fetchone()
         return str(row["id"]) if row else signal_id
 
-    def active_signals(self, *, now_epoch: int, limit: int = 50) -> list[dict[str, Any]]:
+    def active_signals(self, *, now_epoch: int, limit: int = 50,
+                       strategy_version: str | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
             conn.execute(
                 "UPDATE signals SET status='expired',updated_at=? WHERE status='active' AND expires_at<=?",
                 (utc_now_iso(), int(now_epoch)),
             )
-            rows = conn.execute(
-                "SELECT * FROM signals WHERE status='active' AND expires_at>? ORDER BY score DESC,candle_close_time DESC LIMIT ?",
-                (int(now_epoch), min(max(int(limit), 1), 200)),
-            ).fetchall()
+            query = "SELECT * FROM signals WHERE status='active' AND expires_at>?"
+            params: list[Any] = [int(now_epoch)]
+            if strategy_version:
+                query += " AND strategy_version=?"
+                params.append(str(strategy_version))
+            query += " ORDER BY candle_close_time DESC LIMIT ?"
+            params.append(min(max(int(limit), 1), 200))
+            rows = conn.execute(query, tuple(params)).fetchall()
         result = []
         for row in rows:
             item = dict(row)

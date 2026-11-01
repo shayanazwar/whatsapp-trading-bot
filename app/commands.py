@@ -38,7 +38,7 @@ def _symbol(value: str) -> str:
 
 
 def _parse_backtest(parts: list[str]) -> Command:
-    """Parse a period-explicit research job with CONTROL/CANDIDATE/BOTH selection."""
+    """Parse a period-explicit S1-RFPC swing-research job."""
     rest = [part.upper() for part in parts[1:]]
     if len(rest) == 1 and rest[0] == "STATUS":
         return Command("BACKTEST_STATUS", {})
@@ -48,7 +48,7 @@ def _parse_backtest(parts: list[str]) -> Command:
             raise CommandError("BACKTEST REPORT requires a valid job ID")
         return Command("BACKTEST_REPORT", {"job_id": job_id})
     if any(token in {"LEGACY", "FIXED", "FIXED_PAYOUT", "REALISTIC", "EXCHANGE_REALISTIC"} for token in rest):
-        raise CommandError("This release uses 3M RSI/EMA control and MTF-TPR candidate research only.")
+        raise CommandError("Legacy 3M backtests are inactive. This release runs S1-RFPC on completed 1D/12H/4H/1H candles.")
     if any(token.startswith("TP=") for token in rest):
         raise CommandError("TP scenario overrides are not supported; use the configured control/candidate models.")
     clean = list(rest)
@@ -57,11 +57,11 @@ def _parse_backtest(parts: list[str]) -> Command:
         raise CommandError("Specify the backtest period explicitly: BACKTEST 1D or BACKTEST 7D")
     if len(windows) != 1:
         raise CommandError("Run one backtest period at a time: 1D, 7D, 30D, 60D or 90D")
-    strategies = [token for token in clean if token in {"CONTROL", "CANDIDATE", "BOTH"}]
-    if len(strategies) > 1:
-        raise CommandError("Choose one strategy scope: CONTROL, CANDIDATE or BOTH")
-    strategy_scope = strategies[0].lower() if strategies else "both"
-    ignored = set(windows + strategies)
+    obsolete_scopes = [token for token in clean if token in {"CONTROL", "CANDIDATE", "BOTH"}]
+    if obsolete_scopes:
+        raise CommandError("CONTROL/CANDIDATE/BOTH are retired. Use BACKTEST 1D or BACKTEST 7D for S1-RFPC.")
+    strategy_scope = "s1-rfpc"
+    ignored = set(windows)
     symbols = [token for token in clean if token not in ignored]
     if any(re.fullmatch(r"\d+[A-Z]+", token) for token in symbols):
         raise CommandError("Backtest period must be 1D, 7D, 30D, 60D or 90D")
@@ -171,52 +171,39 @@ def parse_command(text: str) -> Command:
     raise CommandError("Unknown command. Send HELP for the command list.")
 
 
-HELP_TEXT = """📈 Pak Trading Academy Trading Bot
+HELP_TEXT = """📈 Pak Trading Academy — MEXC Futures Research Bot
 
-💰 PRICE
+💰 MARKET DATA
 PRICE BTCUSDT
-
-📊 ANALYZE
 ANALYZE BTCUSDT
-
-📈 CHART
-CHART BTCUSDT 3M
-CHART BTCUSDT 1H
-CHART BTCUSDT 4H
-CHART BTCUSDT 12H
-CHART BTCUSDT 1D
-
-🔎 MARKET SCAN
-SCAN — Top 100 active MEXC USDT perpetuals by 24H turnover
-SIGNALS — Latest 3M scan results
+CHART BTCUSDT 1H | 4H | 12H | 1D
 SEARCH PEPE
 
-🧪 BACKTEST — 3M RESEARCH
-BACKTEST 1D — Run CONTROL + CANDIDATE
-BACKTEST 7D — Run CONTROL + CANDIDATE
-BACKTEST CONTROL 7D
-BACKTEST CANDIDATE 7D
+🔎 SWING SCANNER
+SCAN — Latest top-100 S1-RFPC cycle
+SIGNALS — Active, unexpired S1-RFPC research alerts
+
+🧪 BACKTEST — S1-RFPC SWING RESEARCH
+BACKTEST 1D — Top 100 USDT perpetuals
+BACKTEST 7D — Top 100 USDT perpetuals
+BACKTEST BTCUSDT 30D — One symbol, extended history
 BACKTEST STATUS
 BACKTEST REPORT <JOB_ID>
-BACKTEST BTCUSDT 30D — Single-symbol longer test
 
-🧪 PAPER (FAKE MONEY ONLY)
-PAPER
-PAPER OPEN
-PAPER HISTORY
+Strategy: completed 1D regime → 12H structure → 4H setup → 1H trigger.
+Backtests use chronological portfolio simulation with up to 50 concurrent research positions, 0.5% nominal risk per entry, a 25% aggregate planned stop-risk ceiling and a 3× wallet gross-notional ceiling. Actual entries can be fewer due to strategy, data, liquidity, contract-minimum, margin and risk constraints.
+
+📊 PAPER (SEPARATE SIMULATOR; FAKE MONEY ONLY)
+PAPER | PAPER OPEN | PAPER HISTORY
 
 🔔 ALERTS
 ALERT BTCUSDT ABOVE 120000
-ALERTS
-DELETE 12
-DELETE ALL
+ALERTS | DELETE <ID> | DELETE ALL
 
 STATUS • PERFORMANCE • PNL • RISK • COST
 AUTOTRADE STATUS • AUTOTRADE OFF • PAUSE
 
-Strategy A CONTROL: completed 3-minute RSI/EMA momentum baseline. Strategy B CANDIDATE: 15-minute trend context + 3-minute pullback/reclaim, ATR-based exits and risk-derived size.
-BACKTEST: durable worker job; exact period coverage required. $100 wallet, maximum $1 initial margin, 0.5% candidate risk budget, max one simulated position, Cross Margin. Live orders OFF.
-Top universe: active USDT perpetuals ranked by 24H turnover. Live orders: OFF.
+Reports model fees, funding where available and slippage assumptions. They are not guaranteed execution results and do not fully replay exchange order-book impact or cross-margin liquidation. Backtests and scanner alerts are research only. Live orders are disabled. The separate paper simulator remains capped at one concurrent position.
 """
 
 WHATSAPP_SUPPORT_HELP_TEXT = """📈 Pak Trading Academy Bot — Service Help

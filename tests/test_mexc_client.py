@@ -185,3 +185,43 @@ async def test_funding_history_window_reports_partial_vs_complete_coverage():
         assert len(complete_rows) == 1 and complete_coverage is True
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_klines_window_paginates_long_1m_history_without_gaps_or_duplicates():
+    calls = []
+    start = 1_704_067_200
+    count = 3_500
+    end = start + (count - 1) * 60
+
+    async def handler(request):
+        assert request.url.path == "/api/v1/contract/kline/BTC_USDT"
+        page_start = int(request.url.params["start"])
+        page_end = int(request.url.params["end"])
+        calls.append((page_start, page_end))
+        times = list(range(page_start, page_end + 1, 60))
+        return httpx.Response(200, json={"success": True, "data": {
+            "time": times,
+            "open": [100.0] * len(times),
+            "high": [101.0] * len(times),
+            "low": [99.0] * len(times),
+            "close": [100.5] * len(times),
+            "vol": [1.0] * len(times),
+            "amount": [100.5] * len(times),
+        }})
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MexcClient(client=transport, min_interval_by_family={"kline": 0})
+    try:
+        bars = await client.get_klines_window(
+            "BTCUSDT", "1M", start=start, end=end,
+            now_epoch=end + 120, close_grace_seconds=5, max_bars_per_request=1000,
+        )
+        assert len(calls) == 4
+        assert len(bars) == count
+        assert bars[0].open_time == start
+        assert bars[-1].open_time == end
+        assert len({bar.open_time for bar in bars}) == count
+        assert all(bars[i + 1].open_time - bars[i].open_time == 60 for i in range(len(bars) - 1))
+    finally:
+        await client.aclose()

@@ -1,3 +1,4 @@
+import pytest
 import hashlib
 import hmac
 
@@ -131,3 +132,73 @@ def test_alert_crossing_broadcasts_to_all_recipients_once(tmp_path):
     service.evaluate_symbol("BTC_USDT", candles_by_interval={}, latest_price=102.0,
                             recipient=["923000000001", "923000000002"])
     assert len(store.pending_outbox()) == 2
+
+
+def test_backtest_job_enqueue_is_idempotent_and_worker_claims_once(tmp_path):
+    store = Store(tmp_path / "jobs.sqlite3")
+    args = {"window": "7D", "strategy_scope": "both"}
+    first = store.enqueue_backtest_job("923001234567", args, idempotency_key="wamid.backtest.1")
+    duplicate = store.enqueue_backtest_job("923001234567", args, idempotency_key="wamid.backtest.1")
+    assert duplicate == first
+    claimed = store.claim_next_backtest_job("worker-test")
+    assert claimed is not None
+    assert claimed["id"] == first
+    assert claimed["status"] == "running"
+    assert store.claim_next_backtest_job("worker-test-2") is None
+    store.finish_backtest_job(first, result={"text": "completed"})
+    report = store.get_backtest_job(first, recipient="923001234567")
+    assert report["status"] == "complete"
+    assert report["result"]["text"] == "completed"
+
+
+def test_backtest_job_restart_recovery_requeues_running_jobs(tmp_path):
+    store = Store(tmp_path / "jobs-recovery.sqlite3")
+    job_id = store.enqueue_backtest_job("923001234567", {"window": "1D"}, idempotency_key="restart-1")
+    assert store.claim_next_backtest_job("worker-old") is not None
+    assert store.requeue_interrupted_backtest_jobs() == 1
+    recovered = store.get_backtest_job(job_id)
+    assert recovered["status"] == "queued"
+    assert recovered["progress"]["stage"] == "recovered_after_restart"
+
+
+def test_cross_margin_liquidation_price_matches_mexc_single_position_example():
+    from app.backtest_rsi_ema import _cross_liquidation_price
+
+    price = _cross_liquidation_price(
+        direction="LONG", entry_price=8000.0, unit_quantity=1.0,
+        wallet_balance=500.0, maintenance_rate=0.005,
+        liquidation_fee_rate=0.0, isolated_margin=0.0,
+    )
+    assert price == pytest.approx(7540.0, abs=1e-9)
+
+
+def test_cross_margin_wallet_buffer_moves_liquidation_farther_than_isolated_margin():
+    from app.backtest_rsi_ema import _cross_liquidation_price
+
+    cross_price = _cross_liquidation_price(
+        direction="LONG", entry_price=100.0, unit_quantity=1.0,
+        wallet_balance=100.0, maintenance_rate=0.005,
+        liquidation_fee_rate=0.0, isolated_margin=0.0,
+    )
+    isolated_price = _cross_liquidation_price(
+        direction="LONG", entry_price=100.0, unit_quantity=1.0,
+        wallet_balance=100.0, maintenance_rate=0.005,
+        liquidation_fee_rate=0.0, isolated_margin=1.0,
+    )
+    assert cross_price < 0 or cross_price < isolated_price
+
+
+def test_backtest_reconciliation_rejects_corrupted_signal_counts():
+    import pytest
+    from app.backtest_rsi_ema import _assert_backtest_reconciliation
+
+    with pytest.raises(ArithmeticError, match="signals_direction_sum"):
+        _assert_backtest_reconciliation({
+            "trade_ledger": [], "signals": 2, "long_signals": 1, "short_signals": 0,
+            "signals_entered": 0, "trades_opened": 0, "resolved": 0, "open_unresolved": 0,
+            "unfilled_signals": 2, "blocked_signals_due_to_open_position": 0,
+            "other_unentered_signals": 2, "total_r": 0.0, "ending_equity": 100.0,
+            "starting_equity": 100.0, "net_profit": 0.0, "realized_net_profit": 0.0,
+            "unrealized_pnl_at_end": 0.0, "liquidation_exits": 0,
+            "take_profit_exits": 0, "stop_loss_exits": 0,
+        })

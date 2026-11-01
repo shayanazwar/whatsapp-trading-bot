@@ -30,11 +30,19 @@ def test_command_parser_rejects_unknown_chart_timeframe():
 
 
 def test_command_parser_backtest_modes_and_windows():
-    assert parse_command("BACKTEST").args == {"mode": "rsi_ema", "windows": ["7D"]}
-    assert parse_command("BACKTEST BTCUSDT 7D").args == {"mode": "rsi_ema", "windows": ["7D"], "symbol": "BTC_USDT"}
-    with pytest.raises(CommandError, match="3M RSI/EMA backtest only"):
+    with pytest.raises(CommandError, match="period explicitly"):
+        parse_command("BACKTEST")
+    assert parse_command("BACKTEST 7D").args == {
+        "mode": "research", "window": "7D", "windows": ["7D"], "strategy_scope": "both",
+    }
+    assert parse_command("BACKTEST BTCUSDT 7D").args == {
+        "mode": "research", "window": "7D", "windows": ["7D"],
+        "strategy_scope": "both", "symbol": "BTC_USDT",
+    }
+    assert parse_command("BACKTEST CANDIDATE 1D").args["strategy_scope"] == "candidate"
+    with pytest.raises(CommandError, match="control and MTF-TPR candidate"):
         parse_command("BACKTEST LEGACY BTCUSDT 30D")
-    with pytest.raises(CommandError, match="3M RSI/EMA backtest only"):
+    with pytest.raises(CommandError, match="control and MTF-TPR candidate"):
         parse_command("BACKTEST FIXED BTCUSDT 7D")
     with pytest.raises(CommandError):
         parse_command("BACKTEST 5M")

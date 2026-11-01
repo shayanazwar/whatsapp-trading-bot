@@ -212,3 +212,21 @@ def test_closed_gate_support_commands_get_real_menu_and_status(tmp_path, monkeyp
         assert help_result == WHATSAPP_SUPPORT_HELP_TEXT
         assert "SYSTEM STATUS" in status_result
         assert not app.state.store.recent_events(10, "WHATSAPP_POLICY_GATE_BLOCKED")
+
+
+def test_health_exposes_worker_heartbeat_freshness(tmp_path):
+    from datetime import datetime, timezone
+
+    base = load_settings()
+    cfg = replace(
+        base, database_path=tmp_path / "scanner-health.sqlite3",
+        reports_dir=tmp_path / "reports", mexc_universe_scan_enabled=True,
+    )
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        body = client.get("/healthz").json()
+        assert body["scanner_health"] == "not_seen"
+        app.state.store.set_state("worker_heartbeat_utc", datetime.now(timezone.utc).isoformat())
+        body = client.get("/healthz").json()
+        assert body["scanner_health"] == "healthy"
+        assert body["scanner_worker_heartbeat_age_seconds"] is not None

@@ -1,29 +1,47 @@
-# Test Report — MEXC RSI/EMA Bot v0.4.0
+# v0.7.0 Test & Validation Report
 
-Date: 29 October 2026
+**Date:** 1 November 2026  
+**Source:** supplied `whatsapp-trading-bot-main (39).zip`, patched in a clean working extraction.
 
-## Results
+## Automated verification
 
 | Check | Result |
-|---|---|
-| Python compilation | PASS — `python -m compileall -q app tests` |
-| Automated tests | PASS — `pytest -q`, 94 passed |
-| Render Blueprint YAML | PASS — one web service, one background worker, one PostgreSQL database parsed |
-| Local web smoke test | PASS — `/healthz` and `/dashboard` both returned HTTP 200 with application lifespan enabled |
-| Live flags | PASS — `live_execution_enabled=false`, `live_execution_build_released=false` |
-| Ruff lint | NOT RUN — Ruff executable unavailable in this environment |
-| MEXC public API reachability | BLOCKED — DNS resolution failed in this runtime |
-| Real historical performance backtest | NOT RUN — no verified MEXC historical candles were downloaded; no performance numbers are claimed |
-| Live MEXC order test | NOT RUN — no released private order path and no order was submitted |
-| WhatsApp production delivery | NOT RUN — no live Meta credentials or approved crypto notification path tested |
-| PostgreSQL / Render deploy | NOT RUN — no cloud resources created |
+|---|---:|
+| `python -m compileall -q app tests` | PASS |
+| `python -m pytest -q` | **129 passed** |
+| FastAPI application import | PASS |
+| Application version | `0.7.0` |
+| Render Blueprint YAML parse/structural assertions | PASS |
+| Archive/candle aggregation tests, including hot-shard cache bound | PASS |
+| Historical Kline pagination regression | PASS |
+| Top-100 universe filtering/fallback tests | PASS |
+| Strategy B warm-up, gap and trigger tests | PASS |
+| Fee/slippage net-RR parity tests (LONG and SHORT) | PASS |
+| Worker health/heartbeat tests | PASS |
+| PostgreSQL job-store / idempotency tests | PASS |
+| Cross-margin ledger and report reconciliation tests | PASS |
+| ZIP integrity | Verified during packaging |
 
-## What the automated tests cover
+## Additional local benchmark
 
-The suite includes candle interval aggregation, RSI/EMA signal rules, completed-candle timing, no future data use in the deterministic strategy tests, contract-sized paper sizing, fee and slippage calculations, conservative stop/target/liquidation priority, empty-data backtest labeling, chart output with multiple timeframes, command policy checks, webhook/authentication behavior, storage and risk regression cases.
+A synthetic Python allocation test created 100 symbols × 4,610 3M-candle objects (461,000 candle objects; approximately 7D plus candidate warm-up). `tracemalloc` peak was approximately 84.4 MiB for that narrow allocation test.
+
+This is **not** a full historical backtest benchmark, process RSS measurement, or Render memory guarantee. It does not include HTTP response buffers, database drivers, pandas/numpy data, fair-price/funding data, or the complete job pipeline.
+
+## Environment caveats
+
+- `ruff` was not installed in the execution environment, so no Ruff lint result is claimed.
+- Global `pip check` reported an unrelated pre-existing environment conflict: `moviepy 2.2.1` requires Pillow `<12`, while the environment has Pillow `12.3.0`. Pillow/moviepy are not project runtime dependencies in this patch. The project test suite still passed.
+
+## Not performed
+
+- No live MEXC API calls or account-specific fee/tier verification.
+- No actual 100-symbol scan against live MEXC.
+- No actual MEXC 1D/7D/30D backtest result generated in this session.
+- No Render deployment, memory-limit observation, database provisioning or disk-mount check.
+- No Meta/WhatsApp production message test.
+- No live trading or order placement.
 
 ## Interpretation
 
-The 92 passing tests establish regression evidence for the tested code and fixtures only. They do not prove future profitability, correct behavior against every live MEXC payload, live order correctness, or production availability. Strategy fixtures and any synthetic demonstration data are not market-performance evidence.
-
-The new live-market backtest must be run from a network environment that can reach MEXC. Its JSON must be inspected for symbol coverage, missing candles, missing funding intervals, contract metadata validation and the assumptions applied to costs and liquidation before interpreting any performance value.
+The code compiles and the included automated tests pass. Tests use deterministic fixtures and mocks for external APIs. Passing tests establishes behavior under those fixtures; it does not establish live data coverage, trading profitability, exact exchange-liquidation parity, or deployment success.

@@ -8,6 +8,8 @@ import logging
 import mimetypes
 import secrets
 import time
+import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -169,13 +171,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allowed_web_commands = {
             "HELP", "STATUS", "PRICE", "MARKET", "CHART", "ANALYZE", "SCAN", "BACKTEST",
             "SIGNALS", "PERFORMANCE", "PNL", "RISK", "LIVE_STATUS",
-            "OPEN_POSITIONS", "POSITIONS", "PAPER", "SEARCH",
+            "OPEN_POSITIONS", "POSITIONS", "PAPER", "SEARCH", "BACKTEST_STATUS", "BACKTEST_REPORT",
         }
         if parsed.name not in allowed_web_commands:
             raise HTTPException(status_code=403, detail="This command is not available in the read-only web interface")
         try:
             result = await app.state.processor.process_text(
-                "authenticated-web-dashboard", command_text, enforce_whatsapp_policy=False
+                "authenticated-web-dashboard", command_text, request_id=f"dashboard-{uuid.uuid4()}", enforce_whatsapp_policy=False
             )
         except CommandError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -246,6 +248,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             db = "error"
         settings: Settings = app.state.settings
+        worker_heartbeat = store.get_state("worker_heartbeat_utc")
+        scanner_health = "disabled"
+        worker_heartbeat_age_seconds: float | None = None
+        if settings.mexc_universe_scan_enabled:
+            scanner_health = "not_seen"
+            if worker_heartbeat:
+                try:
+                    heartbeat_dt = datetime.fromisoformat(str(worker_heartbeat).replace("Z", "+00:00"))
+                    worker_heartbeat_age_seconds = max(
+                        0.0, (datetime.now(timezone.utc) - heartbeat_dt.astimezone(timezone.utc)).total_seconds()
+                    )
+                    scanner_health = "healthy" if worker_heartbeat_age_seconds <= 75.0 else "worker_stale"
+                except (TypeError, ValueError):
+                    scanner_health = "invalid_heartbeat"
         return {
             "status": "ok" if db == "ok" else "degraded",
             "build_version": APP_VERSION,
@@ -254,9 +270,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "scheduler_worker": store.get_state("scheduler_status", "not_started"),
             "scheduler_last_success": store.get_state("scheduler_last_success"),
             "scanner_enabled": settings.mexc_universe_scan_enabled,
+            "scanner_health": scanner_health,
             "scanner_top_n": settings.mexc_universe_top_n,
             "scanner_worker_status": store.get_state("worker_status", "unknown"),
-            "scanner_worker_heartbeat_utc": store.get_state("worker_heartbeat_utc"),
+            "scanner_worker_heartbeat_utc": worker_heartbeat,
+            "scanner_worker_heartbeat_age_seconds": worker_heartbeat_age_seconds,
             "scanner_last_attempt": store.get_state("top100_3m_scan_last_attempt"),
             "scanner_last_success": store.get_state("top100_3m_scan_last_success"),
             "scanner_last_summary": store.get_state("top100_3m_scan_summary"),

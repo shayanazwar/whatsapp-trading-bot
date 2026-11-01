@@ -34,6 +34,11 @@ class RsiEmaBacktestConfig:
     max_holding_minutes: int = 1440
     assumed_funding_rate_per_8h: float = 0.0
     strategy: RsiEmaConfig = RsiEmaConfig()
+    target_mode: str = "fixed_usd"
+    risk_per_trade_fraction: float = 0.005
+    min_net_reward_risk: float = 1.2
+    candidate_stop_atr_multiple: float = 1.5
+    candidate_target_atr_multiple: float = 2.5
 
     def validate(self) -> None:
         if not math.isfinite(self.starting_equity) or self.starting_equity <= 0:
@@ -52,6 +57,12 @@ class RsiEmaBacktestConfig:
             raise ValueError("Invalid liquidation fee assumption")
         if self.margin_mode not in {"cross", "isolated"}:
             raise ValueError("margin_mode must be cross or isolated")
+        if self.target_mode not in {"fixed_usd", "atr"}:
+            raise ValueError("target_mode must be fixed_usd or atr")
+        if not 0 < self.risk_per_trade_fraction <= 0.05 or self.min_net_reward_risk <= 0:
+            raise ValueError("Risk fraction or minimum net RR is invalid")
+        if self.candidate_stop_atr_multiple <= 0 or self.candidate_target_atr_multiple <= 0:
+            raise ValueError("ATR stop/target multiples must be positive")
         if self.max_positions != 1:
             raise ValueError("This backtest currently models one global position at a time")
         if self.max_holding_minutes < 3:
@@ -328,6 +339,14 @@ def _risk_tier_terms(
     return {"status": "UNKNOWN", "mmr": base_mmr, "max_leverage": contract_max_leverage, "tier": None}
 
 
+def _expected_completed_bar_count(start_exclusive: int, end_inclusive: int, step_seconds: int) -> int:
+    if step_seconds <= 0 or end_inclusive <= start_exclusive:
+        return 0
+    first_close = (int(start_exclusive) // step_seconds + 1) * step_seconds
+    last_close = (int(end_inclusive) // step_seconds) * step_seconds
+    return max(0, ((last_close - first_close) // step_seconds) + 1)
+
+
 def run_backtest_rsi_ema(
     candles_by_symbol: Mapping[str, Sequence[Candle]],
     *,
@@ -339,6 +358,8 @@ def run_backtest_rsi_ema(
     funding_price_candles_by_symbol: Mapping[str, Sequence[Candle]] | None = None,
     now_epoch: int | None = None,
     close_grace_seconds: int = 5,
+    signal_evaluator: Any | None = None,
+    intrabar_candles_by_symbol: Mapping[str, Sequence[Candle]] | None = None,
 ) -> dict[str, Any]:
     cfg = config or RsiEmaBacktestConfig()
     cfg.validate()
@@ -372,6 +393,10 @@ def run_backtest_rsi_ema(
 
     fair_by_symbol: dict[str, dict[int, Candle]] = {}
     fair_data_symbols: list[str] = []
+    intrabar_by_symbol: dict[str, dict[int, Candle]] = {
+        str(symbol).upper(): {bar.open_time: bar for bar in bars if bar.complete and bar.timeframe == "1M"}
+        for symbol, bars in (intrabar_candles_by_symbol or {}).items()
+    }
     funding_price_by_symbol: dict[str, list[Candle]] = {
         str(symbol).upper(): sorted(list(bars), key=lambda bar: bar.close_time)
         for symbol, bars in (funding_price_candles_by_symbol or {}).items()
@@ -389,7 +414,8 @@ def run_backtest_rsi_ema(
     candidates: list[tuple[int, str, int, Candle, Candle, dict[str, Any]]] = []
     signal_count = long_signals = short_signals = 0
     for symbol, bars in warmup.items():
-        strategy_signals = evaluate_signals(bars, cfg.strategy)
+        strategy_signals = (signal_evaluator(bars) if signal_evaluator is not None
+                            else evaluate_signals(bars, cfg.strategy))
         for signal in strategy_signals:
             idx = signal.candle_index
             if signal.timestamp <= cutoff or signal.timestamp > now_epoch:
@@ -416,7 +442,7 @@ def run_backtest_rsi_ema(
                 entry_bar.open_time, symbol, idx, signal_bar, entry_bar,
                 {"signal": signal.as_dict(), "leverage": leverage, "spec": dict(spec), "bars": bars},
             ))
-    candidates.sort(key=lambda item: (item[0], item[1]))
+    candidates.sort(key=lambda item: (item[0], -float(item[5]["signal"].get("score", 0.0)), item[1]))
 
     equity = cfg.starting_equity
     peak_equity = equity
@@ -438,6 +464,8 @@ def run_backtest_rsi_ema(
     slip = cfg.slippage_bps_per_side / 10000.0
     liquidations = 0
     expiries = 0
+    same_bar_ambiguities = 0
+    same_minute_ambiguities = 0
 
     for entry_time, symbol, idx, signal_bar, entry_bar, context in candidates:
         if entry_time <= active_until:
@@ -475,14 +503,43 @@ def run_backtest_rsi_ema(
         contract_max_leverage = leverage
         quantity = quantity_units = notional = actual_initial_margin = 0.0
         tier_terms: dict[str, Any] = {"status": "UNKNOWN", "mmr": 0.0, "max_leverage": leverage, "tier": None}
-        for _ in range(5):
+        signal_data = context["signal"]
+        if cfg.target_mode == "atr":
+            raw_stop = _positive(signal_data, "stop_price", default=0.0)
+            atr_value = _positive(signal_data, "atr", default=0.0)
+            if raw_stop <= 0 or atr_value <= 0:
+                continue
+            raw_target = _positive(signal_data, "target_price", default=0.0)
+            if raw_target <= 0:
+                raw_target = (reference_entry + cfg.candidate_target_atr_multiple * atr_value
+                              if direction == "LONG" else
+                              reference_entry - cfg.candidate_target_atr_multiple * atr_value)
+            # Position risk is the configured fraction of current equity, not the
+            # posted initial margin. Initial margin remains a hard cap on notional.
+            unit_stop = _net_exit_pnl(
+                direction=direction, ref_entry=reference_entry, entry_fill=entry_fill,
+                exit_ref=raw_stop, quantity_units=1.0, fee_rate=contract_fee_rate,
+                slippage_rate=slip,
+            )
+            unit_risk = abs(min(0.0, unit_stop["net_pnl"]))
+            if unit_risk <= 0:
+                continue
+            desired_units = equity * cfg.risk_per_trade_fraction / unit_risk
+            max_units_by_margin = (cfg.initial_margin * leverage) / max(entry_fill, 1e-12)
+            quantity_units_raw = min(desired_units, max_units_by_margin)
+            quantity_raw = quantity_units_raw / contract_size
+            quantity = round(math.floor((quantity_raw + 1e-12) / vol_step) * vol_step, precision)
+            quantity = min(quantity, max_vol)
+        else:
             target_notional = cfg.initial_margin * leverage
             quantity_raw = target_notional / (entry_fill * contract_size)
             quantity = round(math.floor((quantity_raw + 1e-12) / vol_step) * vol_step, precision)
-            if quantity <= 0 or quantity < min_vol or quantity > max_vol:
-                break
-            quantity_units = quantity * contract_size
-            notional = quantity_units * entry_fill
+
+        if quantity <= 0 or quantity < min_vol or quantity > max_vol:
+            continue
+        quantity_units = quantity * contract_size
+        notional = quantity_units * entry_fill
+        for _ in range(5):
             tier_terms = _risk_tier_terms(
                 spec, direction=direction, quantity=quantity, notional=notional,
                 base_mmr=_positive(spec, "maintenanceMarginRate", "maintenance_margin_rate", "mmr", default=cfg.maintenance_margin_rate),
@@ -530,15 +587,24 @@ def run_backtest_rsi_ema(
             liquidation_fee_rate=liquidation_fee_rate, isolated_margin=isolated_margin,
         )
 
-        stop_price = _stop_trigger_price(
-            direction=direction, reference_entry=reference_entry, quantity_units=quantity_units,
-            net_loss_limit=cfg.requested_stop_loss_usd, fee_rate=contract_fee_rate,
-            slippage_rate=slip,
-        )
-        target_price = _target_trigger_price(
-            direction=direction, reference_entry=reference_entry, quantity_units=quantity_units,
-            net_target=cfg.net_take_profit_usd, fee_rate=contract_fee_rate, slippage_rate=slip,
-        )
+        if cfg.target_mode == "atr":
+            stop_price = _number(signal_data, "stop_price", default=0.0)
+            target_price = _number(signal_data, "target_price", default=0.0)
+            if target_price <= 0:
+                atr_value = _positive(signal_data, "atr", default=0.0)
+                target_price = (reference_entry + cfg.candidate_target_atr_multiple * atr_value
+                                if direction == "LONG" else
+                                reference_entry - cfg.candidate_target_atr_multiple * atr_value)
+        else:
+            stop_price = _stop_trigger_price(
+                direction=direction, reference_entry=reference_entry, quantity_units=quantity_units,
+                net_loss_limit=cfg.requested_stop_loss_usd, fee_rate=contract_fee_rate,
+                slippage_rate=slip,
+            )
+            target_price = _target_trigger_price(
+                direction=direction, reference_entry=reference_entry, quantity_units=quantity_units,
+                net_target=cfg.net_take_profit_usd, fee_rate=contract_fee_rate, slippage_rate=slip,
+            )
         stop_price = _round_trigger_to_tick(stop_price, price_tick, direction, "STOP")
         target_price = _round_trigger_to_tick(target_price, price_tick, direction, "TARGET")
         if stop_price <= 0 or target_price <= 0:
@@ -564,7 +630,26 @@ def run_backtest_rsi_ema(
         if expected_stop_loss <= 0 or expected_target_profit <= 0:
             continue
         actual_fill_rr = expected_target_profit / expected_stop_loss
-        signal_rr = cfg.net_take_profit_usd / cfg.requested_stop_loss_usd
+        # Signal RR and actual-fill RR use the same cost model but different entry bases:
+        # signal close for the first, next completed candle open for the second. Funding is
+        # excluded from planned RR because future settlement/hold duration is not yet known.
+        signal_entry = signal_bar.close
+        signal_fill = signal_entry * (1.0 + slip if direction == "LONG" else 1.0 - slip)
+        signal_stop_result = _net_exit_pnl(
+            direction=direction, ref_entry=signal_entry, entry_fill=signal_fill,
+            exit_ref=stop_price, quantity_units=quantity_units, fee_rate=contract_fee_rate,
+            slippage_rate=slip,
+        )
+        signal_target_result = _net_exit_pnl(
+            direction=direction, ref_entry=signal_entry, entry_fill=signal_fill,
+            exit_ref=target_price, quantity_units=quantity_units, fee_rate=contract_fee_rate,
+            slippage_rate=slip,
+        )
+        signal_risk = abs(min(0.0, signal_stop_result["net_pnl"]))
+        signal_reward = max(0.0, signal_target_result["net_pnl"])
+        signal_rr = signal_reward / signal_risk if signal_risk > 0 else 0.0
+        if cfg.target_mode == "atr" and actual_fill_rr < cfg.min_net_reward_risk:
+            continue
 
         bars: list[Candle] = context["bars"]
         fair_map = fair_by_symbol.get(symbol, {})
@@ -596,6 +681,20 @@ def run_backtest_rsi_ema(
                 quantity_units=quantity_units, fair_price_bars=trade_funding_prices,
             )
             wallet_at_bar = wallet_after_entry_fee - funding_to_bar
+            # Mark-to-market drawdown uses the adverse 3M OHLC extreme and a modeled
+            # market-close exit cost. This is deliberately conservative because the
+            # 3M candle does not reveal the exact intrabar path.
+            adverse_mark_price = future.low if direction == "LONG" else future.high
+            adverse_mark = _net_exit_pnl(
+                direction=direction, ref_entry=reference_entry, entry_fill=entry_fill,
+                exit_ref=adverse_mark_price, quantity_units=quantity_units,
+                fee_rate=contract_fee_rate, slippage_rate=slip,
+                funding_cost=funding_to_bar,
+            )
+            adverse_equity = max(0.0, equity + adverse_mark["net_pnl"])
+            adverse_drawdown = ((peak_equity - adverse_equity) / peak_equity * 100.0
+                                if peak_equity > 0 else 100.0)
+            max_drawdown_pct = max(max_drawdown_pct, adverse_drawdown)
             current_liquidation_price = _cross_liquidation_price(
                 direction=direction, entry_price=entry_fill, unit_quantity=quantity_units,
                 wallet_balance=wallet_at_bar, maintenance_rate=maintenance_rate,
@@ -614,30 +713,101 @@ def run_backtest_rsi_ema(
                 exit_time, exit_bar = future.close_time, future
                 break
 
-            # Stop gaps receive the candle open (worse execution); otherwise SL has precedence
-            # over TP when OHLC cannot reveal intrabar ordering.
-            if direction == "LONG":
-                if future.open <= stop_price:
-                    exit_reason, exit_reference = "STOP_LOSS_GAP", future.open
-                elif future.low <= stop_price:
-                    exit_reason, exit_reference = "STOP_LOSS", stop_price
-                elif future.high >= target_price:
-                    exit_reason, exit_reference = "TAKE_PROFIT", target_price
+            # Prefer constituent 1M bars for TP/SL ordering. If those bars are not
+            # complete/contiguous, fall back to conservative 3M SL-first handling.
+            micro_by_time = intrabar_by_symbol.get(symbol, {})
+            micro_bars = [micro_by_time.get(future.open_time + offset * 60) for offset in range(3)]
+            use_micro = all(bar is not None for bar in micro_bars)
+            if use_micro:
+                for micro in micro_bars:
+                    assert micro is not None
+                    if direction == "LONG":
+                        if micro.open <= stop_price:
+                            exit_reason, exit_reference = "STOP_LOSS_GAP", micro.open
+                        elif micro.open >= target_price:
+                            exit_reason, exit_reference = "TAKE_PROFIT_GAP", target_price
+                        else:
+                            hit_stop = micro.low <= stop_price
+                            hit_target = micro.high >= target_price
+                            if hit_stop and hit_target:
+                                exit_reason, exit_reference = "STOP_LOSS_AMBIGUOUS_1M", stop_price
+                                same_minute_ambiguities += 1
+                            elif hit_stop:
+                                exit_reason, exit_reference = "STOP_LOSS", stop_price
+                            elif hit_target:
+                                exit_reason, exit_reference = "TAKE_PROFIT", target_price
+                    else:
+                        if micro.open >= stop_price:
+                            exit_reason, exit_reference = "STOP_LOSS_GAP", micro.open
+                        elif micro.open <= target_price:
+                            exit_reason, exit_reference = "TAKE_PROFIT_GAP", target_price
+                        else:
+                            hit_stop = micro.high >= stop_price
+                            hit_target = micro.low <= target_price
+                            if hit_stop and hit_target:
+                                exit_reason, exit_reference = "STOP_LOSS_AMBIGUOUS_1M", stop_price
+                                same_minute_ambiguities += 1
+                            elif hit_stop:
+                                exit_reason, exit_reference = "STOP_LOSS", stop_price
+                            elif hit_target:
+                                exit_reason, exit_reference = "TAKE_PROFIT", target_price
+                    if exit_reason:
+                        exit_time, exit_bar = micro.close_time, future
+                        break
             else:
-                if future.open >= stop_price:
-                    exit_reason, exit_reference = "STOP_LOSS_GAP", future.open
-                elif future.high >= stop_price:
-                    exit_reason, exit_reference = "STOP_LOSS", stop_price
-                elif future.low <= target_price:
-                    exit_reason, exit_reference = "TAKE_PROFIT", target_price
+                if direction == "LONG":
+                    if future.open <= stop_price:
+                        exit_reason, exit_reference = "STOP_LOSS_GAP", future.open
+                    elif future.open >= target_price:
+                        exit_reason, exit_reference = "TAKE_PROFIT_GAP", target_price
+                    else:
+                        hit_stop = future.low <= stop_price
+                        hit_target = future.high >= target_price
+                        if hit_stop and hit_target:
+                            exit_reason, exit_reference = "STOP_LOSS_AMBIGUOUS_3M", stop_price
+                            same_bar_ambiguities += 1
+                        elif hit_stop:
+                            exit_reason, exit_reference = "STOP_LOSS", stop_price
+                        elif hit_target:
+                            exit_reason, exit_reference = "TAKE_PROFIT", target_price
+                else:
+                    if future.open >= stop_price:
+                        exit_reason, exit_reference = "STOP_LOSS_GAP", future.open
+                    elif future.open <= target_price:
+                        exit_reason, exit_reference = "TAKE_PROFIT_GAP", target_price
+                    else:
+                        hit_stop = future.high >= stop_price
+                        hit_target = future.low <= target_price
+                        if hit_stop and hit_target:
+                            exit_reason, exit_reference = "STOP_LOSS_AMBIGUOUS_3M", stop_price
+                            same_bar_ambiguities += 1
+                        elif hit_stop:
+                            exit_reason, exit_reference = "STOP_LOSS", stop_price
+                        elif hit_target:
+                            exit_reason, exit_reference = "TAKE_PROFIT", target_price
+                if exit_reason:
+                    exit_time, exit_bar = future.close_time, future
             if exit_reason:
-                exit_time, exit_bar = future.close_time, future
                 break
 
             if future.close_time - entry_time >= cfg.max_holding_minutes * 60:
                 exit_reason, exit_reference = "EXPIRED", future.close
                 exit_time, exit_bar = future.close_time, future
                 break
+
+            # Record the close-to-close mark while the position remains open.
+            close_mark = _net_exit_pnl(
+                direction=direction, ref_entry=reference_entry, entry_fill=entry_fill,
+                exit_ref=future.close, quantity_units=quantity_units,
+                fee_rate=contract_fee_rate, slippage_rate=slip,
+                funding_cost=funding_to_bar,
+            )
+            close_equity = max(0.0, equity + close_mark["net_pnl"])
+            peak_equity = max(peak_equity, close_equity)
+            close_drawdown = ((peak_equity - close_equity) / peak_equity * 100.0
+                              if peak_equity > 0 else 100.0)
+            max_drawdown_pct = max(max_drawdown_pct, close_drawdown)
+            equity_curve.append({"timestamp": future.close_time, "equity": close_equity})
 
         # Define 1R as the full modeled net loss if the planned stop executes,
         # including entry/exit taker fees and both-side slippage.
@@ -667,7 +837,15 @@ def run_backtest_rsi_ema(
                 ),
             )
             unrealised_total += mark["net_pnl"]
+            gross_total += mark["gross_pnl"]
+            fees_total += mark["fees"]
+            slippage_total += mark["slippage_cost"]
+            funding_total += mark["funding_cost"]
             unresolved_count += 1
+            mark_equity = equity + mark["net_pnl"]
+            peak_equity = max(peak_equity, mark_equity)
+            mark_dd = (peak_equity - mark_equity) / peak_equity * 100.0 if peak_equity > 0 else 100.0
+            max_drawdown_pct = max(max_drawdown_pct, mark_dd)
             ledger.append({
                 "symbol": symbol, "direction": direction, "signal_time": signal_bar.close_time,
                 "entry_time": entry_time, "exit_time": None, "signal_reason": ";".join(context["signal"]["reason"]),
@@ -765,7 +943,7 @@ def run_backtest_rsi_ema(
         peak_r = max(peak_r, cumulative_r)
         max_drawdown_r = max(max_drawdown_r, peak_r - cumulative_r)
 
-    tps = [trade for trade in resolved if trade["exit_reason"] == "TAKE_PROFIT"]
+    tps = [trade for trade in resolved if str(trade["exit_reason"]).startswith("TAKE_PROFIT")]
     sls = [trade for trade in resolved if str(trade["exit_reason"]).startswith("STOP_LOSS")]
     signal_rr_values = [float(trade["signal_rr"]) for trade in ledger]
     actual_rr_values = [float(trade["actual_fill_rr"]) for trade in ledger]
@@ -816,6 +994,8 @@ def run_backtest_rsi_ema(
         "long_stop_losses": sum(trade["direction"] == "LONG" for trade in sls),
         "short_stop_losses": sum(trade["direction"] == "SHORT" for trade in sls),
         "expired_exits": expiries, "liquidation_exits": liquidations,
+        "same_bar_tp_sl_ambiguities_3m": same_bar_ambiguities,
+        "same_bar_tp_sl_ambiguities_1m": same_minute_ambiguities,
         "end_of_window_unresolved": unresolved_count,
         "avg_signal_rr": sum(signal_rr_values) / len(signal_rr_values) if signal_rr_values else None,
         "avg_actual_fill_rr": sum(actual_rr_values) / len(actual_rr_values) if actual_rr_values else None,
@@ -835,8 +1015,11 @@ def run_backtest_rsi_ema(
         "limit_entries": sum(trade.get("entry_mode") == "LIMIT" for trade in ledger),
         "gross_pnl": gross_total, "trading_fees": fees_total, "funding_costs": funding_total,
         "estimated_slippage_cost": slippage_total, "liquidation_fees": liquidation_fees_total,
-        "max_drawdown_pct": max_drawdown_pct, "peak_margin_used": peak_margin_used,
-        "margin_mode": cfg.margin_mode, "max_concurrent_positions": 1 if ledger else 0,
+        "max_drawdown_pct": max_drawdown_pct, "drawdown_basis": "mark-to-market using adverse 3M OHLC extreme and completed 3M closes; intrabar path unknown",
+        "peak_margin_used": peak_margin_used,
+        "margin_mode": cfg.margin_mode, "max_concurrent_positions": cfg.max_positions,
+        "observed_max_concurrent_positions": 1 if ledger else 0,
+        "target_mode": cfg.target_mode, "risk_per_trade_fraction": cfg.risk_per_trade_fraction,
         "average_holding_minutes": (
             sum(float(trade["holding_minutes"]) for trade in resolved) / len(resolved) if resolved else None
         ),
@@ -845,7 +1028,7 @@ def run_backtest_rsi_ema(
             "symbols_with_bars": sorted(eligible),
             "bar_counts": {symbol: len(bars) for symbol, bars in eligible.items()},
             "warmup_bars_used": {symbol: max(0, len(warmup[symbol]) - len(eligible[symbol])) for symbol in eligible},
-            "expected_completed_3m_bars_per_symbol": max(0, int((now_epoch - close_grace_seconds - cutoff) // 180)),
+            "expected_completed_3m_bars_per_symbol": _expected_completed_bar_count(cutoff, now_epoch - close_grace_seconds, 180),
             "first_completed_bar_by_symbol": {symbol: bars[0].close_time for symbol, bars in eligible.items()},
             "last_completed_bar_by_symbol": {symbol: bars[-1].close_time for symbol, bars in eligible.items()},
             "historical_funding_events_supplied": funding_events is not None,
@@ -862,12 +1045,14 @@ def run_backtest_rsi_ema(
             "liquidation_trigger_source": "MEXC fair-price OHLC when supplied; no liquidation inference for symbols without it",
             "limitations": [
                 "Synthetic market fills; no exchange order-book replay or confirmed fills.",
+            "Candidate ATR sizing uses risk budget from current equity capped by configured initial margin and leverage; actual MEXC fills are not replayed.",
                 "Cross-margin equation assumes this backtest holds at most one bot position at a time, has no other account positions and has no open order margins or isolated positions.",
                 "MEXC liquidation is triggered by Fair Price; liquidation checks are disabled where historical fair-price bars are unavailable.",
                 "Risk tiers use published INCREASE/CUSTOM metadata when complete; symbols without tier metadata fall back to base MMR and are flagged.",
                 "Missing contract taker/liquidation fee fields use configured fallbacks; dynamic/tiered fee modes may differ from account-specific fees.",
-                "Intrabar stop/target order is unknown from OHLC; stop loss is prioritized over take profit.",
+                "Constituent 1M bars resolve 3M TP/SL ordering where supplied; if the same 1M bar touches both, stop loss is assumed first. Without 1M source bars, 3M ambiguity is resolved stop-first and counted.",
                 "Positive funding rates are charged to LONG and credited to SHORT; missing settlement history is excluded and flagged.",
+                "Planned signal/fill RR uses fees and slippage but excludes future funding; realized P&L includes funding only when complete historical settlements are supplied.",
             ],
         },
         "assumptions": {
@@ -879,10 +1064,35 @@ def run_backtest_rsi_ema(
             "max_concurrent_positions": cfg.max_positions,
             "one_r_definition": "net planned stop loss including contract taker fees, entry/exit slippage and price-tick rounding",
             "requested_stop_loss_is_net_usdt": True,
+            "planned_rr_basis": "net of modeled entry/exit fees and slippage; funding excluded until actual settlement events are known",
             "actual_live_orders": False,
         },
     }
+    _assert_backtest_reconciliation(report)
     return report
+
+
+def _assert_backtest_reconciliation(report: Mapping[str, Any]) -> None:
+    """Fail closed when trade/signal/equity counters do not reconcile exactly."""
+    ledger = list(report.get("trade_ledger", []))
+    resolved = [trade for trade in ledger if trade.get("exit_reason") != "OPEN_UNRESOLVED"]
+    opened = len(ledger)
+    checks = {
+        "signals_direction_sum": int(report.get("signals", 0)) == int(report.get("long_signals", 0)) + int(report.get("short_signals", 0)),
+        "entered_matches_ledger": int(report.get("signals_entered", 0)) == opened == int(report.get("trades_opened", 0)),
+        "entered_outcomes_reconcile": opened == len(resolved) + int(report.get("open_unresolved", 0)),
+        "resolved_count_reconciles": int(report.get("resolved", 0)) == len(resolved),
+        "unentered_reconciles": int(report.get("signals", 0)) == opened + int(report.get("unfilled_signals", 0)),
+        "blocked_and_other_reconcile": int(report.get("unfilled_signals", 0)) == int(report.get("blocked_signals_due_to_open_position", 0)) + int(report.get("other_unentered_signals", 0)),
+        "total_r_reconciles": abs(float(report.get("total_r", 0.0)) - sum(float(t.get("realized_r") or 0.0) for t in resolved)) <= 1e-8,
+        "ending_equity_reconciles": abs(float(report.get("ending_equity", 0.0)) - (float(report.get("starting_equity", 0.0)) + float(report.get("net_profit", 0.0)))) <= 1e-8,
+        "net_profit_reconciles": abs(float(report.get("net_profit", 0.0)) - (float(report.get("realized_net_profit", 0.0)) + float(report.get("unrealized_pnl_at_end", 0.0)))) <= 1e-8,
+        "liquidations_match_ledger": int(report.get("liquidation_exits", 0)) == sum(t.get("exit_reason") == "LIQUIDATION" for t in resolved),
+        "tp_sl_reconcile": int(report.get("take_profit_exits", 0)) + int(report.get("stop_loss_exits", 0)) <= len(resolved),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise ArithmeticError("BACKTEST RECONCILIATION FAILED: " + ", ".join(failed))
 
 
 def _per_symbol(ledger: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -947,6 +1157,7 @@ def format_backtest_whatsapp(report: Mapping[str, Any], *, elapsed_seconds: floa
         f"   🔴 SHORT Trade SLs: {report['short_stop_losses']}",
         f"⌛ Expired: {report['expired_exits']}",
         f"⚠️ Liquidations: {report['liquidation_exits']}",
+        f"🔀 TP/SL same-bar ambiguity: 1M {report.get('same_bar_tp_sl_ambiguities_1m', 0)} · 3M fallback {report.get('same_bar_tp_sl_ambiguities_3m', 0)}",
         "",
         f"📈 Win Rate: {pct(report['win_rate_pct'])}",
         f"⚖️ Avg Signal RR: {ratio(report['avg_signal_rr'])}",
@@ -955,7 +1166,7 @@ def format_backtest_whatsapp(report: Mapping[str, Any], *, elapsed_seconds: floa
         f"💰 Total R: {r_value(report['total_r'])}",
         f"📊 Expectancy: {r_value(report['expectancy_r_per_trade'])}/trade" if report['expectancy_r_per_trade'] is not None else "📊 Expectancy: n/a",
         f"📐 Profit Factor: {ratio(report['profit_factor'])}",
-        f"📉 Max Drawdown: {r_plain(report['max_drawdown_r'])}",
+        f"📉 Max Drawdown: {r_plain(report['max_drawdown_r'])} · {float(report.get('max_drawdown_pct', 0.0)):.2f}%",
         f"📉 Max Losing Streak: {report['max_losing_streak']}",
         f"🧭 Avg MAE / MFE: {r_plain(report['avg_mae_r'])} / {r_plain(report['avg_mfe_r'])}",
         f"⚙️ Entry Mode: MARKET {report['market_entries']} / LIMIT {report['limit_entries']}",

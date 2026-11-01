@@ -1,4 +1,4 @@
-"""Standalone worker for the top-100 MEXC 3-minute RSI/EMA research scanner.
+"""Standalone worker for the top-100 MEXC 3-minute MTF research scanner.
 
 The worker runs ResearchScheduler, which can scan active USDT perpetuals once
 per completed 3-minute slot. Legacy paper-position processing is separate and
@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.config import load_settings
+from app.market.archive import CandleArchive
+from app.services.command_processor import CommandProcessor
 from app.version import APP_VERSION
 from app.mexc.client import MexcClient
 from app.services.scheduler import ResearchScheduler
@@ -114,6 +116,10 @@ async def _run() -> None:
         raise RuntimeError(
             "Another research worker holds the database advisory lock; refusing duplicate workers"
         )
+    recovered_jobs = store.requeue_interrupted_backtest_jobs()
+    if recovered_jobs:
+        logger.warning("BACKTEST JOB RECOVERY | requeued_interrupted_jobs=%d", recovered_jobs)
+    store.set_state("worker_last_start_utc", datetime.now(timezone.utc).isoformat())
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -136,13 +142,21 @@ async def _run() -> None:
             max_retries=settings.http_max_retries,
         )
         whatsapp = WhatsAppCloud(settings)
-        scheduler = ResearchScheduler(settings, store, mexc, whatsapp)
+        # One archive instance is shared by scanner and backtest jobs in this worker.
+        archive = CandleArchive(settings.market_data_dir)
+        backtest_processor = CommandProcessor(
+            settings, store, mexc, whatsapp, backtest_inline=True, archive=archive,
+        )
+        scheduler = ResearchScheduler(
+            settings, store, mexc, whatsapp, backtest_processor=backtest_processor, archive=archive,
+        )
         store.set_state("worker_status", "starting")
         logger.info(
-            "MEXC research worker starting | build=%s | universe=top-%d | strategy=3M-RSI-EMA | auto_scan=%s | paper=%s | live_execution=false",
+            "MEXC research worker starting | build=%s | universe=top-%d | strategy=3M-MTF-TPR | auto_scan=%s | archive=%s | paper=%s | live_execution=false",
             APP_VERSION,
             settings.mexc_universe_top_n,
             settings.mexc_universe_scan_enabled,
+            settings.market_data_dir,
             settings.paper_trading_enabled,
         )
         # This is a dedicated Render worker. SCHEDULER_ENABLED controls only the web
@@ -193,6 +207,9 @@ async def _run() -> None:
 
 
 def main() -> None:
+    # Render attaches the durable market archive disk to this worker only.
+    import os
+    os.environ["APP_ROLE"] = "worker"
     asyncio.run(_run())
 
 

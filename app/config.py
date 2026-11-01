@@ -55,6 +55,20 @@ class Settings:
     default_symbols: tuple[str, ...]
     mexc_universe_top_n: int
     mexc_universe_scan_enabled: bool
+    market_data_dir: Path
+    signal_push_enabled: bool
+    signal_ttl_bars: int
+    signal_min_score: float
+    signal_push_min_score: float
+    candidate_stop_atr_multiple: float
+    candidate_target_atr_multiple: float
+    candidate_min_net_rr: float
+    mtf_htf_warmup_bars: int
+    live_max_spread_atr_fraction: float
+    live_min_orderbook_depth_usdt: float
+    max_adverse_funding_rate: float
+    backtest_min_coverage_pct: float
+    backtest_min_universe_coverage_pct: float
     strategy_version: str
     risk_per_trade_fraction: float
     max_open_risk_fraction: float
@@ -131,11 +145,17 @@ def load_settings() -> Settings:
     if not stresses or any(x < 1 or not (x == x and abs(x) != float("inf")) for x in stresses):
         raise ValueError("Cost stress multipliers must be finite numbers >= 1")
 
+    app_role = os.getenv("APP_ROLE", "web").strip().lower()
+    if app_role not in {"web", "worker"}:
+        raise ValueError("APP_ROLE must be web or worker")
+    # Render's persistent disk is attached only to the background worker. The web
+    # service must never try to create or write into the worker-only /var/data mount.
+    default_data_root = Path("/var/data") if app_role == "worker" else Path("./data")
     settings = Settings(
         app_env=os.getenv("APP_ENV", "development"),
         database_path=Path(os.getenv("DATABASE_PATH", "./data/mexc_bot.sqlite3")),
         database_url=os.getenv("DATABASE_URL", "").strip(),
-        reports_dir=Path(os.getenv("REPORTS_DIR", "./reports")),
+        reports_dir=Path(os.getenv("REPORTS_DIR", str(default_data_root / "reports"))),
         mexc_rest_base_url=base_url,
         mexc_price_series=os.getenv("MEXC_PRICE_SERIES", "standard").strip().lower(),
         http_timeout_seconds=_float("HTTP_TIMEOUT_SECONDS", 12.0),
@@ -151,7 +171,21 @@ def load_settings() -> Settings:
         default_symbols=symbols,
         mexc_universe_top_n=_int("MEXC_UNIVERSE_TOP_N", 100),
         mexc_universe_scan_enabled=_bool("MEXC_UNIVERSE_SCAN_ENABLED", False),
-        strategy_version=os.getenv("STRATEGY_VERSION", "RSI-EMA-3M-LONG-SHORT-CROSS-v2"),
+        market_data_dir=Path(os.getenv("MARKET_DATA_DIR", str(default_data_root / "market"))),
+        signal_push_enabled=_bool("SIGNAL_PUSH_ENABLED", False),
+        signal_ttl_bars=_int("SIGNAL_TTL_BARS", 2),
+        signal_min_score=_float("SIGNAL_MIN_SCORE", 65.0),
+        signal_push_min_score=_float("SIGNAL_PUSH_MIN_SCORE", 80.0),
+        candidate_stop_atr_multiple=_float("CANDIDATE_STOP_ATR_MULTIPLE", 1.5),
+        candidate_target_atr_multiple=_float("CANDIDATE_TARGET_ATR_MULTIPLE", 2.5),
+        candidate_min_net_rr=_float("CANDIDATE_MIN_NET_RR", 1.2),
+        mtf_htf_warmup_bars=_int("MTF_HTF_WARMUP_BARS", 250),
+        live_max_spread_atr_fraction=_float("LIVE_MAX_SPREAD_ATR_FRACTION", 0.10),
+        live_min_orderbook_depth_usdt=_float("LIVE_MIN_ORDERBOOK_DEPTH_USDT", 250.0),
+        max_adverse_funding_rate=_float("MAX_ADVERSE_FUNDING_RATE", 0.0005),
+        backtest_min_coverage_pct=_float("BACKTEST_MIN_COVERAGE_PCT", 98.0),
+        backtest_min_universe_coverage_pct=_float("BACKTEST_MIN_UNIVERSE_COVERAGE_PCT", 90.0),
+        strategy_version=os.getenv("STRATEGY_VERSION", "RSI-EMA-3M-CONTROL-v3"),
         risk_per_trade_fraction=_float("RISK_PER_TRADE_FRACTION", 0.005),
         max_open_risk_fraction=_float("MAX_OPEN_RISK_FRACTION", 0.02),
         max_drawdown_fraction=_float("MAX_DRAWDOWN_FRACTION", 0.10),
@@ -206,6 +240,10 @@ def load_settings() -> Settings:
         raise ValueError("Fixed payout TP/SL price distances must be positive percentages")
     if settings.default_starting_balance <= 0 or settings.initial_margin_usdt <= 0:
         raise ValueError("DEFAULT_STARTING_BALANCE and INITIAL_MARGIN_USDT must be positive")
+    if settings.initial_margin_usdt > settings.default_starting_balance:
+        raise ValueError("INITIAL_MARGIN_USDT cannot exceed DEFAULT_STARTING_BALANCE")
+    if settings.max_concurrent_positions != 1:
+        raise ValueError("MAX_CONCURRENT_POSITIONS is currently fixed at 1 until portfolio multi-position modeling is implemented")
     if not 1 <= settings.max_leverage <= 50:
         raise ValueError("MAX_LEVERAGE must be between 1 and 50")
     if settings.net_take_profit_usdt <= 0 or settings.requested_stop_loss_usdt <= 0:
@@ -224,4 +262,20 @@ def load_settings() -> Settings:
         raise ValueError("Fee rates cannot be negative")
     if not 1 <= settings.mexc_universe_top_n <= 100:
         raise ValueError("MEXC_UNIVERSE_TOP_N must be between 1 and 100")
+    if settings.signal_ttl_bars < 1 or not 0 <= settings.signal_min_score <= settings.signal_push_min_score <= 100:
+        raise ValueError("Signal TTL/score thresholds are invalid")
+    if settings.candidate_stop_atr_multiple <= 0 or settings.candidate_target_atr_multiple <= 0 or settings.candidate_min_net_rr <= 0:
+        raise ValueError("Candidate ATR and net-RR settings must be positive")
+    if not 50 <= settings.mtf_htf_warmup_bars <= 1000:
+        raise ValueError("MTF_HTF_WARMUP_BARS must be between 50 and 1000")
+    if not 0 < settings.live_max_spread_atr_fraction <= 1:
+        raise ValueError("LIVE_MAX_SPREAD_ATR_FRACTION must be in (0, 1]")
+    if settings.live_min_orderbook_depth_usdt < 0 or settings.max_adverse_funding_rate < 0:
+        raise ValueError("Liquidity/funding gates cannot be negative")
+    if not 50 <= settings.backtest_min_coverage_pct <= 100:
+        raise ValueError("BACKTEST_MIN_COVERAGE_PCT must be between 50 and 100")
+    if not 50 <= settings.backtest_min_universe_coverage_pct <= 100:
+        raise ValueError("BACKTEST_MIN_UNIVERSE_COVERAGE_PCT must be between 50 and 100")
+    if settings.app_env.lower() == "production" and not settings.database_url:
+        raise ValueError("DATABASE_URL is required in production; local SQLite is not shared across Render services")
     return settings

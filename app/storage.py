@@ -112,7 +112,7 @@ class Store:
                   id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
                   category TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL,
                   created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-                  attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, delivered_at TEXT, provider_message_id TEXT
+                  attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, delivered_at TEXT, provider_message_id TEXT, expires_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, created_at);
 
@@ -151,11 +151,33 @@ class Store:
                   config_json TEXT NOT NULL, result_json TEXT, status TEXT NOT NULL,
                   error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS signals (
+                  id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                  symbol TEXT NOT NULL, direction TEXT NOT NULL, candle_close_time INTEGER NOT NULL,
+                  expires_at INTEGER NOT NULL, score REAL NOT NULL, strategy_version TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'active', payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL, invalidation_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_signals_active ON signals(status, expires_at, score);
+
+                CREATE TABLE IF NOT EXISTS backtest_jobs (
+                  id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                  recipient TEXT NOT NULL, args_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'queued', worker_id TEXT,
+                  started_at TEXT, finished_at TEXT, result_json TEXT, error TEXT,
+                  progress_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_backtest_jobs_status ON backtest_jobs(status, created_at);
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(outbox)").fetchall()}
             if "provider_message_id" not in columns:
                 conn.execute("ALTER TABLE outbox ADD COLUMN provider_message_id TEXT")
+            if "expires_at" not in columns:
+                conn.execute("ALTER TABLE outbox ADD COLUMN expires_at TEXT")
+            job_columns = {row[1] for row in conn.execute("PRAGMA table_info(backtest_jobs)").fetchall()}
+            if "progress_json" not in job_columns:
+                conn.execute("ALTER TABLE backtest_jobs ADD COLUMN progress_json TEXT")
             conn.commit()
 
     def _initialize_postgres(self) -> None:
@@ -164,7 +186,7 @@ class Store:
             "CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
             "CREATE TABLE IF NOT EXISTS inbox (message_id TEXT PRIMARY KEY, sender TEXT NOT NULL, body TEXT, received_at TEXT NOT NULL, payload_json TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0, process_note TEXT)",
-            "CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, category TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, delivered_at TEXT, provider_message_id TEXT)",
+            "CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, category TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, delivered_at TEXT, provider_message_id TEXT, expires_at TEXT)",
             "CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, created_at)",
             "CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, kind TEXT NOT NULL, params_json TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, last_state_json TEXT, last_trigger_at TEXT, last_trigger_key TEXT)",
             "CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(active, symbol)",
@@ -174,7 +196,13 @@ class Store:
             "CREATE INDEX IF NOT EXISTS idx_paper_intents_status ON paper_intents(status, expected_entry_time)",
             "CREATE TABLE IF NOT EXISTS app_state (state_key TEXT PRIMARY KEY, state_value TEXT NOT NULL, updated_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS research_runs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, mode TEXT NOT NULL, config_json TEXT NOT NULL, result_json TEXT, status TEXT NOT NULL, error TEXT)",
+            "CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL, direction TEXT NOT NULL, candle_close_time BIGINT NOT NULL, expires_at BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL, strategy_version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, invalidation_reason TEXT)",
+            "CREATE INDEX IF NOT EXISTS idx_signals_active ON signals(status, expires_at, score)",
+            "CREATE TABLE IF NOT EXISTS backtest_jobs (id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, recipient TEXT NOT NULL, args_json TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', worker_id TEXT, started_at TEXT, finished_at TEXT, result_json TEXT, error TEXT, progress_json TEXT)",
+            "CREATE INDEX IF NOT EXISTS idx_backtest_jobs_status ON backtest_jobs(status, created_at)",
+            "ALTER TABLE backtest_jobs ADD COLUMN IF NOT EXISTS progress_json TEXT",
             "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS provider_message_id TEXT",
+            "ALTER TABLE outbox ADD COLUMN IF NOT EXISTS expires_at TEXT",
         ]
         with self.connection() as conn:
             for statement in statements:
@@ -235,7 +263,8 @@ class Store:
             conn.execute("UPDATE inbox SET processed=1, process_note=? WHERE message_id=?", (note[:500], message_id))
 
     def enqueue_outbox(
-        self, recipient: str, body: str, *, category: str = "service", idempotency_key: str
+        self, recipient: str, body: str, *, category: str = "service", idempotency_key: str,
+        expires_at: str | None = None,
     ) -> str:
         outbox_id = str(uuid.uuid4())
         with self.connection() as conn:
@@ -243,15 +272,18 @@ class Store:
             if row:
                 return str(row["id"])
             conn.execute(
-                "INSERT INTO outbox(id,idempotency_key,category,recipient,body,created_at,status) VALUES(?,?,?,?,?,?, 'pending')",
-                (outbox_id, idempotency_key, category, recipient, body, utc_now_iso()),
+                "INSERT INTO outbox(id,idempotency_key,category,recipient,body,created_at,status,expires_at) VALUES(?,?,?,?,?,?, 'pending', ?)",
+                (outbox_id, idempotency_key, category, recipient, body, utc_now_iso(), expires_at),
             )
         return outbox_id
 
     def pending_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        now = utc_now_iso()
         with self.connection() as conn:
+            conn.execute("UPDATE outbox SET status='expired', last_error='signal TTL elapsed' WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<=?", (now,))
             rows = conn.execute(
-                "SELECT * FROM outbox WHERE status='pending' ORDER BY created_at LIMIT ?", (min(max(limit, 1), 500),)
+                "SELECT * FROM outbox WHERE status='pending' AND (expires_at IS NULL OR expires_at>?) ORDER BY created_at LIMIT ?",
+                (now, min(max(limit, 1), 500)),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -405,6 +437,182 @@ class Store:
         with self.connection() as conn:
             cur = conn.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
             return cur.rowcount == 1
+
+    def save_signal(self, payload: Mapping[str, Any], *, strategy_version: str) -> str:
+        """Persist a signal once per symbol/direction/candle/strategy version."""
+        symbol = str(payload["symbol"]).upper()
+        direction = str(payload["direction"]).upper()
+        candle_time = int(payload["timestamp"])
+        expires_at = int(payload["expires_at"])
+        score = float(payload.get("score", 0.0))
+        key = f"{symbol}:{direction}:{candle_time}:{strategy_version}"
+        signal_id = str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT INTO signals(id,idempotency_key,symbol,direction,candle_close_time,expires_at,score,strategy_version,status,payload_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,'active',?,?,?) ON CONFLICT(idempotency_key) DO NOTHING",
+                (signal_id, key, symbol, direction, candle_time, expires_at, score, strategy_version,
+                 canonical_json(dict(payload)), now, now),
+            )
+            row = conn.execute("SELECT id FROM signals WHERE idempotency_key=?", (key,)).fetchone()
+        return str(row["id"]) if row else signal_id
+
+    def active_signals(self, *, now_epoch: int, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE signals SET status='expired',updated_at=? WHERE status='active' AND expires_at<=?",
+                (utc_now_iso(), int(now_epoch)),
+            )
+            rows = conn.execute(
+                "SELECT * FROM signals WHERE status='active' AND expires_at>? ORDER BY score DESC,candle_close_time DESC LIMIT ?",
+                (int(now_epoch), min(max(int(limit), 1), 200)),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def update_signal_status(self, signal_id: str, *, status: str, reason: str | None = None) -> bool:
+        allowed = {"active", "expired", "invalidated", "triggered", "closed"}
+        if status not in allowed:
+            raise ValueError("Invalid signal lifecycle status")
+        with self.connection() as conn:
+            cur = conn.execute(
+                "UPDATE signals SET status=?,invalidation_reason=?,updated_at=? WHERE id=? AND status='active'",
+                (status, (reason or "")[:300] or None, utc_now_iso(), signal_id),
+            )
+            return cur.rowcount == 1
+
+    def enqueue_backtest_job(self, recipient: str, args: Mapping[str, Any], *, idempotency_key: str) -> str:
+        """Create a durable backtest job; repeated webhook delivery returns the same job ID."""
+        if not idempotency_key:
+            raise ValueError("Backtest job idempotency_key is required")
+        job_id = str(uuid.uuid4())
+        with self.connection() as conn:
+            # Insert-first + unique constraint is atomic across concurrent Postgres
+            # webhook retries. A SELECT-then-INSERT sequence can race and enqueue twice.
+            conn.execute(
+                "INSERT INTO backtest_jobs(id,idempotency_key,recipient,args_json,created_at,status) "
+                "VALUES(?,?,?,?,?,'queued') ON CONFLICT(idempotency_key) DO NOTHING",
+                (job_id, idempotency_key, recipient or "", canonical_json(dict(args)), utc_now_iso()),
+            )
+            existing = conn.execute(
+                "SELECT id FROM backtest_jobs WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+        if not existing:
+            raise StoreError("Backtest job insert was not persisted")
+        return str(existing["id"])
+
+    def claim_next_backtest_job(self, worker_id: str) -> dict[str, Any] | None:
+        """Atomically lease one queued job. Postgres uses row locking; SQLite uses IMMEDIATE."""
+        with self.connection() as conn:
+            if self.database_url:
+                row = conn.execute(
+                    "SELECT * FROM backtest_jobs WHERE status='queued' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                ).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    "UPDATE backtest_jobs SET status='running',worker_id=?,started_at=? WHERE id=? AND status='queued'",
+                    (worker_id, utc_now_iso(), row["id"]),
+                )
+            else:
+                row = conn.execute(
+                    "SELECT * FROM backtest_jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    return None
+                updated = conn.execute(
+                    "UPDATE backtest_jobs SET status='running',worker_id=?,started_at=? WHERE id=? AND status='queued'",
+                    (worker_id, utc_now_iso(), row["id"]),
+                )
+                if updated.rowcount != 1:
+                    return None
+            result = dict(row)
+            result["status"] = "running"
+            result["worker_id"] = worker_id
+            result["args"] = json.loads(result.pop("args_json"))
+            return result
+
+    def requeue_interrupted_backtest_jobs(self) -> int:
+        """Recover jobs left RUNNING after a worker crash/redeploy.
+
+        Call only after the single-worker PostgreSQL advisory lock has been acquired.
+        The worker is then the exclusive consumer, so no live job is stolen.
+        """
+        with self.connection() as conn:
+            cur = conn.execute(
+                "UPDATE backtest_jobs SET status='queued', worker_id=NULL, started_at=NULL, "
+                "error='Requeued after worker restart', progress_json=? WHERE status='running'",
+                (canonical_json({"stage": "recovered_after_restart", "recovered_at": utc_now_iso()}),),
+            )
+            return int(cur.rowcount)
+
+    def update_backtest_job_progress(self, job_id: str, progress: Mapping[str, Any]) -> bool:
+        """Persist bounded job progress without storing large intermediate market data."""
+        with self.connection() as conn:
+            cur = conn.execute(
+                "UPDATE backtest_jobs SET progress_json=? WHERE id=? AND status='running'",
+                (canonical_json(dict(progress)), job_id),
+            )
+            return cur.rowcount == 1
+
+    def finish_backtest_job(self, job_id: str, *, result: Mapping[str, Any] | None = None, error: str | None = None) -> None:
+        status = "failed" if error else "complete"
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE backtest_jobs SET status=?,finished_at=?,result_json=?,error=?,progress_json=? WHERE id=?",
+                (status, utc_now_iso(), canonical_json(dict(result)) if result is not None else None,
+                 (error or "")[:2000] or None,
+                 canonical_json({"stage": "failed" if error else "completed", "finished_at": utc_now_iso()}),
+                 job_id),
+            )
+
+    def get_backtest_job(self, job_id: str, *, recipient: str | None = None) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            if recipient:
+                row = conn.execute("SELECT * FROM backtest_jobs WHERE id=? AND recipient=?", (job_id, recipient)).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM backtest_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["args"] = json.loads(result.pop("args_json"))
+        if result.get("result_json"):
+            result["result"] = json.loads(result.pop("result_json"))
+        if result.get("progress_json"):
+            result["progress"] = json.loads(result.pop("progress_json"))
+        else:
+            result.pop("progress_json", None)
+        return result
+
+    def recent_backtest_jobs(self, limit: int = 10, *, recipient: str | None = None) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 100)
+        with self.connection() as conn:
+            if recipient:
+                rows = conn.execute(
+                    "SELECT * FROM backtest_jobs WHERE recipient=? ORDER BY created_at DESC LIMIT ?",
+                    (recipient, bounded),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM backtest_jobs ORDER BY created_at DESC LIMIT ?", (bounded,)).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["args"] = json.loads(item.pop("args_json"))
+            if item.get("result_json"):
+                item["result"] = json.loads(item.pop("result_json"))
+            else:
+                item.pop("result_json", None)
+            if item.get("progress_json"):
+                item["progress"] = json.loads(item.pop("progress_json"))
+            else:
+                item.pop("progress_json", None)
+            output.append(item)
+        return output
 
     def create_research_run(self, mode: str, config: Mapping[str, Any], run_id: str | None = None) -> str:
         run_id = run_id or str(uuid.uuid4())

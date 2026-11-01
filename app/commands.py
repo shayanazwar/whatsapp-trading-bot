@@ -38,30 +38,38 @@ def _symbol(value: str) -> str:
 
 
 def _parse_backtest(parts: list[str]) -> Command:
-    """Parse a 3-minute RSI/EMA backtest over the current top-turnover universe."""
+    """Parse a period-explicit research job with CONTROL/CANDIDATE/BOTH selection."""
     rest = [part.upper() for part in parts[1:]]
+    if len(rest) == 1 and rest[0] == "STATUS":
+        return Command("BACKTEST_STATUS", {})
+    if len(rest) == 2 and rest[0] == "REPORT":
+        job_id = rest[1].lower()
+        if not re.fullmatch(r"[A-F0-9-]{8,40}", job_id):
+            raise CommandError("BACKTEST REPORT requires a valid job ID")
+        return Command("BACKTEST_REPORT", {"job_id": job_id})
     if any(token in {"LEGACY", "FIXED", "FIXED_PAYOUT", "REALISTIC", "EXCHANGE_REALISTIC"} for token in rest):
-        raise CommandError("This release uses the 3M RSI/EMA backtest only; legacy modes are unavailable.")
+        raise CommandError("This release uses 3M RSI/EMA control and MTF-TPR candidate research only.")
     if any(token.startswith("TP=") for token in rest):
-        raise CommandError("3M RSI/EMA uses configured net TP/SL values; TP scenario overrides are not supported.")
+        raise CommandError("TP scenario overrides are not supported; use the configured control/candidate models.")
     clean = list(rest)
     windows = [token for token in clean if token in ALLOWED_BACKTEST_WINDOWS]
     if not windows:
         raise CommandError("Specify the backtest period explicitly: BACKTEST 1D or BACKTEST 7D")
     if len(windows) != 1:
         raise CommandError("Run one backtest period at a time: 1D, 7D, 30D, 60D or 90D")
-    symbols = [token for token in clean if token not in ALLOWED_BACKTEST_WINDOWS]
+    strategies = [token for token in clean if token in {"CONTROL", "CANDIDATE", "BOTH"}]
+    if len(strategies) > 1:
+        raise CommandError("Choose one strategy scope: CONTROL, CANDIDATE or BOTH")
+    strategy_scope = strategies[0].lower() if strategies else "both"
+    ignored = set(windows + strategies)
+    symbols = [token for token in clean if token not in ignored]
     if any(re.fullmatch(r"\d+[A-Z]+", token) for token in symbols):
         raise CommandError("Backtest period must be 1D, 7D, 30D, 60D or 90D")
     if len(symbols) > 1:
         raise CommandError("Use at most one symbol per backtest command")
-    if not symbols and windows and windows[0] not in {"1D", "7D"}:
-        raise CommandError(
-            "Top-100 3M backtests support 1D or 7D only. Add one symbol for longer periods, e.g. BACKTEST BTCUSDT 30D."
-        )
-    # Store one canonical scalar as well as the legacy list alias. The runner
-    # consumes `window` so a lost/empty list can never silently select a period.
-    args: dict[str, Any] = {"mode": "rsi_ema", "window": windows[0], "windows": windows}
+    if not symbols and windows[0] not in {"1D", "7D"}:
+        raise CommandError("Top-100 backtests support 1D/7D; use BACKTEST BTCUSDT 30D for longer single-symbol history.")
+    args: dict[str, Any] = {"mode": "research", "window": windows[0], "windows": windows, "strategy_scope": strategy_scope}
     if symbols:
         args["symbol"] = _symbol(symbols[0])
     return Command("BACKTEST", args)
@@ -183,12 +191,14 @@ SCAN — Top 100 active MEXC USDT perpetuals by 24H turnover
 SIGNALS — Latest 3M scan results
 SEARCH PEPE
 
-🧪 BACKTEST — 3M RSI/EMA
-BACKTEST 1D
-BACKTEST 7D
+🧪 BACKTEST — 3M RESEARCH
+BACKTEST 1D — Run CONTROL + CANDIDATE
+BACKTEST 7D — Run CONTROL + CANDIDATE
+BACKTEST CONTROL 7D
+BACKTEST CANDIDATE 7D
+BACKTEST STATUS
+BACKTEST REPORT <JOB_ID>
 BACKTEST BTCUSDT 30D — Single-symbol longer test
-BACKTEST BTCUSDT 60D
-BACKTEST BTCUSDT 90D
 
 🧪 PAPER (FAKE MONEY ONLY)
 PAPER
@@ -204,8 +214,8 @@ DELETE ALL
 STATUS • PERFORMANCE • PNL • RISK • COST
 AUTOTRADE STATUS • AUTOTRADE OFF • PAUSE
 
-Strategy: completed 3-minute candles · LONG and SHORT RSI/EMA momentum · EMA 21/50/100 alignment and crossover · prior-candle breakout/breakdown · relative-volume confirmation.
-BACKTEST: Cross-margin single-position research model by default, $100 starting wallet, $1 initial margin, 50x leverage cap, +$0.30 net TP, -$3.00 requested SL, 24-hour maximum holding period. Actual contract leverage and quantity limits apply.
+Strategy A CONTROL: completed 3-minute RSI/EMA momentum baseline. Strategy B CANDIDATE: 15-minute trend context + 3-minute pullback/reclaim, ATR-based exits and risk-derived size.
+BACKTEST: durable worker job; exact period coverage required. $100 wallet, maximum $1 initial margin, 0.5% candidate risk budget, max one simulated position, Cross Margin. Live orders OFF.
 Top universe: active USDT perpetuals ranked by 24H turnover. Live orders: OFF.
 """
 

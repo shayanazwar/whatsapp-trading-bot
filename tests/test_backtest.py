@@ -91,3 +91,76 @@ def test_ambiguous_exit_bar_charges_adverse_funding_but_not_favorable_funding():
 
     assert favorable.funding_pnl == 0.0
     assert adverse.funding_pnl < 0.0
+
+
+def test_backtest_config_allows_maximum_fifty_research_positions():
+    import pytest
+
+    cfg = BacktestConfig(mode="exchange_realistic", max_concurrent_positions=50,
+                         max_open_risk_fraction=0.25)
+    assert cfg.max_concurrent_positions == 50
+    with pytest.raises(ValueError, match="between 1 and 50"):
+        BacktestConfig(max_concurrent_positions=51)
+
+
+def test_exchange_backtest_opens_concurrent_positions_across_symbols(monkeypatch):
+    """Research portfolio may hold simultaneous symbol positions up to its configured cap."""
+    from app.strategy.rfpc import StrategyEvaluation, TradeCandidate, STRATEGY_VERSION
+
+    day_start = 1_704_067_200
+    end = day_start + 220 * 86400
+    symbols = ("AAA_USDT", "BBB_USDT")
+    series_by_symbol = {}
+    contract_specs = {}
+    for symbol in symbols:
+        daily = candles(symbol, "1D", day_start, 220, 86400, base=100, trend=0)
+        bars4 = candles(symbol, "4H", end - 180 * 14400, 180, 14400, base=100, trend=0)
+        bars1 = candles(symbol, "1H", end - 72 * 3600, 72, 3600, base=100, trend=0)
+        series_by_symbol[symbol] = {
+            "1D": daily,
+            "12H": aggregate_12h_from_4h(bars4),
+            "4H": bars4,
+            "1H": bars1,
+        }
+        contract_specs[symbol] = {
+            "contractSize": 1.0, "volUnit": 0.001, "minVol": 0.001, "maxVol": 100.0,
+        }
+
+    emitted = set()
+
+    def candidate_once(symbol, series, *, decision_time, **kwargs):
+        if symbol in emitted:
+            candidate = None
+        else:
+            emitted.add(symbol)
+            candidate = TradeCandidate(
+                candidate_id=f"{symbol}-candidate", strategy_version=STRATEGY_VERSION,
+                symbol=symbol, side="LONG", decision_time=decision_time,
+                entry_reference=100.0, stop_price=99.0, target_price=110.0,
+                initial_risk_distance=1.0, regime="BULLISH",
+                setup_pivot_time=decision_time - 8 * 3600,
+                breakout_time=decision_time - 4 * 3600,
+                reclaim_time=decision_time - 2 * 3600,
+                trigger_time=decision_time - 3600, gross_reward_risk=10.0,
+                reason="deterministic concurrent-position test", evidence={},
+            )
+        return StrategyEvaluation(
+            symbol=symbol, decision_time=decision_time, regime="BULLISH",
+            candidate=candidate, rejection_reasons=(), evidence={},
+        )
+
+    monkeypatch.setattr("app.backtest.evaluate_strategy", candidate_once)
+    result = run_backtest(
+        series_by_symbol, window="1D",
+        config=BacktestConfig(
+            mode="exchange_realistic", risk_fraction=0.005,
+            max_concurrent_positions=50, max_open_risk_fraction=0.25,
+            max_holding_hours=48,
+        ),
+        contract_specs=contract_specs, now_epoch=end,
+    )
+
+    assert result["max_observed_concurrent_positions"] == 2
+    assert result["configured_max_concurrent_positions"] == 50
+    assert result["open_trades_at_end"] == 2
+    assert result["rejection_reasons"].get("MAX_CONCURRENT_POSITIONS", 0) == 0

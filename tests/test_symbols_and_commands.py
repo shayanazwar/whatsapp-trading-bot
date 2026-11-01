@@ -33,17 +33,17 @@ def test_command_parser_backtest_modes_and_windows():
     with pytest.raises(CommandError, match="period explicitly"):
         parse_command("BACKTEST")
     assert parse_command("BACKTEST 7D").args == {
-        "mode": "research", "window": "7D", "windows": ["7D"], "strategy_scope": "both",
+        "mode": "research", "window": "7D", "windows": ["7D"], "strategy_scope": "s1-rfpc",
     }
     assert parse_command("BACKTEST BTCUSDT 7D").args == {
         "mode": "research", "window": "7D", "windows": ["7D"],
-        "strategy_scope": "both", "symbol": "BTC_USDT",
+        "strategy_scope": "s1-rfpc", "symbol": "BTC_USDT",
     }
-    assert parse_command("BACKTEST CANDIDATE 1D").args["strategy_scope"] == "candidate"
-    with pytest.raises(CommandError, match="control and MTF-TPR candidate"):
+    assert parse_command("BACKTEST 1D").args["strategy_scope"] == "s1-rfpc"
+    with pytest.raises(CommandError, match="Legacy 3M backtests are inactive"):
         parse_command("BACKTEST LEGACY BTCUSDT 30D")
-    with pytest.raises(CommandError, match="control and MTF-TPR candidate"):
-        parse_command("BACKTEST FIXED BTCUSDT 7D")
+    with pytest.raises(CommandError, match="CONTROL/CANDIDATE/BOTH are retired"):
+        parse_command("BACKTEST CANDIDATE 7D")
     with pytest.raises(CommandError):
         parse_command("BACKTEST 5M")
     with pytest.raises(CommandError, match="TP scenario overrides"):

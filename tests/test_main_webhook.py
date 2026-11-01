@@ -230,3 +230,36 @@ def test_health_exposes_worker_heartbeat_freshness(tmp_path):
         body = client.get("/healthz").json()
         assert body["scanner_health"] == "healthy"
         assert body["scanner_worker_heartbeat_age_seconds"] is not None
+
+
+@pytest.mark.asyncio
+async def test_delayed_backtest_webhook_command_is_queued_once(tmp_path):
+    from app.services.command_processor import CommandProcessor
+    from app.storage import Store
+
+    base = load_settings()
+    cfg = replace(
+        base,
+        database_path=tmp_path / "delayed-backtest.sqlite3",
+        reports_dir=tmp_path / "reports",
+        whatsapp_allowed_senders=("923001234567",),
+    )
+    store = Store(cfg.database_path)
+    processor = CommandProcessor(cfg, store, mexc=object(), whatsapp=object())
+    delayed_timestamp = int(time.time()) - 3600
+
+    first = await processor.process_text(
+        "923001234567", "BACKTEST 1D", received_timestamp=delayed_timestamp,
+        request_id="wamid.delayed.backtest", enforce_whatsapp_policy=True,
+    )
+    second = await processor.process_text(
+        "923001234567", "BACKTEST 1D", received_timestamp=delayed_timestamp,
+        request_id="wamid.delayed.backtest", enforce_whatsapp_policy=True,
+    )
+
+    assert "BACKTEST JOB QUEUED" in first.text
+    assert "BACKTEST JOB QUEUED" in second.text
+    assert first.text.split("Job: ", 1)[1].splitlines()[0] == second.text.split("Job: ", 1)[1].splitlines()[0]
+    jobs = store.recent_backtest_jobs(10, recipient="923001234567")
+    assert len(jobs) == 1
+    assert jobs[0]["args"]["strategy_scope"] == "s1-rfpc"

@@ -472,6 +472,37 @@ class MexcClient:
             raise MexcRequestError("Unexpected recent-trades payload")
         return [row for row in data if isinstance(row, dict)]
 
+    async def all_current_funding_rates(self) -> list[dict[str, Any]]:
+        """Fetch the current funding snapshot without a symbol parameter where supported.
+
+        MEXC's current funding endpoint documents symbol as optional. Response adapters
+        accept a single-symbol object, a list, or a symbol-keyed object without guessing
+        numeric values when the response shape is unknown.
+        """
+        payload = await self._get("/api/v1/contract/funding_rate", family="funding")
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(data, list):
+            rows = [dict(row) for row in data if isinstance(row, dict)]
+        elif isinstance(data, dict) and data.get("symbol"):
+            rows = [dict(data)]
+        elif isinstance(data, dict):
+            rows = [dict(row, symbol=row.get("symbol") or key)
+                    for key, row in data.items() if isinstance(row, dict)]
+        else:
+            raise MexcRequestError("Unexpected bulk funding-rate payload")
+        if not rows:
+            raise MexcRequestError("MEXC returned an empty bulk funding-rate snapshot")
+        normalized: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            raw_symbol = row.get("symbol")
+            if not raw_symbol:
+                continue
+            try:
+                normalized[normalize_symbol(str(raw_symbol))] = dict(row)
+            except ValueError:
+                continue
+        return list(normalized.values())
+
     async def funding_current(self, symbol: str) -> dict[str, Any]:
         symbol = normalize_symbol(symbol)
         payload = await self._get(f"/api/v1/contract/funding_rate/{symbol}", family="funding")

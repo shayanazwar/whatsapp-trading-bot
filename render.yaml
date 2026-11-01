@@ -17,14 +17,16 @@ services:
     dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /healthz
     envVars: &commonEnv
+      - key: APP_ROLE
+        value: web
       - key: DATABASE_URL
         fromDatabase:
           name: mexc-rsi-ema-db
           property: connectionString
+      - key: APP_ENV
+        value: production
       - key: DATABASE_PATH
         value: /tmp/mexc_bot.sqlite3
-      - key: REPORTS_DIR
-        value: /tmp/reports
       - key: MEXC_REST_BASE_URL
         value: https://api.mexc.com
       - key: MEXC_PRICE_SERIES
@@ -33,6 +35,36 @@ services:
         value: "100"
       - key: MEXC_UNIVERSE_SCAN_ENABLED
         value: "true"
+      - key: SIGNAL_PUSH_ENABLED
+        value: "false"
+      - key: SIGNAL_TTL_BARS
+        value: "2"
+      - key: SIGNAL_MIN_SCORE
+        value: "65"
+      - key: SIGNAL_PUSH_MIN_SCORE
+        value: "80"
+      - key: CANDIDATE_STOP_ATR_MULTIPLE
+        value: "1.5"
+      - key: CANDIDATE_TARGET_ATR_MULTIPLE
+        value: "2.5"
+      - key: CANDIDATE_MIN_NET_RR
+        value: "1.2"
+      - key: BACKTEST_MIN_COVERAGE_PCT
+        value: "98"
+      - key: BACKTEST_MIN_UNIVERSE_COVERAGE_PCT
+        value: "90"
+      - key: RISK_PER_TRADE_FRACTION
+        value: "0.005"
+      - key: MAX_CONCURRENT_POSITIONS
+        value: "1"
+      - key: MTF_HTF_WARMUP_BARS
+        value: "250"
+      - key: LIVE_MAX_SPREAD_ATR_FRACTION
+        value: "0.10"
+      - key: LIVE_MIN_ORDERBOOK_DEPTH_USDT
+        value: "250"
+      - key: MAX_ADVERSE_FUNDING_RATE
+        value: "0.0005"
       - key: DEFAULT_STARTING_BALANCE
         value: "100"
       - key: INITIAL_MARGIN_USDT
@@ -88,4 +120,8 @@ services:
     plan: starter
     region: singapore
     dockerCommand: python -m app.worker
+    disk:
+      name: mexc-market-archive
+      mountPath: /var/data
+      sizeGB: 10
     envVars: *commonEnv

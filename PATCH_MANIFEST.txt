@@ -1,0 +1,38 @@
+PAK TRADING ACADEMY v0.7.0 — COMPLETE SOURCE + TEST PATCH
+Source baseline: the user-supplied whatsapp-trading-bot-main (39).zip
+Extract this archive at the repository root, preserving folder paths.
+Do not upload or commit .env secrets. Keep live execution disabled.
+
+Files (29):
+REPLACE .env.example  sha256:540b07c30023
+REPLACE README.md  sha256:c2ba49e2e6b0
+REPLACE app/backtest_rsi_ema.py  sha256:230fbf86119a
+REPLACE app/commands.py  sha256:b5b61e39b137
+REPLACE app/config.py  sha256:009f8e74ca7a
+REPLACE app/main.py  sha256:d54e501c65b3
+NEW     app/market/archive.py  sha256:87055a0fc6c9
+REPLACE app/market/candles.py  sha256:769a49767c7a
+REPLACE app/mexc/client.py  sha256:f945fc771bc8
+REPLACE app/services/command_processor.py  sha256:a8018bcc365a
+NEW     app/services/market_quality.py  sha256:bfcc660b43ca
+REPLACE app/services/scheduler.py  sha256:826dc9d79728
+REPLACE app/services/universe.py  sha256:4c82f9848c96
+REPLACE app/storage.py  sha256:3ce00e2c17a6
+NEW     app/strategy/mtf_tpr.py  sha256:eec344162bb6
+REPLACE app/version.py  sha256:6bdb2c3a0897
+REPLACE app/worker.py  sha256:ff32a4fe5a01
+NEW     docs/IMPLEMENTATION_REPORT_V0.7.0.md  sha256:f63d7d97cf2b
+REPLACE docs/TEST_REPORT.md  sha256:d2dd3d329e14
+REPLACE pyproject.toml  sha256:6546d5ded32b
+REPLACE render.yaml  sha256:7a802821eca6
+NEW     tests/test_archive.py  sha256:4d359430a47d
+REPLACE tests/test_main_webhook.py  sha256:d2290d302cfc
+NEW     tests/test_market_quality.py  sha256:8a9a829b0062
+REPLACE tests/test_mexc_client.py  sha256:85b994f9ee4c
+NEW     tests/test_mtf_tpr.py  sha256:77bf63736f4f
+REPLACE tests/test_risk_store_whatsapp.py  sha256:711ed6733182
+REPLACE tests/test_symbols_and_commands.py  sha256:b488a9820da5
+NEW     tests/test_universe.py  sha256:38dba8985b0c
+
+Local validation: Python compile PASS; pytest 129 passed; Render YAML structural checks PASS.
+External validation not performed: no live MEXC calls, Render deployment, Postgres provision, or WhatsApp send.

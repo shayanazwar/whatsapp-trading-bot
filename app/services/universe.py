@@ -37,12 +37,13 @@ async def top_usdt_perpetual_symbols(mexc: MexcClient, limit: int = 100) -> list
         eligible_contracts = []
         for row in contracts:
             quote = str(row.get("quoteCoin") or row.get("quote_coin") or "").upper()
+            settle = str(row.get("settleCoin") or row.get("settle_coin") or "").upper()
             try:
                 active = int(row.get("state")) == 0
                 perpetual = int(row.get("futureType")) == 1
             except (TypeError, ValueError):
                 active, perpetual = False, False
-            if quote == "USDT" and active and perpetual:
+            if quote == "USDT" and settle == "USDT" and active and perpetual:
                 raw = row.get("symbol") or row.get("contractCode")
                 if raw:
                     eligible_contracts.append(str(raw))
@@ -81,7 +82,8 @@ async def top_usdt_perpetual_symbols(mexc: MexcClient, limit: int = 100) -> list
             continue
         seen.add(symbol)
         quote = str(contract.get("quoteCoin") or contract.get("quote_coin") or "").upper()
-        if quote != "USDT":
+        settle = str(contract.get("settleCoin") or contract.get("settle_coin") or "").upper()
+        if quote != "USDT" or settle != "USDT":
             continue
         try:
             active = int(contract.get("state")) == 0

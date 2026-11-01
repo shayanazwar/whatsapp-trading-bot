@@ -21,7 +21,9 @@ from typing import Any, Mapping, Sequence
 
 from app.alerts import AlertService
 from app.config import Settings
-from app.market.candles import Candle, aggregate_12h_from_4h
+from app.commands import Command
+from app.services.command_processor import CommandProcessor
+from app.market.candles import Candle, aggregate_12h_from_4h, aggregate_3m_from_1m
 from app.mexc.client import MexcClient, MexcError
 from app.paper import PaperBroker
 from app.risk import RiskConfig, RiskEngine
@@ -29,7 +31,11 @@ from app.services.market_data import MarketDataService
 from app.storage import Store
 from app.strategy.rfpc import TradeCandidate, evaluate_strategy
 from app.strategy.rsi_ema import RsiEmaConfig, evaluate_signals
+from app.strategy.mtf_tpr import MtfTprConfig, evaluate_mtf_tpr
+from app.market.archive import CandleArchive
 from app.services.universe import top_usdt_perpetual_symbols
+from app.services.market_quality import assess_orderbook, adverse_funding_rate, net_reward_risk_after_costs
+from app.backtest_rsi_ema import _round_trigger_to_tick
 from app.whatsapp import WhatsAppCloud, sender_key
 
 logger = logging.getLogger(__name__)
@@ -86,7 +92,9 @@ def _exit_reason_and_raw_price(position: Mapping[str, Any], candle: Candle, seri
 class ResearchScheduler:
     """Scheduled alerts and forward paper simulation; never sends MEXC orders."""
 
-    def __init__(self, settings: Settings, store: Store, mexc: MexcClient, whatsapp: WhatsAppCloud) -> None:
+    def __init__(self, settings: Settings, store: Store, mexc: MexcClient, whatsapp: WhatsAppCloud,
+                 backtest_processor: CommandProcessor | None = None,
+                 archive: CandleArchive | None = None) -> None:
         self.settings = settings
         self.store = store
         self.mexc = mexc
@@ -107,6 +115,9 @@ class ResearchScheduler:
             slippage_rate_per_side=settings.backtest_slippage_bps_per_side / 10000.0,
         ))
         self._stopped = asyncio.Event()
+        self.archive = archive or CandleArchive(settings.market_data_dir)
+        self.backtest_processor = backtest_processor
+        self._backtest_task: asyncio.Task | None = None
 
     def alignment_gate_passed(self) -> tuple[bool, str]:
         if not self.settings.data_alignment_probe_approved:
@@ -152,6 +163,12 @@ class ResearchScheduler:
                 except TimeoutError:
                     pass
         finally:
+            if self._backtest_task is not None and not self._backtest_task.done():
+                try:
+                    await asyncio.wait_for(self._backtest_task, timeout=5.0)
+                except TimeoutError:
+                    self._backtest_task.cancel()
+                    await asyncio.gather(self._backtest_task, return_exceptions=True)
             self.store.set_state("scheduler_status", "stopped")
 
     def stop(self) -> None:
@@ -159,6 +176,8 @@ class ResearchScheduler:
 
     async def run_once(self) -> None:
         """Single testable worker cycle. All data access stays on MEXC."""
+        if self.backtest_processor is not None and (self._backtest_task is None or self._backtest_task.done()):
+            self._backtest_task = asyncio.create_task(self._process_next_backtest_job(), name="backtest-job-runner")
         if self.settings.mexc_universe_scan_enabled:
             await self._universe_scan_tick()
 
@@ -181,68 +200,276 @@ class ResearchScheduler:
         else:
             self.store.set_state("whatsapp_dispatch_gate", "blocked; no crypto message sent")
 
+
+    async def _process_next_backtest_job(self) -> None:
+        """Claim one durable job and execute it away from the FastAPI web service."""
+        if self.backtest_processor is None:
+            return
+        job = self.store.claim_next_backtest_job(f"research-worker-{id(self)}")
+        if not job:
+            return
+        job_id = str(job["id"])
+        args = dict(job.get("args") or {})
+        args["_job_id"] = job_id
+        try:
+            logger.info("BACKTEST JOB START | job_id=%s window=%s scope=%s",
+                        job_id, args.get("window"), args.get("strategy_scope", "both"))
+            result = await self.backtest_processor.execute(Command("BACKTEST", args))
+            stored = {"text": result.text, "event_type": result.event_type}
+            self.store.finish_backtest_job(job_id, result=stored)
+            recipient = str(job.get("recipient") or "")
+            if recipient and self.settings.whatsapp_policy_gate_open:
+                self.store.enqueue_outbox(
+                    recipient, result.text, category="crypto_research",
+                    idempotency_key=f"backtest-job-result:{job_id}:{recipient}",
+                )
+            self.store.append_event("BACKTEST_JOB_COMPLETED", {"job_id": job_id, "event_type": result.event_type},
+                                    idempotency_key=f"backtest-job-complete:{job_id}")
+            logger.info("BACKTEST JOB COMPLETE | job_id=%s response_chars=%d", job_id, len(result.text))
+        except asyncio.CancelledError:
+            self.store.finish_backtest_job(job_id, error="Worker shutdown cancelled the job")
+            raise
+        except Exception as exc:
+            self.store.finish_backtest_job(job_id, error=f"{type(exc).__name__}: {str(exc)[:1600]}")
+            self.store.append_event("BACKTEST_JOB_FAILED", {"job_id": job_id, "error_type": type(exc).__name__},
+                                    idempotency_key=f"backtest-job-failed:{job_id}")
+            logger.exception("BACKTEST JOB FAILED | job_id=%s", job_id)
+
     async def _universe_scan_tick(self) -> None:
-        """Scan active USDT perpetuals once per completed 3-minute slot."""
+        """Scan the current top universe using the 3M MTF pullback/reclaim candidate."""
+        started = time.perf_counter()
+        self.store.set_state("top100_3m_scan_last_attempt", datetime.now(timezone.utc).isoformat())
         try:
             now = await self.mexc.server_time()
-            # A 3M bar becomes eligible only after its close-grace period has elapsed.
             slot = (now - self.settings.candle_close_grace_seconds) // 180
             if self.store.get_state("top100_3m_scan_slot") == str(slot):
                 return
             universe = await top_usdt_perpetual_symbols(self.mexc, self.settings.mexc_universe_top_n)
-            cfg = RsiEmaConfig(
-                rsi_period=self.settings.rsi_period, rsi_overbought=self.settings.rsi_overbought,
-                ema_fast=self.settings.ema_fast, ema_mid=self.settings.ema_mid,
-                ema_slow=self.settings.ema_slow, volume_period=self.settings.rsi_volume_period,
-                volume_multiplier=self.settings.rsi_volume_multiplier,
+            cfg = MtfTprConfig(
+                min_score=self.settings.signal_min_score,
+                stop_atr_multiple=self.settings.candidate_stop_atr_multiple,
+                target_atr_multiple=self.settings.candidate_target_atr_multiple,
+                htf_warmup_bars=self.settings.mtf_htf_warmup_bars,
             )
-            semaphore = asyncio.Semaphore(8)
+            semaphore = asyncio.Semaphore(2)
+            funding_snapshot: dict[str, dict[str, Any]] = {}
+            funding_snapshot_error: str | None = None
+            try:
+                funding_rows = await self.mexc.all_current_funding_rates()
+                funding_snapshot = {
+                    str(row.get("symbol", "")).upper(): row for row in funding_rows if row.get("symbol")
+                }
+            except Exception as exc:
+                funding_snapshot_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                logger.warning("TOP-100 FUNDING SNAPSHOT FAILED | error=%s", type(exc).__name__)
+            # 15M EMA context needs a real convergence warm-up; 250 complete 15M bars
+            # is 62.5 hours. Keep one extra day to survive small data gaps.
+            archive_start = now - (self.settings.mtf_htf_warmup_bars + 96) * 900
 
             async def scan_one(item: Mapping[str, Any]):
                 symbol = str(item["symbol"])
                 async with semaphore:
-                    bars = await self.mexc.get_klines_window(
-                        symbol, "3M", start=now - 450 * 180, end=now,
-                        now_epoch=now, close_grace_seconds=self.settings.candle_close_grace_seconds,
-                    )
-                    if self.settings.mexc_price_series == "real":
-                        missing = [bar.open_time for bar in bars if any(
-                            value is None for value in (bar.real_open, bar.real_high, bar.real_low, bar.real_close)
-                        )]
-                        if missing:
-                            raise MexcError(
-                                f"Configured real OHLC series is incomplete on {len(missing)} 3M candle(s)."
-                            )
-                        bars = [replace(bar, open=float(bar.real_open), high=float(bar.real_high),
-                                        low=float(bar.real_low), close=float(bar.real_close)) for bar in bars]
-                    signals = evaluate_signals(bars, cfg)
-                    latest = signals[-1] if signals and bars and signals[-1].timestamp == bars[-1].close_time else None
-                    return symbol, item["turnover_24h"], latest, len(bars)
+                    try:
+                        latest_1m = self.archive.latest_open_time(symbol, "1M")
+                        # Capture raw 1M continuously. A 2-minute overlap reconstructs a
+                        # boundary safely after retries/restarts; the archive deduplicates it.
+                        fetch_start = archive_start if latest_1m is None or latest_1m < archive_start else max(archive_start, latest_1m - 120)
+                        source = await self.mexc.get_klines_window(
+                            symbol, "1M", start=fetch_start, end=now, now_epoch=now,
+                            close_grace_seconds=self.settings.candle_close_grace_seconds,
+                            max_bars_per_request=1800,
+                        )
+                        await asyncio.to_thread(self.archive.append, source)
+
+                        # Build and persist 3M bars only from the unseen portion of the
+                        # 1M archive. Subsequent cycles load 3M history, not all 1M rows.
+                        latest_3m = self.archive.latest_open_time(symbol, "3M")
+                        derive_start = archive_start if latest_3m is None else max(archive_start, latest_3m + 180)
+                        one_minute_new = await asyncio.to_thread(
+                            self.archive.load, symbol, derive_start, now, "1M"
+                        )
+                        derived_3m = aggregate_3m_from_1m(one_minute_new)
+                        if derived_3m:
+                            await asyncio.to_thread(self.archive.append, derived_3m)
+                        bars = await asyncio.to_thread(self.archive.load, symbol, archive_start, now, "3M")
+                        if self.settings.mexc_price_series == "real":
+                            if any(any(v is None for v in (b.real_open, b.real_high, b.real_low, b.real_close)) for b in bars):
+                                raise MexcError("Configured real OHLC series is incomplete")
+                            bars = [replace(b, open=float(b.real_open), high=float(b.real_high), low=float(b.real_low), close=float(b.real_close)) for b in bars]
+                        if len(bars) < 300:
+                            return symbol, float(item["turnover_24h"]), "INSUFFICIENT_HISTORY", None, None, len(bars)
+                        signals = evaluate_mtf_tpr(bars, cfg)
+                        latest = signals[-1] if signals and bars and signals[-1].timestamp == bars[-1].close_time else None
+                        payload = latest.as_dict() if latest else None
+                        if payload:
+                            payload["expires_at"] = int(payload["timestamp"]) + self.settings.signal_ttl_bars * 180
+                            payload["strategy"] = "MTF-TPR-3M-15M-v1"
+                            # Live execution-quality checks are performed only for actual
+                            # signal candidates; they are not fabricated into historical tests.
+                            funding = funding_snapshot.get(symbol)
+                            payload["funding_snapshot_available"] = funding is not None
+                            payload["funding_snapshot_error"] = funding_snapshot_error
+                            funding_rate = None
+                            if funding is not None:
+                                try:
+                                    funding_rate = float(funding.get("fundingRate"))
+                                except (TypeError, ValueError, OverflowError):
+                                    funding_rate = None
+                            payload["current_funding_rate"] = funding_rate
+                            payload["funding_collect_cycle_hours"] = funding.get("collectCycle") if funding else None
+                            payload["funding_next_settle_time"] = funding.get("nextSettleTime") if funding else None
+                            adverse_rate = adverse_funding_rate(latest.direction, funding_rate) if funding_rate is not None else None
+                            payload["adverse_funding_rate"] = adverse_rate
+                            try:
+                                contract = item["contract"]
+                                contract_size = float(contract.get("contractSize", 0.0))
+                                price_tick = float(contract.get("priceUnit", 0.0))
+                                price_tick_ok = price_tick > 0
+                                if price_tick_ok:
+                                    payload["stop_price"] = _round_trigger_to_tick(
+                                        float(payload["stop_price"]), price_tick, latest.direction, "STOP"
+                                    )
+                                    payload["target_price"] = _round_trigger_to_tick(
+                                        float(payload["target_price"]), price_tick, latest.direction, "TARGET"
+                                    )
+                                fee_raw = contract.get("takerFeeRate", self.settings.exchange_taker_fee_rate)
+                                try:
+                                    fee_rate = float(fee_raw)
+                                except (TypeError, ValueError, OverflowError):
+                                    fee_rate = self.settings.exchange_taker_fee_rate
+                                if not 0 <= fee_rate < 0.1:
+                                    fee_rate = self.settings.exchange_taker_fee_rate
+                                cost_rr = net_reward_risk_after_costs(
+                                    direction=latest.direction, entry_price=float(latest.close),
+                                    stop_price=float(payload["stop_price"]),
+                                    target_price=float(payload["target_price"]),
+                                    fee_rate_per_side=fee_rate,
+                                    slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
+                                )
+                                payload["cost_model"] = {
+                                    "fee_rate_per_side": fee_rate,
+                                    "slippage_bps_per_side": self.settings.backtest_slippage_bps_per_side,
+                                    "funding_excluded_from_planned_rr": True,
+                                    **cost_rr,
+                                }
+                                payload["planned_net_rr"] = cost_rr["net_rr"]
+                                net_rr_ok = cost_rr["net_rr"] >= self.settings.candidate_min_net_rr
+                                depth = await self.mexc.depth(symbol, limit=20)
+                                quality = assess_orderbook(
+                                    depth, contract_size=contract_size, atr_value=float(latest.atr),
+                                    max_spread_atr_fraction=self.settings.live_max_spread_atr_fraction,
+                                    min_depth_usdt=self.settings.live_min_orderbook_depth_usdt,
+                                )
+                                payload["orderbook_quality"] = quality
+                                funding_ok = (
+                                    adverse_rate is not None
+                                    and adverse_rate <= self.settings.max_adverse_funding_rate
+                                )
+                                payload["delivery_eligible"] = bool(
+                                    price_tick_ok and quality["passed"] and funding_ok and net_rr_ok
+                                )
+                                blocked_reasons = list(quality["reasons"])
+                                if not price_tick_ok:
+                                    blocked_reasons.append("PRICE_TICK_UNAVAILABLE")
+                                if not payload["funding_snapshot_available"]:
+                                    blocked_reasons.append("FUNDING_SNAPSHOT_UNAVAILABLE")
+                                elif not funding_ok:
+                                    blocked_reasons.append("ADVERSE_FUNDING_TOO_HIGH")
+                                if not net_rr_ok:
+                                    blocked_reasons.append("NET_RR_BELOW_MINIMUM")
+                                payload["delivery_block_reasons"] = blocked_reasons
+                            except Exception as exc:
+                                payload["orderbook_quality"] = None
+                                payload["delivery_eligible"] = False
+                                payload["delivery_block_reasons"] = [f"ORDERBOOK_DATA_ERROR:{type(exc).__name__}"]
+                                logger.warning("SIGNAL LIQUIDITY CHECK FAILED | symbol=%s error=%s", symbol, type(exc).__name__)
+                        return symbol, float(item["turnover_24h"]), "SIGNAL" if latest else "NO_SIGNAL", payload, None, len(bars)
+                    except Exception as exc:
+                        return symbol, float(item.get("turnover_24h", 0.0)), "DATA_ERROR", None, f"{type(exc).__name__}: {str(exc)[:140]}", 0
 
             results = await asyncio.gather(*(scan_one(item) for item in universe), return_exceptions=True)
-            errors = signal_count = 0
-            for result in results:
+            rows: list[tuple[str, float, str, dict[str, Any] | None, str | None, int]] = []
+            for item, result in zip(universe, results):
                 if isinstance(result, Exception):
-                    errors += 1
-                    continue
-                symbol, turnover, signal, bar_count = result
+                    rows.append((str(item["symbol"]), float(item["turnover_24h"]), "DATA_ERROR", None,
+                                 f"{type(result).__name__}: {str(result)[:140]}", 0))
+                else:
+                    rows.append(result)
+            rows.sort(key=lambda row: (-row[1], row[0]))
+            signals = [row for row in rows if row[2] == "SIGNAL"]
+            errors = [row for row in rows if row[2] == "DATA_ERROR"]
+            for symbol, turnover, status, signal, error, bar_count in rows:
                 payload = {
                     "symbol": symbol, "timeframe": "3M", "turnover_24h": turnover,
-                    "scan_slot": slot, "status": "SIGNAL" if signal else "NO_SIGNAL",
-                    "signal": signal.as_dict() if signal else None, "bars": bar_count,
+                    "scan_slot": slot, "status": status, "signal": signal,
+                    "error": error, "bars": bar_count,
                 }
-                signal_count += int(signal is not None)
+                if signal:
+                    signal_version = str(signal.get("strategy") or "MTF-TPR-3M-15M-v1")
+                    signal["signal_id"] = self.store.save_signal(signal, strategy_version=signal_version)
+                    payload["signal"] = signal
                 self.store.append_event("SCAN_RESULT_3M", payload, symbol=symbol,
                     idempotency_key=f"scheduled-scan3m:{symbol}:{slot}")
+                if (signal and signal.get("delivery_eligible") is True
+                        and self.settings.signal_push_enabled and self.settings.whatsapp_policy_gate_open
+                        and float(signal.get("score", 0.0)) >= self.settings.signal_push_min_score):
+                    await self._queue_validated_signal(signal, turnover, slot)
+            success_count = sum(r[2] in {"SIGNAL", "NO_SIGNAL"} for r in rows)
+            insufficient = sum(r[2] == "INSUFFICIENT_HISTORY" for r in rows)
+            delivery_blocked = sum(
+                bool(r[3]) and r[3].get("delivery_eligible") is False for r in rows
+            )
+            summary = (
+                f"discovered={len(universe)} processed={len(rows)} successful={success_count} "
+                f"signals={len(signals)} delivery_blocked={delivery_blocked} "
+                f"insufficient_history={insufficient} errors={len(errors)} "
+                f"no_signal={sum(r[2]=='NO_SIGNAL' for r in rows)}"
+            )
             self.store.set_state("top100_3m_scan_slot", str(slot))
-            self.store.set_state("top100_3m_scan_last_success", datetime.now(timezone.utc).isoformat())
-            self.store.set_state("top100_3m_scan_summary",
-                f"scanned={len(universe)-errors}/{len(universe)} signals={signal_count} errors={errors}")
-            logger.info("TOP-100 3M SCAN COMPLETE | scanned=%d signals=%d errors=%d slot=%d",
-                        len(universe)-errors, signal_count, errors, slot)
+            if success_count > 0:
+                self.store.set_state("top100_3m_scan_last_success", datetime.now(timezone.utc).isoformat())
+                self.store.set_state("top100_3m_scan_last_error", "")
+            else:
+                self.store.set_state("top100_3m_scan_last_error", "No symbol returned a valid completed-candle analysis")
+            self.store.set_state("top100_3m_scan_summary", summary)
+            self.store.append_event("TOP100_SCAN_CYCLE", {
+                "scan_slot": slot, "symbols_discovered": len(universe),
+                "symbols_processed": len(rows), "signals": len(signals),
+                "data_errors": len(errors), "duration_seconds": round(time.perf_counter()-started, 3),
+            }, idempotency_key=f"top100-cycle:{slot}")
+            logger.info("TOP-100 MTF-TPR 3M SCAN COMPLETE | %s slot=%d duration_s=%.1f",
+                        summary, slot, time.perf_counter()-started)
         except Exception as exc:
-            logger.warning("TOP-100 3M SCAN FAILED | error_type=%s detail=%s",
-                           type(exc).__name__, str(exc)[:180])
+            error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            self.store.set_state("top100_3m_scan_last_error", error)
+            self.store.append_event("TOP100_SCAN_CYCLE_FAILED", {"error": error},
+                                    idempotency_key=f"top100-cycle-failed:{int(time.time()//180)}")
+            logger.warning("TOP-100 MTF-TPR 3M SCAN FAILED | %s", error)
+
+    async def _queue_validated_signal(self, signal: Mapping[str, Any], turnover: float, slot: int) -> None:
+        """Queue only fresh grade-A research signals; never bypass the Meta policy gate."""
+        now = int(time.time())
+        if signal.get("delivery_eligible") is not True:
+            return
+        expires_at = int(signal.get("expires_at", 0))
+        if not expires_at or expires_at <= now:
+            return
+        symbol = str(signal.get("symbol", ""))
+        direction = str(signal.get("direction", ""))
+        key = f"mtf-tpr-push:{symbol}:{direction}:{int(signal.get('timestamp', 0))}"
+        body = (
+            "📡 PAK TRADING ACADEMY — RESEARCH SIGNAL\n"
+            f"{symbol} · {direction} · 3M / 15M context\n"
+            f"Entry reference: {float(signal.get('close', 0)):.10g}\n"
+            f"Stop: {float(signal.get('stop_price', 0)):.10g} · Target: {float(signal.get('target_price', 0)):.10g}\n"
+            f"Score: {float(signal.get('score', 0)):.1f}/100 · Grade {signal.get('grade', 'B')}\n"
+            f"Valid until: {datetime.fromtimestamp(expires_at, timezone.utc).strftime('%H:%M:%S UTC')}\n"
+            "Research signal only. No live order was placed; verify current price before acting."
+        )
+        for recipient in dict.fromkeys(sender_key(x) for x in self.settings.whatsapp_allowed_senders if sender_key(x)):
+            expiry_iso = datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
+            self.store.enqueue_outbox(recipient, body, category="crypto_research",
+                                      idempotency_key=f"{key}:{recipient}", expires_at=expiry_iso)
 
     async def _paper_tick(self) -> None:
         if self.store.get_state("entry_halt", "false") == "true":

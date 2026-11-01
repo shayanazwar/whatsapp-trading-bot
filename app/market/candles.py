@@ -328,3 +328,8 @@ def aggregate_3m_from_1m(candles: Iterable[Candle]) -> list[Candle]:
 def aggregate_3d_from_1d(candles: Iterable[Candle]) -> list[Candle]:
     """Build 3-day display bars from three contiguous UTC-aligned daily bars."""
     return _aggregate_exact_groups(candles, "1D", "3D", 86400, 3 * 86400)
+
+
+def aggregate_15m_from_3m(candles: Iterable[Candle]) -> list[Candle]:
+    """Build 15-minute context bars from exactly five contiguous completed 3M bars."""
+    return _aggregate_exact_groups(candles, "3M", "15M", 180, 900)

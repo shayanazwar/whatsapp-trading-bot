@@ -25,6 +25,7 @@ from app.market.candles import Candle, INTERVAL_SECONDS, aggregate_3m_from_1m, a
 from app.mexc.client import MexcClient, MexcError
 from app.services.market_data import MarketDataService, SymbolData
 from app.storage import Store, canonical_json
+from app.strategy.rfpc import STRATEGY_VERSION
 from app.symbols import normalize_symbol
 from app.whatsapp import WhatsAppCloud, WhatsAppPolicyBlocked, sender_key
 
@@ -71,8 +72,10 @@ class CommandProcessor:
         allowed = {sender_key(x) for x in self.settings.whatsapp_allowed_senders}
         if enforce_whatsapp_policy and (not allowed or sender_key(sender) not in allowed):
             raise CommandError("Sender is not authorized")
-        if received_timestamp is not None and int(time.time()) - received_timestamp > 300:
-            raise CommandError("This message is too old to execute. Send the command again.")
+        # A signed, persisted webhook delivery remains valid after background queueing.
+        # Meta can deliver retries and our own workers can be briefly delayed; a five-minute
+        # age check here incorrectly rejected commands that had already been accepted.
+        # Duplicate execution is handled by the inbound message ID/idempotency key instead.
         command = parse_command(text)
         if command.name == "BACKTEST":
             command.args["_recipient"] = sender_key(sender) if enforce_whatsapp_policy else ""
@@ -233,7 +236,7 @@ class CommandProcessor:
             analysis_text = format_analysis(report)
             return CommandResult(analysis_text, event_type="ANALYSIS_COMPLETED")
         if name == "SCAN":
-            return await self._scan_top_100_3m()
+            return await self._scan_top_100_swing()
         if name == "BACKTEST":
             if not self.backtest_inline:
                 clean_args = {k: v for k, v in args.items() if not str(k).startswith("_")}
@@ -246,11 +249,11 @@ class CommandProcessor:
                     "strategy_scope": args.get("strategy_scope", "both"),
                 }, idempotency_key=f"backtest-job-queued:{job_id}")
                 return CommandResult(
-                    f"🧪 BACKTEST JOB QUEUED\nJob: {job_id}\nPeriod: {args.get('window')}\nStrategy: {args.get('strategy_scope', 'both').upper()}\nThe dedicated research worker will process this job. Use BACKTEST REPORT {job_id} or BACKTEST STATUS. Live orders OFF.",
+                    f"🧪 BACKTEST JOB QUEUED\nJob: {job_id}\nPeriod: {args.get('window')}\nStrategy: S1-RFPC (1D → 12H → 4H → 1H)\nPortfolio cap: {self.settings.backtest_max_positions} open research positions\nThe dedicated worker will process this job. Use BACKTEST REPORT {job_id} or BACKTEST STATUS. Live orders OFF.",
                     event_type="BACKTEST_JOB_QUEUED",
                 )
             async with self._backtest_lock:
-                return await self._run_rsi_ema_backtest(args)
+                return await self._run_backtest(args)
         if name == "BACKTEST_STATUS":
             recipient = str(args.get("_recipient") or "") or None
             jobs = self.store.recent_backtest_jobs(8, recipient=recipient)
@@ -259,7 +262,15 @@ class CommandProcessor:
             lines = ["BACKTEST JOBS"]
             for job in jobs:
                 progress = job.get("progress") or {}
-                detail = f" · {progress.get('stage', '')} {progress.get('processed', '')}/{progress.get('total', '')}" if progress else ""
+                if progress:
+                    pct = progress.get("percent")
+                    pct_text = f" {pct:.0f}%" if isinstance(pct, (int, float)) else ""
+                    cursor = f" {progress.get('processed', 0)}/{progress.get('total', 0)}{pct_text}"
+                    last_symbol = progress.get("last_completed_symbol") or progress.get("current_symbol")
+                    symbol_text = f" · {last_symbol}" if last_symbol else ""
+                    detail = f" · {progress.get('stage', '')}{cursor}{symbol_text}"
+                else:
+                    detail = ""
                 lines.append(f"{job['id']} | {job['args'].get('window', '?')} | {job['status']}{detail} | {job.get('created_at', '')}")
             lines.append("Use BACKTEST REPORT <JOB_ID> for a completed result.")
             return CommandResult("\n".join(lines))
@@ -301,28 +312,30 @@ class CommandProcessor:
             return CommandResult(f"Alert {args['alert_id']}: {'ACTIVE' if active else 'PAUSED'}" if changed else f"Alert {args['alert_id']} not found.")
         if name in {"SIGNALS", "PERFORMANCE", "PNL"}:
             if name == "SIGNALS":
-                active = self.store.active_signals(now_epoch=int(time.time()), limit=50)
+                active = self.store.active_signals(
+                    now_epoch=int(time.time()), limit=200, strategy_version=STRATEGY_VERSION,
+                )
                 if not active:
-                    summary = self.store.get_state("top100_3m_scan_summary", "No completed scan summary yet.")
-                    last = self.store.get_state("top100_3m_scan_last_success", "never")
+                    summary = self.store.get_state("top100_swing_scan_summary", "No completed S1-RFPC scan summary yet.")
+                    last = self.store.get_state("top100_swing_scan_last_success", "never")
                     return CommandResult(
-                        "ACTIVE 3M RESEARCH SIGNALS\nNo unexpired signals currently available.\n"
+                        "ACTIVE S1-RFPC SWING SIGNALS\nNo unexpired, validated signals currently available.\n"
                         f"Last successful scan: {last}\nScanner: {summary}"
                     )
-                lines = [f"ACTIVE 3M RESEARCH SIGNALS — {len(active)}"]
+                lines = [f"ACTIVE S1-RFPC SWING SIGNALS — {len(active)}"]
                 for row in active[:20]:
                     signal = row["payload"]
-                    expiry = datetime.fromtimestamp(int(row["expires_at"]), timezone.utc).strftime("%H:%M:%S UTC")
-                    delivery = "PUSH-ELIGIBLE" if signal.get("delivery_eligible") else "PULL-ONLY / DELIVERY BLOCKED"
+                    expiry = datetime.fromtimestamp(int(row["expires_at"]), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    delivery = "PUSH-ELIGIBLE" if signal.get("delivery_eligible") else "DELIVERY BLOCKED"
                     reasons = ",".join(signal.get("delivery_block_reasons") or [])
                     lines.append(
-                        f"{row['symbol']} {row['direction']} @ {float(signal.get('close', 0.0)):.8g} "
-                        f"· Score {row['score']:.1f}/100 · Price RR {float(signal.get('planned_price_rr', 0.0)):.2f} "
-                        f"· {delivery} · expires {expiry}"
+                        f"{row['symbol']} {row['direction']} @ {float(signal.get('entry_reference', signal.get('close', 0.0))):.8g} "
+                        f"· gross RR {float(signal.get('planned_price_rr', 0.0)):.2f}R "
+                        f"· net RR {float(signal.get('planned_net_rr', 0.0)):.2f}R · {delivery} · expires {expiry}"
                     )
                     if reasons:
                         lines.append(f"  Delivery checks: {reasons}")
-                lines.append("Research only. Entries are not exchange orders; verify current price and risk.")
+                lines.append("Strategy: 1D → 12H → 4H → 1H completed candles. Research only; no exchange orders.")
                 return CommandResult("\n".join(lines))
             runs = self.store.research_runs(20)
             if not runs:
@@ -345,8 +358,10 @@ class CommandProcessor:
                 f"Max open risk: {self.settings.max_open_risk_fraction:.2%}\n"
                 f"Daily loss halt: {self.settings.max_daily_loss_fraction:.2%}\n"
                 f"Peak drawdown halt: {self.settings.max_drawdown_fraction:.2%}\n"
-                f"Max concurrent positions: {self.settings.max_concurrent_positions}\n"
-                "These are unvalidated research defaults, not a recommendation to trade."
+                f"Paper simulator position cap: {self.settings.max_concurrent_positions}\n"
+                f"Backtest research position cap: {self.settings.backtest_max_positions}\n"
+                f"Backtest aggregate planned stop-risk cap: {self.settings.backtest_max_open_risk_fraction:.2%}\n"
+                "Research settings do not enable live trading and are not a recommendation to trade."
             )
         if name == "COST":
             counts = self.store.outbox_month_summary()
@@ -389,12 +404,12 @@ class CommandProcessor:
             volume_multiplier=self.settings.rsi_volume_multiplier,
         )
 
-    async def _scan_top_100_3m(self) -> CommandResult:
-        """Return the latest dedicated-worker scan; never start a competing web scan."""
-        events = self.store.recent_events(250, "SCAN_RESULT_3M")
+    async def _scan_top_100_swing(self) -> CommandResult:
+        """Return the latest dedicated-worker S1-RFPC cycle; never start a competing scan."""
+        events = self.store.recent_events(250, "SCAN_RESULT_S1_RFPC")
         if not events:
             return CommandResult(
-                "TOP-100 SCANNER HAS NO STORED CYCLE YET.\n"
+                "TOP-100 S1-RFPC SCANNER HAS NO STORED CYCLE YET.\n"
                 "Check /healthz for scanner_enabled, worker heartbeat and last scan error."
             )
         decoded = [(event, json.loads(event["payload_json"])) for event in events]
@@ -405,17 +420,19 @@ class CommandProcessor:
         errors = sum(row.get("status") == "DATA_ERROR" for row in rows)
         insufficient = sum(row.get("status") == "INSUFFICIENT_HISTORY" for row in rows)
         lines = [
-            "🔎 MEXC TOP-100 FUTURES SCANNER · 3M / 15M",
-            f"Latest cycle: {len(rows)} symbols · signals {len(signals)} · data errors {errors} · insufficient history {insufficient}",
-            f"Last successful scan: {self.store.get_state('top100_3m_scan_last_success', 'never')}",
+            "🔎 MEXC TOP-100 FUTURES SCANNER · S1-RFPC 1D / 12H / 4H / 1H",
+            f"Latest cycle: {len(rows)} symbols · candidates {len(signals)} · data errors {errors} · insufficient history {insufficient}",
+            f"Last successful scan: {self.store.get_state('top100_swing_scan_last_success', 'never')}",
         ]
-        for row in sorted(signals, key=lambda x: float((x.get("signal") or {}).get("score", 0)), reverse=True)[:15]:
+        for row in sorted(signals, key=lambda x: str(x.get("symbol", "")))[:15]:
             signal = row["signal"]
             lines.append(
-                f"{row.get('symbol')} {signal.get('direction')} @ {float(signal.get('close', 0)):.8g} "
-                f"· score {float(signal.get('score', 0)):.1f} · grade {signal.get('grade', '?')}"
+                f"{row.get('symbol')} {signal.get('direction')} @ {float(signal.get('entry_reference', signal.get('close', 0))):.8g} "
+                f"· gross RR {float(signal.get('planned_price_rr', 0)):.2f}R "
+                f"· net RR {float(signal.get('planned_net_rr', 0)):.2f}R "
+                f"· {'push-eligible' if signal.get('delivery_eligible') else 'delivery blocked'}"
             )
-        lines.append("SCAN displays the dedicated worker's latest cycle; it does not launch a duplicate scan from the web process.")
+        lines.append("SCAN reads the dedicated worker's latest completed-candle cycle; it does not launch a duplicate scan.")
         return CommandResult("\n".join(lines), event_type="LATEST_SCAN_VIEWED")
 
     async def _run_rsi_ema_backtest(self, args: dict[str, Any]) -> CommandResult:
@@ -755,9 +772,8 @@ class CommandProcessor:
                              event_type="BACKTEST_3M_RESEARCH_COMPLETED")
 
     async def _run_backtest(self, args: dict[str, Any]) -> CommandResult:
-        """Run the selected completed-bar strategy and return one concise WhatsApp reply."""
+        """Run the completed-bar 1D→12H→4H→1H strategy on a bounded symbol universe."""
         command_started = time.perf_counter()
-        symbols = [args["symbol"]] if args.get("symbol") else list(self.settings.default_symbols)
         windows = list(args.get("windows") or ["7D"])
         days_by_window = {"1D": 1, "3D": 3, "7D": 7, "30D": 30, "60D": 60,
                           "90D": 90, "180D": 180, "365D": 365}
@@ -772,38 +788,83 @@ class CommandProcessor:
             now_epoch = int(time.time())
             clock_warning = [f"Exchange time unavailable ({type(exc).__name__}); local UTC clock bounded the test window."]
 
+        if args.get("symbol"):
+            symbols = [str(args["symbol"])]
+            universe_note = "single symbol"
+        else:
+            universe_rows = await self._load_top_universe(self.settings.mexc_universe_top_n)
+            symbols = [str(row["symbol"]) for row in universe_rows]
+            universe_note = f"top {len(symbols)} USDT perpetuals by 24H turnover"
+        if not symbols:
+            raise CommandError("No eligible MEXC USDT perpetual symbols were returned for this backtest.")
+
         longest = max(days_by_window[window] for window in windows)
         loaded: dict[str, SymbolData] = {}
         data_load_errors: dict[str, str] = {}
         load_started = time.perf_counter()
 
-        async def load_one(symbol: str):
-            symbol_started = time.perf_counter()
-            logger.info("BACKTEST SYMBOL LOAD START | symbol=%s window_days=%d", symbol, longest)
-            data = await self.market_data.fetch_symbol(
-                symbol, window_days=longest, daily_warmup_days=400,
-                extra_intraday_warmup_days=45, now_epoch=now_epoch,
-            )
-            logger.info(
-                "BACKTEST SYMBOL LOAD COMPLETE | symbol=%s bars=%s contract_metadata=%s elapsed_ms=%.0f",
-                symbol,
-                {tf: len(data.timeframes.get(tf, [])) for tf in ("1D", "12H", "4H", "1H")},
-                bool(data.contract),
-                (time.perf_counter() - symbol_started) * 1000,
-            )
-            return symbol, data
+        job_id = str(args.get("_job_id") or "")
+        job_total = len(symbols)
+        if job_id:
+            self.store.update_backtest_job_progress(job_id, {
+                "stage": "loading_historical_data", "processed": 0, "total": job_total,
+                "percent": 0.0, "loaded": 0, "failed": 0,
+                "strategy_timeframes": ["1D", "12H", "4H", "1H"],
+            })
+        logger.info(
+            "BACKTEST SYMBOL SCAN START | job_id=%s universe=%s symbols=%d window_days=%d strategy=1D-12H-4H-1H",
+            job_id or "inline", universe_note, job_total, longest,
+        )
+        semaphore = asyncio.Semaphore(min(5, max(1, len(symbols))))
 
-        load_results = await asyncio.gather(*(load_one(symbol) for symbol in symbols), return_exceptions=True)
-        for symbol, item in zip(symbols, load_results):
-            if isinstance(item, Exception):
-                data_load_errors[symbol] = f"{type(item).__name__}: {str(item)[:160]}"
+        async def load_one(index: int, symbol: str):
+            symbol_started = time.perf_counter()
+            async with semaphore:
+                logger.info("BACKTEST SYMBOL LOAD START | progress_index=%d/%d symbol=%s window_days=%d",
+                            index, job_total, symbol, longest)
+                try:
+                    data = await self.market_data.fetch_symbol(
+                        symbol, window_days=longest, daily_warmup_days=400,
+                        extra_intraday_warmup_days=45, now_epoch=now_epoch,
+                    )
+                    logger.info(
+                        "BACKTEST SYMBOL LOAD COMPLETE | progress_index=%d/%d symbol=%s bars=%s contract_metadata=%s elapsed_ms=%.0f",
+                        index, job_total, symbol,
+                        {tf: len(data.timeframes.get(tf, [])) for tf in ("1D", "12H", "4H", "1H")},
+                        bool(data.contract), (time.perf_counter() - symbol_started) * 1000,
+                    )
+                    return symbol, data, None
+                except Exception as exc:
+                    logger.warning("BACKTEST SYMBOL LOAD FAILED | progress_index=%d/%d symbol=%s error_type=%s detail=%s",
+                                   index, job_total, symbol, type(exc).__name__, str(exc)[:180])
+                    return symbol, None, exc
+
+        tasks = [asyncio.create_task(load_one(index, symbol)) for index, symbol in enumerate(symbols, 1)]
+        processed = 0
+        for completed_task in asyncio.as_completed(tasks):
+            symbol, data, error = await completed_task
+            processed += 1
+            if error is not None:
+                data_load_errors[symbol] = f"{type(error).__name__}: {str(error)[:160]}"
                 self.store.append_event("BACKTEST_DATA_LOAD_FAILED", {
-                    "symbol": symbol, "error_type": type(item).__name__, "window_days": longest,
-                }, symbol=symbol, idempotency_key=f"backtest-load-failed:{symbol}:{now_epoch // 60}")
-                logger.warning("BACKTEST SYMBOL LOAD FAILED | symbol=%s error_type=%s detail=%s",
-                               symbol, type(item).__name__, str(item)[:180])
+                    "job_id": job_id or None, "symbol": symbol,
+                    "error_type": type(error).__name__, "window_days": longest,
+                }, symbol=symbol, idempotency_key=f"backtest-load-failed:{job_id or now_epoch}:{symbol}")
             else:
-                loaded[symbol] = item[1]
+                loaded[symbol] = data
+            progress = {
+                "stage": "loading_historical_data", "processed": processed, "total": job_total,
+                "percent": round(processed / job_total * 100, 1),
+                "loaded": len(loaded), "failed": len(data_load_errors),
+                "last_completed_symbol": symbol,
+                "strategy_timeframes": ["1D", "12H", "4H", "1H"],
+            }
+            if job_id:
+                self.store.update_backtest_job_progress(job_id, progress)
+            logger.info(
+                "BACKTEST SYMBOL SCAN | progress=%d/%d (%.1f%%) symbol=%s loaded=%d failed=%d",
+                processed, job_total, processed / job_total * 100, symbol, len(loaded), len(data_load_errors),
+            )
 
         logger.info(
             "BACKTEST DATA LOAD COMPLETE | requested=%d loaded=%d failed=%d bars=%s elapsed_ms=%.0f",
@@ -817,8 +878,10 @@ class CommandProcessor:
         if not series_map:
             series_map = {symbol: {} for symbol in symbols}
         specs = {symbol: data.contract for symbol, data in loaded.items() if data.contract}
-        mode = args.get("mode", "exchange_realistic")
-        scenario = str(args.get("tp_scenario", "CONTROL"))
+        # parse_command sets mode='research' as a route label; BacktestConfig expects
+        # the actual accounting mode. Do not pass the parser label into the engine.
+        mode = "exchange_realistic"
+        scenario = "S1-RFPC"
         reward_risk = float(args.get("reward_risk_multiple", 2.0))
         cfg = BacktestConfig(
             mode=mode, starting_balance=self.settings.default_starting_balance,
@@ -828,7 +891,18 @@ class CommandProcessor:
             taker_fee_rate=self.settings.exchange_taker_fee_rate,
             slippage_bps_per_side=self.settings.backtest_slippage_bps_per_side,
             reward_risk_multiple=reward_risk,
+            max_concurrent_positions=self.settings.backtest_max_positions,
+            max_open_risk_fraction=self.settings.backtest_max_open_risk_fraction,
+            max_holding_hours=max(1, self.settings.backtest_max_holding_minutes // 60),
         )
+
+        if job_id:
+            self.store.update_backtest_job_progress(job_id, {
+                "stage": "simulating_portfolio", "processed": job_total, "total": job_total,
+                "percent": 90.0, "loaded": len(loaded), "failed": len(data_load_errors),
+                "last_completed_symbol": symbols[-1],
+                "configured_max_positions": cfg.max_concurrent_positions,
+            })
 
         data_warnings = list(clock_warning)
         data_warnings.extend(
@@ -869,10 +943,20 @@ class CommandProcessor:
                     symbol, start=funding_start, end=now_epoch, max_pages=30,
                 )
 
+            funded_symbols = sorted({
+                str(trade.get("symbol"))
+                for report in preflight_results for trade in report.get("trades", [])
+                if trade.get("symbol")
+            } | {
+                str(position.get("symbol"))
+                for report in preflight_results for position in report.get("open_positions", [])
+                if position.get("symbol")
+            })
+            funding_symbols = [symbol for symbol in funded_symbols if symbol in loaded]
             funding_results = await asyncio.gather(
-                *(load_funding(symbol) for symbol in loaded), return_exceptions=True,
+                *(load_funding(symbol) for symbol in funding_symbols), return_exceptions=True,
             )
-            for symbol, item in zip(loaded, funding_results):
+            for symbol, item in zip(funding_symbols, funding_results):
                 if isinstance(item, Exception):
                     funding[symbol] = []
                     funding_missing_symbols.append(symbol)
@@ -928,6 +1012,13 @@ class CommandProcessor:
                 "contract_metadata_available": sorted(specs),
                 "completed_candles_only": True,
             }
+            if job_id:
+                self.store.update_backtest_job_progress(job_id, {
+                    "stage": f"simulating_{window}", "processed": job_total, "total": job_total,
+                    "percent": round(90 + 10 * (window_index + 1) / len(windows), 1),
+                    "loaded": len(loaded), "failed": len(data_load_errors),
+                    "configured_max_positions": cfg.max_concurrent_positions,
+                })
 
             # If there were no entries/open positions, cost multipliers cannot change
             # the result. Avoid rerunning the entire simulation three times for a zero-trade test.
@@ -958,7 +1049,7 @@ class CommandProcessor:
             result["cost_sensitivity"] = sensitivity
 
             run_id = self.store.create_research_run(mode, {
-                "symbols": symbols, "window": window, "strategy_version": self.settings.strategy_version,
+                "symbols": symbols, "window": window, "strategy_version": STRATEGY_VERSION,
                 "tp_scenario": scenario, "reward_risk_multiple": reward_risk,
                 "config": {
                     "mode": cfg.mode, "tp_pct": cfg.tp_pct, "sl_pct": cfg.sl_pct,
@@ -989,9 +1080,22 @@ class CommandProcessor:
                 continue
 
             lines.append(f"🧪 BACKTEST {window} · {scenario}")
+            start_utc = datetime.fromtimestamp(int(result["start_time"]), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            end_utc = datetime.fromtimestamp(int(result["end_time"]), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            lines.append(f"Requested UTC window: {start_utc} → {end_utc}")
             lines.append(f"Symbols {result['symbols_eligible']}/{result['symbols_tested']} · 1H bars {result['valid_candles']}")
             lines.append(
+                f"Positions: max {result.get('max_observed_concurrent_positions', 0)}/"
+                f"{result.get('configured_max_concurrent_positions', cfg.max_concurrent_positions)} observed/configured · "
+                f"open at end {result.get('open_trades_at_end', 0)}"
+            )
+            lines.append(
                 f"Evaluations {result.get('strategy_evaluations', 0)} · Candidates {result.get('candidate_signals', 0)} · Entries {result.get('entry_attempts', 0)}"
+            )
+            lines.append(
+                f"🎯 TP {result.get('take_profit_hits', 0)} (L{result.get('long_take_profit_hits', 0)}/S{result.get('short_take_profit_hits', 0)}) · "
+                f"🛑 SL {result.get('stop_loss_hits', 0)} (L{result.get('long_stop_loss_hits', 0)}/S{result.get('short_stop_loss_hits', 0)}) · "
+                f"Time-stop {result.get('time_stop_exits', 0)} · Data-gap exits {result.get('data_gap_exits', 0)}"
             )
             if result.get("completed_trades", 0) == 0 and result.get("open_trades_at_end", 0) == 0:
                 lines.append("No qualifying trades in this period.")
@@ -1017,6 +1121,11 @@ class CommandProcessor:
                 lines.append("Data note: " + " · ".join(result["warnings"][:2]))
 
         lines.append("Live orders: OFF")
+        lines.append("Limitations: modeled fills/costs; no full order-book replay or cross-margin liquidation simulation. Open positions are not included in realized P&L.")
+        lines.append(
+            f"Universe: {universe_note} · Backtest cap: {cfg.max_concurrent_positions} positions · "
+            f"Aggregate stop-risk cap: {cfg.max_open_risk_fraction:.1%} · Strategy: 1D → 12H → 4H → 1H"
+        )
         total_ms = (time.perf_counter() - command_started) * 1000
         logger.info(
             "BACKTEST COMMAND COMPLETE | windows=%s requested_symbols=%d loaded_symbols=%d elapsed_ms=%.0f",

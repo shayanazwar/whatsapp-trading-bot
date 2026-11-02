@@ -1,0 +1,17 @@
+# Complete Repository Manifest — v0.8.1
+
+This archive contains the complete source tree for GitHub replacement. Root entries include `app/`, `tests/`, `docs/`, `.github/`, `Dockerfile`, `render.yaml`, `pyproject.toml`, `requirements-runtime.lock` and current release documentation.
+
+Runtime/strategy core:
+- app/main.py, app/worker.py, app/config.py, app/storage.py
+- app/services/command_processor.py, app/services/scheduler.py, app/services/market_data.py
+- app/mexc/client.py
+- app/market/candles.py, app/market/indicators.py
+- app/strategy/rfpc.py, app/backtest.py, app/analysis.py
+
+The repository intentionally retains `app/backtest_rsi_ema.py` as inactive legacy implementation; active `BACKTEST` and `SCAN` routes use S1-RFPC.
+- app/market/precision.py (shared instrument tick-size rounding helper)
+- tests/test_release_v081.py (release-specific regression coverage)
+
+Full release also includes the GitHub Actions workflow, `.env.example`, Docker/Render
+configuration, operations/fundamentals/backtest documentation and the complete test suite.

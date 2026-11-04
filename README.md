@@ -16,7 +16,7 @@
 - Event-driven historical backtester that only uses higher-timeframe bars completed at each decision time and enters no earlier than the following 1H bar open.
 - Durable database jobs with leases, retries and worker roles; forecast paths compressed for storage.
 - Authenticated React dashboard with scanner, analysis, backtesting, signals, risk and forecast desk tabs. A canvas-based forecast visualizer draws historical candles, individual future paths and quantile bands.
-- Optional WhatsApp Cloud API integration: signed inbound webhooks, sender allowlist, `HELP`, `PRICE`, `ANALYZE`, `CHART`, `BACKTEST`, `STATUS` and `SCAN` commands, plus worker completion notifications. Chart commands send PNG images. All trading remains research/paper-only.
+- Optional WhatsApp Cloud API command interface: signed inbound webhooks at `/webhook` and `/api/whatsapp/webhook`, sender allowlist, `HELP`, `PING`, `DASHBOARD`, `ANALYZE`, `FORECAST`, `BACKTEST`, `STATUS`, `SCAN` and `SIGNALS`. It sends command acknowledgements and job-status notices only; detailed trading research remains in the authenticated dashboard.
 - No live order placement, no private MEXC trading key requirement and no withdrawals.
 
 ## Run locally
@@ -82,9 +82,9 @@ The current MEXC Futures API base used here is `https://api.mexc.com`. Use the d
 
 See `docs/RENDER_DEPLOYMENT.md`. The Render Blueprint provisions a web service, market-data worker, backtest/compute worker, dedicated CPU Kronos inference worker and PostgreSQL database. Render's published service plans are CPU/RAM plans, not a GPU inference tier. The project therefore uses CPU inference by default and exposes an optional external GPU inference integration boundary. Benchmark model loading and sample generation before choosing a production instance size.
 
-## WhatsApp policy
+## WhatsApp operation and message boundary
 
-See `docs/WHATSAPP_COMPLIANCE.md`. WhatsApp signal sending is intentionally blocked in code, not merely switched off by an environment variable. Do not reword crypto-futures messages, use an unofficial client or route through another identity to evade Meta's policy. This project uses the authenticated web dashboard for its own signal feed.
+See `docs/WHATSAPP_COMPLIANCE.md` and `docs/WHATSAPP_SETUP.md`. WhatsApp is an authenticated command/status interface. It can enqueue research jobs and report job progress, but it does not send crypto-futures entries, stops, targets, directional recommendations or signal lists. Those remain in the authenticated dashboard. Use only an account and message purposes permitted by the platform; do not use unofficial clients or attempt to evade enforcement.
 
 See [`TEST_REPORT.md`](TEST_REPORT.md) for exact checks performed, checks blocked by this environment, and known functional limitations.
 

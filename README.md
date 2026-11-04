@@ -2,7 +2,7 @@
 
 **PAK TRADING ACADEMY — KRONOS INTELLIGENCE** is an independent MEXC USDT-M perpetual-futures quantitative research platform. It combines MEXC public market data, the official Kronos financial-candlestick foundation model, a transparent multi-timeframe setup engine, a sequence-preserving historical simulator, event-driven backtesting, an authenticated research dashboard and paper-only signals.
 
-> **Current release status: corrected source package 1.0.1 prepared; external model download, live exchange verification and cloud deployment require network/account access. This is not a claim of production deployment or trading profitability.**
+> **V12 source status: forensic fixes and Python regression suite completed (98/98 passed in the local test environment). Cloud worker startup, live MEXC data, live WhatsApp delivery, frontend production build and actual pretrained Kronos inference still require deployment/network resources; this package is not certified production-ready.**
 
 ## Capabilities in this release
 
@@ -14,9 +14,9 @@
 - 10,000-path moving-block OHLC bootstrap, partial-exit-aware TP/SL barrier evaluation and fee/slippage/funding-aware calculations.
 - Side-aware live order-book capacity gate based on MEXC's documented `[price, order_count, contract_quantity]` depth levels; a missing funding snapshot or insufficient visible depth blocks paper-signal approval.
 - Event-driven historical backtester that only uses higher-timeframe bars completed at each decision time and enters no earlier than the following 1H bar open.
-- Durable database jobs with leases, retries and worker roles; forecast paths compressed for storage.
-- Authenticated React dashboard with scanner, analysis, backtesting, signals, risk and forecast desk tabs. A canvas-based forecast visualizer draws historical candles, individual future paths and quantile bands.
-- Optional WhatsApp Cloud API command interface: signed inbound webhooks at `/webhook` and `/api/whatsapp/webhook`, sender allowlist, `HELP`, `PING`, `DASHBOARD`, `ANALYZE`, `FORECAST`, `BACKTEST`, `STATUS`, `SCAN` and `SIGNALS`. It sends command acknowledgements and job-status notices only; detailed trading research remains in the authenticated dashboard.
+- Durable PostgreSQL-backed jobs with role-specific workers, owner-bound leases, bounded exponential retry, expired-job recovery and queue/worker diagnostics; forecast paths compressed for storage.
+- Authenticated React dashboard with scanner, analysis, backtesting, signals, risk and forecast desk tabs. The forecast visualizer separates observed candles from future median OHLC forecast candles, individual paths, P10–P90 bands and validated strategy levels.
+- Optional WhatsApp Cloud API command interface: signed inbound webhooks at `/webhook` and `/api/whatsapp/webhook`, sender allowlist, `HELP`, `PING`, `PRICE`, `DASHBOARD`, `ANALYZE`, `CHART`, `FORECAST`, `KRONOS`, `BACKTEST [KRONOS]`, `STATUS`, `QUEUE`, `WORKERS`, `HEALTH`, `DIAGNOSTICS`, `SCAN` and `SIGNALS`. It sends command acknowledgements and job-status notices only; detailed trading research remains in the authenticated dashboard.
 - No live order placement, no private MEXC trading key requirement and no withdrawals.
 
 ## Run locally
@@ -80,13 +80,13 @@ The current MEXC Futures API base used here is `https://api.mexc.com`. Use the d
 
 ## Deployment
 
-See `docs/RENDER_DEPLOYMENT.md`. The Render Blueprint provisions a web service, market-data worker, backtest/compute worker, dedicated CPU Kronos inference worker and PostgreSQL database. Render's published service plans are CPU/RAM plans, not a GPU inference tier. The project therefore uses CPU inference by default and exposes an optional external GPU inference integration boundary. Benchmark model loading and sample generation before choosing a production instance size.
+See `docs/RENDER_DEPLOYMENT.md`. The Render Blueprint provisions a web service, market-data worker, backtest/compute worker, dedicated CPU Kronos inference worker and PostgreSQL database. All three worker roles must be deployed and use the same `DATABASE_URL`; a healthy web service by itself does not consume queue jobs. Render's published service plans are CPU/RAM plans, not a GPU inference tier. The project therefore uses CPU inference by default and exposes an optional external GPU inference integration boundary. Benchmark model loading and sample generation before choosing a production instance size.
 
 ## WhatsApp operation and message boundary
 
 See `docs/WHATSAPP_COMPLIANCE.md` and `docs/WHATSAPP_SETUP.md`. WhatsApp is an authenticated command/status interface. It can enqueue research jobs and report job progress, but it does not send crypto-futures entries, stops, targets, directional recommendations or signal lists. Those remain in the authenticated dashboard. Use only an account and message purposes permitted by the platform; do not use unofficial clients or attempt to evade enforcement.
 
-See [`TEST_REPORT.md`](TEST_REPORT.md) for exact checks performed, checks blocked by this environment, and known functional limitations.
+See [`V12_TEST_REPORT.md`](V12_TEST_REPORT.md), [`V12_AUDIT_REPORT.md`](V12_AUDIT_REPORT.md), and [`V12_DEPLOYMENT.md`](V12_DEPLOYMENT.md) for tested changes, unresolved limitations and exact deployment steps.
 
 ## Security and operating mode
 

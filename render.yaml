@@ -30,13 +30,13 @@ services:
         value: "false"
       - key: WHATSAPP_ENABLED
         value: "true"
-      - key: WHATSAPP_ACCESS_TOKEN
+      - key: META_ACCESS_TOKEN
         sync: false
-      - key: WHATSAPP_PHONE_NUMBER_ID
+      - key: META_PHONE_NUMBER_ID
         sync: false
-      - key: WHATSAPP_VERIFY_TOKEN
+      - key: META_VERIFY_TOKEN
         sync: false
-      - key: WHATSAPP_APP_SECRET
+      - key: META_APP_SECRET
         sync: false
       - key: WHATSAPP_ALLOWED_RECIPIENTS
         sync: false
@@ -80,16 +80,16 @@ services:
           type: web
           name: kronos-mexc-intelligence-web
           envVarKey: WHATSAPP_ENABLED
-      - key: WHATSAPP_ACCESS_TOKEN
+      - key: META_ACCESS_TOKEN
         fromService:
           type: web
           name: kronos-mexc-intelligence-web
-          envVarKey: WHATSAPP_ACCESS_TOKEN
-      - key: WHATSAPP_PHONE_NUMBER_ID
+          envVarKey: META_ACCESS_TOKEN
+      - key: META_PHONE_NUMBER_ID
         fromService:
           type: web
           name: kronos-mexc-intelligence-web
-          envVarKey: WHATSAPP_PHONE_NUMBER_ID
+          envVarKey: META_PHONE_NUMBER_ID
       - key: AUTO_SCAN_ENABLED
         value: "true"
       - key: PAPER_MODE
@@ -134,16 +134,16 @@ services:
           type: web
           name: kronos-mexc-intelligence-web
           envVarKey: WHATSAPP_ENABLED
-      - key: WHATSAPP_ACCESS_TOKEN
+      - key: META_ACCESS_TOKEN
         fromService:
           type: web
           name: kronos-mexc-intelligence-web
-          envVarKey: WHATSAPP_ACCESS_TOKEN
-      - key: WHATSAPP_PHONE_NUMBER_ID
+          envVarKey: META_ACCESS_TOKEN
+      - key: META_PHONE_NUMBER_ID
         fromService:
           type: web
           name: kronos-mexc-intelligence-web
-          envVarKey: WHATSAPP_PHONE_NUMBER_ID
+          envVarKey: META_PHONE_NUMBER_ID
       - key: HF_HOME
         value: /var/data/huggingface
       - key: FORECAST_SAMPLE_COUNT
@@ -193,16 +193,16 @@ services:
           type: web
           name: kronos-mexc-intelligence-web
           envVarKey: WHATSAPP_ENABLED
-      - key: WHATSAPP_ACCESS_TOKEN
+      - key: META_ACCESS_TOKEN
         fromService:
           type: web
           name: kronos-mexc-intelligence-web
-          envVarKey: WHATSAPP_ACCESS_TOKEN
-      - key: WHATSAPP_PHONE_NUMBER_ID
+          envVarKey: META_ACCESS_TOKEN
+      - key: META_PHONE_NUMBER_ID
         fromService:
           type: web
           name: kronos-mexc-intelligence-web
-          envVarKey: WHATSAPP_PHONE_NUMBER_ID
+          envVarKey: META_PHONE_NUMBER_ID
       - key: HF_HOME
         value: /var/data/huggingface
       - key: FORECAST_DEVICE

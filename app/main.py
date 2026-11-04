@@ -7,7 +7,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import router
+from app.api.routes import (
+    router,
+    verify_whatsapp_webhook,
+    receive_whatsapp_webhook,
+)
 from app.db import init_db
 
 @asynccontextmanager
@@ -18,11 +22,17 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="KRONOS-MEXC-INTELLIGENCE",
-    version="1.0.2",
+    version="1.0.3",
     description="Independent MEXC Futures research platform. Paper/research only; no live order endpoints.",
     lifespan=lifespan,
 )
 app.include_router(router)
+
+# Backward-compatible webhook path. The deployed callback in the user's logs
+# POSTs to /webhook, while the API router's canonical path is /api/whatsapp/webhook.
+# Both paths use the same token verification and raw-body HMAC validation.
+app.add_api_route("/webhook", verify_whatsapp_webhook, methods=["GET"], include_in_schema=False)
+app.add_api_route("/webhook", receive_whatsapp_webhook, methods=["POST"], include_in_schema=False)
 
 
 @app.middleware("http")

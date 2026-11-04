@@ -139,6 +139,82 @@ def _metrics(trades: list[dict], equity_curve: list[dict], start_equity: float,
     }
 
 
+def _performance_group(trades: list[dict]) -> dict:
+    pnls = [float(t.get("net_pnl_usdt") or 0) for t in trades]
+    rs = [float(t.get("net_r") or 0) for t in trades]
+    return {
+        "trades": len(trades),
+        "wins": sum(value > 0 for value in pnls),
+        "losses": sum(value < 0 for value in pnls),
+        "breakeven": sum(value == 0 for value in pnls),
+        "win_rate": (sum(value > 0 for value in pnls) / len(pnls)) if pnls else None,
+        "net_pnl_after_costs_usdt": float(sum(pnls)),
+        "total_r": float(sum(rs)),
+        "average_r": float(np.mean(rs)) if rs else None,
+    }
+
+
+def _extended_backtest_metrics(*, trades: list[dict], unresolved_positions: list[dict],
+                               decisions_evaluated: int, signals_generated: int,
+                               long_signals: int, short_signals: int, net_rr_rejections: int,
+                               risk_rejections: int, kronos_rejections: int, entries_opened: int,
+                               candles_1h: int, candles_4h: int, candles_12h: int, candles_1d: int) -> dict:
+    # Accuracy is intentionally null: this event simulator measures trade P&L, not
+    # calibrated standalone direction forecasts. ForecastEvaluation records those separately.
+    closed = trades
+    regimes: dict[str, list[dict]] = {}
+    for trade in closed:
+        regimes.setdefault(str(trade.get("market_regime") or "UNKNOWN"), []).append(trade)
+    planned = [float(t["planned_rr"]) for t in closed if t.get("planned_rr") is not None]
+    net_planned = [float(t["net_planned_rr"]) for t in closed if t.get("net_planned_rr") is not None]
+    unresolved_planned = [float(t["planned_rr"]) for t in unresolved_positions if t.get("planned_rr") is not None]
+    total = candles_1h + candles_4h + candles_12h + candles_1d
+    zero_signal_reason = None
+    if signals_generated == 0:
+        zero_signal_reason = (
+            "No LONG_CANDIDATE or SHORT_CANDIDATE was produced by the completed-candle "
+            "1D/12H/4H/1H strategy at any evaluated 1H decision point."
+        )
+    elif entries_opened == 0:
+        zero_signal_reason = (
+            f"{signals_generated} strategy candidates were generated but none opened; "
+            f"net-RR rejections={net_rr_rejections}, risk/margin rejections={risk_rejections}, "
+            f"Kronos filter rejections={kronos_rejections}."
+        )
+    return {
+        "period_tested": None,
+        "coins_tested": 1,
+        "candles_processed": total,
+        "candles_processed_by_timeframe": {"1D": candles_1d, "12H_derived": candles_12h, "4H": candles_4h, "1H": candles_1h},
+        "decisions_evaluated": decisions_evaluated,
+        "signals_generated": signals_generated,
+        "long_signals": long_signals,
+        "short_signals": short_signals,
+        "signals_opened": entries_opened,
+        "net_rr_rejections": net_rr_rejections,
+        "risk_rejections": risk_rejections,
+        "kronos_rejections": kronos_rejections,
+        "tp3_hits": None,
+        "tp3_status": "NOT_IMPLEMENTED_IN_CURRENT_STRATEGY",
+        "total_r": float(sum(float(t.get("net_r") or 0) for t in closed)),
+        "net_pnl_after_costs_usdt": float(sum(float(t.get("net_pnl_usdt") or 0) for t in closed)),
+        "average_planned_rr": float(np.mean(planned)) if planned else None,
+        "average_net_planned_rr": float(np.mean(net_planned)) if net_planned else None,
+        "average_planned_rr_including_unresolved": (
+            float(np.mean(planned + unresolved_planned)) if planned or unresolved_planned else None
+        ),
+        "actual_realized_rr": float(np.mean([float(t.get("net_r") or 0) for t in closed])) if closed else None,
+        "kronos_directional_accuracy": None,
+        "technical_directional_accuracy": None,
+        "combined_directional_accuracy": None,
+        "directional_accuracy_status": "NOT_COMPUTED_BY_TRADE_PNL_BACKTEST; USE_FORECAST_EVALUATION_FOR_FORECAST_METRICS",
+        "performance_by_timeframe": {"1H_execution_with_1D_12H_4H_context": _performance_group(closed)},
+        "performance_by_market_regime": {key: _performance_group(value) for key, value in sorted(regimes.items())},
+        "zero_signal_explanation": zero_signal_reason,
+        "unresolved_positions_excluded_from_wins_losses_and_total_r": len(unresolved_positions),
+    }
+
+
 def _mark_to_market_pnl(*, side: str, entry: float, mark: float, stop: float, tp1: float,
                         tp1_seen: bool, contracts: float, contract_size: float,
                         entry_fee: float, entry_slippage: float, fee_rate: float,
@@ -218,6 +294,14 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
         "No historical order-book queue priority, actual partial fills or full cross-margin liquidation replay is available.",
     ]
     i = 0
+    decisions_evaluated = 0
+    signals_generated = 0
+    long_signals = 0
+    short_signals = 0
+    net_rr_rejections = 0
+    risk_rejections = 0
+    kronos_rejections = 0
+    entries_opened = 0
     start_ts = pd.Timestamp(start_time)
     end_ts = pd.Timestamp(end_time)
     while i < len(h1) - 1:
@@ -243,6 +327,11 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
         if decision.decision not in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
             i += 1
             continue
+        signals_generated += 1
+        if decision.side == "LONG":
+            long_signals += 1
+        elif decision.side == "SHORT":
+            short_signals += 1
         side = decision.side
         forecast_decision = None
         if use_kronos_filter and kronos_filter is None:
@@ -268,6 +357,7 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
             taker_fee_rate=fee, slippage_bps=slippage_bps,
         )
         if net_geometry["net_rr"] < min_net_rr:
+            net_rr_rejections += 1
             i += 1
             continue
         if use_kronos_filter:
@@ -279,6 +369,7 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
                 {"entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2},
             )
             if not forecast_decision.get("approved"):
+                kronos_rejections += 1
                 i += 1
                 continue
         maintenance = risk_limits["maintenance_margin_rate"]
@@ -295,9 +386,11 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
                 max_leverage=int(risk_limits["max_leverage"]),
             )
         except ValueError as exc:
+            risk_rejections += 1
             warnings.append(f"{symbol}: position skipped by risk/margin/contract limits: {exc}")
             i += 1
             continue
+        entries_opened += 1
         contracts = float(plan.contracts)
         qty = contracts * contract_size
         risk_budget_usdt = float(plan.risk_budget_usdt)
@@ -452,7 +545,10 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
                 else "NO_SETTLEMENT_OR_UNAVAILABLE"
             ),
             "net_pnl_usdt": float(net_pnl), "net_r": float(net_r),
-            "strategy_score": float(decision.score), "kronos_filter_used": bool(use_kronos_filter),
+            "strategy_score": float(getattr(decision, "score", 0.0)), "market_regime": getattr(decision, "regime_1d", None) or "UNKNOWN",
+            "planned_rr": float(abs(tp2 - entry) / max(abs(entry - stop), 1e-12)),
+            "net_planned_rr": float(net_geometry["net_rr"]),
+            "kronos_filter_used": bool(use_kronos_filter),
             "kronos_filter_result": forecast_decision,
         }
         if exit_type == "OPEN_AT_END":
@@ -471,6 +567,14 @@ def run_event_backtest(*, symbol: str, candles_1h: pd.DataFrame, candles_4h: pd.
         i = max(i + 1, exit_index + 1)
 
     metrics = _metrics(trades, equity_curve, starting_equity, unresolved_positions)
+    metrics.update(_extended_backtest_metrics(
+        trades=trades, unresolved_positions=unresolved_positions,
+        decisions_evaluated=decisions_evaluated, signals_generated=signals_generated,
+        long_signals=long_signals, short_signals=short_signals,
+        net_rr_rejections=net_rr_rejections, risk_rejections=risk_rejections,
+        kronos_rejections=kronos_rejections, entries_opened=entries_opened,
+        candles_1h=len(h1), candles_4h=len(h4), candles_12h=len(h12), candles_1d=len(d1),
+    ))
     metrics["funding_data_status"] = "UNAVAILABLE_OR_FETCH_FAILED" if funding_events is None else "HISTORICAL_EVENTS_FETCHED_WITH_PER_TRADE_VALUATION"
     metrics["kronos_filter_used"] = bool(use_kronos_filter)
     metrics["kronos_pretraining_cutoff_verified"] = False if use_kronos_filter else None

@@ -5,49 +5,47 @@ import hmac
 import logging
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from PIL import Image, ImageDraw
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.market.candles import aggregate_12h_from_4h
 from app.market.mexc import MexcPublicClient, normalize_symbol
-from app.models import Job, SystemEvent, WhatsAppInboundEvent
+from app.models import Forecast, Job, SystemEvent, WhatsAppInboundEvent, WorkerHeartbeat
 from app.notifications.whatsapp import WhatsAppCloudAPI
 from app.services.jobs import enqueue_job, job_to_dict
 
 log = logging.getLogger(__name__)
+_REQUEST_ID: ContextVar[str] = ContextVar("kronos_whatsapp_request_id", default="")
 
 HELP_TEXT = """KRONOS commands
 
 PING
-  Check whether the bot and webhook command handler are responding.
-
-DASHBOARD
-  Open the authenticated KRONOS research dashboard.
-
-SIGNALS
-  Open the authenticated dashboard's research signal feed.
+  Check that WhatsApp command processing and replies are working.
 
 PRICE [symbol]
-  Live MEXC Futures market quote. Example: PRICE BTCUSDT
-
-CHART [symbol] [1H|4H|1D]
-  Send a market chart image. Default: 4H.
+  Live MEXC Futures quote. Example: PRICE BTCUSDT
 
 ANALYZE [symbol]
   Queue full 1D > 12H > 4H > 1H research analysis.
 
-FORECAST [symbol]
-  Queue a Kronos forecast. Example: FORECAST BTCUSDT
+CHART [symbol] [1H|4H|1D]
+  Send a candlestick chart image. Default: 4H.
 
-BACKTEST [symbol] [1D|7D|30D]
-  Queue a historical paper backtest. Example: BACKTEST BTCUSDT 7D
+FORECAST [symbol] / KRONOS [symbol]
+  Queue a real Kronos model forecast (1H by default).
+
+BACKTEST [symbol] [1D|7D|30D] [KRONOS]
+  Queue a historical paper backtest. Example: BACKTEST BTCUSDT 7D KRONOS
+  KRONOS runs the real model filter at each historical decision point and is expensive.
   You can also send: BACKTEST 1D
 
 BACKTEST STATUS
@@ -56,13 +54,25 @@ BACKTEST STATUS
 STATUS [job_id]
   Show your latest job, or one of your own job IDs.
 
+QUEUE
+  Show queue counts and oldest queued job age.
+
+WORKERS
+  Show inference, compute and market worker heartbeats.
+
+HEALTH / DIAGNOSTICS
+  Show database, queue, worker and Kronos readiness diagnostics.
+
+DASHBOARD / SIGNALS
+  Open the authenticated dashboard for detailed research results. WhatsApp does not send entries, stops or targets.
+
 SCAN
   Queue a MEXC universe scan.
 
 HELP
   Show this command list.
 
-Research/paper only. No exchange orders are placed. Detailed directional research and trade levels remain in the authenticated dashboard."""
+Live exchange orders are disabled. All outputs are research/paper only."""
 
 
 def normalize_phone(value: str) -> str:
@@ -114,7 +124,125 @@ def _send_text(sender: str, text: str) -> dict:
 
 
 def _job_payload(sender: str, **kwargs) -> dict:
-    return {**kwargs, "whatsapp_recipient": sender, "whatsapp_notify_on_completion": True}
+    request_id = _REQUEST_ID.get() or uuid.uuid4().hex
+    return {**kwargs, "request_id": request_id, "whatsapp_recipient": sender,
+            "whatsapp_notify_on_completion": True}
+
+
+def _enqueue_whatsapp_job(job_type: str, payload: dict) -> Job:
+    job = enqueue_job(job_type, payload)
+    request_id = str(payload.get("request_id") or "")
+    log.info("[JOB_CREATED] job_id=%s request_id=%s type=%s", job.id, request_id, job_type)
+    log.info("[JOB_QUEUED] job_id=%s request_id=%s type=%s", job.id, request_id, job_type)
+    return job
+
+
+def _required_worker(job_type: str) -> str:
+    return {
+        "analysis": "inference", "forecast": "inference", "evaluate_forecast": "inference",
+        "backtest": "compute", "scan": "market",
+    }.get(job_type, "unknown")
+
+
+def _worker_rows() -> list[WorkerHeartbeat]:
+    with SessionLocal() as db:
+        rows = db.scalars(select(WorkerHeartbeat).order_by(desc(WorkerHeartbeat.last_seen))).all()
+        for row in rows:
+            db.expunge(row)
+        return rows
+
+
+def _is_recent_heartbeat(row: WorkerHeartbeat, *, seconds: int = 60) -> bool:
+    seen = row.last_seen
+    if seen is None:
+        return False
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - seen).total_seconds() <= seconds
+
+
+def _queue_snapshot() -> dict[str, Any]:
+    with SessionLocal() as db:
+        counts = {
+            status: int(db.scalar(select(func.count(Job.id)).where(Job.status == status)) or 0)
+            for status in ("queued", "running", "completed", "failed", "cancelled")
+        }
+        oldest = db.scalar(select(func.min(Job.created_at)).where(Job.status == "queued"))
+    age = None
+    if oldest is not None:
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        age = max(0, int((datetime.now(timezone.utc) - oldest).total_seconds()))
+    return {"counts": counts, "oldest_queued_age_seconds": age}
+
+
+def _queue_message() -> str:
+    snapshot = _queue_snapshot()
+    counts = snapshot["counts"]
+    age = snapshot["oldest_queued_age_seconds"]
+    lines = [
+        "📥 KRONOS JOB QUEUE",
+        f"⏳ Queued: {counts['queued']}",
+        f"⚙️ Running: {counts['running']}",
+        f"✅ Completed: {counts['completed']}",
+        f"❌ Failed: {counts['failed']}",
+        f"Oldest queued: {age}s" if age is not None else "Oldest queued: none",
+    ]
+    return "\n".join(lines)
+
+
+def _workers_message() -> str:
+    rows = _worker_rows()
+    if not rows:
+        return "🛠️ No worker heartbeat has been recorded yet. Check the Render market, inference and compute worker services."
+    lines = ["🛠️ KRONOS WORKERS"]
+    seen_roles = set()
+    for row in rows:
+        if row.role in seen_roles:
+            continue
+        seen_roles.add(row.role)
+        live = _is_recent_heartbeat(row)
+        age = max(0, int((datetime.now(timezone.utc) - (
+            row.last_seen.replace(tzinfo=timezone.utc) if row.last_seen.tzinfo is None else row.last_seen
+        )).total_seconds()))
+        state = "🟢 ONLINE" if live else "🔴 STALE/OFFLINE"
+        lines.append(f"{row.role.upper()}: {state} · heartbeat {age}s ago · {row.message[:90]}")
+    for role in ("inference", "compute", "market"):
+        if role not in seen_roles:
+            lines.append(f"{role.upper()}: 🔴 NO HEARTBEAT")
+    return "\n".join(lines)
+
+
+def _diagnostics_message() -> str:
+    try:
+        with SessionLocal() as db:
+            db.execute(select(1)).scalar_one()
+        database_state = "✅ CONNECTED"
+    except Exception as exc:
+        database_state = f"❌ ERROR ({type(exc).__name__})"
+    rows = _worker_rows()
+    role_ok = {role: any(row.role in {role, "all"} and _is_recent_heartbeat(row) for row in rows)
+               for role in ("inference", "compute", "market")}
+    try:
+        with SessionLocal() as db:
+            last_forecast = db.scalar(select(Forecast.created_at).order_by(desc(Forecast.created_at)).limit(1))
+        kronos_state = "✅ forecast record exists" if last_forecast else "🟡 not yet verified by a completed forecast"
+    except Exception as exc:
+        kronos_state = f"❌ unavailable ({type(exc).__name__})"
+    snapshot = _queue_snapshot()
+    c = snapshot["counts"]
+    lines = [
+        "🔎 KRONOS DIAGNOSTICS",
+        f"Database: {database_state}",
+        f"Inference worker: {'🟢 online' if role_ok['inference'] else '🔴 missing/stale'}",
+        f"Backtest worker: {'🟢 online' if role_ok['compute'] else '🔴 missing/stale'}",
+        f"Market worker: {'🟢 online' if role_ok['market'] else '🔴 missing/stale'}",
+        f"Kronos: {kronos_state}",
+        f"Queue: {c['queued']} queued / {c['running']} running / {c['failed']} failed",
+    ]
+    if c["queued"] and not (role_ok["inference"] or role_ok["compute"] or role_ok["market"]):
+        lines.append("⚠️ No recent worker heartbeat: queued jobs cannot be consumed until the correct Render worker is online.")
+    return "\n".join(lines)
 
 
 def _format_job_status(job: Job) -> str:
@@ -127,6 +255,26 @@ def _format_job_status(job: Job) -> str:
     ]
     if job.status == "failed" and job.error:
         lines.append(f"Error: {job.error[:700]}")
+    if job.status == "queued":
+        role = _required_worker(job.job_type)
+        rows = _worker_rows()
+        online = any(row.role in {role, "all"} and _is_recent_heartbeat(row) for row in rows)
+        if online:
+            lines.append(f"Worker: {role.upper()} heartbeat detected; waiting for job claim/retry time.")
+            if job.next_attempt_at:
+                retry_at = job.next_attempt_at
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                lines.append(f"Next eligible retry: {retry_at.isoformat()}")
+        else:
+            lines.append(f"⚠️ Wait reason: no recent {role.upper()} worker heartbeat. Check that Render worker service is running and uses the same DATABASE_URL.")
+        queued_at = job.created_at
+        if queued_at is not None:
+            if queued_at.tzinfo is None:
+                queued_at = queued_at.replace(tzinfo=timezone.utc)
+            age_seconds = max(0, int((datetime.now(timezone.utc) - queued_at).total_seconds()))
+            if age_seconds > 60 and online:
+                lines.append(f"⚠️ Worker heartbeat exists but this job has not been claimed after {age_seconds}s. Check worker logs, role routing and shared DATABASE_URL.")
     if job.status == "completed" and job.result:
         if job.job_type == "backtest":
             m = (job.result or {}).get("metrics") or {}
@@ -162,18 +310,20 @@ def _format_job_status(job: Job) -> str:
 
 def _find_sender_job(sender: str, job_id: str | None = None, job_type: str | None = None) -> Job | None:
     with SessionLocal() as db:
-        rows = db.scalars(select(Job).order_by(desc(Job.created_at)).limit(150)).all()
-        for row in rows:
-            payload = row.payload or {}
-            if payload.get("whatsapp_recipient") != sender:
-                continue
-            if job_id and row.id != job_id:
-                continue
+        if job_id:
+            row = db.get(Job, job_id)
+            if row is None or (row.payload or {}).get("whatsapp_recipient") != sender:
+                return None
             if job_type and row.job_type != job_type:
-                continue
+                return None
+        else:
+            stmt = select(Job).where(Job.payload["whatsapp_recipient"].as_string() == sender)
+            if job_type:
+                stmt = stmt.where(Job.job_type == job_type)
+            row = db.scalars(stmt.order_by(desc(Job.created_at)).limit(1)).first()
+        if row is not None:
             db.expunge(row)
-            return row
-    return None
+        return row
 
 
 def _render_candlestick_chart(frame: pd.DataFrame, symbol: str, interval: str, path: Path) -> None:
@@ -226,14 +376,18 @@ def _render_candlestick_chart(frame: pd.DataFrame, symbol: str, interval: str, p
 
 
 def _create_chart(sender: str, symbol: str, interval: str, public_base_url: str) -> None:
-    intervals = {"1H": "Min60", "4H": "Hour4", "1D": "Day1"}
+    intervals = {"1H": "Min60", "4H": "Hour4", "12H": "12H", "1D": "Day1"}
     if interval not in intervals:
-        raise ValueError("Chart timeframe must be 1H, 4H or 1D")
+        raise ValueError("Chart timeframe must be 1H, 4H, 12H or 1D")
     mexc_interval = intervals[interval]
-    seconds = {"1H": 3600, "4H": 14400, "1D": 86400}[interval]
+    seconds = {"1H": 3600, "4H": 14400, "12H": 43200, "1D": 86400}[interval]
     end = int(datetime.now(timezone.utc).timestamp())
     with MexcPublicClient() as client:
-        frame = client.klines(symbol, mexc_interval, end - 100 * seconds, end)
+        if interval == "12H":
+            h4 = client.klines(symbol, "Hour4", end - 320 * 14400, end)
+            frame = aggregate_12h_from_4h(h4).tail(100)
+        else:
+            frame = client.klines(symbol, mexc_interval, end - 100 * seconds, end)
     cfg = get_settings()
     base_url = (cfg.public_base_url or public_base_url or "").rstrip("/")
     if not base_url.startswith("https://"):
@@ -250,6 +404,7 @@ def _create_chart(sender: str, symbol: str, interval: str, public_base_url: str)
             pass
     path = chart_dir / f"{chart_id}.png"
     _render_candlestick_chart(frame, symbol, interval, path)
+    log.info("[CHART_GENERATED] symbol=%s timeframe=%s candles=%s chart_id=%s", symbol, interval, len(frame), chart_id)
     url = f"{base_url}/api/whatsapp/charts/{chart_id}.png"
     adapter = WhatsAppCloudAPI()
     try:
@@ -258,30 +413,36 @@ def _create_chart(sender: str, symbol: str, interval: str, public_base_url: str)
         adapter.close()
 
 
-def _dashboard_link(public_base_url: str = "") -> str:
-    cfg = get_settings()
-    base_url = str(cfg.public_base_url or public_base_url or "").rstrip("/")
-    if not base_url.startswith("https://"):
-        return ("Use the authenticated dashboard for detailed research. "
-                "Dashboard URL is not configured; set PUBLIC_BASE_URL to your public HTTPS service URL.")
-    return f"Open the authenticated dashboard for detailed research: {base_url}/"
-
-
 def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return "Send HELP to see available commands."
     parts = cleaned.replace(",", " ").split()
-    command = parts[0].upper()
-
-    if command == "PING":
-        return "KRONOS is online. The WhatsApp webhook and command handler received your message."
-
-    if command in {"DASHBOARD", "SIGNALS"}:
-        return _dashboard_link(public_base_url)
+    command = parts[0].lstrip("/").upper()
+    request_id = _REQUEST_ID.get() or uuid.uuid4().hex
 
     if command in {"HELP", "START", "MENU"}:
         return HELP_TEXT
+
+    if command == "PING":
+        return f"✅ KRONOS command handler is responding.\nRequest: {request_id[:12]}"
+
+    if command in {"DASHBOARD", "SIGNALS"}:
+        cfg = get_settings()
+        base = (cfg.public_base_url or public_base_url or "").rstrip("/")
+        if base.startswith("https://"):
+            return ("📊 Detailed research and paper signals are available in the authenticated dashboard:\n"
+                    f"{base}/\n🔐 Sign in to view account data.")
+        return "📊 Detailed research and signals are available in the authenticated dashboard. Set PUBLIC_BASE_URL to show its link."
+
+    if command in {"QUEUE", "JOBS"}:
+        return _queue_message()
+
+    if command == "WORKERS":
+        return _workers_message()
+
+    if command in {"HEALTH", "DIAGNOSTICS", "DIAG"}:
+        return _diagnostics_message()
 
     if command == "PRICE":
         symbol = normalize_symbol(parts[1] if len(parts) > 1 else "BTCUSDT")
@@ -303,9 +464,9 @@ def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
 
     if command == "ANALYZE":
         symbol = normalize_symbol(parts[1] if len(parts) > 1 else "BTCUSDT")
-        job = enqueue_job("analysis", _job_payload(sender, symbol=symbol))
+        job = _enqueue_whatsapp_job("analysis", _job_payload(sender, request_id=request_id, symbol=symbol))
         return (
-            f"Analysis queued for {symbol}.\nJob: {job.id}\n"
+            f"⏳ Analysis queued for {symbol}.\nJob: {job.id}\n"
             "You will receive the result when the inference worker finishes. Send STATUS to check progress."
         )
 
@@ -313,23 +474,23 @@ def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
         symbol = normalize_symbol(parts[1] if len(parts) > 1 else "BTCUSDT")
         interval = parts[2].upper() if len(parts) > 2 else "4H"
         _create_chart(sender, symbol, interval, public_base_url)
-        return f"Chart sent: {symbol} {interval}."
+        return f"📈 Chart sent: {symbol} {interval}."
 
-    if command == "FORECAST":
-        symbol = normalize_symbol(parts[1] if len(parts) > 1 else "BTCUSDT")
+    if command in {"FORECAST", "KRONOS"}:
         cfg = get_settings()
-        job = enqueue_job("forecast", _job_payload(
-            sender,
-            symbol=symbol,
-            timeframe="Min60",
-            samples=cfg.forecast_sample_count,
-            horizon=cfg.forecast_horizon,
-            seed=getattr(cfg, "forecast_random_seed", None),
+        symbol = normalize_symbol(parts[1] if len(parts) > 1 else "BTCUSDT")
+        timeframe = "Min60"
+        if len(parts) > 2:
+            timeframe = {"1H": "Min60", "4H": "Hour4", "1D": "Day1"}.get(parts[2].upper(), "")
+            if not timeframe:
+                raise ValueError("Forecast timeframe must be 1H, 4H or 1D")
+        job = _enqueue_whatsapp_job("forecast", _job_payload(
+            sender, request_id=request_id, symbol=symbol, timeframe=timeframe,
+            samples=cfg.forecast_sample_count, horizon=cfg.forecast_horizon,
+            seed=getattr(cfg, "forecast_random_seed", 42),
         ))
-        return (
-            f"Forecast queued for {symbol}.\nJob: {job.id}\n"
-            "You will receive a completion notice. Send STATUS to check progress."
-        )
+        return (f"🔮 Kronos forecast queued for {symbol} ({timeframe}).\nJob: {job.id}\n"
+                "⏳ The inference worker will send a completion notice. Send STATUS to check.")
 
     if command == "BACKTEST":
         if len(parts) > 1 and parts[1].upper() == "STATUS":
@@ -337,22 +498,28 @@ def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
             return _format_job_status(job) if job else "No backtest jobs found for your number."
         symbol = "BTC_USDT"
         days = 30
-        if len(parts) > 1:
-            token = parts[1].upper()
+        use_kronos_filter = any(token.upper() == "KRONOS" for token in parts[1:])
+        args = [token for token in parts[1:] if token.upper() != "KRONOS"]
+        if args:
+            token = args[0].upper()
             if re.fullmatch(r"1D|7D|30D", token):
                 days = int(token[:-1])
             else:
                 symbol = normalize_symbol(token)
-        if len(parts) > 2:
-            duration = parts[2].upper()
+        if len(args) > 1:
+            duration = args[1].upper()
             if not re.fullmatch(r"1D|7D|30D", duration):
                 raise ValueError("Backtest duration must be 1D, 7D or 30D")
             days = int(duration[:-1])
-        job = enqueue_job("backtest", _job_payload(
-            sender, symbol=symbol, days=days, use_kronos_filter=False,
+        if len(args) > 2:
+            raise ValueError("Usage: BACKTEST [symbol] [1D|7D|30D] [KRONOS]")
+        job = _enqueue_whatsapp_job("backtest", _job_payload(
+            sender, request_id=request_id, symbol=symbol, days=days,
+            use_kronos_filter=use_kronos_filter,
         ))
         return (
-            f"{days}D backtest queued for {symbol}.\nJob: {job.id}\n"
+            f"📚 {days}D backtest queued for {symbol}.\n"
+            f"🔮 Kronos historical filter: {'ON' if use_kronos_filter else 'OFF'}\nJob: {job.id}\n"
             "You will receive the report when the compute worker finishes. Send BACKTEST STATUS to check."
         )
 
@@ -362,7 +529,7 @@ def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
         return _format_job_status(job) if job else "No matching jobs found for your number."
 
     if command == "SCAN":
-        job = enqueue_job("scan", _job_payload(sender, source="whatsapp"))
+        job = _enqueue_whatsapp_job("scan", _job_payload(sender, request_id=request_id, source="whatsapp"))
         return f"MEXC universe scan queued.\nJob: {job.id}\nSend STATUS to check progress."
 
     raise ValueError("Unknown command. Send HELP to see available commands.")
@@ -376,50 +543,14 @@ def notify_job_completion(job: Job, result: dict | None = None, error: str | Non
     if not recipient:
         return
     if error:
-        message = f"KRONOS {job.job_type.upper()} FAILED\nJob: {job.id}\n{str(error)[:900]}"
+        # Keep sensitive provider/network exception details in server logs only.
+        message = (f"❌ KRONOS {job.job_type.upper()} JOB FAILED\nJob: {job.id}\n"
+                   f"Error type: {type(error).__name__ if isinstance(error, Exception) else 'ExecutionError'}\n"
+                   "Use STATUS with this job ID for progress and check the authenticated dashboard for diagnostics.")
     else:
-        result = result or {}
-        if job.job_type == "analysis":
-            symbol = result.get("symbol", "UNKNOWN")
-            message = "\n".join([
-                f"KRONOS ANALYSIS JOB COMPLETED — {symbol}",
-                f"Job: {job.id}",
-                "Your research analysis is ready.",
-                _dashboard_link(),
-                "Research/paper only — no exchange order was placed.",
-            ])
-        elif job.job_type == "backtest":
-            metrics = result.get("metrics") or {}
-            days = (payload.get("days") or "n/a")
-            message = "\n".join([
-                f"KRONOS BACKTEST COMPLETE — {result.get('symbol', payload.get('symbol', 'UNKNOWN'))}",
-                f"Period: {days}D",
-                f"Trades: {metrics.get('trades', 0)} | Wins: {metrics.get('wins', 0)} | Losses: {metrics.get('losses', 0)}",
-                f"Win rate: {_format_number((metrics.get('win_rate') or 0) * 100, 2)}%",
-                f"Net return: {_format_number(metrics.get('net_return_pct'), 2)}%",
-                f"Profit factor: {_format_number(metrics.get('profit_factor'), 2)}",
-                f"Max drawdown: {_format_number(metrics.get('max_drawdown_pct'), 2)}%",
-                f"Funding data: {metrics.get('funding_data_quality', 'unknown')}",
-                f"Job: {job.id}",
-                "Historical research only; results are not a forecast or a guarantee.",
-            ])
-        elif job.job_type == "scan":
-            candidates = result.get("candidates") or []
-            message = "\n".join([
-                "KRONOS MEXC SCAN COMPLETE",
-                f"Universe checked: {result.get('universe_size', 'n/a')}",
-                f"Research jobs queued: {len(candidates)}",
-                f"Rejected: {result.get('rejected_count', 'n/a')}",
-                f"Job: {job.id}",
-                _dashboard_link(),
-            ])
-        else:
-            message = "\n".join([
-                f"KRONOS {job.job_type.upper()} JOB COMPLETED",
-                f"Job: {job.id}",
-                "Your research output is ready.",
-                _dashboard_link(),
-            ])
+        message = (f"✅ KRONOS {job.job_type.upper()} JOB COMPLETED\nJob: {job.id}\n"
+                   "📊 Open the authenticated dashboard for the full research output.\n"
+                   "Research/paper mode only; no exchange order was placed.")
     adapter = WhatsAppCloudAPI()
     try:
         adapter.send_text(str(recipient), message)
@@ -441,13 +572,13 @@ def process_whatsapp_payload(payload: dict, public_base_url: str = "") -> None:
                             message=f"WhatsApp message delivery status: {str(status.get('status') or 'unknown')[:40]}",
                             details={
                                 "message_id": str(status.get("id") or "")[:128],
-                                "recipient_id": str(status.get("recipient_id") or "")[:32],
                                 "status": str(status.get("status") or "")[:40],
                             },
                         ))
                 except Exception:
                     log.exception("Could not persist WhatsApp delivery status")
             for message in value.get("messages", []) or []:
+                request_id = uuid.uuid4().hex
                 sender_raw = str(message.get("from") or "")
                 try:
                     sender = normalize_phone(sender_raw)
@@ -456,7 +587,7 @@ def process_whatsapp_payload(payload: dict, public_base_url: str = "") -> None:
                     continue
                 allowed = allowed_senders()
                 if sender not in allowed:
-                    log.warning("Ignoring WhatsApp command from non-allowlisted sender %s", sender)
+                    log.warning("[COMMAND_REJECTED] request_id=%s reason=sender_not_allowlisted", request_id)
                     continue
 
                 msg_type = str(message.get("type") or "unknown")
@@ -486,27 +617,42 @@ def process_whatsapp_payload(payload: dict, public_base_url: str = "") -> None:
                         db.flush()
                 except IntegrityError:
                     # Meta retries webhook notifications. The primary key prevents duplicate commands.
+                    log.info("[WEBHOOK_DUPLICATE] request_id=%s", request_id)
                     continue
                 except Exception:
                     log.exception("Unable to record inbound WhatsApp event")
                     continue
 
                 try:
+                    log.info("[WEBHOOK_RECEIVED] request_id=%s message_id=%s type=%s",
+                             request_id, message_id[:24], msg_type)
                     if msg_type not in {"text", "interactive", "button"} or not body.strip():
                         reply = "I can process text commands. Send HELP for the command list."
                     else:
-                        reply = dispatch_command(sender, body, public_base_url)
+                        log.info("[PAYLOAD_PARSED] request_id=%s body_length=%s", request_id, len(body))
+                        log.info("[COMMAND_IDENTIFIED] request_id=%s command=%s",
+                                 request_id, body.strip().split()[0].lstrip("/").upper())
+                        context_token = _REQUEST_ID.set(request_id)
+                        try:
+                            reply = dispatch_command(sender, body, public_base_url)
+                        finally:
+                            _REQUEST_ID.reset(context_token)
+                        log.info("[COMMAND_VALIDATED] request_id=%s", request_id)
+                    log.info("[RESPONSE_FORMATTED] request_id=%s command=%s chars=%s",
+                             request_id, body.strip().split()[0].lstrip("/").upper() if body.strip() else "UNKNOWN", len(reply))
                     _send_text(sender, reply)
+                    log.info("[RESPONSE_SENT] request_id=%s message_id=%s", request_id, message_id[:24])
                     status_value = "PROCESSED"
                     error_value = None
                 except Exception as exc:
-                    log.exception("WhatsApp command failed sender=%s type=%s", sender, msg_type)
+                    log.exception("[COMMAND_FAILED] request_id=%s type=%s error_type=%s",
+                                  request_id, msg_type, type(exc).__name__)
                     status_value = "FAILED"
                     error_value = f"{type(exc).__name__}: {exc}"[:1000]
                     try:
-                        _send_text(sender, f"Command failed: {str(exc)[:800]}\nSend HELP for available commands.")
+                        _send_text(sender, f"❌ Command failed ({type(exc).__name__}).\nSend HELP for available commands.")
                     except Exception:
-                        log.exception("Could not send WhatsApp command error reply")
+                        log.exception("[RESPONSE_FAILED] request_id=%s", request_id)
                 finally:
                     with SessionLocal.begin() as db:
                         event = db.get(WhatsAppInboundEvent, message_id[:128])

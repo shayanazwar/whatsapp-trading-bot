@@ -17,8 +17,7 @@ from app.db import SessionLocal, init_db
 from app.models import Job, MarketSnapshot, WorkerHeartbeat
 from app.market.websocket import MexcTickerFeed
 from app.services.jobs import (claim_job, enqueue_job, fail_job, finish_job,
-                               recover_expired_jobs, renew_job_lease)
-from app.services.pipeline import process_job
+                               recover_expired_jobs, renew_job_lease, worker_job_context)
 from app.notifications.whatsapp_commands import notify_job_completion
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -59,6 +58,12 @@ def run(role: str | None = None):
     cfg = get_settings()
     role = role or cfg.worker_role
     init_db()
+    log.info("[WORKER_BOOT] role=%s pid=%s", role, os.getpid())
+    try:
+        from app.services.pipeline import process_job
+    except Exception:
+        log.exception("[WORKER_IMPORT_FAILED] role=%s module=app.services.pipeline", role)
+        raise
     worker_id = f"{socket.gethostname()}:{os.getpid()}:{role}"
     recover_expired_jobs()
     signal.signal(signal.SIGTERM, _stop)
@@ -108,7 +113,9 @@ def run(role: str | None = None):
         ws_thread.start()
         log.info("MEXC ticker WebSocket feed started url=%s", cfg.mexc_ws_url)
 
-    log.info("worker online id=%s role=%s auto_scan=%s", worker_id, role, cfg.auto_scan_enabled)
+    log.info("[WORKER_STARTED] id=%s role=%s auto_scan=%s database=%s",
+             worker_id, role, cfg.auto_scan_enabled,
+             "postgresql" if cfg.database_url.startswith("postgresql") else "sqlite")
     while not STOP:
         now_mono = time.monotonic()
         if now_mono - last_recovery >= 30:
@@ -130,17 +137,22 @@ def run(role: str | None = None):
                     enqueue_job("scan", {"scheduled": True})
                 except Exception:
                     log.exception("Failed to enqueue scheduled market scan")
-        job = claim_job(role)
+        job = claim_job(role, worker_id=worker_id)
         if job is None:
             time.sleep(cfg.worker_poll_seconds)
             continue
-        log.info("job started id=%s type=%s attempt=%s", job.id, job.job_type, job.attempts)
+        request_id = str((job.payload or {}).get("request_id") or "")
+        log.info("[WORKER_PICKED] worker=%s job_id=%s request_id=%s type=%s attempt=%s",
+                 worker_id, job.id, request_id, job.job_type, job.attempts)
+        log.info("[JOB_STARTED] job_id=%s request_id=%s type=%s", job.id, request_id, job.job_type)
         stop_lease = threading.Event()
 
         def keep_alive():
             while not stop_lease.wait(max(10, cfg.job_lease_seconds / 3)):
                 try:
-                    renew_job_lease(job.id)
+                    if not renew_job_lease(job.id, worker_id=worker_id):
+                        log.warning("[JOB_LEASE_LOST] worker=%s job_id=%s", worker_id, job.id)
+                        return
                     _save_heartbeat(worker_id, role, "BUSY", job.id, f"Processing {job.job_type}")
                 except Exception:
                     log.exception("Job lease/heartbeat renewal failed id=%s", job.id)
@@ -149,16 +161,28 @@ def run(role: str | None = None):
         thread.start()
         try:
             _save_heartbeat(worker_id, role, "BUSY", job.id, f"Processing {job.job_type}")
-            result = process_job(job)
-            finish_job(job.id, result)
-            log.info("job completed id=%s type=%s", job.id, job.job_type)
-            try:
-                notify_job_completion(job, result=result)
-            except Exception:
-                log.exception("WhatsApp completion notification failed id=%s", job.id)
+            with worker_job_context(worker_id):
+                result = process_job(job)
+                completed = finish_job(job.id, result)
+            if not completed:
+                log.warning("[JOB_COMPLETION_IGNORED] worker=%s job_id=%s reason=lease_or_owner_changed",
+                            worker_id, job.id)
+            else:
+                log.info("[JOB_COMPLETED] worker=%s job_id=%s request_id=%s type=%s progress=100",
+                         worker_id, job.id, request_id, job.job_type)
+                try:
+                    notify_job_completion(job, result=result)
+                except Exception:
+                    log.exception("WhatsApp completion notification failed id=%s", job.id)
         except Exception as exc:
-            log.exception("job failed id=%s type=%s", job.id, job.job_type)
-            fail_job(job.id, f"{type(exc).__name__}: {exc}")
+            log.exception("[JOB_FAILED] worker=%s job_id=%s request_id=%s type=%s error_type=%s",
+                          worker_id, job.id, request_id, job.job_type, type(exc).__name__)
+            with worker_job_context(worker_id):
+                accepted_failure = fail_job(job.id, f"{type(exc).__name__}: {exc}")
+            if not accepted_failure:
+                log.warning("[JOB_FAILURE_IGNORED] worker=%s job_id=%s reason=lease_or_owner_changed",
+                            worker_id, job.id)
+                continue
             # Do not tell the user a job is finally failed while a bounded retry is queued.
             if int(job.attempts or 0) >= int(job.max_attempts or 1):
                 try:
@@ -181,7 +205,7 @@ def run(role: str | None = None):
         ws_feed.stop()
     if ws_thread is not None:
         ws_thread.join(timeout=5)
-    log.info("worker shutdown complete")
+    log.info("[WORKER_STOPPED] id=%s role=%s graceful=true", worker_id, role)
     try:
         _save_heartbeat(worker_id, role, "OFFLINE", message="Graceful shutdown")
     except Exception:

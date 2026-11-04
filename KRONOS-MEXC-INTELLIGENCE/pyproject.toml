@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kronos-mexc-intelligence"
-version = "1.0.2"
+version = "1.2.0"
 description = "Independent MEXC USDT-M Futures forecasting and quantitative research platform"
 requires-python = ">=3.11"
 readme = "README.md"

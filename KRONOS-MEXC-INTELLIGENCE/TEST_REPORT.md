@@ -1,7 +1,7 @@
 # KRONOS-MEXC-INTELLIGENCE — Corrected Build Verification Report
 
-**Snapshot date:** 2026-11-03  
-**Project version:** 1.0.2  
+**Snapshot date:** 2026-11-04  
+**Project version:** 1.0.3  
 **Mode:** research and paper only; no live order execution.
 
 ## Fixes applied to the uploaded source
@@ -33,7 +33,7 @@
 
 | Check | Result | Evidence / scope |
 |---|---|---|
-| Backend automated tests | **PASS** | `python -m pytest -q` — **83 passed** |
+| Backend automated tests | **PASS** | `python -m pytest -q` — **86 passed** |
 | Python byte compilation | **PASS** | `python -m compileall -q app scripts alembic` |
 | Editable package install | **PASS** | `pip install -e . --no-deps --no-build-isolation` |
 | Fresh SQLite Alembic migration | **PASS** | New temporary DB; migrations `0001_initial` and `0002_whatsapp_events` |
@@ -84,3 +84,22 @@ Before describing this as operational: run the full npm build and Docker builds 
 - `83` automated tests pass, including mocked webhook, command, sender, chart, status and queue cases. No live Cloud API request was made from this environment.
 
 **A passing offline suite is not evidence of profitability, live exchange correctness, live WhatsApp delivery or production readiness.**
+
+
+## WhatsApp webhook repair — 2026-11-04
+
+- Added `GET /webhook` and `POST /webhook` compatibility aliases to the canonical `/api/whatsapp/webhook` handlers. Both paths perform identical verify-token and HMAC-signature checks. This directly addresses Render log entries showing `POST /webhook` returning 404.
+- Added `FORECAST`, `PING`, `DASHBOARD` and `SIGNALS` command handling. `ANALYZE`, `FORECAST`, `BACKTEST` and `SCAN` enqueue existing research jobs.
+- WhatsApp sends command acknowledgements and operational job status only. Detailed trading recommendations, entries, stops, targets, signal lists and full forecast/backtest results remain in the authenticated dashboard. `send_crypto_signal` fails closed.
+- Added allowlist diagnostics to the WhatsApp status payload; an empty allowlist is now explicitly reported rather than appearing fully configured.
+- Latest local verification after these changes: see attached ZIP's final run report; live provider delivery remains unverified without the user's configured credentials and provider console.
+
+
+## WhatsApp webhook and command repair — 2026-11-04
+
+- Added `GET /webhook` and `POST /webhook` aliases to the same handlers already exposed at `/api/whatsapp/webhook`. This directly resolves the path mismatch shown in the supplied Render logs (`POST /webhook` previously returned 404). Both paths retain verify-token and raw-body HMAC validation.
+- Added `PING`, `DASHBOARD`, `FORECAST` and `SIGNALS` command support. Existing `ANALYZE`, `BACKTEST`, `SCAN`, `STATUS` and `HELP` commands remain available.
+- Job completion and status replies now contain operational status only. Detailed market analysis, forecast paths, signal directions, entries, stops, targets and backtest metrics remain in the authenticated dashboard. The direct `send_crypto_signal` method fails closed.
+- WhatsApp status now reports whether `WHATSAPP_ALLOWED_RECIPIENTS` is configured and how many valid recipients are present; an empty allowlist is explicitly diagnosed.
+- Added automated tests for both webhook paths, command queueing, forecast enqueueing, dashboard-only signal access, status-only completion notices, the direct signal guard and allowlist diagnostics.
+- Final local backend suite: **86 passed**. This does not establish live Cloud API delivery; live credentials, callback subscription, allowlist and Render deployment still require user-side configuration and verification.

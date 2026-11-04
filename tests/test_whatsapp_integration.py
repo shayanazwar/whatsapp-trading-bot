@@ -61,6 +61,8 @@ def test_whatsapp_status_and_text_sender_use_cloud_api():
     assert kwargs["headers"]["Authorization"] == "Bearer test-token"
     assert adapter.status().enabled is True
     assert adapter.status().webhook_configured is True
+    assert adapter.status().recipient_allowlist_configured is True
+    assert adapter.status().recipient_allowlist_count == 1
 
 
 def test_whatsapp_sender_fails_closed_when_disabled_or_missing_credentials():
@@ -73,6 +75,12 @@ def test_whatsapp_sender_fails_closed_when_disabled_or_missing_credentials():
     assert missing.status().configured is False
     with pytest.raises(WhatsAppConfigurationError):
         missing.send_text("923001234567", "test")
+
+
+def test_direct_crypto_signal_delivery_is_blocked_from_whatsapp():
+    adapter = WhatsAppCloudAPI(settings=settings(), client=Mock())
+    with pytest.raises(WhatsAppConfigurationError, match="not sent via WhatsApp"):
+        adapter.send_crypto_signal({"symbol": "BTC_USDT", "side": "LONG", "entry": 100, "stop": 95, "tp1": 110})
 
 
 def test_whatsapp_sender_rejects_invalid_phone_and_non_https_chart():
@@ -121,8 +129,9 @@ def test_backtest_commands_queue_1d_7d_and_30d(monkeypatch):
 
 def test_help_includes_real_command_names():
     help_text = commands.dispatch_command("923001234567", "HELP")
-    for command in ("PRICE", "ANALYZE", "CHART", "BACKTEST", "BACKTEST STATUS", "STATUS", "SCAN"):
+    for command in ("PING", "ANALYZE", "FORECAST", "BACKTEST", "BACKTEST STATUS", "STATUS", "SCAN", "SIGNALS", "DASHBOARD"):
         assert command in help_text
+    assert "entries, stops" in help_text
 
 
 def test_chart_renderer_creates_png(tmp_path):
@@ -195,26 +204,59 @@ def test_whatsapp_webhook_routes_verify_and_accept_signed_post(monkeypatch):
     assert post_response.json()["accepted"] is True
     assert captured and captured[0][0]["object"] == "whatsapp_business_account"
 
+    alias_get = client.get(
+        "/webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "verify-me",
+            "hub.challenge": "alias-challenge",
+        },
+    )
+    assert alias_get.status_code == 200
+    assert alias_get.text == "alias-challenge"
 
-def test_price_command_reads_mexc_ticker(monkeypatch):
-    class FakeMexc:
-        def __enter__(self):
-            return self
-        def __exit__(self, *_):
-            return None
-        def tickers(self, symbol):
-            assert symbol == "BTC_USDT"
-            return [{
-                "symbol": "BTC_USDT", "lastPrice": 67000.5, "fairPrice": 67001,
-                "indexPrice": 66999, "bid1": 67000, "ask1": 67001,
-                "amount24": 125000000, "fundingRate": 0.0001,
-            }]
+    alias_post = client.post(
+        "/webhook",
+        content=raw,
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": signature},
+    )
+    assert alias_post.status_code == 200
+    assert alias_post.json()["accepted"] is True
 
-    monkeypatch.setattr(commands, "MexcPublicClient", FakeMexc)
+
+def test_price_and_chart_commands_route_users_to_dashboard():
     message = commands.dispatch_command("923001234567", "PRICE BTCUSDT")
-    assert "BTC_USDT" in message
-    assert "67,000.5" in message
-    assert "125,000,000" in message
+    assert "authenticated dashboard" in message
+    chart_message = commands.dispatch_command("923001234567", "CHART BTCUSDT 4H")
+    assert "authenticated dashboard" in chart_message
+
+
+def test_forecast_command_queues_pinned_forecast_job(monkeypatch):
+    captured = {}
+    job = SimpleNamespace(id="forecast-123")
+    cfg = settings(forecast_sample_count=1000, forecast_horizon=24)
+    monkeypatch.setattr(commands, "get_settings", lambda: cfg)
+
+    def enqueue(job_type, payload):
+        captured["job_type"] = job_type
+        captured["payload"] = payload
+        return job
+
+    monkeypatch.setattr(commands, "enqueue_job", enqueue)
+    reply = commands.dispatch_command("923001234567", "FORECAST BTCUSDT")
+    assert captured["job_type"] == "forecast"
+    assert captured["payload"]["symbol"] == "BTC_USDT"
+    assert captured["payload"]["samples"] == 1000
+    assert captured["payload"]["horizon"] == 24
+    assert "forecast-123" in reply
+
+
+def test_signals_command_only_links_to_authenticated_dashboard(monkeypatch):
+    monkeypatch.setattr(commands, "get_settings", lambda: settings())
+    reply = commands.dispatch_command("923001234567", "SIGNALS")
+    assert "https://example.onrender.com/" in reply
+    assert "authenticated dashboard" in reply
+    assert "Entry:" not in reply and "Stop:" not in reply
 
 
 def test_analyze_command_queues_existing_analysis_worker(monkeypatch):
@@ -259,8 +301,10 @@ def test_completion_notification_reports_analysis_result(monkeypatch):
     })
     assert sent
     assert sent[0][0] == "923001234567"
-    assert "KRONOS ANALYSIS" in sent[0][1]
-    assert "no exchange order was placed" in sent[0][1]
+    assert "KRONOS ANALYSIS JOB COMPLETED" in sent[0][1]
+    assert "authenticated dashboard" in sent[0][1]
+    for forbidden in ("Entry:", "Stop:", "TP1:", "TP2:", "LONG", "67000"):
+        assert forbidden not in sent[0][1]
 
 
 def test_webhook_rejects_invalid_signature(monkeypatch):

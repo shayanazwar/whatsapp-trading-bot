@@ -78,16 +78,16 @@ class Settings(BaseSettings):
     # WhatsApp Cloud API. Secrets are supplied through Render environment variables.
     whatsapp_enabled: bool = False
     whatsapp_access_token: str = Field(
-        default="", validation_alias=AliasChoices("WHATSAPP_ACCESS_TOKEN", "META_ACCESS_TOKEN")
+        default="", validation_alias=AliasChoices("META_ACCESS_TOKEN", "WHATSAPP_ACCESS_TOKEN")
     )
     whatsapp_phone_number_id: str = Field(
-        default="", validation_alias=AliasChoices("WHATSAPP_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID")
+        default="", validation_alias=AliasChoices("META_PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID")
     )
     whatsapp_verify_token: str = Field(
-        default="", validation_alias=AliasChoices("WHATSAPP_VERIFY_TOKEN", "META_VERIFY_TOKEN")
+        default="", validation_alias=AliasChoices("META_VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN")
     )
     whatsapp_app_secret: str = Field(
-        default="", validation_alias=AliasChoices("WHATSAPP_APP_SECRET", "META_APP_SECRET")
+        default="", validation_alias=AliasChoices("META_APP_SECRET", "WHATSAPP_APP_SECRET")
     )
     whatsapp_graph_api_version: str = "v26.0"
     whatsapp_api_timeout_seconds: float = Field(default=15.0, gt=1.0, le=60.0)

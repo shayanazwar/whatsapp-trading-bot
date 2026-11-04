@@ -1,7 +1,0 @@
-# Backtesting methodology
-
-The event-driven backtester iterates through the historical 1H candle stream chronologically. A signal decision is evaluated only after the current 1H candle closes. Each 1D, 12H and 4H context is filtered so its full candle close is no later than the decision timestamp. The hypothetical entry is the next 1H candle open, not the signal candle close.
-
-The engine applies contract-specific contract size and taker fee metadata, configured slippage, and historical funding events when supplied. If no historical funding dataset is available, funding is reported as unavailable—not silently assumed to be zero. When stop and target are both touched in one OHLC bar, the simulator uses a conservative stop-first assumption. Positions still open at the end are marked separately and are not counted as closed wins.
-
-The current event engine is single-symbol per job and uses the current contract metadata. Historical point-in-time contract metadata, order-book queue replay, partial depth fills, market impact and full portfolio/cross-margin liquidation are not modeled. This limitation must remain visible in every interpretation. The backtest can optionally apply a user-supplied historical Kronos filter callback; actual full rolling Kronos walk-forward backtests require model inference at each historical origin and sufficient compute and are expensive. Never reuse future forecast outputs as earlier backtest features.

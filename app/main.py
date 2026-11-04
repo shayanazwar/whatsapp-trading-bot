@@ -6,6 +6,9 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+
+from app.db import SessionLocal
 
 from app.api.routes import (
     router,
@@ -22,7 +25,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="KRONOS-MEXC-INTELLIGENCE",
-    version="1.0.3",
+    version="1.2.0",
     description="Independent MEXC Futures research platform. Paper/research only; no live order endpoints.",
     lifespan=lifespan,
 )
@@ -58,10 +61,11 @@ def healthz():
 @app.get("/readyz", tags=["health"])
 def readyz():
     try:
-        init_db()
-        return {"status": "ready", "database": "initialized"}
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+        return {"status": "ready", "database": "reachable"}
     except Exception as exc:
-        return JSONResponse(status_code=503, content={"status": "not_ready", "reason": str(exc)[:300]})
+        return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unreachable", "error_type": type(exc).__name__})
 
 
 static_dir = Path(__file__).resolve().parent / "static"

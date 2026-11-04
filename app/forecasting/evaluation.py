@@ -3,7 +3,8 @@ from __future__ import annotations
 import numpy as np
 
 
-def evaluate_forecast_paths(paths: np.ndarray, actual_close: np.ndarray, baseline_close: float) -> dict:
+def evaluate_forecast_paths(paths: np.ndarray, actual_close: np.ndarray, baseline_close: float,
+                            drift_mean_log_return_per_bar: float | None = None) -> dict:
     """Evaluate an ensemble against realized closes; all scores are out-of-sample only."""
     samples = np.asarray(paths, dtype=float)
     actual = np.asarray(actual_close, dtype=float)
@@ -20,6 +21,16 @@ def evaluate_forecast_paths(paths: np.ndarray, actual_close: np.ndarray, baselin
     p10, p90 = np.quantile(predicted, [0.10, 0.90], axis=0)
     errors = median - actual
     coverage = (actual >= p10) & (actual <= p90)
+    naive = np.full(len(actual), float(baseline_close), dtype=float)
+    drift = (
+        baseline_close * np.exp(float(drift_mean_log_return_per_bar) * np.arange(1, len(actual) + 1))
+        if drift_mean_log_return_per_bar is not None and np.isfinite(drift_mean_log_return_per_bar)
+        else naive.copy()
+    )
+    def _error_metrics(values: np.ndarray) -> dict:
+        delta = values - actual
+        return {"mae_close": float(np.mean(np.abs(delta))),
+                "rmse_close": float(np.sqrt(np.mean(delta ** 2)))}
     # Empirical ensemble CRPS; sorted formula avoids a samples x samples matrix.
     n = predicted.shape[0]
     crps_values = []
@@ -40,6 +51,19 @@ def evaluate_forecast_paths(paths: np.ndarray, actual_close: np.ndarray, baselin
         "p10_p90_coverage": float(np.mean(coverage)),
         "mean_p10_p90_width": float(np.mean(p90 - p10)),
         "crps_ensemble_mean": float(np.mean(crps_values)),
+        "baseline_comparison": {
+            "naive_last_value": _error_metrics(naive),
+            "drift": _error_metrics(drift),
+            "drift_mean_log_return_per_bar": float(drift_mean_log_return_per_bar)
+            if drift_mean_log_return_per_bar is not None else None,
+            "kronos_mae_improvement_vs_naive_pct": (
+                (1.0 - float(np.mean(np.abs(errors))) / max(float(np.mean(np.abs(naive - actual))), 1e-12)) * 100.0
+            ),
+            "kronos_rmse_improvement_vs_naive_pct": (
+                (1.0 - float(np.sqrt(np.mean(errors ** 2))) / max(float(np.sqrt(np.mean((naive - actual) ** 2))), 1e-12)) * 100.0
+            ),
+            "baseline_method": "last observed close; drift is mean log return over the prior 24 completed input bars",
+        },
         "median_close_forecast": median.tolist(),
         "actual_close": actual.tolist(),
         "p10_close": p10.tolist(),

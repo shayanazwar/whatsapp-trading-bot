@@ -91,6 +91,76 @@ def _validate_and_repair(paths: np.ndarray, max_invalid_fraction: float = 0.005)
     }
 
 
+def summarize_forecast_paths(paths: np.ndarray, historical_closes: np.ndarray | list[float]) -> dict:
+    """Summarize real decoded Kronos paths without presenting path share as probability.
+
+    Direction is based on the median terminal sample return. Volatility outlook is a
+    transparent heuristic comparing path dispersion with recent historical return
+    volatility; it is not a calibrated forecast probability.
+    """
+    paths = np.asarray(paths, dtype=np.float64)
+    closes = np.asarray(historical_closes, dtype=np.float64).reshape(-1)
+    if paths.ndim != 3 or paths.shape[0] < 1 or paths.shape[1] < 1 or paths.shape[2] < 4:
+        raise ValueError("Forecast paths must have shape [samples, horizon, >=4]")
+    if closes.size < 2 or not np.isfinite(closes).all() or (closes <= 0).any():
+        raise ValueError("At least two finite positive historical closes are required")
+    if not np.isfinite(paths[..., :4]).all() or (paths[..., :4] <= 0).any():
+        raise ValueError("Forecast paths contain invalid OHLC values")
+    last_close = float(closes[-1])
+    final_close = paths[:, -1, 3]
+    returns = final_close / last_close - 1.0
+    median_return = float(np.median(returns))
+    expected_close = float(np.median(final_close))
+    median_ohlc = np.median(paths[..., :4], axis=0)
+    median_ohlc[:, 1] = np.maximum(median_ohlc[:, 1], np.maximum(median_ohlc[:, 0], median_ohlc[:, 3]))
+    median_ohlc[:, 2] = np.minimum(median_ohlc[:, 2], np.minimum(median_ohlc[:, 0], median_ohlc[:, 3]))
+    anchored_prices = np.concatenate([np.full((paths.shape[0], 1), last_close), paths[:, :, 3]], axis=1)
+    path_log_returns = np.diff(np.log(anchored_prices), axis=1)
+    horizon_scale = np.sqrt(max(paths.shape[1], 1))
+    path_volatility_pct = np.std(path_log_returns, axis=1) * horizon_scale * 100.0
+    hist_log_returns = np.diff(np.log(closes[-min(len(closes), 97):]))
+    historical_volatility_pct = float(np.std(hist_log_returns) * horizon_scale * 100.0)
+    forecast_volatility_pct = float(np.median(path_volatility_pct))
+    vol_ratio = forecast_volatility_pct / max(historical_volatility_pct, 1e-9)
+    if vol_ratio < 0.8:
+        volatility_outlook = "LOW"
+    elif vol_ratio > 1.25:
+        volatility_outlook = "HIGH"
+    else:
+        volatility_outlook = "NORMAL"
+    if median_return > 0.001:
+        direction = "BULLISH"
+    elif median_return < -0.001:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+    return {
+        "samples": int(paths.shape[0]),
+        "horizon": int(paths.shape[1]),
+        "baseline_close": last_close,
+        "expected_close": expected_close,
+        "expected_return_pct": median_return * 100.0,
+        "forecast_direction": direction,
+        "bullish_path_share": float(np.mean(final_close > last_close)),
+        "bearish_path_share": float(np.mean(final_close < last_close)),
+        "neutral_path_share": float(np.mean(final_close == last_close)),
+        "return_quantiles": {f"p{q}": float(np.quantile(returns, q / 100)) for q in [5, 10, 25, 50, 75, 90, 95]},
+        "close_quantiles_by_step": {
+            f"p{q}": np.quantile(paths[:, :, 3], q / 100, axis=0).astype(float).tolist()
+            for q in [10, 25, 50, 75, 90]
+        },
+        "high_quantiles_by_step": np.quantile(paths[:, :, 1], [0.1, 0.5, 0.9], axis=0).astype(float).tolist(),
+        "low_quantiles_by_step": np.quantile(paths[:, :, 2], [0.1, 0.5, 0.9], axis=0).astype(float).tolist(),
+        "median_ohlc_by_step": median_ohlc.astype(float).tolist(),
+        "uncertainty_width_pct": float((np.quantile(final_close, 0.90) - np.quantile(final_close, 0.10)) / last_close * 100.0),
+        "forecast_volatility_pct": forecast_volatility_pct,
+        "historical_comparable_volatility_pct": historical_volatility_pct,
+        "volatility_outlook": volatility_outlook,
+        "volatility_outlook_method": "median_path_realized_volatility_vs_recent_historical_volatility; heuristic_not_calibrated",
+        "calibration_status": "UNVALIDATED_PATH_SHARE_NOT_MARKET_PROBABILITY",
+    }
+
+
 def _individual_sample_inference(tokenizer, model, x, x_stamp, y_stamp, max_context: int,
                                  pred_len: int, temperature: float, top_p: float):
     """Decode individual Kronos paths instead of upstream's default sample-axis mean.
@@ -258,27 +328,8 @@ class KronosForecastEngine:
         )
         if paths.shape != (samples, horizon, 6):
             raise RuntimeError(f"Expected {(samples, horizon, 6)}, got {paths.shape}")
-        last_close = float(frame.iloc[-1]["close"])
-        final_close = paths[:, -1, 3]
-        returns = final_close / last_close - 1.0
-        close_by_horizon = paths[:, :, 3]
-        summary = {
-            "samples": samples,
-            "horizon": horizon,
-            "baseline_close": last_close,
-            "bullish_path_share": float(np.mean(final_close > last_close)),
-            "bearish_path_share": float(np.mean(final_close < last_close)),
-            "neutral_path_share": float(np.mean(final_close == last_close)),
-            "return_quantiles": {f"p{q}": float(np.quantile(returns, q / 100)) for q in [5, 10, 25, 50, 75, 90, 95]},
-            "close_quantiles_by_step": {
-                f"p{q}": np.quantile(close_by_horizon, q / 100, axis=0).astype(float).tolist()
-                for q in [10, 25, 50, 75, 90]
-            },
-            "high_quantiles_by_step": np.quantile(paths[:, :, 1], [0.1, 0.5, 0.9], axis=0).astype(float).tolist(),
-            "low_quantiles_by_step": np.quantile(paths[:, :, 2], [0.1, 0.5, 0.9], axis=0).astype(float).tolist(),
-            "calibration_status": "UNVALIDATED_PATH_SHARE_NOT_MARKET_PROBABILITY",
-            "ohlc_repairs": repair_counts,
-        }
+        summary = summarize_forecast_paths(paths, frame["close"].to_numpy())
+        summary["ohlc_repairs"] = repair_counts
         metadata = {
             "model_id": self.settings.kronos_model_id,
             "model_revision": self.settings.kronos_model_revision,
@@ -290,6 +341,11 @@ class KronosForecastEngine:
             "top_p": self.settings.forecast_top_p,
             "input_candles": len(frame),
             "input_end_time": x_ts.iloc[-1].isoformat(),
+            "baseline_models": {
+                "naive_last_value": float(frame["close"].iloc[-1]),
+                "drift_mean_log_return_per_bar": float(np.mean(np.diff(np.log(frame["close"].tail(25).to_numpy(dtype=float))))),
+                "drift_lookback_bars": min(24, len(frame) - 1),
+            },
             "prediction_timestamps": [x.isoformat() for x in y_ts],
             "individual_paths_preserved": True,
             "timeframe_seconds": timeframe_seconds,

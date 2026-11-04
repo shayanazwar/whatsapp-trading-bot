@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /srv/app
+COPY pyproject.toml README.md ./
+COPY app/ ./app/
+COPY alembic.ini ./alembic.ini
+COPY alembic/ ./alembic/
+RUN pip install .
+CMD ["sh", "-c", "python -m app.migration_lock && python -m app.worker --role market"]

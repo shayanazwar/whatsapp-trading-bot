@@ -12,14 +12,14 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 
 from app.config import get_settings
 from app.db import SessionLocal
 from app.forecasting.kronos import _repo_path
 from app.market.mexc import MexcPublicClient, MexcAPIError, normalize_symbol
 from app.market.universe import eligible_universe
-from app.models import (BacktestReport, Forecast, ForecastEvaluation, Job, Signal,
+from app.models import (BacktestReport, Forecast, ForecastEvaluation, Job, MarketSnapshot, Signal,
                         SystemEvent, WorkerHeartbeat)
 from app.notifications.whatsapp import WhatsAppCloudAPI
 from app.notifications.whatsapp_commands import process_whatsapp_payload, verify_webhook_signature
@@ -103,14 +103,21 @@ def me(user: AdminUser):
 def status(_: AdminUser):
     cfg = get_settings()
     with SessionLocal() as db:
-        queued = db.scalar(select(Job.id).where(Job.status == "queued").limit(1)) is not None
+        queue_counts = {
+            state: int(db.scalar(select(func.count(Job.id)).where(Job.status == state)) or 0)
+            for state in ("queued", "running", "completed", "failed")
+        }
+        oldest_queued = db.scalar(select(func.min(Job.created_at)).where(Job.status == "queued"))
         last_forecast = db.scalar(select(Forecast.created_at).order_by(desc(Forecast.created_at)).limit(1))
         last_scan = db.scalar(select(Job.finished_at).where(Job.job_type == "scan", Job.status == "completed")
                               .order_by(desc(Job.finished_at)).limit(1))
+        last_market_fetch = db.scalar(select(func.max(MarketSnapshot.timestamp)))
+        latest_failed = db.scalars(select(Job).where(Job.status == "failed")
+                                   .order_by(desc(Job.finished_at)).limit(1)).first()
         active_signals = db.scalar(select(Signal.id).where(
             Signal.status.in_(["APPROVED_FOR_PAPER", "ACTIVE_PAPER"]), Signal.expires_at > datetime.now(timezone.utc)
         ).limit(1)) is not None
-        worker_rows = db.scalars(select(WorkerHeartbeat).order_by(desc(WorkerHeartbeat.last_seen)).limit(10)).all()
+        worker_rows = db.scalars(select(WorkerHeartbeat).order_by(desc(WorkerHeartbeat.last_seen)).limit(20)).all()
     now = datetime.now(timezone.utc)
     def worker_recent(roles: set[str]) -> bool:
         return any(
@@ -140,14 +147,24 @@ def status(_: AdminUser):
         "backtest_worker_online": backtest_worker_online,
         "market_worker_online": market_worker_online,
         "kronos_model_status": (
-            "INFERENCE_WORKER_ONLINE_MODEL_LOADS_ON_FIRST_INFERENCE"
-            if inference_worker_online else "INFERENCE_WORKER_NOT_SEEN_RECENTLY"
+            "INFERENCE_WORKER_ONLINE; MODEL_WEIGHTS_LOAD_LAZILY; ACTUAL_LOAD_REQUIRES_COMPLETED_FORECAST"
+            if inference_worker_online else "INFERENCE_WORKER_NOT_SEEN_RECENTLY; MODEL_NOT_VERIFIED"
         ),
         "forecast_samples": cfg.forecast_sample_count,
         "forecast_horizon": cfg.forecast_horizon,
-        "job_queue_has_pending": queued,
+        "queue_counts": queue_counts,
+        "oldest_queued_job_age_seconds": (
+            max(0, int((now - (oldest_queued.replace(tzinfo=timezone.utc) if oldest_queued.tzinfo is None else oldest_queued)).total_seconds()))
+            if oldest_queued else None
+        ),
+        "job_queue_has_pending": queue_counts["queued"] > 0,
         "last_forecast_at": last_forecast.isoformat() if last_forecast else None,
+        "last_successful_market_fetch_at": last_market_fetch.isoformat() if last_market_fetch else None,
         "last_market_scan_at": last_scan.isoformat() if last_scan else None,
+        "latest_failed_job": ({"id": latest_failed.id, "type": latest_failed.job_type,
+                               "error": (latest_failed.error or "")[:500],
+                               "finished_at": latest_failed.finished_at.isoformat() if latest_failed.finished_at else None}
+                              if latest_failed else None),
         "active_paper_signals": active_signals,
         "workers": [{"worker_id": x.worker_id, "role": x.role, "pid": x.pid,
                      "status": x.status, "current_job_id": x.current_job_id,

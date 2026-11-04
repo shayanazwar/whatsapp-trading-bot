@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -11,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.backtesting.engine import _metrics, run_event_backtest
+from app.backtesting.engine import _extended_backtest_metrics, _metrics, run_event_backtest
 from app.artifacts.store import DatabaseForecastArtifactStore
 from app.config import get_settings
 from app.db import SessionLocal
@@ -206,6 +207,8 @@ def _analysis_payload(symbol: str, d1: pd.DataFrame, h12: pd.DataFrame,
 
 
 def run_forecast_job(payload: dict) -> dict:
+    started = time.monotonic()
+    request_id = str(payload.get("request_id") or "")
     symbol = normalize_symbol(payload.get("symbol", "BTC_USDT"))
     timeframe = payload.get("timeframe", "Min60")
     horizon = int(payload.get("horizon") or get_settings().forecast_horizon)
@@ -220,10 +223,18 @@ def run_forecast_job(payload: dict) -> dict:
         candles = client.klines(symbol, timeframe, end - 2000 * interval_seconds, end)
     # Archive validated source candles even if subsequent model loading/inference fails.
     _persist_candle_history(symbol, timeframe, candles)
+    log.info("[DATA_FETCHED] job_request_id=%s symbol=%s timeframe=%s candles=%s",
+             request_id, symbol, timeframe, len(candles))
     engine = _get_model_engine()
+    log.info("[KRONOS_STARTED] job_request_id=%s model=%s samples=%s horizon=%s",
+             request_id, get_settings().kronos_model_id, samples, horizon)
     output = engine.forecast(candles, samples=samples, horizon=horizon, seed=payload.get("seed"),
                              timeframe_seconds=interval_seconds)
+    log.info("[KRONOS_COMPLETED] job_request_id=%s samples=%s horizon=%s",
+             request_id, len(output.paths), output.paths.shape[1])
     forecast_id = _save_forecast(symbol, timeframe, candles.iloc[-1]["timestamp"], output)
+    log.info("[FORECAST_COMPLETED] forecast_id=%s job_request_id=%s duration_ms=%s",
+             forecast_id, request_id, int((time.monotonic() - started) * 1000))
     return {"forecast_id": forecast_id, "symbol": symbol, "summary": output.summary,
             "metadata": output.metadata}
 
@@ -240,7 +251,10 @@ def _candidate_race(paths: np.ndarray, historical_paths: np.ndarray, side: str,
 
 
 def run_analysis_job(job_id: str, payload: dict) -> dict:
+    started = time.monotonic()
+    request_id = str(payload.get("request_id") or "")
     cfg = get_settings()
+    log.info("[ANALYSIS_STARTED] job_id=%s request_id=%s symbol=%s", job_id, request_id, payload.get("symbol", "BTC_USDT"))
     symbol = normalize_symbol(payload.get("symbol", "BTC_USDT"))
     update_progress(job_id, 5, "Fetching current MEXC Futures market data")
     with MexcPublicClient() as client:
@@ -251,6 +265,8 @@ def run_analysis_job(job_id: str, payload: dict) -> dict:
         funding = client.funding_rate(symbol)
     if not contracts or not tickers or h1.empty:
         raise ValueError("MEXC did not return complete contract, ticker and candle data")
+    log.info("[DATA_FETCHED] job_id=%s request_id=%s symbol=%s candles_1d=%s candles_12h=%s candles_4h=%s candles_1h=%s",
+             job_id, request_id, symbol, len(d1), len(h12), len(h4), len(h1))
     contract, ticker = contracts[0], tickers[0]
     _persist_market_observations(symbol, ticker, contract, depth or {}, funding or {})
     update_progress(job_id, 15, "Evaluating completed-candle multi-timeframe strategy")
@@ -268,8 +284,12 @@ def run_analysis_job(job_id: str, payload: dict) -> dict:
         raise ValueError("At least 64 completed 1H candles are required for Kronos")
     update_progress(job_id, 25, "Generating individual Kronos forecast paths")
     engine = _get_model_engine()
+    log.info("[KRONOS_STARTED] job_id=%s request_id=%s model=%s samples=%s horizon=%s",
+             job_id, request_id, cfg.kronos_model_id, cfg.forecast_sample_count, cfg.forecast_horizon)
     output = engine.forecast(h1, samples=cfg.forecast_sample_count, horizon=cfg.forecast_horizon,
                              timeframe_seconds=3600)
+    log.info("[KRONOS_COMPLETED] job_id=%s request_id=%s samples=%s horizon=%s",
+             job_id, request_id, len(output.paths), cfg.forecast_horizon)
     forecast_id = _save_forecast(symbol, "Min60", h1.iloc[-1]["timestamp"], output)
     with SessionLocal() as db:
         forecast_record = db.get(Forecast, forecast_id)
@@ -563,6 +583,8 @@ def run_analysis_job(job_id: str, payload: dict) -> dict:
     result["forecast"]["status"] = "GENERATED"
     result["forecast"]["id"] = forecast_id
     update_progress(job_id, 95, "Persisting analysis and paper research signal")
+    log.info("[ANALYSIS_COMPLETED] job_id=%s request_id=%s symbol=%s decision=%s duration_ms=%s",
+             job_id, request_id, symbol, decision, int((time.monotonic() - started) * 1000))
     return result
 
 
@@ -602,7 +624,11 @@ def run_forecast_evaluation_job(job_id: str, payload: dict) -> dict:
     # Directional validation requires the last observed input close stored with the forecast.
     baseline = record.summary.get("baseline_close")
     if baseline is not None:
-        metrics = evaluate_forecast_paths(paths, actual["close"].to_numpy(dtype=float), float(baseline))
+        baseline_models = (record.metadata_json or {}).get("baseline_models") or {}
+        metrics = evaluate_forecast_paths(
+            paths, actual["close"].to_numpy(dtype=float), float(baseline),
+            drift_mean_log_return_per_bar=baseline_models.get("drift_mean_log_return_per_bar"),
+        )
     else:
         raise ValueError("Forecast summary is missing baseline_close; refusing directional scoring")
     update_progress(job_id, 85, "Persisting out-of-sample forecast evaluation")
@@ -744,7 +770,11 @@ def _aggregate_sleeve_equity_curves(results: list[dict], starting_equity: float,
 
 
 def run_backtest_job(job_id: str, payload: dict) -> dict:
+    started = time.monotonic()
+    request_id = str(payload.get("request_id") or "")
     cfg = get_settings()
+    log.info("[BACKTEST_STARTED] job_id=%s request_id=%s symbol=%s days=%s",
+             job_id, request_id, payload.get("symbol", "BTC_USDT"), payload.get("days", 30))
     requested_symbol = str(payload.get("symbol", "BTC_USDT")).strip().upper()
     all_symbols = requested_symbol == "ALL"
     symbols: list[str]
@@ -776,6 +806,8 @@ def run_backtest_job(job_id: str, payload: dict) -> dict:
                 use_kronos=use_kronos, model_engine=model_engine,
             )
             results.append(result)
+            log.info("[BACKTEST_PROGRESS] job_id=%s request_id=%s symbol=%s index=%s/%s",
+                     job_id, request_id, symbol, index, len(symbols))
         except Exception as exc:
             failures.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"[:400]})
             log.exception("Backtest symbol failed: %s", symbol)
@@ -789,7 +821,29 @@ def run_backtest_job(job_id: str, payload: dict) -> dict:
         results, cfg.backtest_default_equity, sleeve_count=len(symbols)
     )
     metrics = _metrics(trades, equity_curve, cfg.backtest_default_equity, unresolved)
+    metrics.update(_extended_backtest_metrics(
+        trades=trades, unresolved_positions=unresolved,
+        decisions_evaluated=sum(int(item["metrics"].get("decisions_evaluated") or 0) for item in results),
+        signals_generated=sum(int(item["metrics"].get("signals_generated") or 0) for item in results),
+        long_signals=sum(int(item["metrics"].get("long_signals") or 0) for item in results),
+        short_signals=sum(int(item["metrics"].get("short_signals") or 0) for item in results),
+        net_rr_rejections=sum(int(item["metrics"].get("net_rr_rejections") or 0) for item in results),
+        risk_rejections=sum(int(item["metrics"].get("risk_rejections") or 0) for item in results),
+        kronos_rejections=sum(int(item["metrics"].get("kronos_rejections") or 0) for item in results),
+        entries_opened=sum(int(item["metrics"].get("signals_opened") or 0) for item in results),
+        candles_1h=sum(int(item["metrics"].get("candles_processed_by_timeframe", {}).get("1H") or 0) for item in results),
+        candles_4h=sum(int(item["metrics"].get("candles_processed_by_timeframe", {}).get("4H") or 0) for item in results),
+        candles_12h=sum(int(item["metrics"].get("candles_processed_by_timeframe", {}).get("12H_derived") or 0) for item in results),
+        candles_1d=sum(int(item["metrics"].get("candles_processed_by_timeframe", {}).get("1D") or 0) for item in results),
+    ))
     metrics.update({
+        "period_tested": f"{days}D",
+        "coins_tested": len(results),
+        "candles_processed": sum(int(item["metrics"].get("candles_processed") or 0) for item in results),
+        "signals_generated": sum(int(item["metrics"].get("signals_generated") or 0) for item in results),
+        "long_signals": sum(int(item["metrics"].get("long_signals") or 0) for item in results),
+        "short_signals": sum(int(item["metrics"].get("short_signals") or 0) for item in results),
+        "signals_opened": sum(int(item["metrics"].get("signals_opened") or 0) for item in results),
         "symbols_requested": len(symbols),
         "symbols_tested": [item["symbol"] for item in results],
         "symbol_failures": failures,
@@ -811,6 +865,8 @@ def run_backtest_job(job_id: str, payload: dict) -> dict:
         "per_symbol": [{"symbol": item["symbol"], "metrics": item["metrics"]} for item in results],
     }
     update_progress(job_id, 90, "Saving verified backtest report")
+    log.info("[BACKTEST_METRICS] job_id=%s request_id=%s symbols_completed=%s signals=%s trades=%s",
+             job_id, request_id, len(results), metrics.get("signals_generated"), metrics.get("trades"))
     with SessionLocal.begin() as db:
         db.add(BacktestReport(
             job_id=job_id, symbol=result["symbol"],
@@ -819,6 +875,8 @@ def run_backtest_job(job_id: str, payload: dict) -> dict:
             unresolved_positions=result["unresolved_positions"],
             equity_curve=result["equity_curve"], warnings=result["warnings"],
         ))
+    log.info("[BACKTEST_COMPLETED] job_id=%s request_id=%s duration_ms=%s",
+             job_id, request_id, int((time.monotonic() - started) * 1000))
     return result
 
 
@@ -835,8 +893,8 @@ def run_market_scan(job_id: str, payload: dict | None = None) -> dict:
             try:
                 d1, h12, h4, h1 = _fetch_bundle(client, symbol, lookback_days=270)
                 strategy = analyze_multitimeframe(
-        symbol, d1, h12, h4, h1, tp2_r_multiple=cfg.tp2_r_multiple
-    ).as_dict()
+                    symbol, d1, h12, h4, h1, tp2_r_multiple=cfg.tp2_r_multiple
+                ).as_dict()
                 if strategy["decision"] in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                     job = enqueue_job("analysis", {"symbol": symbol})
                     candidates.append({"symbol": symbol, "side": strategy["side"], "score": strategy["score"], "analysis_job_id": job.id})
@@ -872,14 +930,28 @@ def run_market_scan(job_id: str, payload: dict | None = None) -> dict:
 
 
 def process_job(job: Job) -> dict:
-    if job.job_type == "forecast":
-        return run_forecast_job(job.payload or {})
-    if job.job_type == "analysis":
-        return run_analysis_job(job.id, job.payload or {})
-    if job.job_type == "backtest":
-        return run_backtest_job(job.id, job.payload or {})
-    if job.job_type == "evaluate_forecast":
-        return run_forecast_evaluation_job(job.id, job.payload or {})
-    if job.job_type == "scan":
-        return run_market_scan(job.id, job.payload or {})
-    raise ValueError(f"Unknown job type: {job.job_type}")
+    payload = job.payload or {}
+    request_id = str(payload.get("request_id") or "")
+    started = time.monotonic()
+    log.info("[JOB_DISPATCH] job_id=%s request_id=%s type=%s", job.id, request_id, job.job_type)
+    try:
+        if job.job_type == "forecast":
+            result = run_forecast_job(payload)
+        elif job.job_type == "analysis":
+            result = run_analysis_job(job.id, payload)
+        elif job.job_type == "backtest":
+            result = run_backtest_job(job.id, payload)
+        elif job.job_type == "evaluate_forecast":
+            result = run_forecast_evaluation_job(job.id, payload)
+        elif job.job_type == "scan":
+            result = run_market_scan(job.id, payload)
+        else:
+            raise ValueError(f"Unknown job type: {job.job_type}")
+        log.info("[JOB_DISPATCH_COMPLETED] job_id=%s request_id=%s type=%s duration_ms=%s",
+                 job.id, request_id, job.job_type, int((time.monotonic() - started) * 1000))
+        return result
+    except Exception as exc:
+        log.exception("[JOB_DISPATCH_FAILED] job_id=%s request_id=%s type=%s error_type=%s duration_ms=%s",
+                      job.id, request_id, job.job_type, type(exc).__name__,
+                      int((time.monotonic() - started) * 1000))
+        raise

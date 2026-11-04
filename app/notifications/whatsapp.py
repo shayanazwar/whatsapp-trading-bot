@@ -26,6 +26,8 @@ class WhatsAppStatus:
     enabled: bool
     configured: bool
     webhook_configured: bool
+    recipient_allowlist_configured: bool
+    recipient_allowlist_count: int
     api_version: str
     reason: str
 
@@ -53,18 +55,33 @@ class WhatsAppCloudAPI:
     def status(self) -> WhatsAppStatus:
         configured = bool(self.settings.whatsapp_access_token and self.settings.whatsapp_phone_number_id)
         webhook_configured = bool(self.settings.whatsapp_verify_token and self.settings.whatsapp_app_secret)
+        allowlist_raw = (
+            getattr(self.settings, "whatsapp_allowed_recipients", "")
+            or getattr(self.settings, "whatsapp_default_recipient", "")
+        )
+        allowlist_items = [
+            re.sub(r"[^0-9]", "", item.strip())
+            for item in str(allowlist_raw or "").split(",")
+            if item.strip()
+        ]
+        allowlist = {item for item in allowlist_items if 8 <= len(item) <= 15}
+        allowlist_configured = bool(allowlist)
         if not self.settings.whatsapp_enabled:
             reason = "WHATSAPP_ENABLED is false"
         elif not configured:
             reason = "Missing WhatsApp access token or phone-number ID"
         elif not webhook_configured:
             reason = "Outbound API configured; webhook verify token/app secret still required"
+        elif not allowlist_configured:
+            reason = "Webhook credentials configured, but WHATSAPP_ALLOWED_RECIPIENTS is empty; inbound commands are ignored"
         else:
-            reason = "Cloud API and webhook credentials configured"
+            reason = "Cloud API, webhook credentials and sender allowlist configured"
         return WhatsAppStatus(
             enabled=self.is_enabled,
             configured=configured,
             webhook_configured=webhook_configured,
+            recipient_allowlist_configured=allowlist_configured,
+            recipient_allowlist_count=len(allowlist),
             api_version=self.settings.whatsapp_graph_api_version,
             reason=reason,
         )
@@ -167,20 +184,10 @@ class WhatsAppCloudAPI:
         return self._post(payload)
 
     def send_crypto_signal(self, signal: dict, recipient_phone: str | None = None) -> dict[str, Any]:
-        """Send a research/paper signal summary; this does not place an exchange order."""
-        recipient = recipient_phone or self.settings.whatsapp_default_recipient
-        symbol = str(signal.get("symbol") or "UNKNOWN")
-        side = str(signal.get("side") or signal.get("decision") or "RESEARCH")
-        lines = [
-            f"KRONOS PAPER RESEARCH — {symbol}",
-            f"Decision: {side}",
-            f"Status: {signal.get('status') or signal.get('decision') or 'RESEARCH_ONLY'}",
-        ]
-        for key, label in (("entry", "Entry"), ("stop", "Stop"), ("tp1", "TP1"), ("tp2", "TP2"), ("score", "Score")):
-            if signal.get(key) is not None:
-                lines.append(f"{label}: {signal[key]}")
-        lines.append("Research only. No order was placed.")
-        return self.send_text(recipient, "\n".join(lines))
+        raise WhatsAppConfigurationError(
+            "Trade entries, stops, targets and directional crypto-futures recommendations are not sent via WhatsApp. "
+            "Use the authenticated KRONOS dashboard for the full research feed."
+        )
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:

@@ -25,14 +25,26 @@ log = logging.getLogger(__name__)
 
 HELP_TEXT = """KRONOS commands
 
+PING
+  Check whether the bot and webhook command handler are responding.
+
+DASHBOARD
+  Open the authenticated KRONOS research dashboard.
+
+SIGNALS
+  Open the authenticated dashboard's research signal feed.
+
 PRICE [symbol]
-  Live MEXC Futures quote. Example: PRICE BTCUSDT
+  Live MEXC Futures market quote. Example: PRICE BTCUSDT
+
+CHART [symbol] [1H|4H|1D]
+  Send a market chart image. Default: 4H.
 
 ANALYZE [symbol]
   Queue full 1D > 12H > 4H > 1H research analysis.
 
-CHART [symbol] [1H|4H|1D]
-  Send a candlestick chart image. Default: 4H.
+FORECAST [symbol]
+  Queue a Kronos forecast. Example: FORECAST BTCUSDT
 
 BACKTEST [symbol] [1D|7D|30D]
   Queue a historical paper backtest. Example: BACKTEST BTCUSDT 7D
@@ -50,7 +62,7 @@ SCAN
 HELP
   Show this command list.
 
-Live exchange orders are disabled. All outputs are research/paper only."""
+Research/paper only. No exchange orders are placed. Detailed directional research and trade levels remain in the authenticated dashboard."""
 
 
 def normalize_phone(value: str) -> str:
@@ -246,12 +258,27 @@ def _create_chart(sender: str, symbol: str, interval: str, public_base_url: str)
         adapter.close()
 
 
+def _dashboard_link(public_base_url: str = "") -> str:
+    cfg = get_settings()
+    base_url = str(cfg.public_base_url or public_base_url or "").rstrip("/")
+    if not base_url.startswith("https://"):
+        return ("Use the authenticated dashboard for detailed research. "
+                "Dashboard URL is not configured; set PUBLIC_BASE_URL to your public HTTPS service URL.")
+    return f"Open the authenticated dashboard for detailed research: {base_url}/"
+
+
 def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return "Send HELP to see available commands."
     parts = cleaned.replace(",", " ").split()
     command = parts[0].upper()
+
+    if command == "PING":
+        return "KRONOS is online. The WhatsApp webhook and command handler received your message."
+
+    if command in {"DASHBOARD", "SIGNALS"}:
+        return _dashboard_link(public_base_url)
 
     if command in {"HELP", "START", "MENU"}:
         return HELP_TEXT
@@ -287,6 +314,22 @@ def dispatch_command(sender: str, text: str, public_base_url: str = "") -> str:
         interval = parts[2].upper() if len(parts) > 2 else "4H"
         _create_chart(sender, symbol, interval, public_base_url)
         return f"Chart sent: {symbol} {interval}."
+
+    if command == "FORECAST":
+        symbol = normalize_symbol(parts[1] if len(parts) > 1 else "BTCUSDT")
+        cfg = get_settings()
+        job = enqueue_job("forecast", _job_payload(
+            sender,
+            symbol=symbol,
+            timeframe="Min60",
+            samples=cfg.forecast_sample_count,
+            horizon=cfg.forecast_horizon,
+            seed=getattr(cfg, "forecast_random_seed", None),
+        ))
+        return (
+            f"Forecast queued for {symbol}.\nJob: {job.id}\n"
+            "You will receive a completion notice. Send STATUS to check progress."
+        )
 
     if command == "BACKTEST":
         if len(parts) > 1 and parts[1].upper() == "STATUS":
@@ -337,28 +380,14 @@ def notify_job_completion(job: Job, result: dict | None = None, error: str | Non
     else:
         result = result or {}
         if job.job_type == "analysis":
-            strategy = result.get("strategy") or {}
-            reasons = result.get("reasons") or []
-            message_lines = [
-                f"KRONOS ANALYSIS — {result.get('symbol', 'UNKNOWN')}",
-                f"Decision: {result.get('decision', 'n/a')}",
-                f"Side: {strategy.get('side') or 'n/a'}",
-                f"Score: {_format_number(strategy.get('score'), 1)}",
-                f"Market price: {_format_number((result.get('market') or {}).get('last_price'))}",
-                f"Timeframes: 1D / 12H / 4H / 1H",
-            ]
-            if strategy.get("entry") is not None:
-                message_lines.append(f"Entry: {_format_number(strategy.get('entry'))}")
-            if strategy.get("stop") is not None:
-                message_lines.append(f"Stop: {_format_number(strategy.get('stop'))}")
-            if strategy.get("tp1") is not None:
-                message_lines.append(f"TP1: {_format_number(strategy.get('tp1'))}")
-            if strategy.get("tp2") is not None:
-                message_lines.append(f"TP2: {_format_number(strategy.get('tp2'))}")
-            for reason in reasons[:3]:
-                message_lines.append(f"• {str(reason)[:180]}")
-            message_lines.append("Research/paper output only — no exchange order was placed.")
-            message = "\n".join(message_lines)
+            symbol = result.get("symbol", "UNKNOWN")
+            message = "\n".join([
+                f"KRONOS ANALYSIS JOB COMPLETED — {symbol}",
+                f"Job: {job.id}",
+                "Your research analysis is ready.",
+                _dashboard_link(),
+                "Research/paper only — no exchange order was placed.",
+            ])
         elif job.job_type == "backtest":
             metrics = result.get("metrics") or {}
             days = (payload.get("days") or "n/a")
@@ -376,20 +405,21 @@ def notify_job_completion(job: Job, result: dict | None = None, error: str | Non
             ])
         elif job.job_type == "scan":
             candidates = result.get("candidates") or []
-            lines = [
+            message = "\n".join([
                 "KRONOS MEXC SCAN COMPLETE",
-                f"Universe: {result.get('universe_size', 'n/a')}",
-                f"Analysis jobs queued: {len(candidates)}",
+                f"Universe checked: {result.get('universe_size', 'n/a')}",
+                f"Research jobs queued: {len(candidates)}",
                 f"Rejected: {result.get('rejected_count', 'n/a')}",
-            ]
-            for item in candidates[:8]:
-                lines.append(
-                    f"{item.get('symbol')} {item.get('side')} | score {_format_number(item.get('score'), 1)}"
-                )
-            lines.append(f"Job: {job.id}")
-            message = "\n".join(lines)
+                f"Job: {job.id}",
+                _dashboard_link(),
+            ])
         else:
-            message = f"KRONOS {job.job_type.upper()} COMPLETE\nJob: {job.id}\nSend STATUS for details."
+            message = "\n".join([
+                f"KRONOS {job.job_type.upper()} JOB COMPLETED",
+                f"Job: {job.id}",
+                "Your research output is ready.",
+                _dashboard_link(),
+            ])
     adapter = WhatsAppCloudAPI()
     try:
         adapter.send_text(str(recipient), message)

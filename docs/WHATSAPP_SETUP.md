@@ -20,24 +20,28 @@ The market, compute and inference workers receive the outbound token, phone-numb
 
 Callback URL:
 
-`https://YOUR-SERVICE.onrender.com/api/whatsapp/webhook`
+`https://YOUR-SERVICE.onrender.com/webhook`
+
+The canonical API path `https://YOUR-SERVICE.onrender.com/api/whatsapp/webhook` is also supported. Both paths use the same verification-token and HMAC-signature checks. The `/webhook` alias is provided for deployments whose provider console is already configured with that path.
 
 Subscribe to the `messages` webhook field. The GET verification handler checks `hub.mode`, `hub.verify_token` and returns `hub.challenge`. The POST handler validates the HMAC SHA-256 signature against the raw request body before queueing message processing.
 
 ## Commands
 
 - `HELP`
-- `PRICE BTCUSDT`
+- `PING`
+- `DASHBOARD`
 - `ANALYZE BTCUSDT`
-- `CHART BTCUSDT 4H` (also `1H` or `1D`; sends a PNG)
+- `FORECAST BTCUSDT`
 - `BACKTEST 1D`
 - `BACKTEST BTCUSDT 7D`
 - `BACKTEST BTCUSDT 30D`
 - `BACKTEST STATUS`
 - `STATUS` or `STATUS JOB_ID`
 - `SCAN`
+- `SIGNALS` — returns the authenticated dashboard link.
 
-`ANALYZE`, `BACKTEST` and `SCAN` create durable jobs. The inference/compute/market worker sends a completion or failure message to the command sender. `STATUS` only reveals jobs created by that sender. Duplicate inbound message IDs are ignored.
+Analysis, forecast, backtest and scan commands queue durable research jobs. WhatsApp replies provide acknowledgements and job status only; detailed prices, entries, stops, targets, directional recommendations, forecast paths and signal lists remain in the authenticated dashboard.
 
 ## Important operating notes
 

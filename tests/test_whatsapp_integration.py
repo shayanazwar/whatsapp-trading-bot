@@ -30,6 +30,7 @@ def settings(**overrides):
         "whatsapp_api_max_retries": 0,
         "whatsapp_default_recipient": "923001234567",
         "whatsapp_allowed_recipients": "923001234567",
+        "forecast_random_seed": 42,
         "public_base_url": "https://example.onrender.com",
         "data_dir": __import__("pathlib").Path("/tmp/kronos-test-data"),
     }
@@ -122,8 +123,10 @@ def test_backtest_commands_queue_1d_7d_and_30d(monkeypatch):
     assert "1D backtest queued" in commands.dispatch_command("923001234567", "BACKTEST 1D")
     assert "7D backtest queued" in commands.dispatch_command("923001234567", "BACKTEST BTCUSDT 7D")
     assert "30D backtest queued" in commands.dispatch_command("923001234567", "BACKTEST ETHUSDT 30D")
-    assert [item[1]["days"] for item in queued] == [1, 7, 30]
-    assert [item[1]["symbol"] for item in queued] == ["BTC_USDT", "BTC_USDT", "ETH_USDT"]
+    assert "Kronos historical filter: ON" in commands.dispatch_command("923001234567", "BACKTEST 1D KRONOS")
+    assert [item[1]["days"] for item in queued] == [1, 7, 30, 1]
+    assert [item[1]["symbol"] for item in queued] == ["BTC_USDT", "BTC_USDT", "ETH_USDT", "BTC_USDT"]
+    assert [item[1]["use_kronos_filter"] for item in queued] == [False, False, False, True]
     assert all(item[1]["whatsapp_recipient"] == "923001234567" for item in queued)
 
 
@@ -224,11 +227,25 @@ def test_whatsapp_webhook_routes_verify_and_accept_signed_post(monkeypatch):
     assert alias_post.json()["accepted"] is True
 
 
-def test_price_and_chart_commands_route_users_to_dashboard():
+def test_price_and_chart_commands_use_their_actual_handlers(monkeypatch):
+    class FakeMexcClient:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def tickers(self, symbol=None):
+            return [{"symbol": "BTC_USDT", "lastPrice": 70000, "fairPrice": 70010,
+                     "indexPrice": 70005, "bid1": 69999, "ask1": 70001,
+                     "amount24": 1234567, "fundingRate": 0.0001}]
+
+    monkeypatch.setattr(commands, "MexcPublicClient", FakeMexcClient)
+    chart_calls = []
+    monkeypatch.setattr(commands, "_create_chart", lambda sender, symbol, interval, base: chart_calls.append((sender, symbol, interval)))
     message = commands.dispatch_command("923001234567", "PRICE BTCUSDT")
-    assert "authenticated dashboard" in message
+    assert "MEXC Futures" in message and "Last: 70,000" in message
     chart_message = commands.dispatch_command("923001234567", "CHART BTCUSDT 4H")
-    assert "authenticated dashboard" in chart_message
+    assert "Chart sent" in chart_message
+    assert chart_calls == [("923001234567", "BTC_USDT", "4H")]
 
 
 def test_forecast_command_queues_pinned_forecast_job(monkeypatch):

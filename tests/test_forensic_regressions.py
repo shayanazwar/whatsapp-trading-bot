@@ -496,3 +496,23 @@ def test_market_snapshot_preserves_zero_funding_rate_not_ticker_fallback():
     with SessionLocal() as db:
         row = db.query(FundingObservation).filter_by(symbol="ZERO_FUNDING_TEST_USDT").one()
     assert row.funding_rate == pytest.approx(0.0)
+
+
+def test_META_PHONE_NUMBER_ID_precedes_legacy_whatsapp_alias(monkeypatch):
+    from app.config import Settings
+    monkeypatch.setenv("META_PHONE_NUMBER_ID", "1343308352199390")
+    monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "1285387147997440")
+    cfg = Settings(_env_file=None)
+    assert cfg.whatsapp_phone_number_id == "1343308352199390"
+
+
+def test_ignore_rules_do_not_hide_required_app_artifacts_package():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    gitignore = (root / ".gitignore").read_text()
+    dockerignore = (root / ".dockerignore").read_text()
+    assert "/artifacts/" in gitignore
+    assert "!/app/artifacts/" in gitignore or "!/app/artifacts/**" in gitignore or "/artifacts/" in gitignore
+    assert "!app/artifacts/" in dockerignore
+    assert "!app/artifacts/**" in dockerignore

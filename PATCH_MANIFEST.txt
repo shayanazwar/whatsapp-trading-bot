@@ -1,0 +1,23 @@
+PAK TRADING ACADEMY v0.8.4 — AUDIT FOLLOW-UP PATCH MANIFEST
+Base: PAK_TRADING_ACADEMY_MEXC_S1_RFPC_v0.8.2_FIXED.zip + v0.8.3 complete patch
+Active strategy preserved: S1-RFPC 1D -> 12H -> 4H -> 1H
+Live execution: OFF
+
+RUNTIME REPLACEMENTS:
+  .env.example
+  README.md
+  pyproject.toml
+  app/backtest.py
+  app/commands.py
+  app/services/command_processor.py
+  app/version.py
+  docs/TEST_REPORT.md
+  docs/RELEASE_NOTES_v0.8.4.md
+
+TEST UPDATES:
+  tests/test_active_cross_margin_portfolio.py
+  tests/test_release_metadata.py
+  tests/test_funding_final_coverage.py
+
+Extract into repository root; preserve paths. Existing secrets are not included.
+This is a patch bundle, not a standalone full repository. Apply it on top of the v0.8.3 source/base package.

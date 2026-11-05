@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: rslr-trading-bot
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    dockerCommand: sh -c 'alembic upgrade head && uvicorn rslr.web:app --host 0.0.0.0 --port 8000'
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rslr-postgres
+          property: connectionString
+      - key: APP_ENV
+        value: production
+      - key: AUTO_TRADING_ENABLED
+        value: "false"
+      - key: LIVE_EXECUTION_ENABLED
+        value: "false"
+      - key: PAPER_TRADING_ENABLED
+        value: "true"
+  - type: worker
+    name: rslr-signal-worker
+    runtime: docker
+    plan: starter
+    dockerCommand: sh -c 'alembic upgrade head && python -m rslr.worker' 
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rslr-postgres
+          property: connectionString
+      - key: APP_ENV
+        value: production
+      - key: AUTO_TRADING_ENABLED
+        value: "false"
+      - key: LIVE_EXECUTION_ENABLED
+        value: "false"
+      - key: PAPER_TRADING_ENABLED
+        value: "true"
+databases:
+  - name: rslr-postgres
+    plan: basic-256mb
+    databaseName: rslr
+    user: rslr

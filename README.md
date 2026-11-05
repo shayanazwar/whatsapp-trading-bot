@@ -1,6 +1,6 @@
-# PAK TRADING ACADEMY — MEXC Futures Research Platform v0.8.5
+# PAK TRADING ACADEMY — MEXC Futures Research Platform v0.8.6
 
-Research-only MEXC USDT perpetual scanner, swing-strategy backtester, durable job worker and protected dashboard. v0.8.5 enables all supported allowlisted WhatsApp commands and removes the separate research-message gate. v0.8.4 includes audited fixes on top of v0.8.3, including exit-aware MAE/MFE and final-run funding coverage. v0.8.3 added bounded per-position initial-margin sizing, contract leverage/MMR checks, a shared-wallet maintenance stress proxy, marked-to-market open positions, stronger ledger reconciliation and memory telemetry. It preserves the active S1-RFPC 1D → 12H → 4H → 1H strategy. Live order execution is disabled and no live order-placement loop is available in this build.
+Research-only MEXC USDT perpetual scanner, swing-strategy backtester, in-process durable job queue and protected dashboard. v0.8.6 runs the durable backtest consumer inside the existing web service, without a separate Render worker. v0.8.5 enables all supported allowlisted WhatsApp commands and removes the separate research-message gate. v0.8.4 includes audited fixes on top of v0.8.3, including exit-aware MAE/MFE and final-run funding coverage. v0.8.3 added bounded per-position initial-margin sizing, contract leverage/MMR checks, a shared-wallet maintenance stress proxy, marked-to-market open positions, stronger ledger reconciliation and memory telemetry. It preserves the active S1-RFPC 1D → 12H → 4H → 1H strategy. Live order execution is disabled and no live order-placement loop is available in this build.
 
 ## Strategy and supported timeframes
 
@@ -13,8 +13,8 @@ The 12H series is deterministically aggregated from completed UTC-aligned 4H bar
 ## Backtest and portfolio model
 
 - `BACKTEST 1D` and `BACKTEST 7D` rank the current top 100 active USDT-settled MEXC perpetual contracts by 24-hour turnover. A symbol-specific command such as `BACKTEST BTCUSDT 30D` is supported for longer windows.
-- Jobs are durably queued by the web process and claimed by the dedicated worker through the shared PostgreSQL database. The job stores symbol-by-symbol progress and the completed report. The report is also placed in the WhatsApp outbox for the command sender when that sender is allowlisted.
-- Historical data is fetched with a bounded concurrency of five symbols for a backtest. Worker logs include `BACKTEST SYMBOL SCAN | progress=1/100 ...`, plus per-symbol start, completion and failure details. The scheduled top-100 scan is deferred while a backtest job is using MEXC API capacity.
+- Jobs are durably queued and claimed by a queue consumer running inside the existing Render web process through the shared PostgreSQL database. The consumer runs one backtest at a time, stores symbol-by-symbol progress and persists the completed report. The report is also placed in the outbox for the original allowlisted sender.
+- Historical data is fetched with a bounded concurrency of five symbols for a backtest. Web-service logs include `BACKTEST SYMBOL SCAN | progress=1/100 ...`, plus per-symbol start, completion and failure details. The scheduled top-100 scan is deferred while a backtest job is using MEXC API capacity.
 - The research portfolio cap is configurable from 1 to **50 simultaneous positions** (`BACKTEST_MAX_POSITIONS`, default 50). Per-entry modeled risk defaults to 0.5% of realized balance; aggregate planned stop-risk is capped at 25%; gross notional is capped at 25× current modeled equity by default (configurable). These filters mean 50 is a ceiling, not a promise that 50 positions can be opened.
 - The separate paper-trading simulator remains limited to one active position (`MAX_CONCURRENT_POSITIONS=1`). The research portfolio cap does not change paper or live execution settings.
 - Reports show requested UTC window, symbols tested/eligible, 1H bars, strategy evaluations, candidates, entry attempts, maximum concurrent positions, open positions, TP hits, SL hits, time-stop exits, data-gap exits, fees, funding where available, slippage, drawdown, cost-stress runs and warnings.
@@ -31,11 +31,11 @@ The backtest is chronological. Entries at the same timestamp are allocated in sy
 
 ## WhatsApp signals and reports
 
-The worker is configured to evaluate the top-universe swing scanner once per completed 1H candle. A signal is sent only when S1-RFPC produces a candidate and the delivery checks pass: valid contract/price tick, sensible rounded stop/target geometry, minimum net reward/risk after modeled fees/slippage, usable top-of-book depth/spread, and an available non-adverse current funding snapshot. The system does **not** broadcast rejected or incomplete candidates as trade signals.
+The single Render web service runs the top-universe swing scanner once per completed 1H candle (`SCHEDULER_ENABLED=true` in the supplied blueprint). A signal is sent only when S1-RFPC produces a candidate and the delivery checks pass: valid contract/price tick, sensible rounded stop/target geometry, minimum net reward/risk after modeled fees/slippage, usable top-of-book depth/spread, and an available non-adverse current funding snapshot. The system does **not** broadcast rejected or incomplete candidates as trade signals.
 
 All parsed WhatsApp commands are enabled for explicitly configured senders in `WHATSAPP_ALLOWED_SENDERS`. The same allowlist protects inbound command execution and outbound replies/notifications. A valid webhook verification token, app-secret signature, access token and phone-number ID are required. Message de-duplication and the configurable monthly outbound cap remain active.
 
-The user-facing `BACKTEST` acknowledgement is sent immediately after durable queueing. The dedicated worker runs the job and sends the completed report to the original allowlisted sender. Scanner signals are only pushed when the strategy's own data-quality, liquidity, contract and reward/risk checks pass.
+The user-facing `BACKTEST` acknowledgement is sent immediately after durable queueing. The same Render web service claims and runs the job in the background; a separate paid worker service is not required. Scanner signals are only pushed when the strategy's own data-quality, liquidity, contract and reward/risk checks pass.
 
 ## Commands
 
@@ -59,37 +59,29 @@ Legacy `CONTROL`, `CANDIDATE`, `BOTH`, `LEGACY`, and `FIXED` backtest selectors 
 MEXC Futures public API
         |
         v
-Render background worker
-  - top-100 turnover universe
-  - S1-RFPC 1D/12H/4H/1H scanner
-  - per-symbol progress and scan events
-  - durable backtest job consumer
-  - WhatsApp crypto outbox dispatcher (policy-gated)
+Single Render web service (one Uvicorn worker)
+  - signed inbound webhook + protected dashboard
+  - durable BACKTEST enqueue + in-process queue consumer
+  - optional top-100 S1-RFPC scanner and gated paper scheduler
+  - status, progress, reports and /healthz
         |
         v
 Shared PostgreSQL database
-  - inbound/outbound message idempotency
-  - scan results and active signals
+  - inbound/outbound idempotency
   - backtest jobs, progress and reports
-  - worker heartbeat and operational state
-        ^
-        |
-FastAPI web service
-  - signed WhatsApp webhook
-  - command acknowledgement and job creation
-  - read-only dashboard and /healthz diagnostics
+  - scanner state, events and outbox
+  - process heartbeat and advisory-lock coordination
 ```
 
-The Render Blueprint creates one web service, one background worker and a shared PostgreSQL database. The worker polls the durable backtest queue independently using `BACKTEST_JOB_POLL_SECONDS` (default 5 seconds), separate from the 60-second market-scan cycle. Both services must use the same `DATABASE_URL`; otherwise a job queued by the web service will not be visible to the worker. The worker's persistent disk is not shared with the web service, so PostgreSQL—not the local archive disk—is the cross-service source of truth.
+The supplied Render Blueprint defines one web service and the shared PostgreSQL database. The web process runs one backtest at a time in its own background task; `BACKTEST_JOB_POLL_SECONDS` controls queue polling independently of the market-scanner interval. The PostgreSQL advisory lock prevents an old standalone worker or a second web instance from consuming the same queue. Stop/delete any previously deployed `mexc-rsi-ema-scanner` worker service before enabling this build. The backtest queue remains active even when `SCHEDULER_ENABLED=false`; that flag controls only the optional scanner/paper scheduler.
 
 ## Deploy and verify
 
-1. Deploy the same repository commit to the web service and the worker.
-2. Confirm both services connect to the same PostgreSQL database.
-3. Confirm worker logs identify the build, database backend, `S1-RFPC-1D-12H-4H-1H`, `backtest_max_positions=50`, `paper_max_positions=1`, scanner state and whether a WhatsApp sender allowlist is configured.
-4. Check `/healthz` for worker heartbeat, latest scan summary/error, backtest latest job and WhatsApp command readiness.
-5. Run `BACKTEST 1D`; verify `BACKTEST JOB START`, progress lines from `1/100` onward, `BACKTEST WINDOW COMPLETE` and `BACKTEST JOB COMPLETE` in worker logs. Use `BACKTEST STATUS` and `BACKTEST REPORT <JOB_ID>` to inspect queue state and final output.
-6. Keep `AUTO_TRADING_ENABLED=false`, `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_BUILD_RELEASED=false` and `MAX_CONCURRENT_POSITIONS=1`. `PAPER_TRADING_ENABLED=true` is only an opt-in to fake-money simulation; the scheduler still refuses to simulate entries until a genuine alignment probe has been approved and passes every report check.
+1. Apply the replacement files and deploy the new commit to `mexc-rsi-ema-web`.
+2. Stop/delete the old `mexc-rsi-ema-scanner` background worker if it still exists; deploy only one web instance with one Uvicorn worker.
+3. Confirm `/healthz` reports `in_process_backtest_queue=true`, `backtest_executor_status=running`, a fresh `worker_heartbeat_age_seconds`, and `worker_database_match=true`.
+4. Run `BACKTEST 1D`; web-service logs should show `IN-PROCESS BACKTEST QUEUE READY`, `BACKTEST JOB START`, `BACKTEST START`, `BACKTEST SYMBOL SCAN | progress=1/N`, and `BACKTEST JOB COMPLETE`.
+5. Use `BACKTEST STATUS` and `BACKTEST REPORT <JOB_ID>` to inspect progress and the persisted result. Keep all live-execution settings false.
 
 ## Local development
 
@@ -103,7 +95,7 @@ cp .env.example .env                      # Windows: copy .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-For a single local process, blank `DATABASE_URL` uses SQLite. To run a local worker separately, both processes must point to the same PostgreSQL database; separate SQLite files are not a shared job queue. Set `WEB_API_TOKEN` before using dashboard research commands. Never commit `.env`, API tokens, Meta secrets or private account data.
+For a single local process, blank `DATABASE_URL` uses SQLite; the in-process queue consumer starts automatically, so no separate worker command is needed. Set `WEB_API_TOKEN` before using dashboard research commands. Never commit `.env`, API tokens, Meta secrets or private account data.
 
 ## Validation
 
@@ -112,4 +104,4 @@ Run tests with `pytest -q`. Automated tests validate deterministic fixtures, par
 
 ## Release notes
 
-See [`docs/RELEASE_NOTES_v0.8.5.md`](docs/RELEASE_NOTES_v0.8.5.md) for the latest runtime enablement changes and [`docs/RELEASE_NOTES_v0.8.4.md`](docs/RELEASE_NOTES_v0.8.4.md) for the latest audit corrections and [`docs/RELEASE_NOTES_v0.8.3.md`](docs/RELEASE_NOTES_v0.8.3.md) for the portfolio-risk changes.
+See [`docs/RELEASE_NOTES_v0.8.6.md`](docs/RELEASE_NOTES_v0.8.6.md) for the in-process backtest queue fix and [`docs/RELEASE_NOTES_v0.8.5.md`](docs/RELEASE_NOTES_v0.8.5.md) for the runtime enablement changes and [`docs/RELEASE_NOTES_v0.8.4.md`](docs/RELEASE_NOTES_v0.8.4.md) for the latest audit corrections and [`docs/RELEASE_NOTES_v0.8.3.md`](docs/RELEASE_NOTES_v0.8.3.md) for the portfolio-risk changes.

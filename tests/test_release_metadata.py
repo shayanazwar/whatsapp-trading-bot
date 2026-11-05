@@ -10,8 +10,8 @@ def test_release_versions_are_synchronized():
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     env_example = (root / ".env.example").read_text(encoding="utf-8")
-    assert pyproject["project"]["version"] == APP_VERSION == "0.8.5"
-    assert env_example.startswith("# v0.8.5 S1-RFPC research build.")
+    assert pyproject["project"]["version"] == APP_VERSION == "0.8.6"
+    assert env_example.startswith("# v0.8.6 S1-RFPC research build.")
 
 
 def test_help_uses_the_configured_notional_limit():

@@ -1,21 +1,19 @@
-# Automated Test Report — v0.8.4
+# Automated Test Report — v0.8.6
 
 ## Local verification
 
-- `pytest -q`: **174 passed**.
-- `python -m compileall -q app tests`: passed.
-- Application/worker imports: passed as part of the test and import checks.
-- Render Blueprint YAML parse: passed; both services point to the same PostgreSQL database and the background worker uses `python -m app.worker`.
-- Targeted regressions cover active Cross Margin portfolio sizing, 50-position cap, liquidation stress proxy, open-equity reconciliation, exit-aware MAE/MFE, liquidation event timestamps, and final-run funding coverage.
-- `git diff --check`: passed.
+- `pytest -q`: **180 passed**.
+- `python -m compileall -q app`: passed.
+- Render Blueprint YAML parse: covered by regression tests; one web service only, with an in-process queue consumer and scanner scheduler enabled.
+- Queue regressions cover command enqueue, same-process claim/execute/complete, one-at-a-time execution, heartbeat visibility, restart recovery and requeue after cancellation.
+- Existing strategy/backtest, data validation, portfolio accounting, storage, command and webhook suites remain passing.
 
-## Runtime environment
+## Runtime architecture
 
-- Local verification ran on Python 3.13.5. The Dockerfile targets Python 3.12; Python 3.12 was not available for a second local run.
-- Ruff was not installed in this environment, so linting is **not verified** here. The GitHub Actions lint job should run before release.
+The web application starts a queue-only backtest consumer in its existing process. A PostgreSQL advisory lock is shared with the legacy standalone worker entry point to prevent two active consumers. The Render Blueprint no longer declares a separate worker service.
 
 ## Verification boundaries
 
-These checks validate source-level behavior and deterministic fixtures only. They do **not** prove that Render has deployed the same commit to both services, that production PostgreSQL credentials match, that the worker can reach MEXC, that a real historical backtest completes, that Meta approves crypto messaging, or that a strategy is profitable. Those require post-deployment checks.
+These checks validate source-level behavior and deterministic fixtures only. They do **not** prove that Render has deployed this commit, that production credentials/database connectivity are valid, that MEXC historical data is currently available, or that a live network backtest completes. After deployment, confirm `/healthz` reports `in_process_backtest_queue=true`, then run `BACKTEST 1D` and inspect web-service logs and `BACKTEST STATUS`.
 
-The active S1-RFPC backtest uses completed 1D/12H/4H/1H candles and MEXC REST history. It does not activate the legacy 3M RSI/EMA or MTF-TPR strategy modules. It also does not reproduce the exchange-exact Cross Margin liquidation process: liquidation is a conservative 1H trade-price OHLC stress proxy, without historical Fair Price, external positions/open orders, partial liquidation, ADL or order-book impact.
+The simulator remains a research estimate using completed 1D/12H/4H/1H candles, modeled costs and observed funding history. It does not reproduce the exchange-exact order book, external positions, all partial fills or cross-margin liquidation engine. Live order execution remains hard-locked off.

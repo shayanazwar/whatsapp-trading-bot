@@ -206,11 +206,13 @@ def test_health_exposes_worker_heartbeat_freshness(tmp_path):
     app = create_app(cfg)
     with TestClient(app) as client:
         body = client.get("/healthz").json()
-        assert body["scanner_health"] == "not_seen"
+        assert body["scanner_health"] == "scheduler_disabled"
+        assert body["worker_health"] == "healthy"
         app.state.store.set_state("worker_status", "running")
         app.state.store.set_state("worker_heartbeat_utc", datetime.now(timezone.utc).isoformat())
         body = client.get("/healthz").json()
-        assert body["scanner_health"] == "healthy"
+        assert body["scanner_health"] == "scheduler_disabled"
+        assert body["worker_health"] == "healthy"
         assert body["scanner_worker_heartbeat_age_seconds"] is not None
 
 

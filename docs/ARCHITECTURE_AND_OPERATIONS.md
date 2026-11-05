@@ -6,46 +6,36 @@ Research-only MEXC USDT perpetual system. Active strategy: **S1-RFPC**, using co
 
 ## Runtime services
 
-The Render Blueprint omits explicit compute `plan` fields to preserve the current plans on existing resources and avoid hardcoded legacy plan IDs. Review any Render Blueprint changes before applying them.
+The Render Blueprint uses one web service (one Uvicorn worker) plus PostgreSQL. The FastAPI lifespan starts a queue-only backtest consumer in the same process and, when `SCHEDULER_ENABLED=true`, a separate asynchronous market-scanner loop. A PostgreSQL advisory lock prevents a second in-process instance or an old standalone worker from consuming jobs concurrently.
 
 ```text
-WhatsApp / protected dashboard
-        |
-        v
-FastAPI web service
-  - inbound signature verification
-  - command parsing/authorization
+MEXC market data
+      |
+      v
+Single Render web service
+  - webhook/dashboard + command parser
   - durable BACKTEST job enqueue
-  - immediate QUEUED acknowledgement
-  - /healthz diagnostics
-        | shared DATABASE_URL
-        v
+  - in-process queue consumer (one job at a time)
+  - optional top-universe scanner/paper scheduler
+      |
+      v
 PostgreSQL
-  - inbox idempotency
   - backtest_jobs + progress/results
-  - app_state worker heartbeat/build/database fingerprint
-  - signals/events/outbox
-        ^
-        |
-Dedicated Render background worker
-  - startup + heartbeat
-  - backtest queue polling (BACKTEST_JOB_POLL_SECONDS; default 5s)
-  - top-universe scanner on scheduler cadence
-  - S1-RFPC history loading and backtest simulation
-  - gated outbox delivery
+  - app_state heartbeat/build/database fingerprint
+  - events/signals/outbox
 ```
 
-The web service and worker must deploy the same Git commit and use the same PostgreSQL `DATABASE_URL`. The worker also mounts the persistent market archive disk. The disk is worker-local and is not a substitute for PostgreSQL job sharing.
+No separate Render background worker is required. Stop/delete an already deployed `mexc-rsi-ema-scanner` service before deploying this topology. Keep one web instance and one Uvicorn worker so the advisory lock and local archive/cache assumptions stay consistent.
 
-## Worker lifecycle
+## In-process backtest queue lifecycle
 
-The web service inserts the job and returns `BACKTEST JOB QUEUED`. Only the dedicated worker claims it. On claim, worker logs include `BACKTEST JOB START`; the strategy command then emits `BACKTEST START`, `BACKTEST EXCHANGE TIME REQUEST START`, `BACKTEST UNIVERSE LOAD START`, `BACKTEST SYMBOL SCAN START`, and `BACKTEST SYMBOL SCAN | progress=n/N`. A completion or failure is persisted in `backtest_jobs`.
+The web service inserts the job and returns `BACKTEST JOB QUEUED`. A queue-only consumer in the same FastAPI process claims it; no separate Render worker is required. On claim, web-service logs include `BACKTEST JOB START`; the strategy command then emits `BACKTEST START`, `BACKTEST EXCHANGE TIME REQUEST START`, `BACKTEST UNIVERSE LOAD START`, `BACKTEST SYMBOL SCAN START`, and `BACKTEST SYMBOL SCAN | progress=n/N`. A completion or failure is persisted in `backtest_jobs`.
 
-Queue polling is independent from market scan cadence. A slow top-universe scan must not delay queue polling for a full 60-second scan interval. The worker serializes backtests (one active backtest consumer task) to avoid running multiple heavy jobs against the same MEXC client/archive at once.
+Queue polling is independent from market scan cadence. A slow top-universe scan must not delay queue polling for a full 60-second scan interval. The in-process consumer serializes backtests (one active job) to avoid running multiple heavy jobs against the same MEXC client/archive at once. A PostgreSQL advisory lock blocks an old standalone worker or a second web instance from becoming another consumer.
 
 ## Health diagnostics
 
-`GET /healthz` distinguishes: `scanner_health` (the optional scheduled signal scanner) and `worker_health` (the job-consuming worker). `worker_health` is not hidden merely because the optional scanner flag is off. Key diagnostics: `scanner_worker_status`, `worker_heartbeat_age_seconds`, `worker_build_version`, `worker_database_match`, `worker_database_fingerprint`, `backtest_job_poll_seconds`, `backtest_latest_job.status`, and error/progress fields.
+`GET /healthz` distinguishes: `scanner_health` (the optional scheduled signal scanner) and `worker_health` (the job-consuming worker). `worker_health` reports the in-process queue consumer even when the optional scanner flag is off. `scanner_health` separately reports whether the scheduled market scanner is enabled. Key diagnostics: `scanner_worker_status`, `worker_heartbeat_age_seconds`, `worker_build_version`, `worker_database_match`, `worker_database_fingerprint`, `backtest_job_poll_seconds`, `backtest_latest_job.status`, and error/progress fields.
 
 Healthy worker requires a fresh heartbeat and `worker_status=running`. `worker_database_match=true` confirms that the stored worker fingerprint matches the web service's database identity. A missing heartbeat means no worker identity has been recorded; a queued job is not proof of execution.
 
@@ -71,13 +61,11 @@ Tokenomics/on-chain fundamentals are not implemented. `ANALYZE` now says `NOT_IM
 
 ## Deployment verification
 
-1. Deploy the same commit to `mexc-rsi-ema-web` and `mexc-rsi-ema-scanner`.
-2. Confirm the worker's start command is `python -m app.worker`.
-3. Confirm both services use the same PostgreSQL `DATABASE_URL`.
-4. Confirm the worker log contains `MEXC research worker starting` and `BACKTEST QUEUE POLLER READY`.
-5. Check `/healthz` for `worker_health=healthy`, a heartbeat age below 75 seconds, and `worker_database_match=true`.
-6. Send one `BACKTEST 1D`; watch the worker logs for `BACKTEST JOB START`, `BACKTEST START` and symbol progress.
-7. Use `BACKTEST STATUS`, then `BACKTEST REPORT <JOB_ID>`.
+1. Deploy the commit to `mexc-rsi-ema-web` only; stop/delete any old `mexc-rsi-ema-scanner` background worker.
+2. Keep one web instance and one Uvicorn worker.
+3. Check `/healthz` for `in_process_backtest_queue=true`, `backtest_executor_status=running`, `worker_health=healthy`, a heartbeat age below 75 seconds, and `worker_database_match=true`.
+4. Send one `BACKTEST 1D`; watch the web service logs for `IN-PROCESS BACKTEST QUEUE READY`, `BACKTEST JOB START`, `BACKTEST START` and symbol progress.
+5. Use `BACKTEST STATUS`, then `BACKTEST REPORT <JOB_ID>`.
 
 ## Safe operating posture
 

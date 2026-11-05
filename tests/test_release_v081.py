@@ -205,28 +205,21 @@ def test_shared_price_tick_rounding_is_conservative_and_independent_of_legacy_ba
     assert _round_trigger_to_tick(100.01, 0.1, "LONG", "STOP") == 100.1
 
 
-def test_render_blueprint_has_matching_web_and_worker_database_and_queue_settings():
+def test_render_blueprint_uses_one_web_service_for_in_process_backtests():
     import yaml
     from pathlib import Path
 
     blueprint = yaml.safe_load(Path("render.yaml").read_text(encoding="utf-8"))
-    services = {row["name"]: row for row in blueprint["services"]}
-    web = services["mexc-rsi-ema-web"]
-    worker = services["mexc-rsi-ema-scanner"]
+    assert len(blueprint["services"]) == 1
+    web = blueprint["services"][0]
+    assert web["name"] == "mexc-rsi-ema-web"
     assert web["type"] == "web"
-    assert worker["type"] == "worker"
-    assert worker["dockerCommand"] == "python -m app.worker"
-
-    def env_map(service):
-        return {row["key"]: row for row in service["envVars"]}
-
-    web_env = env_map(web)
-    worker_env = env_map(worker)
-    assert web_env["DATABASE_URL"]["fromDatabase"] == worker_env["DATABASE_URL"]["fromDatabase"]
-    assert web_env["DATABASE_URL"]["fromDatabase"]["name"] == "mexc-rsi-ema-db"
-    assert web_env["BACKTEST_JOB_POLL_SECONDS"]["value"] == worker_env["BACKTEST_JOB_POLL_SECONDS"]["value"] == "5"
-    # No legacy Render plan IDs are forced onto existing resources.
-    assert "plan" not in web and "plan" not in worker and "plan" not in blueprint["databases"][0]
+    assert web["dockerCommand"].endswith("--workers 1")
+    env = {row["key"]: row for row in web["envVars"]}
+    assert env["DATABASE_URL"]["fromDatabase"]["name"] == "mexc-rsi-ema-db"
+    assert env["BACKTEST_JOB_POLL_SECONDS"]["value"] == "5"
+    assert env["SCHEDULER_ENABLED"]["value"] == "true"
+    assert "plan" not in web and "plan" not in blueprint["databases"][0]
 
 
 def test_active_strategy_timeframes_and_env_example_are_aligned():

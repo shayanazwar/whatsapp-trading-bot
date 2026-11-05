@@ -585,6 +585,21 @@ class Store:
             )
             return int(cur.rowcount)
 
+    def requeue_backtest_job(self, job_id: str, *, reason: str = "executor_shutdown") -> bool:
+        """Return one interrupted running job to the queue without losing its identity."""
+        progress = {
+            "stage": "requeued_after_shutdown",
+            "reason": str(reason)[:160],
+            "requeued_at": utc_now_iso(),
+        }
+        with self.connection() as conn:
+            cur = conn.execute(
+                "UPDATE backtest_jobs SET status='queued',worker_id=NULL,started_at=NULL,finished_at=NULL,"
+                "result_json=NULL,error=?,progress_json=? WHERE id=? AND status='running'",
+                (None, canonical_json(progress), job_id),
+            )
+            return cur.rowcount == 1
+
     def update_backtest_job_progress(self, job_id: str, progress: Mapping[str, Any]) -> bool:
         """Persist bounded job progress without storing large intermediate market data."""
         with self.connection() as conn:

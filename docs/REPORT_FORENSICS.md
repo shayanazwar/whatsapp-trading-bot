@@ -2,7 +2,7 @@
 
 ## Active report path
 
-`BACKTEST` parses to S1-RFPC and calls `CommandProcessor._run_backtest`. Jobs are persisted by the web process and executed by the dedicated worker. The inactive `_run_rsi_ema_backtest` implementation is legacy and is not the active route.
+`BACKTEST` parses to S1-RFPC and calls `CommandProcessor._run_backtest`. Jobs are persisted and executed by the in-process queue consumer inside the web service. The inactive `_run_rsi_ema_backtest` implementation is legacy and is not the active route.
 
 ## Reading results correctly
 

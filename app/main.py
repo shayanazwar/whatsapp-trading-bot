@@ -20,10 +20,12 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from app.config import Settings, load_settings
 from app.version import APP_VERSION
 from app.mexc.client import MexcClient
+from app.market.archive import CandleArchive
 from app.services.command_processor import CommandProcessor
 from app.commands import CommandError, parse_command
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
+from app.worker import SingleWorkerLock
 from app.whatsapp import (
     WhatsAppCloud, extract_incoming_messages, extract_status_updates, sender_key,
     verify_webhook_signature,
@@ -71,68 +73,124 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = Store(cfg.database_url or cfg.database_path)
-        mexc = MexcClient(base_url=cfg.mexc_rest_base_url, timeout_seconds=cfg.http_timeout_seconds,
-                          max_retries=cfg.http_max_retries)
-        whatsapp = WhatsAppCloud(cfg)
-        processor = CommandProcessor(cfg, store, mexc, whatsapp)
-        scheduler = ResearchScheduler(cfg, store, mexc, whatsapp)
-        app.state.settings = cfg
-        app.state.store = store
-        app.state.mexc = mexc
-        app.state.whatsapp = whatsapp
-        app.state.processor = processor
-        app.state.scheduler = scheduler
-        app.state.scheduler_task = None
-        app.state.background_tasks = set()
-        app.state.inbound_dispatching = set()
-        app.state.artifacts = {}
-        if cfg.scheduler_enabled:
-            app.state.scheduler_task = asyncio.create_task(scheduler.run_forever(), name="research-scheduler")
-        else:
-            store.set_state("scheduler_status", "disabled")
-        logger.info(
-            "APPLICATION STARTUP COMPLETE | whatsapp_allowlist_configured=%s live_execution=false",
-            bool(cfg.whatsapp_allowed_senders),
-        )
-        # Recover every pending row in stable keyset pages. OFFSET pagination would
-        # skip rows as background tasks mark earlier messages processed.
-        if cfg.whatsapp_allowed_senders:
-            allowed_recovery_senders = {sender_key(x) for x in cfg.whatsapp_allowed_senders}
-            cursor: tuple[str, str] | None = None
-            while True:
-                page = store.pending_inbound(limit=500, after=cursor)
-                if not page:
-                    break
-                for row in page:
-                    cursor = (str(row["received_at"]), str(row["message_id"]))
-                    try:
-                        payload = json.loads(row["payload_json"])
-                        msgs = extract_incoming_messages(payload)
-                        msg = next((m for m in msgs if m["message_id"] == row["message_id"]), None)
-                        if not msg:
-                            store.mark_inbound_processed(row["message_id"], "invalid_payload_missing_message_on_recovery")
-                        elif sender_key(msg.get("from", "")) not in allowed_recovery_senders:
-                            store.mark_inbound_processed(row["message_id"], "unauthorized_sender_dropped_on_recovery")
-                        else:
-                            _route_allowed_message(app, msg, row["message_id"])
-                    except Exception as exc:
-                        store.append_event("WHATSAPP_INBOUND_RECOVERY_FAILED", {
-                            "message_id": row["message_id"], "error_type": type(exc).__name__,
-                        }, idempotency_key=f"inbound-recovery-failed:{row['message_id']}")
-                        store.mark_inbound_processed(row["message_id"], f"recovery_failed:{type(exc).__name__}")
-        yield
-        scheduler.stop()
-        scheduler_task = app.state.scheduler_task
-        if scheduler_task is not None:
-            scheduler_task.cancel()
-            await asyncio.gather(scheduler_task, return_exceptions=True)
-        tasks = list(app.state.background_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        await mexc.aclose()
-        await whatsapp.aclose()
+        # The web service is now the sole durable backtest consumer. Reuse the same
+        # advisory lock as the old standalone worker to prevent duplicate consumers
+        # during migration or when an old Render worker has not yet been removed.
+        worker_lock = SingleWorkerLock(cfg.database_url)
+        if not worker_lock.acquire():
+            raise RuntimeError(
+                "Another backtest consumer holds the database advisory lock. "
+                "Stop the old standalone Render worker before using in-process backtests."
+            )
+
+        mexc = None
+        whatsapp = None
+        scheduler = None
+        try:
+            recovered_jobs = store.requeue_interrupted_backtest_jobs()
+            if recovered_jobs:
+                logger.warning("BACKTEST JOB RECOVERY | requeued_interrupted_jobs=%d", recovered_jobs)
+            store.set_state("worker_status", "starting")
+            store.set_state("worker_database_fingerprint", store.database_fingerprint)
+            store.set_state("worker_build_version", APP_VERSION)
+            store.set_state("worker_last_start_utc", datetime.now(timezone.utc).isoformat())
+
+            mexc = MexcClient(
+                base_url=cfg.mexc_rest_base_url,
+                timeout_seconds=cfg.http_timeout_seconds,
+                max_retries=cfg.http_max_retries,
+            )
+            whatsapp = WhatsAppCloud(cfg)
+            archive = CandleArchive(cfg.market_data_dir)
+            processor = CommandProcessor(cfg, store, mexc, whatsapp, archive=archive)
+            backtest_processor = CommandProcessor(
+                cfg, store, mexc, whatsapp, backtest_inline=True, archive=archive,
+            )
+            scheduler = ResearchScheduler(
+                cfg, store, mexc, whatsapp,
+                backtest_processor=backtest_processor,
+                archive=archive,
+            )
+            app.state.settings = cfg
+            app.state.store = store
+            app.state.mexc = mexc
+            app.state.whatsapp = whatsapp
+            app.state.processor = processor
+            app.state.backtest_processor = backtest_processor
+            app.state.scheduler = scheduler
+            app.state.scheduler_task = None
+            app.state.backtest_queue_task = asyncio.create_task(
+                scheduler.run_backtest_queue_forever(), name="in-process-backtest-queue",
+            )
+            app.state.background_tasks = set()
+            app.state.inbound_dispatching = set()
+            app.state.artifacts = {}
+            if cfg.scheduler_enabled:
+                app.state.scheduler_task = asyncio.create_task(
+                    scheduler.run_forever(process_backtest_queue=False),
+                    name="research-market-scheduler",
+                )
+            else:
+                store.set_state("scheduler_status", "disabled")
+            logger.info(
+                "APPLICATION STARTUP COMPLETE | in_process_backtest_queue=true "
+                "whatsapp_allowlist_configured=%s live_execution=false",
+                bool(cfg.whatsapp_allowed_senders),
+            )
+            # Recover every pending row in stable keyset pages. OFFSET pagination would
+            # skip rows as background tasks mark earlier messages processed.
+            if cfg.whatsapp_allowed_senders:
+                allowed_recovery_senders = {sender_key(x) for x in cfg.whatsapp_allowed_senders}
+                cursor: tuple[str, str] | None = None
+                while True:
+                    page = store.pending_inbound(limit=500, after=cursor)
+                    if not page:
+                        break
+                    for row in page:
+                        cursor = (str(row["received_at"]), str(row["message_id"]))
+                        try:
+                            payload = json.loads(row["payload_json"])
+                            msgs = extract_incoming_messages(payload)
+                            msg = next((m for m in msgs if m["message_id"] == row["message_id"]), None)
+                            if not msg:
+                                store.mark_inbound_processed(row["message_id"], "invalid_payload_missing_message_on_recovery")
+                            elif sender_key(msg.get("from", "")) not in allowed_recovery_senders:
+                                store.mark_inbound_processed(row["message_id"], "unauthorized_sender_dropped_on_recovery")
+                            else:
+                                _route_allowed_message(app, msg, row["message_id"])
+                        except Exception as exc:
+                            store.append_event("WHATSAPP_INBOUND_RECOVERY_FAILED", {
+                                "message_id": row["message_id"], "error_type": type(exc).__name__,
+                            }, idempotency_key=f"inbound-recovery-failed:{row['message_id']}")
+                            store.mark_inbound_processed(row["message_id"], f"recovery_failed:{type(exc).__name__}")
+            yield
+        finally:
+            if scheduler is not None:
+                scheduler.stop()
+            # Stop the optional market scheduler first, then let the queue consumer
+            # finish briefly or requeue its active job for the next process start.
+            scheduler_task = getattr(app.state, "scheduler_task", None)
+            if scheduler_task is not None:
+                scheduler_task.cancel()
+                await asyncio.gather(scheduler_task, return_exceptions=True)
+            queue_task = getattr(app.state, "backtest_queue_task", None)
+            if queue_task is not None:
+                try:
+                    await asyncio.wait_for(queue_task, timeout=12.0)
+                except TimeoutError:
+                    queue_task.cancel()
+                    await asyncio.gather(queue_task, return_exceptions=True)
+            tasks = list(getattr(app.state, "background_tasks", set()))
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if mexc is not None:
+                await mexc.aclose()
+            if whatsapp is not None:
+                await whatsapp.aclose()
+            store.set_state("worker_status", "stopped")
+            worker_lock.release()
 
     app = FastAPI(title="MEXC Futures Research Bot", version=APP_VERSION, lifespan=lifespan)
 
@@ -283,7 +341,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             worker_database_match = worker_db_fingerprint == store.database_fingerprint
             if not worker_database_match:
                 worker_health = "database_mismatch"
-        scanner_health = (worker_health if settings.mexc_universe_scan_enabled else "disabled")
+        if not settings.mexc_universe_scan_enabled:
+            scanner_health = "disabled"
+        elif not settings.scheduler_enabled:
+            scanner_health = "scheduler_disabled"
+        else:
+            scanner_health = worker_health
         return {
             "status": "ok" if db == "ok" else "degraded",
             "build_version": APP_VERSION,
@@ -305,6 +368,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Backward-compatible alias retained for older monitoring scripts.
             "scanner_worker_heartbeat_age_seconds": worker_heartbeat_age_seconds,
             "backtest_job_poll_seconds": settings.backtest_job_poll_seconds,
+            "backtest_executor_status": store.get_state("backtest_executor_status", "unknown"),
+            "in_process_backtest_queue": store.get_state("backtest_executor_status") == "running",
             "scanner_last_attempt": store.get_state("top100_swing_scan_last_attempt"),
             "scanner_last_success": store.get_state("top100_swing_scan_last_success"),
             "scanner_last_summary": store.get_state("top100_swing_scan_summary"),

@@ -1,5 +1,5 @@
-# Render Blueprint: split responsive WhatsApp/web traffic from the long-running scanner worker.
-# Live execution is disabled and no order-placement loop is started by this worker.
+# Render Blueprint: one web service handles requests and the in-process durable backtest queue.
+# No separately billed background worker is required; live execution remains disabled.
 databases:
   - name: mexc-rsi-ema-db
     databaseName: mexc_rsi_ema
@@ -86,7 +86,7 @@ services:
       - key: DEFAULT_SYMBOLS
         value: BTC_USDT,ETH_USDT,SOL_USDT
       - key: SCHEDULER_ENABLED
-        value: "false"
+        value: "true"
       - key: SCHEDULER_INTERVAL_SECONDS
         value: "60"
       - key: BACKTEST_JOB_POLL_SECONDS
@@ -114,13 +114,3 @@ services:
       - key: WEB_API_TOKEN
         generateValue: true
 
-  - type: worker
-    name: mexc-rsi-ema-scanner
-    runtime: docker
-    region: singapore
-    dockerCommand: python -m app.worker
-    disk:
-      name: mexc-market-archive
-      mountPath: /var/data
-      sizeGB: 10
-    envVars: *commonEnv

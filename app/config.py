@@ -156,7 +156,7 @@ def load_settings() -> Settings:
         http_timeout_seconds=_float("HTTP_TIMEOUT_SECONDS", 12.0),
         http_max_retries=_int("HTTP_MAX_RETRIES", 3),
         candle_close_grace_seconds=_int("CANDLE_CLOSE_GRACE_SECONDS", 5),
-        scheduler_enabled=_bool("SCHEDULER_ENABLED", False),  # Web scheduler stays off when the dedicated worker is deployed.
+        scheduler_enabled=_bool("SCHEDULER_ENABLED", False),  # Optional market scanner; backtest queue always runs in web process.
         scheduler_interval_seconds=_int("SCHEDULER_INTERVAL_SECONDS", 60),
         backtest_job_poll_seconds=_int("BACKTEST_JOB_POLL_SECONDS", 5),
         paper_trading_enabled=_bool("PAPER_TRADING_ENABLED", True),

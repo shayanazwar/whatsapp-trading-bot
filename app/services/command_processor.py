@@ -277,7 +277,7 @@ class CommandProcessor:
                     "strategy_scope": args.get("strategy_scope", "both"),
                 }, idempotency_key=f"backtest-job-queued:{job_id}")
                 return CommandResult(
-                    f"🧪 BACKTEST JOB QUEUED\nJob: {job_id}\nPeriod: {args.get('window')}\nStrategy: S1-RFPC (1D → 12H → 4H → 1H)\nPortfolio cap: {self.settings.backtest_max_positions} open research positions\nThe dedicated worker will process this job. Use BACKTEST REPORT {job_id} or BACKTEST STATUS. Live orders OFF.",
+                    f"🧪 BACKTEST JOB QUEUED\nJob: {job_id}\nPeriod: {args.get('window')}\nStrategy: S1-RFPC (1D → 12H → 4H → 1H)\nPortfolio cap: {self.settings.backtest_max_positions} open research positions\nThe same Render service will process this job in the background. Use BACKTEST REPORT {job_id} or BACKTEST STATUS. Live orders OFF.",
                     event_type="BACKTEST_JOB_QUEUED",
                 )
             async with self._backtest_lock:

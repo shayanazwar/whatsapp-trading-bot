@@ -1,4 +1,7 @@
-"""Opt-in background worker for research alerts and local paper trading only.
+"""In-process durable backtest queue plus optional research scanning/paper scheduler.
+
+The FastAPI web service runs the backtest queue consumer in its existing process; the
+market scanner/paper scheduler remains separately opt-in. No exchange orders are sent.
 
 Safety posture:
 - Disabled unless SCHEDULER_ENABLED=true.
@@ -161,16 +164,42 @@ class ResearchScheduler:
 
     async def _backtest_queue_poll_loop(self) -> None:
         """Poll durable jobs independently of market-data/scanner network calls."""
-        poll_seconds = float(self.settings.backtest_job_poll_seconds)
+        poll_seconds = max(1.0, float(self.settings.backtest_job_poll_seconds))
         while not self._stopped.is_set():
+            self.store.set_state("worker_heartbeat_utc", datetime.now(timezone.utc).isoformat())
             self._start_backtest_job_if_idle()
             try:
                 await asyncio.wait_for(self._stopped.wait(), timeout=poll_seconds)
             except TimeoutError:
                 pass
 
-    async def run_forever(self) -> None:
-        """Run independent queue and market loops; a slow scan cannot starve jobs."""
+    async def run_backtest_queue_forever(self) -> None:
+        """Consume durable backtests inside the existing web process, without scanner cycles."""
+        if self.backtest_processor is None:
+            raise RuntimeError("In-process backtest queue requires an inline CommandProcessor")
+        self.store.set_state("backtest_executor_status", "running")
+        self.store.set_state("worker_status", "running")
+        self.store.set_state("worker_database_fingerprint", self.store.database_fingerprint)
+        logger.info(
+            "IN-PROCESS BACKTEST QUEUE READY | poll_seconds=%d live_execution=false",
+            max(1, int(self.settings.backtest_job_poll_seconds)),
+        )
+        try:
+            await self._backtest_queue_poll_loop()
+        finally:
+            # Give an active job a brief graceful window. If the web process is stopping,
+            # cancellation requeues the job so the next process start can resume it.
+            if self._backtest_task is not None and not self._backtest_task.done():
+                try:
+                    await asyncio.wait_for(self._backtest_task, timeout=10.0)
+                except TimeoutError:
+                    self._backtest_task.cancel()
+                    await asyncio.gather(self._backtest_task, return_exceptions=True)
+            self.store.set_state("backtest_executor_status", "stopped")
+            self.store.set_state("worker_status", "stopped")
+
+    async def run_forever(self, *, process_backtest_queue: bool = True) -> None:
+        """Run market cycles and, optionally, the durable queue consumer."""
         self.store.set_state("scheduler_status", "running")
         self.store.append_event(
             "SCHEDULER_STARTED",
@@ -182,7 +211,7 @@ class ResearchScheduler:
         )
         queue_task: asyncio.Task | None = None
         try:
-            if self.backtest_processor is not None:
+            if process_backtest_queue and self.backtest_processor is not None:
                 queue_task = asyncio.create_task(
                     self._backtest_queue_poll_loop(), name="backtest-queue-poller"
                 )
@@ -261,7 +290,7 @@ class ResearchScheduler:
 
 
     async def _process_next_backtest_job(self) -> None:
-        """Claim one durable job and execute it away from the FastAPI web service."""
+        """Claim and execute one durable job in the current application process."""
         if self.backtest_processor is None:
             return
         try:
@@ -300,7 +329,7 @@ class ResearchScheduler:
                     f"Job: {job_id}\n"
                     f"Period: {args.get('window', 'n/a')}\n"
                     "Strategy: S1-RFPC (1D → 12H → 4H → 1H)\n"
-                    "The worker has claimed the job and started preparing the symbol scan. "
+                    "The Render service has claimed the job and started preparing the symbol scan. "
                     "Use BACKTEST STATUS for progress. Live orders OFF."
                 )
                 status_outbox = self.store.enqueue_outbox(
@@ -358,7 +387,11 @@ class ResearchScheduler:
             if execution_task is not None and not execution_task.done():
                 execution_task.cancel()
                 await asyncio.gather(execution_task, return_exceptions=True)
-            self.store.finish_backtest_job(job_id, error="Worker shutdown cancelled the job")
+            requeued = self.store.requeue_backtest_job(job_id, reason="executor_shutdown_cancelled")
+            logger.warning(
+                "BACKTEST JOB REQUEUED AFTER SHUTDOWN | job_id=%s requeued=%s",
+                job_id, requeued,
+            )
             raise
         except Exception as exc:
             if execution_task is not None and not execution_task.done():

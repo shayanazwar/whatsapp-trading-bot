@@ -1,3 +1,3 @@
 """Single source of truth for the deployed application build identifier."""
 
-APP_VERSION = "0.8.4"
+APP_VERSION = "0.8.5"

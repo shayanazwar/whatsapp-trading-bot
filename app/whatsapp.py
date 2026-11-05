@@ -11,7 +11,6 @@ from typing import Any, Mapping
 
 import httpx
 
-from app.commands import WHATSAPP_SUPPORT_COMMANDS, WHATSAPP_SUPPORT_HELP_TEXT
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -19,18 +18,6 @@ logger = logging.getLogger(__name__)
 
 class WhatsAppError(RuntimeError):
     """Raised when a WhatsApp Cloud API operation fails."""
-
-
-class WhatsAppPolicyBlocked(WhatsAppError):
-    """Raised when crypto-related messaging is not approved."""
-
-
-# One canonical payload is shared by the sender and the durable outbox so the
-# recorded message always matches the message actually submitted to Meta.
-WHATSAPP_POLICY_BLOCKED_REPLY = (
-    "Research commands are not enabled on this WhatsApp channel. "
-    "Open the MEXC Research Dashboard: https://shayan-millionaire-bot.onrender.com/dashboard"
-)
 
 
 def verify_webhook_signature(
@@ -214,13 +201,6 @@ class WhatsAppCloud:
         self._owns_client = client is None
         self.graph_version = graph_version
 
-    def _require_gate(self) -> None:
-        """Block research messages unless the explicitly configured gate is open."""
-        if not self.settings.whatsapp_policy_gate_open:
-            raise WhatsAppPolicyBlocked(
-                "WhatsApp research messaging is blocked until written policy clearance is configured"
-            )
-
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
@@ -264,83 +244,12 @@ class WhatsAppCloud:
 
         return recipient_key
 
-    async def send_service_status(
-        self,
-        recipient: str,
-    ) -> dict[str, Any]:
-        """Send a fixed generic service reply without trading information.
-
-        This path deliberately does not open the crypto policy gate.
-        The recipient must be explicitly allowlisted.
-        """
-        recipient_key = self._validate_recipient(recipient)
-
-        if not self.settings.meta_access_token:
-            raise WhatsAppError(
-                "META_ACCESS_TOKEN is not configured"
-            )
-
-        text = WHATSAPP_POLICY_BLOCKED_REPLY
-
-        client = await self._ensure_client()
-        response = await client.post(
-            self._endpoint(),
-            headers={
-                "Authorization": (
-                    f"Bearer {self.settings.meta_access_token}"
-                )
-            },
-            json={
-                "messaging_product": "whatsapp",
-                "recipient_type": "individual",
-                "to": recipient_key,
-                "type": "text",
-                "text": {
-                    "preview_url": False,
-                    "body": text,
-                },
-            },
-        )
-
-        if response.is_error:
-            logger.warning(
-                "Meta service-status send failed | HTTP %s",
-                response.status_code,
-            )
-            raise WhatsAppError(
-                "Meta service-status message failed with HTTP "
-                f"{response.status_code}"
-            )
-
-        try:
-            result = response.json()
-        except ValueError as exc:
-            raise WhatsAppError(
-                "Meta returned invalid JSON for service-status message"
-            ) from exc
-
-        return result if isinstance(result, dict) else {}
-
     async def send_text(
         self,
         recipient: str,
         text: str,
     ) -> dict[str, Any]:
-        """Send research text only when the explicit policy gate is open."""
-        self._require_gate()
-        return await self._send_text_payload(recipient, text)
-
-    async def send_support_text(
-        self,
-        recipient: str,
-        text: str,
-        *,
-        command: str = "",
-    ) -> dict[str, Any]:
-        """Send only the small support allowlist while research messaging is gated."""
-        normalized = command.strip().upper()
-        if normalized not in WHATSAPP_SUPPORT_COMMANDS:
-            raise WhatsAppPolicyBlocked("Only HELP and STATUS are allowed through the support path")
+        """Send a command/result message to an explicitly allowlisted recipient."""
         return await self._send_text_payload(recipient, text)
 
     async def _send_text_payload(self, recipient: str, text: str) -> dict[str, Any]:
@@ -377,9 +286,7 @@ class WhatsAppCloud:
         *,
         media_type: str,
     ) -> dict[str, Any]:
-        """Upload media only when the explicit research messaging gate is open."""
-
-        self._require_gate()
+        """Upload supported research media to an explicitly allowlisted recipient."""
         if media_type != "image":
             raise ValueError("Only chart images may be sent; document attachments are disabled")
 

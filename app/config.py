@@ -103,8 +103,6 @@ class Settings:
     backtest_max_total_notional_multiple: float
     backtest_liquidation_fee_rate: float
     cost_stress_multipliers: tuple[float, ...]
-    whatsapp_crypto_messaging_allowed: bool
-    whatsapp_policy_clearance_ref: str
     meta_verify_token: str
     meta_app_secret: str
     meta_access_token: str
@@ -114,14 +112,6 @@ class Settings:
     web_api_token: str
     mexc_api_key: str
     mexc_api_secret: str
-
-    @property
-    def whatsapp_policy_gate_open(self) -> bool:
-        """A configuration gate only; it is not proof that Meta granted permission."""
-        return bool(
-            self.whatsapp_crypto_messaging_allowed
-            and self.whatsapp_policy_clearance_ref.strip()
-        )
 
 
 def load_settings() -> Settings:
@@ -166,19 +156,19 @@ def load_settings() -> Settings:
         http_timeout_seconds=_float("HTTP_TIMEOUT_SECONDS", 12.0),
         http_max_retries=_int("HTTP_MAX_RETRIES", 3),
         candle_close_grace_seconds=_int("CANDLE_CLOSE_GRACE_SECONDS", 5),
-        scheduler_enabled=_bool("SCHEDULER_ENABLED", False),
+        scheduler_enabled=_bool("SCHEDULER_ENABLED", False),  # Web scheduler stays off when the dedicated worker is deployed.
         scheduler_interval_seconds=_int("SCHEDULER_INTERVAL_SECONDS", 60),
         backtest_job_poll_seconds=_int("BACKTEST_JOB_POLL_SECONDS", 5),
-        paper_trading_enabled=_bool("PAPER_TRADING_ENABLED", False),
+        paper_trading_enabled=_bool("PAPER_TRADING_ENABLED", True),
         data_alignment_probe_approved=_bool("DATA_ALIGNMENT_PROBE_APPROVED", False),
         auto_trading_enabled=_bool("AUTO_TRADING_ENABLED", False),
-        live_execution_enabled=_bool("LIVE_EXECUTION_ENABLED", False),
-        live_execution_build_released=_bool("LIVE_EXECUTION_BUILD_RELEASED", False),
+        live_execution_enabled=False,  # Hard-locked off in this research-only build.
+        live_execution_build_released=False,  # No release flag can activate live orders.
         default_symbols=symbols,
         mexc_universe_top_n=_int("MEXC_UNIVERSE_TOP_N", 100),
-        mexc_universe_scan_enabled=_bool("MEXC_UNIVERSE_SCAN_ENABLED", False),
+        mexc_universe_scan_enabled=_bool("MEXC_UNIVERSE_SCAN_ENABLED", True),
         market_data_dir=Path(os.getenv("MARKET_DATA_DIR", str(default_data_root / "market"))),
-        signal_push_enabled=_bool("SIGNAL_PUSH_ENABLED", False),
+        signal_push_enabled=_bool("SIGNAL_PUSH_ENABLED", True),
         signal_ttl_bars=_int("SIGNAL_TTL_BARS", 2),
         signal_min_score=_float("SIGNAL_MIN_SCORE", 65.0),
         signal_push_min_score=_float("SIGNAL_PUSH_MIN_SCORE", 80.0),
@@ -224,8 +214,6 @@ def load_settings() -> Settings:
         backtest_max_total_notional_multiple=_float("BACKTEST_MAX_TOTAL_NOTIONAL_MULTIPLE", 25.0),
         backtest_liquidation_fee_rate=_float("BACKTEST_LIQUIDATION_FEE_RATE", 0.0),
         cost_stress_multipliers=stresses,
-        whatsapp_crypto_messaging_allowed=_bool("WHATSAPP_CRYPTO_MESSAGING_ALLOWED", False),
-        whatsapp_policy_clearance_ref=os.getenv("WHATSAPP_POLICY_CLEARANCE_REF", ""),
         meta_verify_token=os.getenv("META_VERIFY_TOKEN", ""),
         meta_app_secret=os.getenv("META_APP_SECRET", ""),
         meta_access_token=os.getenv("META_ACCESS_TOKEN", ""),

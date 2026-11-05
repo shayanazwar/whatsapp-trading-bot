@@ -11,7 +11,6 @@ ALLOWED_ALERT_INTERVALS = {"1H", "4H", "12H", "1D"}
 BACKTEST_WINDOW_ORDER = ["1D", "7D", "30D", "60D", "90D"]
 ALLOWED_BACKTEST_WINDOWS = set(BACKTEST_WINDOW_ORDER)
 CHART_TIMEFRAMES = frozenset({"3M", "5M", "15M", "30M", "1H", "4H", "8H", "12H", "1D", "3D", "1W", "1MO"})
-WHATSAPP_SUPPORT_COMMANDS = frozenset({"HELP", "STATUS"})
 TP_SCENARIOS: dict[str, float] = {
     "CONTROL": 2.0,
     "1.5R": 1.5,
@@ -204,14 +203,4 @@ STATUS • PERFORMANCE • PNL • RISK • COST
 AUTOTRADE STATUS • AUTOTRADE OFF • PAUSE
 
 Reports model fees, funding where available and slippage assumptions. They are not guaranteed execution results and do not fully replay exchange order-book impact or cross-margin liquidation. Backtests and scanner alerts are research only. Live orders are disabled. The separate paper simulator remains capped at one concurrent position.
-"""
-
-WHATSAPP_SUPPORT_HELP_TEXT = """📈 Pak Trading Academy Bot — Service Help
-
-HELP — Show this menu
-STATUS — Bot and service status
-
-Research commands are not enabled on this WhatsApp channel unless the applicable policy gate has been cleared.
-Dashboard: https://shayan-millionaire-bot.onrender.com/dashboard
-Live orders: OFF
 """

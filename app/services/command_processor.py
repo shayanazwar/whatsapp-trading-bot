@@ -28,7 +28,7 @@ from app.services.universe import top_usdt_perpetual_symbols
 from app.storage import Store, canonical_json
 from app.strategy.rfpc import STRATEGY_VERSION
 from app.symbols import normalize_symbol
-from app.whatsapp import WhatsAppCloud, WhatsAppPolicyBlocked, sender_key
+from app.whatsapp import WhatsAppCloud, sender_key
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +95,10 @@ class CommandProcessor:
 
     async def process_text(self, sender: str, text: str, *, received_timestamp: int | None = None,
                            request_id: str | None = None,
-                           enforce_whatsapp_policy: bool = True) -> CommandResult:
+                           enforce_sender_allowlist: bool = True) -> CommandResult:
         # Authorize before parsing to avoid exposing command grammar to unauthorized senders.
         allowed = {sender_key(x) for x in self.settings.whatsapp_allowed_senders}
-        if enforce_whatsapp_policy and (not allowed or sender_key(sender) not in allowed):
+        if enforce_sender_allowlist and (not allowed or sender_key(sender) not in allowed):
             raise CommandError("Sender is not authorized")
         # A signed, persisted webhook delivery remains valid after background queueing.
         # Meta can deliver retries and our own workers can be briefly delayed; a five-minute
@@ -106,18 +106,18 @@ class CommandProcessor:
         # Duplicate execution is handled by the inbound message ID/idempotency key instead.
         command = parse_command(text)
         if command.name == "BACKTEST":
-            command.args["_recipient"] = sender_key(sender) if enforce_whatsapp_policy else ""
+            command.args["_recipient"] = sender_key(sender) if enforce_sender_allowlist else ""
             command.args["_request_id"] = request_id or f"local-{time.time_ns()}"
         elif command.name in {"BACKTEST_STATUS", "BACKTEST_REPORT"}:
-            command.args["_recipient"] = sender_key(sender) if enforce_whatsapp_policy else ""
+            command.args["_recipient"] = sender_key(sender) if enforce_sender_allowlist else ""
         if command.name == "BACKTEST":
             logger.info(
                 "BACKTEST COMMAND PARSED | raw=%r requested_window=%s symbol=%s",
                 text.strip(), command.args.get("window"), command.args.get("symbol", "TOP_UNIVERSE"),
             )
         result = await self.execute(command)
-        self.store.append_event("WHATSAPP_COMMAND_PROCESSED" if enforce_whatsapp_policy else "LOCAL_COMMAND_PROCESSED",
-            {"sender": sender_key(sender) if enforce_whatsapp_policy else "authenticated-web-dashboard",
+        self.store.append_event("WHATSAPP_COMMAND_PROCESSED" if enforce_sender_allowlist else "LOCAL_COMMAND_PROCESSED",
+            {"sender": sender_key(sender) if enforce_sender_allowlist else "authenticated-web-dashboard",
              "command": command.name, "args": command.args,
              "result_event": result.event_type, "mode": "PAPER/RESEARCH"},
             idempotency_key=result.idempotency_key)
@@ -139,7 +139,7 @@ class CommandProcessor:
                 f"Auto trading: {'ON' if self.settings.auto_trading_enabled else 'OFF'}\n"
                 f"Live execution: DISABLED (build lock={not self.settings.live_execution_build_released})\n"
                 f"Open simulated positions: {len(positions)}\n"
-                f"WhatsApp policy gate: {'OPEN' if self.settings.whatsapp_policy_gate_open else 'CLOSED'}\n"
+                f"WhatsApp sender allowlist: {'CONFIGURED' if self.settings.whatsapp_allowed_senders else 'NOT CONFIGURED'}\n"
                 "No live MEXC order path is enabled."
             )
         if name == "PAPER":

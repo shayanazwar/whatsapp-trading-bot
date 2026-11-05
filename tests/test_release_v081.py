@@ -50,8 +50,7 @@ async def test_worker_claims_job_logs_running_status_and_persists_result(tmp_pat
         base,
         database_path=tmp_path / "worker-jobs.sqlite3",
         reports_dir=tmp_path / "reports",
-        whatsapp_crypto_messaging_allowed=False,
-        whatsapp_policy_clearance_ref="",
+        whatsapp_allowed_senders=("923001234567",),
     )
     store = Store(settings.database_path)
     whatsapp = DummyWhatsApp()
@@ -70,12 +69,11 @@ async def test_worker_claims_job_logs_running_status_and_persists_result(tmp_pat
     assert job is not None
     assert job["status"] == "complete"
     assert job["result"]["text"] == "BACKTEST REPORT: completed"
-    assert len(whatsapp.sent) == 1
+    assert len(whatsapp.sent) == 2
     assert "BACKTEST JOB RUNNING" in whatsapp.sent[0][1]
+    assert "BACKTEST REPORT: completed" in whatsapp.sent[1][1]
     assert "BACKTEST JOB START" in caplog.text
     assert "BACKTEST JOB COMPLETE" in caplog.text
-    # Crypto research report delivery remains blocked while its distinct policy gate is closed.
-    assert not any("BACKTEST REPORT: completed" in body for _, body in whatsapp.sent)
 
 
 @pytest.mark.asyncio
@@ -154,8 +152,6 @@ async def test_backtest_queue_is_not_blocked_by_slow_market_cycle(tmp_path):
         reports_dir=tmp_path / "reports",
         backtest_job_poll_seconds=1,
         scheduler_interval_seconds=60,
-        whatsapp_crypto_messaging_allowed=False,
-        whatsapp_policy_clearance_ref="",
     )
     store = Store(settings.database_path)
     whatsapp = DummyWhatsApp()
@@ -252,8 +248,7 @@ async def test_general_outbox_does_not_double_send_immediate_backtest_status(tmp
         base,
         database_path=tmp_path / "backtest-status-outbox.sqlite3",
         reports_dir=tmp_path / "reports",
-        whatsapp_crypto_messaging_allowed=True,
-        whatsapp_policy_clearance_ref="operator-recorded-test-clearance",
+        whatsapp_allowed_senders=("923001234567",),
         whatsapp_monthly_message_cap=50,
     )
     store = Store(settings.database_path)

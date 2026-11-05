@@ -63,7 +63,7 @@ Healthy worker requires a fresh heartbeat and `worker_status=running`. `worker_d
 
 ## WhatsApp delivery
 
-The command acknowledgement and the worker-claimed `BACKTEST JOB RUNNING` service notification are operational status messages, separate from a research result. The worker only attempts final report/signal delivery when `WHATSAPP_CRYPTO_MESSAGING_ALLOWED=true`, a non-empty written-clearance reference is recorded, recipients are configured/authorized, Meta credentials work, and the service-level push flag permits the relevant path. A closed gate keeps crypto research messages from being sent. Do not bypass it merely to test the worker.
+All supported WhatsApp commands and research notifications are routed for explicitly allowlisted senders. Webhook HMAC verification, sender allowlisting, message-ID idempotency, valid Meta credentials and the monthly outbound cap remain active. Signal delivery additionally requires the strategy's data-quality, contract, liquidity and net reward/risk checks to pass. Live MEXC order placement remains unavailable and hard-locked off.
 
 ## Fundamentals
 

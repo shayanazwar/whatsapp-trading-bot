@@ -149,8 +149,7 @@ def test_paper_close_requests_funding_through_exit_candle_close_and_records_clos
     scheduler = ResearchScheduler.__new__(ResearchScheduler)
     scheduler.settings = SimpleNamespace(
         mexc_price_series="standard", backtest_slippage_bps_per_side=0.0,
-        exchange_taker_fee_rate=0.0, whatsapp_policy_gate_open=False,
-        whatsapp_allowed_senders=(),
+        exchange_taker_fee_rate=0.0, whatsapp_allowed_senders=(),
     )
     scheduler.mexc = fake_mexc
     scheduler.paper = fake_paper
@@ -323,7 +322,7 @@ def test_duplicate_pending_webhook_dispatch_is_guarded_per_process(monkeypatch):
     monkeypatch.setattr(main_module, "_process_one_message", fake_process)
     monkeypatch.setattr(main_module, "_spawn_task", lambda app, coroutine, *, name: scheduled.append(coroutine))
     state = SimpleNamespace(
-        settings=SimpleNamespace(whatsapp_policy_gate_open=True),
+        settings=SimpleNamespace(whatsapp_allowed_senders=("923001234567",)),
         inbound_dispatching=set(),
     )
     app = SimpleNamespace(state=state)

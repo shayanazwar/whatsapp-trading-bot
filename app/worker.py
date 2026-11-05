@@ -155,7 +155,7 @@ async def _run() -> None:
         )
         store.set_state("worker_status", "starting")
         logger.info(
-            "MEXC research worker starting | build=%s | database=%s | database_fingerprint=%s | queue_poll_seconds=%d | universe=top-%d | backtest=S1-RFPC-1D-12H-4H-1H | scanner=S1-RFPC-1H | auto_scan=%s | signal_push=%s | policy_gate=%s | backtest_max_positions=%d | paper_max_positions=%d | archive=%s | paper=%s | live_execution=false",
+            "MEXC research worker starting | build=%s | database=%s | database_fingerprint=%s | queue_poll_seconds=%d | universe=top-%d | backtest=S1-RFPC-1D-12H-4H-1H | scanner=S1-RFPC-1H | auto_scan=%s | signal_push=%s | whatsapp_allowlist=%s | backtest_max_positions=%d | paper_max_positions=%d | archive=%s | paper=%s | live_execution=false",
             APP_VERSION,
             "postgresql" if settings.database_url else "sqlite_local",
             store.database_fingerprint,
@@ -163,7 +163,7 @@ async def _run() -> None:
             settings.mexc_universe_top_n,
             settings.mexc_universe_scan_enabled,
             settings.signal_push_enabled,
-            "open" if settings.whatsapp_policy_gate_open else "closed",
+            bool(settings.whatsapp_allowed_senders),
             settings.backtest_max_positions,
             settings.max_concurrent_positions,
             settings.market_data_dir,

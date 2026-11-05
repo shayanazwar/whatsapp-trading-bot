@@ -21,18 +21,11 @@ from app.config import Settings, load_settings
 from app.version import APP_VERSION
 from app.mexc.client import MexcClient
 from app.services.command_processor import CommandProcessor
-from app.commands import (
-    CommandError, WHATSAPP_SUPPORT_COMMANDS, WHATSAPP_SUPPORT_HELP_TEXT, parse_command,
-)
+from app.commands import CommandError, parse_command
 from app.services.scheduler import ResearchScheduler
 from app.storage import Store
 from app.whatsapp import (
-    WHATSAPP_POLICY_BLOCKED_REPLY,
-    WhatsAppCloud,
-    WhatsAppPolicyBlocked,
-    extract_incoming_messages,
-    extract_status_updates,
-    sender_key,
+    WhatsAppCloud, extract_incoming_messages, extract_status_updates, sender_key,
     verify_webhook_signature,
 )
 
@@ -98,8 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             store.set_state("scheduler_status", "disabled")
         logger.info(
-            "APPLICATION STARTUP COMPLETE | policy_gate=%s allowlist_configured=%s live_execution=false",
-            "open" if cfg.whatsapp_policy_gate_open else "closed",
+            "APPLICATION STARTUP COMPLETE | whatsapp_allowlist_configured=%s live_execution=false",
             bool(cfg.whatsapp_allowed_senders),
         )
         # Recover every pending row in stable keyset pages. OFFSET pagination would
@@ -188,7 +180,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail="This command is not available in the read-only web interface")
         try:
             result = await app.state.processor.process_text(
-                "authenticated-web-dashboard", command_text, request_id=f"dashboard-{uuid.uuid4()}", enforce_whatsapp_policy=False
+                "authenticated-web-dashboard", command_text, request_id=f"dashboard-{uuid.uuid4()}", enforce_sender_allowlist=False
             )
         except CommandError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -328,7 +320,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auto_trading_enabled": settings.auto_trading_enabled,
             "live_execution_enabled": False,
             "live_execution_build_released": settings.live_execution_build_released,
-            "whatsapp_policy_gate": "open" if settings.whatsapp_policy_gate_open else "closed",
+            "whatsapp_commands_enabled": bool(settings.whatsapp_allowed_senders),
         }
 
     @app.get("/webhook", response_class=PlainTextResponse)
@@ -465,13 +457,6 @@ def _authorize_dashboard_request(request: Request, configured_token: str) -> Non
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _is_support_command(body: str) -> bool:
-    try:
-        return parse_command(body).name in WHATSAPP_SUPPORT_COMMANDS
-    except CommandError:
-        return False
-
-
 def _spawn_task(app: FastAPI, coroutine, *, name: str) -> None:
     task = asyncio.create_task(coroutine, name=name)
     app.state.background_tasks.add(task)
@@ -499,22 +484,6 @@ def _spawn_message_task(app: FastAPI, message: dict[str, str], message_id: str) 
     )
 
 
-def _spawn_policy_status_task(app: FastAPI, message: dict[str, str], message_id: str) -> None:
-    _spawn_task(
-        app,
-        _send_policy_status_reply(app, message, message_id),
-        name=f"whatsapp-status-{message_id}",
-    )
-
-
-def _spawn_support_command_task(app: FastAPI, message: dict[str, str], message_id: str) -> None:
-    _spawn_task(
-        app,
-        _send_support_command_reply(app, message, message_id),
-        name=f"whatsapp-support-{message_id}",
-    )
-
-
 async def _dispatch_inbound_once(app: FastAPI, coroutine, message_id: str) -> None:
     try:
         await coroutine
@@ -523,153 +492,26 @@ async def _dispatch_inbound_once(app: FastAPI, coroutine, message_id: str) -> No
 
 
 def _route_allowed_message(app: FastAPI, message: dict[str, str], message_id: str) -> None:
-    """Route each durable inbound ID at most once per process at a time."""
-    settings: Settings = app.state.settings
+    """Dispatch any supported command from an authorized sender exactly once."""
     dispatching = getattr(app.state, "inbound_dispatching", None)
     if dispatching is None:
         dispatching = app.state.inbound_dispatching = set()
     if message_id in dispatching:
         return
     dispatching.add(message_id)
-    coroutine = None
-    dispatch_coroutine = None
+    coroutine = _process_one_message(app, message, message_id)
+    dispatch_coroutine = _dispatch_inbound_once(app, coroutine, message_id)
     try:
-        if settings.whatsapp_policy_gate_open:
-            coroutine = _process_one_message(app, message, message_id)
-            name = f"whatsapp-command-{message_id}"
-        elif _is_support_command(message.get("body", "")):
-            coroutine = _send_support_command_reply(app, message, message_id)
-            name = f"whatsapp-support-{message_id}"
-        else:
-            app.state.store.append_event(
-                "WHATSAPP_POLICY_GATE_BLOCKED",
-                {"message_id": message_id, "command_token": (message.get("body", "").split() or [""])[0].upper()[:24]},
-                idempotency_key=f"wa-policy-blocked:{message_id}",
-            )
-            coroutine = _send_policy_status_reply(app, message, message_id)
-            name = f"whatsapp-status-{message_id}"
-        dispatch_coroutine = _dispatch_inbound_once(app, coroutine, message_id)
-        _spawn_task(app, dispatch_coroutine, name=name)
+        _spawn_task(app, dispatch_coroutine, name=f"whatsapp-command-{message_id}")
     except Exception:
         dispatching.discard(message_id)
-        if dispatch_coroutine is not None:
-            dispatch_coroutine.close()
-        if coroutine is not None:
-            coroutine.close()
+        dispatch_coroutine.close()
+        coroutine.close()
         raise
-
-
-async def _send_support_command_reply(app: FastAPI, message: dict[str, str], message_id: str) -> None:
-    """Serve HELP/STATUS only while the crypto-research messaging gate is closed."""
-    store: Store = app.state.store
-    sender = sender_key(message.get("from", ""))
-    outbox_id: int | None = None
-    try:
-        command = parse_command(message.get("body", ""))
-        if command.name not in WHATSAPP_SUPPORT_COMMANDS:
-            raise CommandError("Only support commands are permitted while the policy gate is closed")
-        if command.name == "HELP":
-            reply = WHATSAPP_SUPPORT_HELP_TEXT
-        else:
-            result = await app.state.processor.execute(command)
-            reply = result.text
-        idempotency_key = f"wa-support:{message_id}"
-        outbox_id = store.enqueue_outbox(
-            sender, reply, category="service", idempotency_key=idempotency_key
-        )
-        provider_result = await app.state.whatsapp.send_support_text(
-            sender, reply, command=command.name
-        )
-        provider_messages = provider_result.get("messages", [])
-        provider_id = (
-            provider_messages[0].get("id")
-            if provider_messages and isinstance(provider_messages[0], dict)
-            else None
-        )
-        store.record_outbox_attempt(outbox_id, accepted=True, provider_message_id=provider_id)
-        store.append_event(
-            "WHATSAPP_SUPPORT_MESSAGE_ACCEPTED_BY_META",
-            {"message_id": message_id, "command": command.name,
-             "provider_message_id": provider_id, "outbox_id": outbox_id,
-             "delivery_confirmed": False},
-            idempotency_key=f"wa-support-accepted:{message_id}",
-        )
-        store.mark_inbound_processed(message_id, "support_reply_accepted_by_meta")
-    except Exception as exc:
-        if outbox_id is not None:
-            try:
-                store.mark_outbox_unknown(outbox_id, type(exc).__name__)
-            except Exception:
-                logger.warning("WHATSAPP SUPPORT OUTBOX UPDATE FAILED | message_id=%s", message_id)
-        store.append_event(
-            "WHATSAPP_SUPPORT_MESSAGE_FAILED",
-            {"message_id": message_id, "error_type": type(exc).__name__},
-            idempotency_key=f"wa-support-failed:{message_id}",
-        )
-        store.mark_inbound_processed(message_id, f"support_reply_failed:{type(exc).__name__}")
-        logger.warning(
-            "WHATSAPP SUPPORT REPLY FAILED | message_id=%s error_type=%s",
-            message_id, type(exc).__name__,
-        )
-
-
-async def _send_policy_status_reply(app: FastAPI, message: dict[str, str], message_id: str) -> None:
-    """Send the policy-status response; never execute the blocked user command."""
-    store: Store = app.state.store
-    sender = sender_key(message.get("from", ""))
-    outbox_id = None
-    generic_reply = WHATSAPP_POLICY_BLOCKED_REPLY
-    response_key = f"wa-policy-status:{message_id}"
-    try:
-        outbox_id = store.enqueue_outbox(
-            sender, generic_reply, category="service", idempotency_key=response_key
-        )
-        result = await app.state.whatsapp.send_service_status(sender)
-        provider_messages = result.get("messages", [])
-        provider_id = (
-            provider_messages[0].get("id")
-            if provider_messages and isinstance(provider_messages[0], dict)
-            else None
-        )
-        store.record_outbox_attempt(
-            outbox_id, accepted=True, provider_message_id=provider_id
-        )
-        store.append_event(
-            "WHATSAPP_SERVICE_STATUS_ACCEPTED_BY_META",
-            {"message_id": message_id, "provider_message_id": provider_id,
-             "outbox_id": outbox_id, "delivery_confirmed": False},
-            idempotency_key=f"wa-service-status-accepted:{message_id}",
-        )
-        store.mark_inbound_processed(
-            message_id, "policy_gate_closed_service_status_sent"
-        )
-        logger.info(
-            "WHATSAPP SERVICE REPLY ACCEPTED BY META | message_id=%s provider_id_present=%s",
-            message_id, bool(provider_id),
-        )
-    except Exception as exc:
-        if outbox_id is not None:
-            try:
-                store.mark_outbox_unknown(outbox_id, type(exc).__name__)
-            except Exception:
-                logger.warning("WHATSAPP OUTBOX UPDATE FAILED | message_id=%s", message_id)
-        store.append_event(
-            "WHATSAPP_SERVICE_STATUS_FAILED",
-            {"message_id": message_id, "error_type": type(exc).__name__},
-            idempotency_key=f"wa-service-status-failed:{message_id}",
-        )
-        store.mark_inbound_processed(
-            message_id, f"service_status_failed:{type(exc).__name__}"
-        )
-        logger.warning(
-            "WHATSAPP SERVICE REPLY FAILED | message_id=%s error_type=%s",
-            message_id, type(exc).__name__,
-        )
 
 
 async def _process_one_message(app: FastAPI, message: dict[str, str], message_id: str) -> None:
     store: Store = app.state.store
-    settings: Settings = app.state.settings
     processor: CommandProcessor = app.state.processor
     sender = message.get("from", "")
     body = message.get("body", "")
@@ -689,7 +531,7 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
         )
         result = await processor.process_text(
             sender, body, received_timestamp=message_time,
-            request_id=message_id, enforce_whatsapp_policy=True,
+            request_id=message_id, enforce_sender_allowlist=True,
         )
         image_attachments = [(path, kind) for path, kind in result.attachments if kind == "image"]
         logger.info(
@@ -760,8 +602,6 @@ async def _process_one_message(app: FastAPI, message: dict[str, str], message_id
                 logger.warning("WHATSAPP COMMAND ERROR REPLY FAILED | message_id=%s error_type=%s",
                                message_id, type(send_exc).__name__)
         store.mark_inbound_processed(message_id, "rejected:CommandError")
-    except WhatsAppPolicyBlocked:
-        store.mark_inbound_processed(message_id, "crypto_policy_gate_closed")
     except Exception as exc:
         store.append_event("WHATSAPP_COMMAND_FAILED", {"message_id": message_id, "error_type": type(exc).__name__},
                            idempotency_key=f"wa-command-failed:{message_id}")

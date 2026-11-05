@@ -1,6 +1,6 @@
-# PAK TRADING ACADEMY — MEXC Futures Research Platform v0.8.3
+# PAK TRADING ACADEMY — MEXC Futures Research Platform v0.8.5
 
-Research-only MEXC USDT perpetual scanner, swing-strategy backtester, durable job worker and protected dashboard. v0.8.4 includes audited fixes on top of v0.8.3, including exit-aware MAE/MFE and final-run funding coverage. v0.8.3 added bounded per-position initial-margin sizing, contract leverage/MMR checks, a shared-wallet maintenance stress proxy, marked-to-market open positions, stronger ledger reconciliation and memory telemetry. It preserves the active S1-RFPC 1D → 12H → 4H → 1H strategy. Live order execution is disabled and no live order-placement loop is available in this build.
+Research-only MEXC USDT perpetual scanner, swing-strategy backtester, durable job worker and protected dashboard. v0.8.5 enables all supported allowlisted WhatsApp commands and removes the separate research-message gate. v0.8.4 includes audited fixes on top of v0.8.3, including exit-aware MAE/MFE and final-run funding coverage. v0.8.3 added bounded per-position initial-margin sizing, contract leverage/MMR checks, a shared-wallet maintenance stress proxy, marked-to-market open positions, stronger ledger reconciliation and memory telemetry. It preserves the active S1-RFPC 1D → 12H → 4H → 1H strategy. Live order execution is disabled and no live order-placement loop is available in this build.
 
 ## Strategy and supported timeframes
 
@@ -13,7 +13,7 @@ The 12H series is deterministically aggregated from completed UTC-aligned 4H bar
 ## Backtest and portfolio model
 
 - `BACKTEST 1D` and `BACKTEST 7D` rank the current top 100 active USDT-settled MEXC perpetual contracts by 24-hour turnover. A symbol-specific command such as `BACKTEST BTCUSDT 30D` is supported for longer windows.
-- Jobs are durably queued by the web process and claimed by the dedicated worker through the shared PostgreSQL database. The job stores symbol-by-symbol progress and the completed report. The report is also placed in the WhatsApp outbox when the crypto-message policy gate is open.
+- Jobs are durably queued by the web process and claimed by the dedicated worker through the shared PostgreSQL database. The job stores symbol-by-symbol progress and the completed report. The report is also placed in the WhatsApp outbox for the command sender when that sender is allowlisted.
 - Historical data is fetched with a bounded concurrency of five symbols for a backtest. Worker logs include `BACKTEST SYMBOL SCAN | progress=1/100 ...`, plus per-symbol start, completion and failure details. The scheduled top-100 scan is deferred while a backtest job is using MEXC API capacity.
 - The research portfolio cap is configurable from 1 to **50 simultaneous positions** (`BACKTEST_MAX_POSITIONS`, default 50). Per-entry modeled risk defaults to 0.5% of realized balance; aggregate planned stop-risk is capped at 25%; gross notional is capped at 25× current modeled equity by default (configurable). These filters mean 50 is a ceiling, not a promise that 50 positions can be opened.
 - The separate paper-trading simulator remains limited to one active position (`MAX_CONCURRENT_POSITIONS=1`). The research portfolio cap does not change paper or live execution settings.
@@ -33,9 +33,9 @@ The backtest is chronological. Entries at the same timestamp are allocated in sy
 
 The worker is configured to evaluate the top-universe swing scanner once per completed 1H candle. A signal is sent only when S1-RFPC produces a candidate and the delivery checks pass: valid contract/price tick, sensible rounded stop/target geometry, minimum net reward/risk after modeled fees/slippage, usable top-of-book depth/spread, and an available non-adverse current funding snapshot. The system does **not** broadcast rejected or incomplete candidates as trade signals.
 
-`SIGNAL_PUSH_ENABLED=true` enables the push feature, but the separate crypto WhatsApp policy gate still controls actual sending. By default `WHATSAPP_CRYPTO_MESSAGING_ALLOWED=false`, and the gate remains closed unless `WHATSAPP_POLICY_CLEARANCE_REF` is populated as well. Configure this only after you have confirmed that your exact business use is permitted and have the required written clearance. The allowed recipient list (`WHATSAPP_ALLOWED_SENDERS`) and valid Meta Cloud API credentials are also required. When the gate is closed, signals/reports remain in research storage and the worker logs that WhatsApp delivery was blocked; it does not claim messages were sent.
+All parsed WhatsApp commands are enabled for explicitly configured senders in `WHATSAPP_ALLOWED_SENDERS`. The same allowlist protects inbound command execution and outbound replies/notifications. A valid webhook verification token, app-secret signature, access token and phone-number ID are required. Message de-duplication and the configurable monthly outbound cap remain active.
 
-The user-facing `BACKTEST` acknowledgement is sent immediately after durable queueing. The final report is sent by the worker only when the policy gate is open; otherwise retrieve it using the protected dashboard or the stored job report route after the gate is addressed.
+The user-facing `BACKTEST` acknowledgement is sent immediately after durable queueing. The dedicated worker runs the job and sends the completed report to the original allowlisted sender. Scanner signals are only pushed when the strategy's own data-quality, liquidity, contract and reward/risk checks pass.
 
 ## Commands
 
@@ -86,10 +86,10 @@ The Render Blueprint creates one web service, one background worker and a shared
 
 1. Deploy the same repository commit to the web service and the worker.
 2. Confirm both services connect to the same PostgreSQL database.
-3. Confirm worker logs identify the build, database backend, `S1-RFPC-1D-12H-4H-1H`, `backtest_max_positions=50`, `paper_max_positions=1`, scanner state and WhatsApp policy gate state.
-4. Check `/healthz` for worker heartbeat, latest scan summary/error, backtest latest job and policy gate.
+3. Confirm worker logs identify the build, database backend, `S1-RFPC-1D-12H-4H-1H`, `backtest_max_positions=50`, `paper_max_positions=1`, scanner state and whether a WhatsApp sender allowlist is configured.
+4. Check `/healthz` for worker heartbeat, latest scan summary/error, backtest latest job and WhatsApp command readiness.
 5. Run `BACKTEST 1D`; verify `BACKTEST JOB START`, progress lines from `1/100` onward, `BACKTEST WINDOW COMPLETE` and `BACKTEST JOB COMPLETE` in worker logs. Use `BACKTEST STATUS` and `BACKTEST REPORT <JOB_ID>` to inspect queue state and final output.
-6. Keep `AUTO_TRADING_ENABLED=false`, `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_BUILD_RELEASED=false`, `PAPER_TRADING_ENABLED=false` and `MAX_CONCURRENT_POSITIONS=1`. Do not open the WhatsApp crypto-message policy gate without confirming the applicable policy/clearance first.
+6. Keep `AUTO_TRADING_ENABLED=false`, `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_BUILD_RELEASED=false` and `MAX_CONCURRENT_POSITIONS=1`. `PAPER_TRADING_ENABLED=true` is only an opt-in to fake-money simulation; the scheduler still refuses to simulate entries until a genuine alignment probe has been approved and passes every report check.
 
 ## Local development
 
@@ -112,4 +112,4 @@ Run tests with `pytest -q`. Automated tests validate deterministic fixtures, par
 
 ## Release notes
 
-See [`docs/RELEASE_NOTES_v0.8.4.md`](docs/RELEASE_NOTES_v0.8.4.md) for the latest audit corrections and [`docs/RELEASE_NOTES_v0.8.3.md`](docs/RELEASE_NOTES_v0.8.3.md) for the portfolio-risk changes.
+See [`docs/RELEASE_NOTES_v0.8.5.md`](docs/RELEASE_NOTES_v0.8.5.md) for the latest runtime enablement changes and [`docs/RELEASE_NOTES_v0.8.4.md`](docs/RELEASE_NOTES_v0.8.4.md) for the latest audit corrections and [`docs/RELEASE_NOTES_v0.8.3.md`](docs/RELEASE_NOTES_v0.8.3.md) for the portfolio-risk changes.

@@ -25,4 +25,4 @@ The Blueprint intentionally omits explicit Render `plan` overrides. Render retai
 
 ## WhatsApp
 
-`SIGNAL_PUSH_ENABLED` alone does not authorize crypto message delivery. The separate `WHATSAPP_CRYPTO_MESSAGING_ALLOWED` + `WHATSAPP_POLICY_CLEARANCE_REF` gate, allowlisted recipient and valid Meta configuration are required. Keep the gate closed until your actual business use is covered by applicable written clearance.
+All parsed commands and research notifications are enabled for explicitly allowlisted recipients. Configure `WHATSAPP_ALLOWED_SENDERS` and valid Meta webhook/access credentials. The app continues to verify webhook signatures, enforce sender allowlisting and de-duplicate message IDs.

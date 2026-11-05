@@ -92,7 +92,7 @@ services:
       - key: BACKTEST_JOB_POLL_SECONDS
         value: "5"
       - key: PAPER_TRADING_ENABLED
-        value: "false"
+        value: "true"
       - key: DATA_ALIGNMENT_PROBE_APPROVED
         value: "false"
       - key: AUTO_TRADING_ENABLED
@@ -100,8 +100,6 @@ services:
       - key: LIVE_EXECUTION_ENABLED
         value: "false"
       - key: LIVE_EXECUTION_BUILD_RELEASED
-        value: "false"
-      - key: WHATSAPP_CRYPTO_MESSAGING_ALLOWED
         value: "false"
       - key: META_VERIFY_TOKEN
         sync: false
@@ -112,8 +110,6 @@ services:
       - key: META_PHONE_NUMBER_ID
         sync: false
       - key: WHATSAPP_ALLOWED_SENDERS
-        sync: false
-      - key: WHATSAPP_POLICY_CLEARANCE_REF
         sync: false
       - key: WEB_API_TOKEN
         generateValue: true

@@ -5,10 +5,8 @@ Safety posture:
 - Paper trading additionally requires PAPER_TRADING_ENABLED=true, an explicit
   DATA_ALIGNMENT_PROBE_APPROVED flag, and a successful alignment report.
 - All orders remain local simulations. There is no exchange order client here.
-- Trade signals and final crypto-research reports are never sent unless the separate
-  policy gate is open and the operator has recorded written Meta clearance for the exact use.
-- A worker-claimed BACKTEST service-status notification is operational metadata, not a
-  trade recommendation; final result delivery remains subject to the crypto policy gate.
+- WhatsApp command replies and research notifications are available to configured allowlisted recipients.
+- Webhook signatures, sender allowlisting, idempotency, and the monthly outbound cap remain enabled.
 """
 from __future__ import annotations
 
@@ -253,13 +251,13 @@ class ResearchScheduler:
             passed, reason = self.alignment_gate_passed()
             self.store.set_state("paper_scheduler_gate", "paper-off" if passed else reason)
 
-        # Never send any crypto-related messaging unless written policy clearance is recorded
-        # and the explicit configuration gate is open.
-        if self.settings.whatsapp_policy_gate_open and self.settings.whatsapp_allowed_senders:
+        # Command replies, alert messages and research reports are enabled only for
+        # explicitly configured recipients. The Cloud adapter independently checks this list.
+        if self.settings.whatsapp_allowed_senders:
             await self._alert_tick()
             await self._flush_outbox()
         else:
-            self.store.set_state("whatsapp_dispatch_gate", "blocked; no crypto message sent")
+            self.store.set_state("whatsapp_dispatch_gate", "waiting for configured sender allowlist")
 
 
     async def _process_next_backtest_job(self) -> None:
@@ -292,7 +290,11 @@ class ResearchScheduler:
                 name=f"backtest-execution-{job_id}",
             )
             recipient = str(job.get("recipient") or "")
-            if recipient and self.whatsapp is not None:
+            allowed_recipients = {
+                sender_key(value) for value in self.settings.whatsapp_allowed_senders
+                if sender_key(value)
+            }
+            if recipient and sender_key(recipient) in allowed_recipients and self.whatsapp is not None:
                 status_text = (
                     "▶️ BACKTEST JOB RUNNING\n"
                     f"Job: {job_id}\n"
@@ -334,20 +336,13 @@ class ResearchScheduler:
             # a Meta timeout or outbox/database error must never rewrite the completed job
             # as failed or erase its result.
             try:
-                if recipient and self.settings.whatsapp_policy_gate_open:
+                if recipient and sender_key(recipient) in {sender_key(x) for x in self.settings.whatsapp_allowed_senders}:
                     self.store.enqueue_outbox(
                         recipient, result.text, category="crypto_research",
                         idempotency_key=f"backtest-job-result:{job_id}:{recipient}",
                     )
                     await self._flush_outbox()
                     logger.info("BACKTEST JOB REPORT QUEUED FOR WHATSAPP | job_id=%s recipient_present=true", job_id)
-                elif recipient:
-                    self.store.append_event(
-                        "BACKTEST_JOB_REPORT_NOT_SENT_POLICY_GATE_CLOSED",
-                        {"job_id": job_id, "recipient_present": True},
-                        idempotency_key=f"backtest-report-policy-blocked:{job_id}",
-                    )
-                    logger.warning("BACKTEST JOB REPORT NOT SENT | job_id=%s reason=WHATSAPP_POLICY_GATE_CLOSED", job_id)
             except Exception as notify_exc:
                 self.store.append_event(
                     "BACKTEST_JOB_REPORT_DELIVERY_FAILED",
@@ -579,7 +574,7 @@ class ResearchScheduler:
                     signal["signal_id"] = self.store.save_signal(signal, strategy_version=signal_version)
                     payload["signal"] = signal
                     if signal.get("delivery_eligible") is True:
-                        if self.settings.signal_push_enabled and self.settings.whatsapp_policy_gate_open:
+                        if self.settings.signal_push_enabled and self.settings.whatsapp_allowed_senders:
                             await self._queue_validated_signal(signal, turnover, slot)
                         else:
                             delivery_blocked += 1
@@ -806,7 +801,7 @@ class ResearchScheduler:
             "position_id": position_id, "simulated_entry": simulated_entry, "stop": stop, "target": target,
             "risk": risk_decision.as_dict(), "simulated": True}, symbol=symbol,
             idempotency_key=f"paper-accepted:{candidate.candidate_id}")
-        if self.settings.whatsapp_policy_gate_open and self.settings.whatsapp_allowed_senders:
+        if self.settings.whatsapp_allowed_senders:
             message = (f"[PAPER POSITION OPENED — SIMULATED] {symbol} {candidate.side}\n"
                       f"Entry: {simulated_entry:.10g} | SL: {stop:.10g} | TP: {target:.10g}\n"
                       f"Quantity: {risk_decision.quantity:g} contracts | risk budget: ${risk_decision.risk_budget:.2f}\n"
@@ -915,7 +910,7 @@ class ResearchScheduler:
                 "exit_price_includes_adverse_slippage": True, "exit_time_is_bar_resolution_time": True,
                 "funding_settlement_query_through": candle.close_time, "simulated": True,
             }, symbol=position["symbol"], idempotency_key=f"paper-pnl-components:{position['id']}")
-            if self.settings.whatsapp_policy_gate_open and self.settings.whatsapp_allowed_senders:
+            if self.settings.whatsapp_allowed_senders:
                 await self._queue_to_allowlist(
                     f"[PAPER RESULT — SIMULATED] {position['symbol']} {side}\nExit: {exit_price:.10g} ({reason})\n"
                     f"Gross: ${gross_pnl:.4f} | fees: ${opening_fee + closing_fee:.4f} | funding: ${funding_pnl:.4f}\n"
@@ -995,7 +990,8 @@ class ResearchScheduler:
                     idempotency_key=f"alert-eval-failed:{symbol}:{now // 3600}")
 
     async def _flush_outbox(self) -> None:
-        if not self.settings.whatsapp_policy_gate_open:
+        if not self.settings.whatsapp_allowed_senders:
+            self.store.set_state("whatsapp_dispatch_gate", "waiting for configured sender allowlist")
             return
         counts = self.store.outbox_month_summary()
         if counts["total"] >= self.settings.whatsapp_monthly_message_cap:
@@ -1026,8 +1022,6 @@ class ResearchScheduler:
             counts = self.store.outbox_month_summary()
 
     async def _queue_to_allowlist(self, body: str, key: str) -> None:
-        if not self.settings.whatsapp_policy_gate_open:
-            return
         for recipient in dict.fromkeys(sender_key(x) for x in self.settings.whatsapp_allowed_senders if sender_key(x)):
             self.store.enqueue_outbox(recipient, body, category="service", idempotency_key=f"{key}:{recipient}")
 

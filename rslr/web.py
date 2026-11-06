@@ -34,6 +34,7 @@ def health() -> dict[str, str | bool]:
 
 
 @app.get("/webhook/whatsapp", response_class=PlainTextResponse)
+@app.get("/webhook", response_class=PlainTextResponse)
 def verify_whatsapp_webhook(
     hub_mode: str | None = Query(None, alias="hub.mode"),
     hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
@@ -45,6 +46,7 @@ def verify_whatsapp_webhook(
 
 
 @app.post("/webhook/whatsapp")
+@app.post("/webhook")
 async def whatsapp_webhook(request: Request) -> dict[str, bool]:
     raw = await request.body()
     if not verify_webhook_signature(raw, request.headers.get("X-Hub-Signature-256")):

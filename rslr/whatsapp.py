@@ -37,7 +37,20 @@ class WhatsAppClient:
             headers={"Authorization": f"Bearer {settings.whatsapp_access_token}"},
             json=payload,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            try:
+                detail = response.json().get("error", {}) or {}
+            except ValueError:
+                detail = {}
+            log.error(
+                "WhatsApp Graph API error: status=%s code=%s message=%s",
+                response.status_code,
+                detail.get("code"),
+                detail.get("message"),
+            )
+            raise
         return response.json()
 
     def send_text(self, to: str, body: str) -> dict[str, Any]:

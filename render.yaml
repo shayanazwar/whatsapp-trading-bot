@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: btc-mexc-signal-backtest
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    autoDeploy: true
+    disk:
+      name: btc-mexc-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /var/data/btc_mexc_bot.sqlite3
+      - key: MONITOR_ENABLED
+        value: "true"
+      - key: MEXC_SYMBOL
+        value: BTC_USDT
+      - key: MEXC_INTERVAL
+        value: Min1
+      - key: GRAPH_API_VERSION
+        value: v26.0
+      - key: WA_PHONE_NUMBER_ID
+        sync: false
+      - key: WA_ACCESS_TOKEN
+        sync: false
+      - key: WA_VERIFY_TOKEN
+        sync: false
+      - key: WA_APP_SECRET
+        sync: false
+      - key: WA_RECIPIENTS
+        sync: false
+      - key: AUTHORIZED_WA_IDS
+        sync: false

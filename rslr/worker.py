@@ -7,6 +7,7 @@ import uuid
 
 from rslr.config import settings
 from rslr.formatting import format_signal
+from rslr.jobs import process_backtest_jobs
 from rslr.services import scan_market
 from rslr.paper import reconcile_paper_positions
 from rslr.storage import Database
@@ -64,13 +65,20 @@ def scheduled_scan(database: Database) -> None:
 def main() -> None:
     database = Database()
     log.info("RSLR worker started. Live execution hard-locked: True")
+    last_scan = 0.0
     while True:
         try:
-            scheduled_scan(database)
+            processed = process_backtest_jobs(database)
+            if processed:
+                log.info("Processed %s backtest jobs", processed)
             deliver_outbox(database)
+            now = time.monotonic()
+            if now - last_scan >= max(60, settings.scan_interval_seconds):
+                last_scan = now
+                scheduled_scan(database)
         except Exception:
             log.exception("Worker cycle failed")
-        time.sleep(max(60, settings.scan_interval_seconds))
+        time.sleep(10)
 
 
 if __name__ == "__main__":

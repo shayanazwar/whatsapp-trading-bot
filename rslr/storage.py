@@ -42,6 +42,30 @@ class BacktestRow(Base):
     payload: Mapped[str] = mapped_column(Text)
 
 
+class BacktestJobRow(Base):
+    """Persistent queue for WhatsApp-requested backtests.
+
+    The webhook only creates a PENDING row and replies immediately; the
+    worker claims the row, runs the backtest, stores the real result and
+    sends the completion report. Statuses: PENDING, RUNNING, DONE, FAILED.
+    """
+
+    __tablename__ = "backtest_jobs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    period: Mapped[str] = mapped_column(String(8), index=True)
+    sender: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    backtest_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class NotificationRow(Base):
     __tablename__ = "notifications"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -240,6 +264,63 @@ class Database:
                 return False
             session.add(NotificationRow(recipient=recipient, dedupe_key=dedupe_key, payload=json.dumps(payload)))
         return True
+
+    def enqueue_backtest_job(self, period: str, sender: str) -> int:
+        with self.Session.begin() as session:
+            row = BacktestJobRow(period=period, sender=sender)
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def claim_backtest_job(self) -> dict[str, Any] | None:
+        """Atomically claim the oldest PENDING job (row lock skips locked rows)."""
+        with self.Session.begin() as session:
+            row = session.scalar(
+                select(BacktestJobRow)
+                .where(BacktestJobRow.status == "PENDING")
+                .order_by(BacktestJobRow.id)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if row is None:
+                return None
+            row.status = "RUNNING"
+            return {"id": row.id, "period": row.period, "sender": row.sender}
+
+    def get_backtest_job(self, job_id: int) -> dict[str, Any] | None:
+        with self.Session() as session:
+            row = session.get(BacktestJobRow, job_id)
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "period": row.period,
+                "sender": row.sender,
+                "status": row.status,
+                "backtest_run_id": row.backtest_run_id,
+                "result_summary": row.result_summary,
+                "error": row.error,
+            }
+
+    def update_backtest_job(
+        self,
+        job_id: int,
+        status: str,
+        backtest_run_id: int | None = None,
+        result_summary: str = "",
+        error: str = "",
+    ) -> None:
+        with self.Session.begin() as session:
+            row = session.get(BacktestJobRow, job_id)
+            if row is None:
+                return
+            row.status = status
+            if backtest_run_id is not None:
+                row.backtest_run_id = backtest_run_id
+            if result_summary:
+                row.result_summary = result_summary[:2000]
+            if error:
+                row.error = error[:2000]
 
     def pending_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.Session() as session:

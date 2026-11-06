@@ -8,7 +8,6 @@ from typing import Any
 
 import httpx
 
-from rslr.backtest import run_backtest
 from rslr.charts import generate_chart
 from rslr.config import settings
 from rslr.data.candles import build_timeframes
@@ -174,10 +173,17 @@ def handle_command(text: str, sender: str, database: Database | None = None) -> 
     if command == "backtest":
         if len(parts) != 2 or parts[1].lower() not in {"1d", "7d", "30d"}:
             return "Use: /backtest 1D, /backtest 7D or /backtest 30D", None
-        result = run_backtest(parts[1])
-        payload = result.to_dict()
-        database.save_backtest(payload)
-        return format_backtest(payload), None
+        # Never run the backtest inline: it fetches days of history and would
+        # block the webhook past Meta's response window. Queue a persistent
+        # job and reply immediately; the worker runs it and reports back.
+        period = parts[1].upper()
+        job_id = database.enqueue_backtest_job(period, sender)
+        log.info("Backtest job #%s (%s) queued for sender ****%s", job_id, period, sender[-4:])
+        return (
+            f"🧪 Backtest {period} queued — job #{job_id}.\n"
+            "Running in the background; I'll send the results here when it's done.",
+            None,
+        )
     if command == "performance":
         result = database.latest_backtest()
         if not result:
@@ -210,31 +216,51 @@ def handle_command(text: str, sender: str, database: Database | None = None) -> 
 def process_webhook_payload(payload: dict[str, Any], database: Database | None = None) -> None:
     database = database or Database()
     whatsapp = WhatsAppClient()
-    for entry in payload.get("entry", []):
+    entries = payload.get("entry", [])
+    log.info("Webhook payload received: %s entries", len(entries))
+    for entry in entries:
         for change in entry.get("changes", []):
             value = change.get("value", {})
-            for status_event in value.get("statuses", []):
+            statuses = value.get("statuses", [])
+            messages = value.get("messages", [])
+            log.debug("Webhook change: %s statuses, %s messages", len(statuses), len(messages))
+            for status_event in statuses:
                 external_id = str(status_event.get("id") or "")
                 status = str(status_event.get("status") or "").upper()
                 errors = status_event.get("errors") or []
                 error_text = json.dumps(errors, default=str) if errors else ""
                 if external_id and status:
-                    database.update_notification_by_external_id(external_id, status, error_text)
-            for message in value.get("messages", []):
+                    try:
+                        matched = database.update_notification_by_external_id(external_id, status, error_text)
+                        log.debug("Notification status %s -> %s (matched=%s)", external_id, status, matched)
+                    except Exception:
+                        log.exception("Notification status update failed for %s", external_id)
+            for message in messages:
                 sender = str(message.get("from", ""))
+                message_type = str(message.get("type", ""))
+                log.info("WhatsApp message received: sender ****%s type=%s", sender[-4:], message_type)
                 if not is_allowed_number(sender):
                     log.warning("Ignoring WhatsApp sender not in allowlist: %s", sender[-4:])
                     continue
                 text = message.get("text", {}).get("body", "")
-                if message.get("type") != "text" or not text:
-                    whatsapp.send_text(sender, "Please send a text command. Use /help.")
+                if message_type != "text" or not text:
+                    try:
+                        whatsapp.send_text(sender, "Please send a text command. Use /help.")
+                    except Exception:
+                        log.exception("Failed to send non-text notice to sender ****%s", sender[-4:])
                     continue
+                command_name = text.strip().split()[0][:20] if text.strip() else ""
+                log.info("Executing command %s for sender ****%s", command_name, sender[-4:])
                 try:
                     reply, image_path = handle_command(text, sender, database)
                     if reply:
                         whatsapp.send_text(sender, reply)
                     if image_path:
                         whatsapp.send_image(sender, image_path, reply or "RSLR chart")
+                    log.info("Command %s completed for sender ****%s", command_name, sender[-4:])
                 except Exception as exc:
-                    log.exception("WhatsApp command failed")
-                    whatsapp.send_text(sender, f"⚠️ Command failed: {str(exc)[:250]}")
+                    log.exception("WhatsApp command failed for sender ****%s", sender[-4:])
+                    try:
+                        whatsapp.send_text(sender, f"⚠️ Command failed: {str(exc)[:250]}")
+                    except Exception:
+                        log.exception("Failed to send command-failure notice to sender ****%s", sender[-4:])
